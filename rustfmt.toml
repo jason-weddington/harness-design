@@ -1,0 +1,4 @@
+# Always set edition so bare-rustfmt / hook invocation paths don't silently
+# fall back to edition-2015 formatting rules.
+edition = "2024"
+max_width = 100

@@ -1,0 +1,39 @@
+# Git hook orchestration for the quality gates. Single binary, no Python/Node
+# runtime. Activate on a fresh clone with:  lefthook install
+# CI re-runs these same commands (the real enforcement boundary — local hooks
+# can be skipped with --no-verify).
+
+commit-msg:
+  commands:
+    conventional:
+      run: cog verify --file {1}
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: cargo fmt --all -- --check
+    clippy:
+      run: cargo clippy --all-targets --all-features --locked -- -D warnings
+    typos:
+      run: typos
+    cargo-sort:
+      run: cargo sort --workspace --check
+    gitleaks:
+      run: gitleaks git --staged --redact
+    test:
+      run: cargo nextest run --workspace
+
+pre-push:
+  parallel: false
+  commands:
+    coverage:
+      # RATCHET this literal up as coverage climbs; keep it in sync with CI.
+      run: cargo llvm-cov nextest --workspace --all-features --fail-under-lines 95
+    doctest:
+      # nextest does NOT run doctests — without this they silently never run.
+      run: cargo test --doc --workspace
+    machete:
+      run: cargo machete
+    deny:
+      run: cargo deny check

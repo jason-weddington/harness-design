@@ -1,0 +1,62 @@
+# The REAL enforcement boundary. Local lefthook hooks can be bypassed with
+# --no-verify or a fresh clone that never ran `lefthook install`; CI re-runs the
+# exact same gates on a clean runner so nothing ungated reaches main.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel + components automatically.
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binaries — seconds, not minutes of source compiles.
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install gate tools
+        run: cargo binstall -y cargo-nextest cargo-llvm-cov cargo-deny cargo-machete typos-cli cargo-sort cocogitto
+
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Typos
+        run: typos
+      - name: Cargo.toml sorted
+        run: cargo sort --workspace --check
+      - name: Coverage (>=95%)
+        run: cargo llvm-cov nextest --workspace --all-features --fail-under-lines 95
+      - name: Doctests
+        run: cargo test --doc --workspace
+      - name: Unused dependencies
+        run: cargo machete
+      - name: Supply chain (cargo-deny)
+        run: cargo deny check
+      - name: Secret scan (full history)
+        uses: gitleaks/gitleaks-action@v2
+
+  # cargo-audit's one non-redundant job: catch advisories disclosed AFTER merge
+  # against the committed Cargo.lock.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

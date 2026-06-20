@@ -1,0 +1,7 @@
+# Cocogitto config. `cog verify` (commit-msg hook) enforces conventional
+# commits; `cog bump --auto` (release.sh) derives the SemVer bump from history.
+from_latest_tag = false
+ignore_merge_commits = true
+
+[changelog]
+path = "CHANGELOG.md"

@@ -1,0 +1,6 @@
+# Pin the toolchain + components so every headless agent, CI runner, and laptop
+# agree on exactly what counts as a warning (clippy lints drift between
+# releases). Bump this deliberately.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

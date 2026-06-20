@@ -1,0 +1,31 @@
+# Virtual workspace root. New crates (model providers, CLI, the GTD build-engine
+# adapter) get added to `members` as the harness grows.
+[workspace]
+resolver = "3"
+members = ["crates/harness"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Jason Weddington"]
+
+# Shared dependency versions live here; member crates opt in with
+# `foo.workspace = true`. Empty until we add the first real dependency.
+[workspace.dependencies]
+
+# Project-wide lint strictness — the layer the compiler frees budget for.
+# Levels are `warn` here (non-blocking local builds); the gate enforces
+# `-D warnings`, turning every one of these into a hard failure at commit time.
+[workspace.lints.rust]
+unsafe_code = "forbid"      # agents must not hand-roll unsafe; compiler-enforced
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Groups MUST carry priority = -1 so the individual `allow`s below win.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Curated opt-outs of noisy pedantic lints (revisit as the codebase grows):
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"

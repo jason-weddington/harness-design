@@ -1,0 +1,6 @@
+# Project vocabulary for the `typos` spell checker. Add real domain terms /
+# proper nouns under extend-words so legitimate identifiers aren't flagged.
+[default.extend-words]
+
+[files]
+extend-exclude = ["CHANGELOG.md", "*.lock"]
