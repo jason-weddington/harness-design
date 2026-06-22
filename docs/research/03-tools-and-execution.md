@@ -267,14 +267,16 @@ State of practice ([AI agent sandbox guides](https://www.firecrawl.dev/blog/ai-a
   tool-definition loading; expose a `search_tools`-style discovery surface) so we don't burn
   context loading every tool up front. Keep direct single-tool calls for the trivial cases.
 
-- **The sandbox is not optional — it is the safety net that replaces the absent human.**
-  Run on a Pi with no human approving calls, we must assume the model will eventually write
-  or call something harmful. Adopt the Cloudflare model: **no ambient network/filesystem,
-  binding-based access (the agent reaches only what we inject), credentials held by the
-  supervisor and never visible to generated code, and an out-of-process policy gate that
-  evaluates a deterministic allow/deny *before* execution.** In Rust this is a natural fit —
-  wasmtime/WASI or a microVM (Firecracker) for the codegen runtime, the supervisor owning
-  all secrets and tool bindings.
+- **The tool registry is the boundary; creds-hygiene is the safety net that matters in v1.**
+  Running unattended with no human approving calls, we must assume the agent will eventually
+  make a mistake — but the only callable tools are the ones we compile in (there is no
+  permission model or allow/deny gate to design, since we author every tool). The piece of
+  the Cloudflare model we adopt in v1 is **creds-hygiene**: the agent reaches only what we
+  inject as typed tool bindings, and credentials are held by the supervisor and never visible
+  to generated code. OS-level sandboxing-against-malice for the codegen runtime (wasmtime/WASI
+  or a microVM such as Firecracker) is a likely v2 concern given our threat model — our own
+  groomed tasks building our own code on our own infra — and is revisited only if the
+  blast-radius bounds below prove insufficient.
 
 - **Hard blast-radius limits per run, enforced by the harness, not requested of the model.**
   Cap files touched, commands run, packages installed, wall-clock, tokens, and dollars. Tie

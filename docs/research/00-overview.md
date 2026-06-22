@@ -6,7 +6,8 @@ This is the entry point to the `harness-design` research corpus: seven tracks
 surveying the mid-2026 state of the art in agent-harness design, all read through
 one lens — **a Rust harness built from the ground up for headless dispatch.** No
 human watches a run. A groomed task goes in; the agent runs unattended (often on
-an always-on Raspberry Pi), implements the change, runs the project's own quality
+a constrained, possibly-ephemeral host — a Pi, a container, a Fargate task; the
+harness shouldn't assume which), implements the change, runs the project's own quality
 gates, and ends by pushing a git feature branch and commenting back on a
 task-tracker item. It targets **both the Anthropic API and local Ollama models**.
 Every finding below is filtered through one question: *what changes when there is
@@ -135,7 +136,10 @@ Annotated and prioritized. **★ = must-read** (the 3–4 that most repay the ti
  + [Claude Code sandboxing — Anthropic](https://www.anthropic.com/engineering/claude-code-sandboxing)
  — Containment beats prompting: 93% prompt-approval fatigue, a 17% classifier
  false-negative rate, and why OS-level sandbox (filesystem + egress proxy) is the
- real boundary. The `dontAsk` permission posture is our headless-correct mode.
+ real boundary in a harness that loads tools it didn't author. For us, the tool
+ registry is the boundary (we compile in every callable tool); creds-hygiene —
+ the supervisor holding git credentials so generated code never sees them — is
+ the part of this we adopt in v1.
 
 [April 23 postmortem — Anthropic](https://www.anthropic.com/engineering/april-23-postmortem)
  — Three harness bugs degraded quality while passing every gate. The case for gating
@@ -200,18 +204,22 @@ These recurred across three or more tracks and are the load-bearing ideas:
 
 - **Externalize state; the process is disposable.** Filesystem + git + task item +
   a structured run record are the source of truth; the in-context conversation is
-  scratch. This is what makes runs resumable after a Pi reboot *and* what enables
-  fresh-context restarts before quality degrades. Appears in 01, 02, 05.
+  scratch. This is what makes runs resumable after a host restart (reboot, container
+  eviction, spot reclaim, laptop sleep) *and* what enables fresh-context restarts
+  before quality degrades. Appears in 01, 02, 05.
 
 - **Context is a depleting resource and a correctness risk.** Context rot is real,
   monotonic, and invisible to an unattended run. Smallest-coherent-context,
   just-in-time loading, and the compaction/context-editing/memory stack are
   correctness controls, not just cost optimizations. Appears in 02, 03, 05, 07.
 
-- **Containment beats prompting.** With no human to absorb a classifier's false
-  negatives, OS-level sandboxing + a tight allowlist + least-privilege creds are
-  the real safety boundary. Permission *prompts* are useless when nobody answers.
-  Appears in 03, 05, 06.
+- **The tool registry is the boundary; bound the blast radius.** We build ground-up,
+  so the only callable tools are the ones we compile in — there's no permission model,
+  allowlist, or prompt to answer (those constructs come from harnesses that load tools
+  they didn't author). v1 safety is (a) blast-radius bounds — cost/wall-clock/iteration/
+  per-tool caps enforced in code — and (b) creds-hygiene: the supervisor holds git
+  credentials and generated code never sees them. OS-level sandboxing-against-malice is
+  a likely v2 concern given our threat model. Appears in 03, 05, 06.
 
 - **Verification by isolation.** A fresh, read-only reviewer with no memory of the
   build's rationale structurally avoids self-review's confirmation bias — the
@@ -235,7 +243,8 @@ choice than an interactive assistant would make, it's called out as **[≠ inter
    HTTP/JSON layer too.** The switch is where budget checks, loop-detection, and
    verification gates get injected — never delegate control flow to a framework.
    Build the agent as a stateless reducer over a single serializable run record so a
-   killed Pi run resumes. **Do not depend on a community Anthropic Rust SDK** — the
+   run survives a host restart (reboot, container eviction, spot reclaim, laptop sleep).
+   **Do not depend on a community Anthropic Rust SDK** — the
    API drifted hard in 2025–26 and a lagging crate 400s every request; `reqwest` +
    `serde` + an SSE parser keeps us one edit from any new field. Ollama rides the
    same transport.
@@ -257,15 +266,19 @@ choice than an interactive assistant would make, it's called out as **[≠ inter
    prompt. There is no human to hit Ctrl-C on a runaway loop, so these are
    non-negotiable, not nice-to-haves.
 
-4. **Sandbox is the safety net that replaces the absent human. [≠ interactive]**
-   `dontAsk` + tight tool allowlist + OS-level sandbox (filesystem isolation +
-   egress proxy), least-privilege git creds held by the supervisor and never visible
-   to generated code, deny rules as the hard floor. **Never `bypassPermissions`** (it
-   approves everything unlisted). Enforce hard per-run blast-radius caps (files,
-   commands, packages). An interactive assistant leans on the human approving the
-   risky call; we must assume the model will eventually do something harmful and
-   contain it structurally. In Rust: wasmtime/WASI or a Firecracker microVM for any
-   code-execution runtime.
+4. **The tool registry is the boundary; bound the blast radius. [≠ interactive]**
+   We build ground-up, so the only callable tools are the ones we compile in — there
+   is no permission model, allowlist, or `bypassPermissions`-style setting in our
+   design (a permission/allowlist layer is YAGNI until there are many tools and an
+   open-source surface). v1 safety comes from two things: (a) **blast-radius bounds** —
+   hard per-run cost/wall-clock/iteration/per-tool caps (files, commands, packages),
+   which are budget limits enforced in deterministic code, not permissions; and
+   (b) **creds-hygiene** — least-privilege git creds held by the supervisor and never
+   visible to generated code. An interactive assistant leans on the human approving the
+   risky call; we instead assume the agent will eventually make a mistake and bound the
+   damage in code. OS-level sandboxing-against-malice (wasmtime/WASI, a microVM) is a
+   likely v2 concern: our threat model is our own groomed tasks building our own code on
+   our own infra, so the dominant risk is an honest mistake, not adversarial input.
 
 5. **Architect as workflow-around-open-loop, not one big open loop.** Hardcode the
    predictable outer sequence (orient → edit → run gates → fix → commit → push →
@@ -280,7 +293,10 @@ choice than an interactive assistant would make, it's called out as **[≠ inter
    trail + live-observe feed + replay source). Draw step boundaries around side
    effects; sync-checkpoint git/filesystem steps; mind the **idempotency landmine**
    (replay re-runs the step you crashed inside — prefer git ops and full-file writes,
-   which are naturally re-runnable). SQLite is the right embedded store for a Pi.
+   which are naturally re-runnable). SQLite is the right default — a zero-ops,
+   single-file, single-process embedded store — but it must live behind the
+   run-record persistence interface so an ephemeral-disk deployment (e.g. a Fargate
+   task) can swap in durable storage without touching the loop.
 
 7. **Default to a single-threaded build loop; fan out only reading.** One writer over
    the working tree is the spine. Read-only explorer subagents (search, repro, "find
@@ -315,8 +331,10 @@ choice than an interactive assistant would make, it's called out as **[≠ inter
 
 10. **Route by capability; abstract over both backends behind one trait.** Build a
     `Capabilities` struct per backend (Anthropic from the live Models API; Ollama
-    from a static registry + empirical checks) and gate every feature off it.
-    Dispatch mechanical/single-step tasks to local Ollama (free, private), reserve
+    from a static registry + empirical checks) and gate every feature off it. Don't
+    assume the local model is co-located: "local model" means an Ollama-protocol
+    endpoint at some URL (maybe localhost, maybe remote, maybe absent), not "Ollama on
+    this box." Dispatch mechanical/single-step tasks to local Ollama (free, private), reserve
     frontier for multi-step/judgment work where a wrong turn is expensive and
     unwatched. Treat Ollama `num_ctx` silent truncation as ship-blocking: set it
     explicitly, token-count every prompt against it, refuse-or-prune before
@@ -339,12 +357,15 @@ choice than an interactive assistant would make, it's called out as **[≠ inter
 
 Framed as decisions we must make next.
 
-1. **Code-execution sandbox technology.** Decide between wasmtime/WASI (lighter,
-   in-process, weaker isolation for arbitrary native tooling) vs. a microVM
-   (Firecracker — stronger isolation, heavier, questionable on a Pi 5) vs. a plain
-   jailed working dir + tool allowlist (simplest, weakest). The build engine needs
-   to run `cargo`/`npm`/`pytest`, which strains pure-WASI. *Likely: container/jail +
-   allowlist on the Pi for v1; revisit if blast-radius proves insufficient.*
+1. **v1 blast-radius bounds (not a sandbox).** For v1, safety is blast-radius bounds
+   — cost/wall-clock/iteration/per-tool caps enforced in code — plus creds-hygiene (the
+   supervisor holds git creds; generated code never sees them). The tool registry is the
+   boundary, so there is no allowlist or permission layer to design. *Decide the exact
+   cap values and the bail-with-report contract for v1.* OS-level
+   sandboxing-against-malice (wasmtime/WASI vs. a Firecracker microVM vs. a jailed
+   working dir) is deferred to v2 given our threat model — our own groomed tasks building
+   our own code on our own infra — and revisited only if blast-radius bounds prove
+   insufficient.
 
 2. **How much code-mode vs. direct tool-calling in v1.** Code-execution wins appear
    at scale (>10 tools, multi-step); our v1 toolset may be small enough that direct
@@ -370,8 +391,9 @@ Framed as decisions we must make next.
    step-count estimate. Needs a first-cut heuristic to start collecting data against.
 
 7. **Local-model viability bar.** Empirically establish which task shapes a local
-   model (Qwen 3.x class on a 16GB Pi) can actually one-shot reliably, given the
-   `num_ctx`/VRAM ceiling, before we route real work to it. May be "none in v1."
+   model (Qwen 3.x class) can actually one-shot reliably, given the `num_ctx`/VRAM
+   ceiling set by the configured host's resources (RAM/VRAM read from config, not a
+   design constant), before we route real work to it. May be "none in v1."
 
 8. **What "bail-with-report" looks like.** Define the terminal-escalation contract:
    the structured comment format, what partial state (if any) gets pushed as a WIP

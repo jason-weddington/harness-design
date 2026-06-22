@@ -152,9 +152,10 @@ checks, loop-detection, and verification gates at exactly the right seams.
 **Factor 12 — Make Your Agent a Stateless Reducer.** Structure the agent as a
 pure function: `(state, context_history) -> next_action`, with no hidden state
 between calls ([12-factor agents](https://github.com/humanlayer/12-factor-agents)).
-This is what makes a run **interruptible and resumable** — and for a Pi-hosted
-agent that may be killed, restarted, or run out of budget mid-task, resumability
-is not a nicety.
+This is what makes a run **interruptible and resumable** — and for an agent on a
+constrained, possibly-ephemeral host (a Pi, a container, a Fargate task — the harness
+shouldn't assume which) that may be killed, restarted, evicted, or run out of budget
+mid-task, resumability is not a nicety.
 
 **Factor 5 — Unify Execution State and Business State.** Merge the agent's
 execution tracking with the real work artifacts so "what the agent knows" and
@@ -340,7 +341,7 @@ absorb them and let the model recover.
   inject budget checks, loop-detection, and verification gates. Keep the model in
   the "decide next step" role only; deterministic Rust executes, appends, and
   decides whether to continue (12-factor Factor 8). Build the agent as a stateless
-  reducer (`(state, history) -> action`) so a Pi run can be killed and resumed.
+  reducer (`(state, history) -> action`) so a run survives a host restart (reboot, container eviction, spot reclaim, laptop sleep) and resumes.
 
 - **Make termination multi-layered and non-negotiable, because there is no human
   stop condition.** Ship all of: max-iteration cap, hard token/cost ceiling that

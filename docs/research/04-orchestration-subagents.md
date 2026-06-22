@@ -249,7 +249,7 @@ inverts several of the tradeoffs above.
   with no memory of the build's rationale, so it can't rationalize the diff.
 - **Engineer the handoff contract before adding any parallelism.** MAST's largest
   failure bucket (~42%) is specification/decomposition. Each subagent dispatch must
-  carry an explicit objective, scope boundaries, tool allowlist, and a
+  carry an explicit objective, scope boundaries, the set of tools it's given, and a
   **structured (JSON/schema-validated) return** — not prose. The brief is where
   fan-out lives or dies.
 - **Bake in hard stop conditions and per-run budgets at the harness level.**
