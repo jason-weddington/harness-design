@@ -1,7 +1,7 @@
 # Run Record Schema (v1)
 
-*Drafted 2026-06-22. Status: proposal for review. Resolves research open-decision
-#4; partially resolves #8 (the `finish`/bail disposition lives in the record).*
+*Drafted 2026-06-22. Status: proposal for review. Resolves research open-decisions
+#4 (run-record schema), #5 (cross-window handoff), and #8 (bail-with-report).*
 
 The run record is the **single serializable state the inner loop is a function
 of** — the thing the stateless reducer reduces over (12-factor Factor 5 + 12). Get
@@ -65,6 +65,113 @@ RunRecord {
 The load-bearing idea: **`durable_facts` + git + filesystem are the real
 cross-window state; `messages` is scratch.** That split is what lets us do a
 fresh-context restart before context rot without losing the task.
+
+## The acceptance checklist — claim vs. verify
+
+`durable_facts` has two parts:
+
+- **`checklist`** — one item per **GTD acceptance criterion**, `{ id, criterion,
+  status, evidence }`. The AC items are **immutable**: the agent cannot add,
+  delete, or reword them (anti-drift — it must not quietly redefine "done" as
+  something easier than what was groomed). If the agent thinks an AC is wrong or
+  incomplete, that is a `Blocked` disposition, not a silent edit.
+- **`findings`** — append-only free-form memory (established facts, decisions,
+  ruled-out approaches). The anti-context-rot carrier: on a fresh-context restart
+  the agent reads `findings` + `checklist`, re-orients from git, and skips dead
+  ends it already walked.
+
+**Write authority is split — this is the enforcement.** There is **no
+`set_verified` tool.** The per-criterion state machine:
+
+```
+NotStarted -> InProgress -> ClaimedDone --[harness runs the criterion's check]--> Verified
+                                  ^                                                  |
+                                  +---------------- check failed --------------------+
+```
+
+The agent may move a criterion up to **`ClaimedDone`** (a *claim* — "I think this
+is met"). **Only the harness writes `Verified`,** and only after running that
+criterion's check and seeing it pass. The agent literally cannot type `Verified`
+into the record. `finish(Done)` requires every criterion `Verified`, so a claim
+that never passes its check can't graduate to a completed run.
+
+**Evidence is typed, in descending trust:**
+
+- **`Verified(test)`** — a deterministic check passed. Strongest. The check is
+  either (a) shipped with the AC ("`test_foo` passes", "clippy clean" — gold
+  standard), or (b) a test the agent wrote as part of the work (the soft spot,
+  below).
+- **`Verified(judge)`** — a calibrated LLM-judge, separate from the builder and
+  rubric-based, passed. Probabilistic; flagged as weaker.
+- **`ClaimedDone(needs-human)`** — no automatable check exists (genuinely
+  subjective AC: "the error message is actionable"). The harness **refuses to
+  auto-verify** and leaves it for the outer review. Never silently promoted to
+  `Verified`.
+
+**The soft spot, named:** agent-authored tests (case b) can be gamed (`assert
+true`). The inner gate alone doesn't catch this; the backstops are *outer* — the
+**coverage gate** in `run_checks` (a no-op test fails coverage, so it can't carry
+the run to Done) and the **outer review / isolated verifier** reading the diff
+*including the test* (the ~21% verification gap a human PR reviewer normally
+closes). Per-criterion `Verified` is strong evidence, not proof; the proof is
+`Verified(test)` + outer review.
+
+**Honest consequence:** a task with subjective AC means the inner harness **cannot
+self-certify pure `Done`** — its best terminal is "all automatable criteria
+`Verified(test)`, the rest `ClaimedDone(needs-human)`," handed to the outer review.
+That's correct behavior, not a gap.
+
+**Forward-link to grooming:** inner verifiability is bounded by how checkable the
+groomed AC are. The fix lives *upstream* — grooming (`groom-to-ready`) should make
+each AC mechanically checkable where possible, and explicitly mark the rest
+`needs-human`. The outer harness's job grows slightly so the inner harness's "done"
+can be honest.
+
+## The `finish` disposition
+
+`finish(status, report)` is the inner harness's output contract to GTD — the
+inverse of grooming (groom is intent→spec; disposition is spec→outcome). Three
+terminal states:
+
+- **`Done`** — gates green and every criterion `Verified`.
+- **`Blocked(needs-decision)`** — the spec or environment is the problem;
+  *retrying unchanged cannot help* (ambiguous/contradictory AC, missing
+  prerequisite, a call outside the agent's scope, missing access). Resolution needs
+  an upstream change.
+- **`Failed(retryable)`** — the run is the problem, the spec is fine; *retrying
+  might work* (loop, budget exhausted mid-progress, persistent tool error,
+  transient infra).
+
+**The discriminator: "does running the same thing again have any chance of
+working?"** No → `Blocked`. Maybe → `Failed`. That's what tells the outer harness
+what to do next: `Blocked` → route to a human / re-groom; `Failed` → re-dispatch or
+escalate (engine/budget), giving up after N attempts.
+
+**Asymmetry of trust:** `finish(Done)` is a *claim that triggers validation*
+(run_checks green + all criteria `Verified`); if it doesn't hold, the harness
+rejects it and either keeps looping or converts to `Failed`. `Blocked`/`Failed` are
+taken at face value — "I can't" is believable in a way "I'm done" is not.
+
+**Report shape (differs by status):**
+
+```
+Disposition {
+  status,            // Done | Blocked | Failed
+  summary,           // short prose
+  checklist_final,   // per-AC status + evidence
+  budget_spent,
+  event_log_ref,     // pointer to the trajectory (also the eval-case seed)
+  // Blocked: the specific decision needed — a question a human can answer
+  // Failed:  the failure mode — loop | budget_exhausted | persistent_tool_error | transient_infra
+}
+```
+
+A WIP branch for `Blocked`/`Failed` is the **outer harness's call** in v1 — the
+inner harness leaves the tree and reports; GTD decides whether to snapshot it.
+
+Seam mapping: `Done` → complete the GTD item (after the outer commit/push);
+`Blocked` → post the question as a comment, move the item to a needs-decision
+state; `Failed` → re-dispatch or escalate.
 
 ## Two resume modes
 
@@ -136,13 +243,16 @@ schema_version, state_blob, updated_at)` holding the latest snapshot. Other impl
 
 ## Open questions
 
-- **`durable_facts` shape** — adopt Anthropic's `passes:false` acceptance-checklist
-  verbatim, or a GTD-item-anchored variant (the item already carries AC)? This is
-  research open-decision #5 (cross-window handoff) and should be pinned with this
-  schema.
+- ~~**`durable_facts` shape**~~ — **resolved (research #5):** AC-anchored,
+  immutable checklist + append-only `findings`, with the claim-vs-verify mechanism
+  above. Cross-window handoff carrier = `findings` + `checklist` + git/filesystem.
+- ~~**`finish` disposition schema**~~ — **resolved (research #8):** Done /
+  Blocked(needs-decision) / Failed(retryable), discriminated by "can retrying
+  unchanged work?"; report shape above.
 - **`messages` persistence** — store the full transcript in the snapshot blob, or
   reconstruct it from the event log on crash-resume (keeping the snapshot lean)?
 - **Checkpoint granularity** — per step is the default; do any sub-steps (a long
   `run_command`) need intermediate checkpoints, or is step-level enough for v1?
-- **`finish` disposition schema** (research #8) — pin the exact `Blocked` vs
-  `Failed` discriminator and the report format here, since it's a record field.
+- **LLM-judge in v1?** — the `Verified(judge)` tier needs a calibrated judge; defer
+  it (start with `Verified(test)` + `ClaimedDone(needs-human)`), or build a minimal
+  judge now? (Lean: defer — judge calibration is its own eval problem.)
