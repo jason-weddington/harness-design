@@ -37,6 +37,13 @@ supply-chain, secret scanning, commit hygiene) vs. what would just be ceremony.
 - **KB `project_ref`: `harness-design`** — store decisions, lessons, and conventions
   for this project under that ref. (The repo-root `.kb_project` file records this so
   the KB hook/preflight surface the right maps.)
+- **Braintrust `project_ref`: `harness-design-research`** — a separate KB project
+  holding ingested external sources on agent-harness design (the references cited
+  in `docs/research/`, ingested via `kb_ingest_url`). Kept separate so source
+  material doesn't clutter our own `harness-design` decisions/lessons. Query it
+  (`kb_search`/`kb_ask` with `project_ref="harness-design-research"`) when you want
+  the field's prior art on a harness question; the synthesis of it lives in
+  `docs/research/00-overview.md`.
 - Query the KB before guessing at architecture or conventions; capture hard-won
   lessons as you go.
 
