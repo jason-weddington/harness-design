@@ -128,7 +128,9 @@ a v1 need.
 - **Permission / allowlist model** — the registry is the boundary.
 - **OS sandbox-against-malice** — v2; our threat model is mistakes, not adversaries
   (our groomed tasks, our code, our infra). v1 safety = blast-radius bounds +
-  creds-hygiene.
+  creds-hygiene, **plus the OS account itself**: headless agents already run in
+  isolated accounts, so the account is the containment boundary — an in-harness
+  sandbox would be redundant in v1.
 - **LSP** — deferred; registry-pluggable later.
 - **Code-mode / programmatic tool-calling / tool-search** — pays off at >10 tools
   and heavy multi-step orchestration; our ~8-tool set makes direct tool-calling
@@ -139,8 +141,10 @@ a v1 need.
 
 ## Open questions
 
-- `run_command` vs `run_checks` boundary — confirmed both (general shell + the
-  declared-gate done-oracle); any risk in exposing general shell this early?
+- ~~`run_command` vs `run_checks` boundary~~ — **resolved (2026-06-22):** ship
+  both. General `run_command` stays in v1; headless agents run in isolated OS
+  accounts (the containment boundary), so arbitrary shell + blast-radius caps +
+  creds-hygiene is acceptable without an in-harness permission layer.
 - `edit_file`: string-replace only for v1, or also a patch/diff mode?
 - `search_code`: bundle a ripgrep binary or shell out to `rg`? Capability-detect
   and fall back to a slower in-process search if absent.
