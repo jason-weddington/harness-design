@@ -94,6 +94,11 @@ ignore = [
 allow = [
     "MIT",
     "Apache-2.0",
+    # Unicode-3.0: permissive, non-copyleft data license that serde's tree pulls
+    # in transitively via unicode-ident ("(MIT OR Apache-2.0) AND Unicode-3.0").
+    # Effectively unavoidable in any serde-using Rust project. Anything beyond
+    # these three is a deliberate, reviewed add.
+    "Unicode-3.0",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
