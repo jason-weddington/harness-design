@@ -7,6 +7,12 @@ authors.workspace = true
 description = "Core agent-harness library."
 
 [dependencies]
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

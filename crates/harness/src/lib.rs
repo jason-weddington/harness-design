@@ -5,6 +5,8 @@
 //! placeholder so the quality-gate harness has something to enforce against —
 //! the real harness loop lands next. See the project `CLAUDE.md` for goals.
 
+pub mod tool;
+
 /// The project's name. Placeholder until the real harness API exists.
 #[must_use]
 pub fn name() -> &'static str {
