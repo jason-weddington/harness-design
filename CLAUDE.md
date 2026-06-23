@@ -47,6 +47,22 @@ supply-chain, secret scanning, commit hygiene) vs. what would just be ceremony.
 - Query the KB before guessing at architecture or conventions; capture hard-won
   lessons as you go.
 
+## Session log (this is a learning project — document the process)
+
+We capture *how* we work, not just what we ship. At a natural breakpoint in each
+working session:
+
+1. Log a dated `lesson_learned` entry in the KB (`project_ref: harness-design`,
+   tags include `session-log`) covering that session's arc — what we did and why,
+   key decisions/lessons, where we landed, and **what's next** — so it doubles as
+   the handoff note for the following session.
+2. Append a 3-4 sentence summary + the KB entry id to
+   [`docs/session-summaries.md`](./docs/session-summaries.md) (chronological,
+   newest at the bottom).
+
+**When resuming a session, read the latest `docs/session-summaries.md` entry and
+its linked KB entry first.** Session 1 (`kb-02851`) is the template.
+
 ## Status
 
 Early/greenfield. The quality-gate harness is in place (commit-time + pre-push via
