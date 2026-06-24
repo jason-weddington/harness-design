@@ -5,6 +5,7 @@
 //! placeholder so the quality-gate harness has something to enforce against —
 //! the real harness loop lands next. See the project `CLAUDE.md` for goals.
 
+pub mod model;
 pub mod run_record;
 pub mod store;
 pub mod tool;
