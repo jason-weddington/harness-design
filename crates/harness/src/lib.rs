@@ -5,10 +5,16 @@
 //! placeholder so the quality-gate harness has something to enforce against —
 //! the real harness loop lands next. See the project `CLAUDE.md` for goals.
 
+pub mod engine;
 pub mod model;
 pub mod run_record;
 pub mod store;
 pub mod tool;
+
+/// Crate-wide, test-only support (scripted backends, etc.). Compiled only
+/// under `#[cfg(test)]` so it never ships in a release build.
+#[cfg(test)]
+mod test_support;
 
 /// The project's name. Placeholder until the real harness API exists.
 #[must_use]
