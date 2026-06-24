@@ -14,12 +14,20 @@ authors = ["Jason Weddington"]
 # `foo.workspace = true`.
 [workspace.dependencies]
 async-trait = "0.1"
+# reqwest pinned to the rustls (ring) TLS backend — no system OpenSSL, no
+# native-tls. `default-features = false` drops the native-tls baseline; we
+# only opt back into the bits we actually need (`json` for body
+# serialization, `rustls-tls` for the rustls + webpki-roots HTTPS stack).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt"] }
+# wiremock is dev-only: a local HTTP mock server so backend adapter tests
+# never touch live providers (no API key, no network).
+wiremock = "0.6"
 
 # Project-wide lint strictness — the layer the compiler frees budget for.
 # Levels are `warn` here (non-blocking local builds); the gate enforces

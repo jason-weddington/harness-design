@@ -99,6 +99,23 @@ allow = [
     # Effectively unavoidable in any serde-using Rust project. Anything beyond
     # these three is a deliberate, reviewed add.
     "Unicode-3.0",
+    # ISC: OSI-approved, permissive (BSD-equivalent). Required by the rustls
+    # TLS stack — `ring` (the default crypto provider) is "Apache-2.0 AND ISC",
+    # and both `untrusted` (a ring dependency) and `rustls-webpki` are pure
+    # ISC. Added when reqwest + rustls-tls landed (Anthropic adapter).
+    "ISC",
+    # BSD-3-Clause: OSI-approved, permissive. `subtle` (constant-time
+    # comparisons used by rustls) ships under BSD-3-Clause. Added alongside
+    # the rest of the rustls stack.
+    "BSD-3-Clause",
+    # CDLA-Permissive-2.0: the Linux Foundation's permissive *data* license,
+    # used by `webpki-roots` to redistribute Mozilla's NSS root-CA trust
+    # store. Not OSI-approved (OSI's scope is source-code licenses), but
+    # genuinely permissive — no copyleft / no patent surprises. Required for
+    # reqwest's `rustls-tls` feature to have a trust anchor; the alternative
+    # is shipping no roots, which is not a posture worth taking. Added
+    # alongside the rest of the rustls stack.
+    "CDLA-Permissive-2.0",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
