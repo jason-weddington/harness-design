@@ -19,12 +19,15 @@
 //!   output is stable across runs (byte-exact prompt-cache friendliness).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::workspace::Workspace;
 
 /// Inline-`detail` size cap, in characters (~25K). Anything longer is
 /// truncated in place and the full copy is offloaded via the [`ToolCtx`] sink.
@@ -58,25 +61,44 @@ impl OffloadSink for StubOffloadSink {
 
 /// Per-run context handed to every [`Tool::run`] call.
 ///
-/// v1 carries only the offload sink; future items thread the run-scoped working
-/// directory, project config, and budgets through here.
+/// It carries the run-scoped [`Workspace`] (which owns confined path
+/// resolution) and the offload sink. Future items thread project config and
+/// budgets through here.
 #[derive(Clone)]
 pub struct ToolCtx {
+    workspace: Arc<Workspace>,
     sink: Arc<dyn OffloadSink>,
 }
 
 impl ToolCtx {
-    /// Build a context backed by the given offload sink.
+    /// Build a context backed by the given workspace and offload sink.
     #[must_use]
-    pub fn new(sink: Arc<dyn OffloadSink>) -> Self {
-        Self { sink }
+    pub fn new(workspace: Arc<Workspace>, sink: Arc<dyn OffloadSink>) -> Self {
+        Self { workspace, sink }
     }
 
-    /// Build a context backed by the [`StubOffloadSink`] — the default for
-    /// tests and the not-yet-wired loop.
+    /// Build a context for tests and examples: an ephemeral temp-directory
+    /// [`Workspace`] (shared per process, intentionally leaked so it lives as
+    /// long as any context) plus the [`StubOffloadSink`]. Not for production
+    /// runs — real runs build a [`ToolCtx`] via [`ToolCtx::new`] with a
+    /// run-scoped workspace and a real sink (e.g.
+    /// [`DiskOffloadSink`](crate::workspace::DiskOffloadSink)).
+    ///
+    /// # Panics
+    /// Panics if the process temp directory cannot be created or canonicalized.
+    /// That is only reachable in a broken test environment.
     #[must_use]
     pub fn stub() -> Self {
-        Self::new(Arc::new(StubOffloadSink))
+        let workspace = Workspace::new(stub_workspace_root(), None)
+            .expect("stub workspace root is an existing directory");
+        Self::new(Arc::new(workspace), Arc::new(StubOffloadSink))
+    }
+
+    /// The run-scoped workspace. Tools resolve model-supplied paths through it
+    /// (never touching the raw strings directly).
+    #[must_use]
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 
     /// Offload `contents` through the configured sink, returning the path.
@@ -84,6 +106,22 @@ impl ToolCtx {
     pub fn offload(&self, contents: &str) -> PathBuf {
         self.sink.offload(contents)
     }
+}
+
+/// Process-wide ephemeral directory used as the root for [`ToolCtx::stub`]
+/// workspaces. Created once under the system temp directory and intentionally
+/// leaked (it lives for the whole process) so every stub context shares a
+/// valid, isolated root without pulling `tempfile` into the crate's runtime
+/// dependencies — `tempfile` stays a dev-dependency used only by tests.
+fn stub_workspace_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("harness-stub-workspace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .expect("create stub workspace root under the system temp dir");
+        dir
+    })
 }
 
 /// The result of running a [`Tool`].
@@ -323,8 +361,8 @@ mod tests {
             sink.offload("anything"),
             std::path::PathBuf::from("<offload-stub>")
         );
-        // Via a ctx built from a custom Arc sink too.
-        let ctx = ToolCtx::new(Arc::new(StubOffloadSink));
+        // Via a ctx (the stub sink is what backs it) too.
+        let ctx = ToolCtx::stub();
         assert_eq!(ctx.offload("x"), std::path::PathBuf::from("<offload-stub>"));
     }
 

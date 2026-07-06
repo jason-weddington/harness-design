@@ -12,6 +12,7 @@ pub mod model;
 pub mod run_record;
 pub mod store;
 pub mod tool;
+pub mod workspace;
 
 /// Crate-wide, test-only support (scripted backends, etc.). Compiled only
 /// under `#[cfg(test)]` so it never ships in a release build.
