@@ -4,4 +4,8 @@
 aci = "aci"   # agent-computer interface (Anthropic's term), not a typo of ACPI
 
 [files]
-extend-exclude = ["CHANGELOG.md", "*.lock"]
+# `fixtures/*` are eval inputs, not project code — the workspace `exclude`s
+# them from cargo, and typos skips them here for the same reason: a fixture
+# may deliberately contain non-standard identifiers or partial-word test
+# vectors (e.g. `"caf"` — the truncated "café" — in the text-preview fixture).
+extend-exclude = ["CHANGELOG.md", "*.lock", "fixtures/**"]

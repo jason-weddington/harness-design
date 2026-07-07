@@ -208,6 +208,29 @@ impl Drop for ScratchDir {
     }
 }
 
+/// List every immediate subdirectory of `fixtures_root`, sorted by path.
+///
+/// The multi-fixture coding eval calls this to enumerate every fixture crate
+/// under `fixtures/` in a deterministic order — one eval per directory. Only
+/// directory entries are returned; stray files (`README.md`, `.gitignore`,
+/// etc.) at that level are ignored. The sort is by full path, which — because
+/// every returned entry lives under the same parent — is equivalent to a sort
+/// by directory name.
+///
+/// # Errors
+/// Propagates `std::fs` errors from `read_dir` and per-entry metadata reads.
+pub fn discover_fixtures(fixtures_root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(fixtures_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
 /// Recursively copy the contents of `src` into `dst`, creating `dst` (and any
 /// nested subdirectories) as needed.
 ///
@@ -362,8 +385,8 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalReport, EvalTask, TrialEnv, coding_fix_task, copy_dir_recursive, finish_env,
-        finish_task, run_eval,
+        EvalReport, EvalTask, TrialEnv, coding_fix_task, copy_dir_recursive, discover_fixtures,
+        finish_env, finish_task, run_eval,
     };
     use crate::engine::{
         FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, Verification,
@@ -613,6 +636,59 @@ mod tests {
     }
 
     #[test]
+    fn discover_fixtures_lists_subdirs_sorted_and_skips_files() {
+        // Build a mini fixtures root: three fake fixture crates + one stray
+        // file that must be skipped. Names are chosen so filesystem order is
+        // unlikely to match sorted order — we're testing the sort.
+        let root = tempdir().expect("root tempdir");
+        std::fs::create_dir(root.path().join("zebra")).expect("mkdir zebra");
+        std::fs::create_dir(root.path().join("alpha")).expect("mkdir alpha");
+        std::fs::create_dir(root.path().join("middle")).expect("mkdir middle");
+        std::fs::write(root.path().join("README.md"), "not a fixture\n").expect("write readme");
+
+        let dirs = discover_fixtures(root.path()).expect("discover");
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "middle".to_string(),
+                "zebra".to_string()
+            ],
+            "directories must be returned sorted; stray files must be dropped"
+        );
+    }
+
+    #[test]
+    fn discover_fixtures_finds_the_four_committed_fixtures() {
+        // The repo's real `fixtures/` root, discovered from this crate's
+        // manifest dir. The four v1 fixtures (`broken-adder`, `interval-merge`,
+        // `lru-cache`, `text-preview`) must be present, sorted, in dir form.
+        let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures");
+        let dirs = discover_fixtures(&fixtures_root).expect("discover fixtures dir");
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "broken-adder".to_string(),
+                "interval-merge".to_string(),
+                "lru-cache".to_string(),
+                "text-preview".to_string(),
+            ],
+            "the four v1 fixtures must be discovered in sorted order",
+        );
+    }
+
+    #[test]
     fn copy_dir_recursive_round_trips_nested_structure() {
         let src = tempdir().expect("src tempdir");
         std::fs::write(src.path().join("top.txt"), "top").expect("write top");
@@ -826,10 +902,17 @@ mod tests {
     }
 
     #[test]
-    fn fixture_crate_is_excluded_from_the_harness_workspace() {
-        // Prove `exclude = ["fixtures/*"]` took effect: the fixture package is
-        // NOT a member of the harness workspace, so the project's gates never
-        // build or test it. `cargo metadata` is offline (no compile, --no-deps).
+    fn no_fixture_crate_is_a_workspace_member() {
+        // Prove `exclude = ["fixtures/*"]` took effect: NO fixture crate under
+        // `fixtures/` is a member of the harness workspace, so the project's
+        // gates never build or test any of them. `cargo metadata` is offline
+        // (no compile, --no-deps).
+        //
+        // The check is generic — the assertion looks at every member's package
+        // id and rejects any whose path passes through a `fixtures/` segment.
+        // That covers `broken-adder` (v0) plus the v1 fixtures
+        // (`interval-merge`, `lru-cache`, `text-preview`) and any future
+        // fixture added to `fixtures/` without touching this test.
         let cargo = env!("CARGO");
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -856,12 +939,31 @@ mod tests {
         let members = meta["workspace_members"]
             .as_array()
             .expect("workspace_members is an array");
-        assert!(
-            members
-                .iter()
-                .all(|m| !m.as_str().unwrap_or_default().contains("broken-adder")),
-            "fixture `broken-adder` must NOT be a workspace member; members: {members:?}"
-        );
+        // Generic guard: no member id may mention `fixtures/` (that would be
+        // a fixture crate leaking into the workspace).
+        for m in members {
+            let s = m.as_str().unwrap_or_default();
+            assert!(
+                !s.contains("/fixtures/") && !s.contains("\\fixtures\\"),
+                "no fixture crate may be a workspace member; found `{s}` in members: {members:?}",
+            );
+        }
+        // Belt-and-suspenders: the four v1 fixture package names must not
+        // appear either — a stronger check than path-substring matching in
+        // case some future cargo-metadata format changes the id shape.
+        for banned in [
+            "broken-adder",
+            "interval-merge",
+            "lru-cache",
+            "text-preview",
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .all(|m| !m.as_str().unwrap_or_default().contains(banned)),
+                "fixture `{banned}` must NOT be a workspace member; members: {members:?}",
+            );
+        }
         // Sanity: the harness crate IS a member (proves metadata actually ran).
         assert!(
             members
