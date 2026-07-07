@@ -3,3 +3,6 @@
 
 # Local, machine-specific deploy script (mirrors the Python projects).
 /deploy.sh
+
+# Local Claude Code session state.
+/.claude/
