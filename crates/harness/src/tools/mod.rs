@@ -6,4 +6,5 @@
 //! [`crate::tool`]; this module just gathers the concrete tools.
 
 pub mod edit_file;
+pub mod list_files;
 pub mod read_file;
