@@ -8,6 +8,7 @@
 pub mod anthropic;
 pub mod engine;
 pub mod eval;
+pub mod exec;
 pub mod model;
 pub mod prompt;
 pub mod run_record;

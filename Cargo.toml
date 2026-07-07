@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 # wiremock is dev-only: a local HTTP mock server so backend adapter tests
 # never touch live providers (no API key, no network).
 wiremock = "0.6"
