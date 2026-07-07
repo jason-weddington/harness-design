@@ -13,6 +13,11 @@ authors = ["Jason Weddington"]
 # Shared dependency versions live here; member crates opt in with
 # `foo.workspace = true`.
 [workspace.dependencies]
+# askama: compile-time-checked Jinja-like templates. A template referencing a
+# missing field is a *build* error, in keeping with "rustc is a gate". Used to
+# render the versioned prompt artifacts (`crates/harness/templates/*.md`) into
+# strings. MIT OR Apache-2.0.
+askama = "0.16"
 async-trait = "0.1"
 # reqwest pinned to the rustls (ring) TLS backend — no system OpenSSL, no
 # native-tls. `default-features = false` drops the native-tls baseline; we
