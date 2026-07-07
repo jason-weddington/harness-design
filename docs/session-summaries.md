@@ -44,3 +44,26 @@ tests, 98.83% coverage, with one inline `typos` fix the lead's merge-gate caught
 E2 agent's gates missed. **The live eval is green: 5/5 pass^k against `claude-haiku-4-5`** —
 the loop drives the real Anthropic API through a `finish` tool call end-to-end. Full
 write-up + handoff: **kb-02855**.
+
+---
+
+## Session 3 — 2026-06-29 → 07-07 — the three seams, overnight waves, v0.1.0
+
+Started from a prompt-engineering question (should we model prompts in BAML?) and ended
+with a released build engine. Investigated BAML against its live repo — verdict: don't
+adopt (single-shot structured-*output* layer, FFI-blob/sidecar footprint, and it replaces
+exactly the layer this project exists to build) but steal its ideas: versioned templated
+prompts, prompts-as-testable-fixtures, lenient parsing (parked for Ollama) (`kb-02870`).
+Decided to release at a **product boundary** ("the harness autonomously completes a
+coding task, verified mechanically"), not an engineering milestone. Designed three seams
+interactively: the confined `Workspace` (path resolution owned in one tested place; a
+clarifying question caught the offload-readback gap early), the **claim-vs-verify**
+control flow (`finish(done)` is a claim; the harness runs the checks itself; rejection is
+steering; `Done` carries evidence by construction), and the askama prompt layer
+(compile-time-checked, versioned template files, load-bearing phrases pinned by tests).
+Then three autonomous dispatch waves overnight — 5 parallel tools/prompt items, the
+engine rework, the eval fixture with per-trial isolation — 7 dispatches, all clean, zero
+quality misses. Morning boundary ritual: **3/3 pass^k** — haiku found and fixed the
+planted bug and the harness verified `cargo test` green itself — then `./release.sh` cut
+**v0.1.0** with the first CHANGELOG and pushed to GitHub. Full write-up + handoff:
+**kb-02899**.
