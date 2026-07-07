@@ -16,12 +16,11 @@
 //! - `ANTHROPIC_MODEL`   (optional) — defaults to `claude-haiku-4-5`.
 
 use std::env;
-use std::sync::Arc;
 
 use harness::anthropic::AnthropicBackend;
-use harness::engine::{FINISH_TOOL_NAME, FinishTool};
 use harness::eval::{finish_task, run_eval};
-use harness::tool::{EchoTool, ToolCtx, ToolRegistry};
+use harness::tool::ToolCtx;
+use harness::tools::standard_registry;
 
 /// Number of independent trials per eval run. Small so a live run is cheap.
 const TRIALS: u32 = 5;
@@ -41,9 +40,9 @@ async fn main() {
 
     let backend = AnthropicBackend::new(&model, api_key);
 
-    let mut tools = ToolRegistry::new();
-    tools.register("echo", Arc::new(EchoTool));
-    tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+    // `finish_task` doesn't wire in a `ChecksRunner`, so a `finish(done)`
+    // here yields the NoChecksConfigured verification path.
+    let tools = standard_registry(None);
 
     let ctx = ToolCtx::stub();
     let task = finish_task();

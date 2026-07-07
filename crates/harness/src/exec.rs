@@ -238,7 +238,12 @@ impl std::fmt::Display for CheckCommand {
 /// The full combined output is offloaded and pointed at by `offload_path`;
 /// `excerpt` is the bounded tail for inline display. This is the evidence a
 /// later engine item attaches to a verified `Done`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// [`PartialEq`] is derived so [`crate::engine::Verification`] — which wraps
+/// a report — can be equality-compared in tests; [`Eq`] is deliberately not
+/// implied here (no float-in-`Duration` reason today, but keeping the door
+/// open for a future field that isn't `Eq`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckReport {
     /// Whether the checks passed (clean exit, not timed out).
     pub passed: bool,
@@ -283,6 +288,15 @@ impl ChecksRunner {
     #[must_use]
     pub fn command(&self) -> &CheckCommand {
         &self.command
+    }
+
+    /// The runner's command rendered as a human-readable display string
+    /// ([`CheckCommand`]'s [`Display`](std::fmt::Display)). Handed to the
+    /// prompt layer so the system prompt can announce which checks the
+    /// harness will use to verify a `finish(done)` claim.
+    #[must_use]
+    pub fn command_display(&self) -> String {
+        self.command.to_string()
     }
 
     /// Run the checks: execute via [`run`] in the workspace root, offload the
@@ -580,6 +594,22 @@ mod tests {
         assert_eq!(back.excerpt, report.excerpt);
         assert_eq!(back.offload_path, report.offload_path);
         assert_eq!(back.duration, report.duration);
+    }
+
+    #[test]
+    fn checks_runner_command_display_matches_command_display() {
+        // `command_display()` is the hook the prompt layer uses to include
+        // the check command in the system prompt — it MUST agree, byte for
+        // byte, with the `CheckCommand`'s own Display, so a wording drift
+        // between prompt and command is impossible.
+        let command = CheckCommand {
+            program: "cargo".to_string(),
+            args: vec!["nextest".to_string(), "run".to_string()],
+        };
+        let runner =
+            ChecksRunner::new(command.clone(), PathBuf::from("/"), Duration::from_secs(10));
+        assert_eq!(runner.command_display(), command.to_string());
+        assert_eq!(runner.command_display(), "cargo nextest run");
     }
 
     #[test]

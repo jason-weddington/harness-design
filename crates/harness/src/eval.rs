@@ -1,9 +1,9 @@
 //! Eval harness: the measuring rig wrapped around the agent loop.
 //!
-//! An [`EvalTask`] is a system + task prompt plus a predicate over the loop's
-//! terminal [`LoopOutcome`] that decides whether a trial passed. [`run_eval`]
-//! runs `k` independent trials against a [`model::ModelBackend`] and reports
-//! the count of passes and the derived rate as an [`EvalReport`].
+//! An [`EvalTask`] is a task prompt plus a predicate over the loop's terminal
+//! [`LoopOutcome`] that decides whether a trial passed. [`run_eval`] runs `k`
+//! independent trials against a [`model::ModelBackend`] and reports the count
+//! of passes and the derived rate as an [`EvalReport`].
 //!
 //! ## Why this exists
 //!
@@ -19,6 +19,14 @@
 //! field-of-evals shorthand for "we ran k trials and counted passes" — that
 //! is exactly the math here.
 //!
+//! ## System prompt sourcing
+//!
+//! The `EvalTask` deliberately does NOT carry a `system` field: the canonical
+//! system prompt is now rendered by [`crate::prompt`] inside the engine, from
+//! the registered tool set (plus the check command, when configured). Every
+//! trial and every real run render the same prompt from the same source of
+//! truth — a wording drift between eval and prod is impossible.
+//!
 //! ## What this is NOT (deferred)
 //!
 //! - **Clean-worktree-per-trial isolation is deliberately deferred.** The
@@ -29,7 +37,7 @@
 //!   multi-provider / model-routing eval, and CI wiring of the live eval all
 //!   land later.
 
-use crate::engine::{self, FinishDisposition, LoopOutcome};
+use crate::engine::{self, FinishDisposition, LoopOutcome, RunConfig};
 use crate::model::ModelBackend;
 use crate::tool::{ToolCtx, ToolRegistry};
 
@@ -41,7 +49,7 @@ use crate::tool::{ToolCtx, ToolRegistry};
 /// pin the future to a single thread.
 pub type SuccessPredicate = Box<dyn Fn(&LoopOutcome) -> bool + Send + Sync>;
 
-/// One eval task: how to set up the run plus how to judge whether it passed.
+/// One eval task: the seed prompt plus how to judge whether it passed.
 ///
 /// All fields are public — the helper [`finish_task`] is just a constructor,
 /// and downstream callers are expected to build their own tasks with struct
@@ -49,10 +57,9 @@ pub type SuccessPredicate = Box<dyn Fn(&LoopOutcome) -> bool + Send + Sync>;
 pub struct EvalTask {
     /// Human-readable label; flows through to [`EvalReport::task_name`].
     pub name: String,
-    /// System prompt for the run (rides on the [`crate::model::TurnRequest`]
-    /// — not part of the chat history).
-    pub system: String,
     /// The seed user message: the actual task description handed to the agent.
+    /// The canonical system prompt is rendered by [`crate::prompt`] inside
+    /// the engine — see the module docs.
     pub task: String,
     /// Predicate over the terminal [`LoopOutcome`] that decides pass/fail.
     pub success: SuccessPredicate,
@@ -76,10 +83,13 @@ pub struct EvalReport {
 /// Run `task` `k` independent times against `backend` + `tools` and report
 /// how many trials the [`EvalTask::success`] predicate accepted.
 ///
-/// Each trial is a fresh call to [`engine::run`] with the same `system` /
-/// `task` / `max_iterations`. The backend is the only stochastic surface in
-/// this slice — clean-worktree-per-trial isolation is **deferred** (there
-/// are no code-editing tools yet, so trials are stateless and don't need it).
+/// Each trial is a fresh call to [`engine::run`] with a [`RunConfig`] carrying
+/// the task's seed prompt and the given `max_iterations`. `checks` is left
+/// unset — the eval fixtures wired here don't verify against real checks yet;
+/// a `finish(done)` in these trials yields
+/// [`crate::engine::Verification::NoChecksConfigured`]. The backend is the
+/// only stochastic surface in this slice — clean-worktree-per-trial isolation
+/// is **deferred**.
 ///
 /// `pass_rate` is `0.0` when `k == 0` so a misuse never produces `NaN`; the
 /// trial loop runs zero times, so the backend is also never touched in that
@@ -94,15 +104,8 @@ pub async fn run_eval(
 ) -> EvalReport {
     let mut passes: u32 = 0;
     for _ in 0..k {
-        let outcome = engine::run(
-            backend,
-            tools,
-            ctx,
-            &task.system,
-            &task.task,
-            max_iterations,
-        )
-        .await;
+        let config = RunConfig::new(task.task.clone(), max_iterations);
+        let outcome = engine::run(backend, tools, ctx, &config).await;
         if (task.success)(&outcome) {
             passes += 1;
         }
@@ -126,21 +129,21 @@ pub async fn run_eval(
 ///
 /// This is the smoke-test rung: any working loop + backend + finish-tool
 /// wiring should hit `pass_rate ≈ 1.0` here. The predicate matches
-/// **only** [`LoopOutcome::Finished`] carrying [`FinishDisposition::Done`];
-/// every other terminal outcome (blocked, failed, hit max iterations,
-/// stopped without finishing, backend error) is a failure.
+/// **any** [`LoopOutcome::Finished`] carrying [`FinishDisposition::Done`] —
+/// including the `NoChecksConfigured` variant, which is what the eval yields
+/// today (no [`crate::exec::ChecksRunner`] is wired). Every other terminal
+/// outcome (blocked, failed, hit max iterations, stopped without finishing,
+/// backend error) is a failure.
 #[must_use]
 pub fn finish_task() -> EvalTask {
     EvalTask {
         name: "finish".to_string(),
-        system: "You are a test harness. You have a tool called `finish`. \
-                 To complete this trivial task, call the `finish` tool exactly \
-                 once with `disposition=\"done\"` and a one-line `summary`. \
-                 Do nothing else."
-            .to_string(),
         task: "Acknowledge and finish.".to_string(),
         success: Box::new(|outcome| {
-            matches!(outcome, LoopOutcome::Finished(FinishDisposition::Done))
+            matches!(
+                outcome,
+                LoopOutcome::Finished(FinishDisposition::Done { .. })
+            )
         }),
     }
 }
@@ -290,8 +293,12 @@ mod tests {
         // explicitly so the contract is locked in.
         let task = finish_task();
 
+        // NoChecksConfigured is the eval-path Done: verify it passes.
         assert!((task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Done
+            FinishDisposition::Done {
+                summary: "ok".to_string(),
+                verification: crate::engine::Verification::NoChecksConfigured,
+            }
         )));
 
         assert!(!(task.success)(&LoopOutcome::Finished(
@@ -316,11 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn finish_task_carries_non_empty_prompts() {
+    fn finish_task_carries_non_empty_task_prompt() {
         let task = finish_task();
         assert_eq!(task.name, "finish");
-        assert!(!task.system.is_empty());
-        assert!(task.system.contains("finish"));
         assert!(!task.task.is_empty());
     }
 
@@ -330,14 +335,16 @@ mod tests {
         // public-field shape works for non-built-in tasks.
         let task = EvalTask {
             name: "custom".to_string(),
-            system: "sys".to_string(),
             task: "do something".to_string(),
             success: Box::new(|outcome| matches!(outcome, LoopOutcome::MaxIterations)),
         };
         assert_eq!(task.name, "custom");
         assert!((task.success)(&LoopOutcome::MaxIterations));
         assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Done
+            FinishDisposition::Done {
+                summary: String::new(),
+                verification: crate::engine::Verification::NoChecksConfigured,
+            }
         )));
     }
 

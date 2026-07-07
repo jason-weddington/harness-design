@@ -31,6 +31,11 @@ pub(crate) struct MockBackend {
     /// Snapshot of the `messages` slice passed to the most recent `turn`
     /// call — lets a test assert on the history the loop actually built.
     last_messages: Mutex<Vec<Message>>,
+    /// One entry per `turn` call, in order, capturing the `system` prompt
+    /// the loop sent that turn (owned copy). Tests use this to prove the
+    /// engine renders the system prompt ONCE and re-sends the byte-identical
+    /// string every iteration — a prompt-cache correctness invariant.
+    systems_seen: Mutex<Vec<Option<String>>>,
 }
 
 impl MockBackend {
@@ -41,6 +46,7 @@ impl MockBackend {
             script: Mutex::new(script.into()),
             calls: Mutex::new(0),
             last_messages: Mutex::new(Vec::new()),
+            systems_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,6 +69,17 @@ impl MockBackend {
             .expect("last_messages lock poisoned")
             .clone()
     }
+
+    /// One entry per `turn` call, in order: the `system` prompt string the
+    /// loop sent that turn. Tests assert every entry is equal to prove the
+    /// engine renders the prompt exactly once and re-sends byte-identical
+    /// bytes.
+    pub(crate) fn systems_seen(&self) -> Vec<Option<String>> {
+        self.systems_seen
+            .lock()
+            .expect("systems_seen lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -73,6 +90,10 @@ impl ModelBackend for MockBackend {
             .last_messages
             .lock()
             .expect("last_messages lock poisoned") = req.messages.to_vec();
+        self.systems_seen
+            .lock()
+            .expect("systems_seen lock poisoned")
+            .push(req.system.map(str::to_string));
         let next = self
             .script
             .lock()
