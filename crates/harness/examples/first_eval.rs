@@ -18,9 +18,7 @@
 use std::env;
 
 use harness::anthropic::AnthropicBackend;
-use harness::eval::{finish_task, run_eval};
-use harness::tool::ToolCtx;
-use harness::tools::standard_registry;
+use harness::eval::{finish_env, finish_task, run_eval};
 
 /// Number of independent trials per eval run. Small so a live run is cheap.
 const TRIALS: u32 = 5;
@@ -40,11 +38,6 @@ async fn main() {
 
     let backend = AnthropicBackend::new(&model, api_key);
 
-    // `finish_task` doesn't wire in a `ChecksRunner`, so a `finish(done)`
-    // here yields the NoChecksConfigured verification path.
-    let tools = standard_registry(None);
-
-    let ctx = ToolCtx::stub();
     let task = finish_task();
 
     println!(
@@ -52,6 +45,16 @@ async fn main() {
         task.name,
     );
 
-    let report = run_eval(&task, &backend, &tools, &ctx, TRIALS, MAX_ITERATIONS).await;
+    // `finish_env` wires no `ChecksRunner`, so a `finish(done)` here yields the
+    // NoChecksConfigured verification path. `|_, _| {}` ignores per-trial output.
+    let report = run_eval(
+        &task,
+        &backend,
+        finish_env,
+        TRIALS,
+        MAX_ITERATIONS,
+        |_, _| {},
+    )
+    .await;
     println!("{report:#?}");
 }

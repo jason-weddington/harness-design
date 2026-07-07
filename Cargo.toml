@@ -3,6 +3,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/harness"]
+# `fixtures/*` are self-contained cargo packages used as eval inputs (e.g.
+# `fixtures/broken-adder`, committed deliberately red). Excluding them keeps the
+# project's own gates from ever building, testing, or linting fixture code —
+# `cargo nextest run --workspace` must never run a fixture's tests.
+exclude = ["fixtures/*"]
 
 [workspace.package]
 version = "0.1.0"

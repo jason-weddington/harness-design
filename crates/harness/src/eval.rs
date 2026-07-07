@@ -27,19 +27,40 @@
 //! trial and every real run render the same prompt from the same source of
 //! truth — a wording drift between eval and prod is impossible.
 //!
+//! ## Per-trial workspace isolation
+//!
+//! Code-editing trials are **stateful** — an `edit_file` in trial 1 must not be
+//! visible to trial 2. So [`run_eval`] takes a per-trial *environment factory*
+//! ([`TrialEnv`]) and calls it once per trial: each trial gets a FRESH workspace
+//! (a recursive copy of a source dir into a new scratch dir via
+//! [`copy_dir_recursive`]), a fresh offload dir, a fresh
+//! [`ToolCtx`](crate::tool::ToolCtx), and a fresh
+//! [`ToolRegistry`](crate::tool::ToolRegistry) whose checks run in that trial's
+//! own workspace. Trials run **sequentially** — no parallelism, which keeps the
+//! model simple and is friendly to provider rate limits.
+//!
 //! ## What this is NOT (deferred)
 //!
-//! - **Clean-worktree-per-trial isolation is deliberately deferred.** The
-//!   harness has no code-editing tools yet, so trials are stateless — the
-//!   only stochastic surface is the backend itself. When code-editing tools
-//!   land, each trial will need a fresh worktree before it runs.
-//! - Real code-editing eval tasks, statistical rigor beyond pass^k counting,
-//!   multi-provider / model-routing eval, and CI wiring of the live eval all
+//! - Statistical rigor beyond pass^k counting, multi-provider / model-routing
+//!   eval, multi-fixture suites, git-worktree isolation (plain dir copy is the
+//!   v1 mechanism — fixtures aren't repos), and CI wiring of the live eval all
 //!   land later.
 
-use crate::engine::{self, FinishDisposition, LoopOutcome, RunConfig};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use crate::engine::{self, FinishDisposition, LoopOutcome, RunConfig, Verification};
+use crate::exec::{CheckCommand, ChecksRunner};
 use crate::model::ModelBackend;
 use crate::tool::{ToolCtx, ToolRegistry};
+use crate::tools::standard_registry;
+use crate::workspace::{DiskOffloadSink, Workspace};
+
+/// Generous timeout for the coding-fix eval's `cargo test`: the first compile of
+/// a fresh crate copy is slow on a small host, so allow a wide margin.
+const CODING_CHECK_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Predicate that judges whether a single trial's [`LoopOutcome`] is a pass.
 ///
@@ -80,35 +101,63 @@ pub struct EvalReport {
     pub pass_rate: f64,
 }
 
-/// Run `task` `k` independent times against `backend` + `tools` and report
-/// how many trials the [`EvalTask::success`] predicate accepted.
+/// One trial's fresh, isolated execution environment.
 ///
-/// Each trial is a fresh call to [`engine::run`] with a [`RunConfig`] carrying
-/// the task's seed prompt and the given `max_iterations`. `checks` is left
-/// unset — the eval fixtures wired here don't verify against real checks yet;
-/// a `finish(done)` in these trials yields
-/// [`crate::engine::Verification::NoChecksConfigured`]. The backend is the
-/// only stochastic surface in this slice — clean-worktree-per-trial isolation
-/// is **deferred**.
+/// [`run_eval`] obtains one of these per trial from its `env_factory`, so a
+/// stateful trial (one that edits files) never leaks writes into the next trial.
+/// The `_scratch` dirs are held for the life of the value and deleted on drop —
+/// the trial's workspace is torn down as soon as the trial ends.
+///
+/// There is no `Debug` impl: [`ToolCtx`] wraps a `dyn` offload sink.
+pub struct TrialEnv {
+    /// The trial's tool registry (wired to `ctx`'s workspace).
+    pub tools: ToolRegistry,
+    /// The trial's run context: its own workspace + offload sink.
+    pub ctx: ToolCtx,
+    /// The checks the harness re-runs to verify a `finish(done)` claim, with a
+    /// cwd pointing at this trial's own workspace. `None` disables verification
+    /// (a `finish(done)` then yields [`Verification::NoChecksConfigured`]).
+    pub checks: Option<ChecksRunner>,
+    /// Scratch dirs kept alive for the trial and removed on drop. Private
+    /// because callers never inspect it — they build a `TrialEnv` via a factory.
+    _scratch: Vec<ScratchDir>,
+}
+
+/// Run `task` `k` independent times and report how many trials the
+/// [`EvalTask::success`] predicate accepted.
+///
+/// `env_factory` is invoked **once per trial** to produce a fresh, isolated
+/// [`TrialEnv`] (see the module docs on per-trial isolation); the trial then
+/// runs [`engine::run`] with a [`RunConfig`] carrying the task's seed prompt,
+/// the given `max_iterations`, and the env's checks. Trials are **sequential**.
+/// `on_trial` is called with each trial's index and terminal
+/// [`LoopOutcome`] as it completes — the live example uses it to stream
+/// per-trial one-liners; pass `|_, _| {}` to ignore it.
 ///
 /// `pass_rate` is `0.0` when `k == 0` so a misuse never produces `NaN`; the
-/// trial loop runs zero times, so the backend is also never touched in that
-/// case.
+/// trial loop runs zero times, so neither the factory nor the backend is
+/// touched in that case.
 pub async fn run_eval(
     task: &EvalTask,
     backend: &impl ModelBackend,
-    tools: &ToolRegistry,
-    ctx: &ToolCtx,
+    env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
+    mut on_trial: impl FnMut(u32, &LoopOutcome),
 ) -> EvalReport {
     let mut passes: u32 = 0;
-    for _ in 0..k {
-        let config = RunConfig::new(task.task.clone(), max_iterations);
-        let outcome = engine::run(backend, tools, ctx, &config).await;
+    for i in 0..k {
+        let env = env_factory();
+        let mut config = RunConfig::new(task.task.clone(), max_iterations);
+        if let Some(checks) = env.checks.clone() {
+            config = config.with_checks(checks);
+        }
+        let outcome = engine::run(backend, &env.tools, &env.ctx, &config).await;
         if (task.success)(&outcome) {
             passes += 1;
         }
+        on_trial(i, &outcome);
+        // `env` — and with it this trial's scratch workspace — drops here.
     }
     let pass_rate = if k == 0 {
         0.0
@@ -122,6 +171,168 @@ pub async fn run_eval(
         passes,
         pass_rate,
     }
+}
+
+/// An owned scratch directory that deletes itself on drop.
+///
+/// A tiny, std-only stand-in for `tempfile::TempDir` so the *library* carries no
+/// extra runtime dependency (`tempfile` stays a dev-dependency, used only by
+/// tests). Uniqueness comes from the process id plus a monotonic counter, so two
+/// scratch dirs never collide within a process.
+#[derive(Debug)]
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    /// Create a fresh, uniquely-named directory under the system temp dir.
+    fn new(prefix: &str) -> std::io::Result<Self> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("harness-eval-{prefix}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    /// The directory's path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Best-effort teardown: a failed cleanup must never panic a trial.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Recursively copy the contents of `src` into `dst`, creating `dst` (and any
+/// nested subdirectories) as needed.
+///
+/// Plain `std::fs`, copying every entry — it skips nothing, which is correct for
+/// eval fixtures (self-contained cargo packages with no `.git` or build
+/// artifacts). Files are copied byte-for-byte; directories recurse.
+///
+/// # Errors
+/// Propagates any `std::fs` error (unreadable source, unwritable destination,
+/// etc.).
+pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// The trivial-smoke-test trial environment: the standard v1 toolset, a stub
+/// context, and NO checks. Used by [`finish_task`] runs, where a `finish(done)`
+/// is accepted on trust ([`Verification::NoChecksConfigured`]).
+///
+/// This is a plain `fn` so it can be passed directly as `run_eval`'s
+/// `env_factory` (a `fn` item implements `Fn`).
+#[must_use]
+pub fn finish_env() -> TrialEnv {
+    TrialEnv {
+        tools: standard_registry(None),
+        ctx: ToolCtx::stub(),
+        checks: None,
+        _scratch: Vec::new(),
+    }
+}
+
+/// Build one fresh coding-fix trial environment: copy the fixture into a new
+/// scratch workspace, wire a fresh offload dir + [`ToolCtx`], and a `cargo test`
+/// [`ChecksRunner`] whose cwd IS this trial's workspace.
+///
+/// # Panics
+/// Panics if the scratch dirs cannot be created, the fixture cannot be copied,
+/// or the workspace roots cannot be canonicalized — all of which indicate a
+/// broken host environment, not a recoverable eval condition.
+fn build_coding_env(fixture_src: &Path) -> TrialEnv {
+    let workspace_scratch =
+        ScratchDir::new("workspace").expect("create trial workspace scratch dir");
+    copy_dir_recursive(fixture_src, workspace_scratch.path())
+        .expect("copy fixture into trial workspace");
+    let offload_scratch = ScratchDir::new("offload").expect("create trial offload scratch dir");
+
+    let workspace = Workspace::new(
+        workspace_scratch.path(),
+        Some(offload_scratch.path().to_path_buf()),
+    )
+    .expect("trial workspace roots are freshly-created dirs");
+    // Canonicalized root — this is where the copied fixture lives and where the
+    // checks (and file tools) operate.
+    let workspace_root = workspace.root().to_path_buf();
+    let offload_canon = offload_scratch
+        .path()
+        .canonicalize()
+        .expect("offload scratch dir canonicalizes");
+
+    let ctx = ToolCtx::new(
+        Arc::new(workspace),
+        Arc::new(DiskOffloadSink::new(offload_canon)),
+    );
+
+    let checks = ChecksRunner::new(
+        CheckCommand {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+        },
+        workspace_root,
+        CODING_CHECK_TIMEOUT,
+    );
+    let tools = standard_registry(Some(checks.clone()));
+
+    TrialEnv {
+        tools,
+        ctx,
+        checks: Some(checks),
+        _scratch: vec![workspace_scratch, offload_scratch],
+    }
+}
+
+/// The coding-fix eval: prove the harness can autonomously FIX a failing test in
+/// a real (tiny) Rust crate, where "done" is HARNESS-VERIFIED (`cargo test` came
+/// back green), not model-claimed.
+///
+/// Returns the [`EvalTask`] plus a per-trial environment factory (pass it
+/// straight to [`run_eval`]). Each factory call copies `fixture_src` into a
+/// fresh scratch workspace and wires a `cargo test` [`ChecksRunner`] rooted
+/// there — so a trial's edits are isolated and its verification is real.
+///
+/// The success predicate accepts **only** a
+/// [`LoopOutcome::Finished`]`(`[`FinishDisposition::Done`]`)` whose verification
+/// is [`Verification::Checks`] with `report.passed == true`. The vacuous
+/// [`Verification::NoChecksConfigured`] path does NOT count — an unverified
+/// `done` claim is a failure here, by design.
+pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) {
+    let task = EvalTask {
+        name: "coding_fix".to_string(),
+        task: "The test suite in this Rust crate fails. Find the bug, fix it, \
+               and make the tests pass."
+            .to_string(),
+        success: Box::new(|outcome| {
+            matches!(
+                outcome,
+                LoopOutcome::Finished(FinishDisposition::Done {
+                    verification: Verification::Checks(report),
+                    ..
+                }) if report.passed
+            )
+        }),
+    };
+
+    let fixture_src = fixture_src.to_path_buf();
+    let factory = move || build_coding_env(&fixture_src);
+    (task, factory)
 }
 
 /// The simplest possible eval task: prove the agent can invoke the `finish`
@@ -150,13 +361,49 @@ pub fn finish_task() -> EvalTask {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalReport, EvalTask, finish_task, run_eval};
-    use crate::engine::{FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome};
+    use super::{
+        EvalReport, EvalTask, TrialEnv, coding_fix_task, copy_dir_recursive, finish_env,
+        finish_task, run_eval,
+    };
+    use crate::engine::{
+        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, Verification,
+    };
+    use crate::exec::{CheckCommand, ChecksRunner};
     use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
     use crate::test_support::MockBackend;
     use crate::tool::{EchoTool, ToolCtx, ToolRegistry};
+    use crate::tools::standard_registry;
+    use crate::workspace::{DiskOffloadSink, Workspace};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    /// A trial-env factory (a plain `fn`) for the finish smoke tests: the
+    /// echo+finish registry and a stub context, no checks. Passable directly as
+    /// `run_eval`'s `env_factory`.
+    fn echo_finish_env() -> TrialEnv {
+        TrialEnv {
+            tools: registry(),
+            ctx: ToolCtx::stub(),
+            checks: None,
+            _scratch: Vec::new(),
+        }
+    }
+
+    /// A tool-use turn that CREATEs `path` with `contents` via `edit_file`.
+    fn edit_create_turn(call_id: &str, path: &str, contents: &str) -> AssistantTurn {
+        AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: call_id.to_string(),
+                name: "edit_file".to_string(),
+                input: json!({ "path": path, "old_string": "", "new_string": contents }),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: usage(),
+        }
+    }
 
     fn usage() -> Usage {
         Usage {
@@ -207,11 +454,9 @@ mod tests {
         let k: u32 = 5;
         let script: Vec<AssistantTurn> = (0..k).map(|_| finish_done_turn()).collect();
         let backend = MockBackend::from_turns(script);
-        let tools = registry();
-        let ctx = ToolCtx::stub();
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, &tools, &ctx, k, 10).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, 10, |_, _| {}).await;
 
         assert_eq!(report.task_name, task.name);
         assert_eq!(report.trials, k);
@@ -230,11 +475,9 @@ mod tests {
         let max_iter: u32 = 2;
         let script: Vec<AssistantTurn> = (0..(k * max_iter)).map(|_| non_finish_turn()).collect();
         let backend = MockBackend::from_turns(script);
-        let tools = registry();
-        let ctx = ToolCtx::stub();
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, &tools, &ctx, k, max_iter).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_, _| {}).await;
 
         assert_eq!(report.task_name, "finish");
         assert_eq!(report.trials, k);
@@ -257,12 +500,10 @@ mod tests {
             non_finish_turn(),  // trial 4: 1 turn, hits max_iter
         ];
         let backend = MockBackend::from_turns(script);
-        let tools = registry();
-        let ctx = ToolCtx::stub();
         let task = finish_task();
 
         let k: u32 = 4;
-        let report = run_eval(&task, &backend, &tools, &ctx, k, max_iter).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_, _| {}).await;
 
         assert_eq!(report.trials, k);
         assert_eq!(report.passes, 2);
@@ -274,11 +515,9 @@ mod tests {
         // No trials run → backend is never called and pass_rate is 0.0
         // (not NaN). The empty script proves the loop body never executes.
         let backend = MockBackend::from_turns(vec![]);
-        let tools = registry();
-        let ctx = ToolCtx::stub();
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, &tools, &ctx, 0, 5).await;
+        let report = run_eval(&task, &backend, echo_finish_env, 0, 5, |_, _| {}).await;
 
         assert_eq!(report.trials, 0);
         assert_eq!(report.passes, 0);
@@ -361,5 +600,274 @@ mod tests {
         assert!(printed.contains("task_name"));
         let cloned = r.clone();
         assert_eq!(r, cloned);
+    }
+
+    #[test]
+    fn finish_env_wires_finish_tool_and_no_checks() {
+        let env = finish_env();
+        assert!(env.checks.is_none());
+        assert!(
+            env.tools.get(FINISH_TOOL_NAME).is_some(),
+            "finish_env must register the finish tool"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_round_trips_nested_structure() {
+        let src = tempdir().expect("src tempdir");
+        std::fs::write(src.path().join("top.txt"), "top").expect("write top");
+        std::fs::create_dir_all(src.path().join("a/b")).expect("mkdir a/b");
+        std::fs::write(src.path().join("a/one.txt"), "one").expect("write one");
+        std::fs::write(src.path().join("a/b/two.txt"), "two").expect("write two");
+
+        let dst = tempdir().expect("dst tempdir");
+        let dst_root = dst.path().join("copy");
+        copy_dir_recursive(src.path(), &dst_root).expect("recursive copy");
+
+        assert_eq!(
+            std::fs::read_to_string(dst_root.join("top.txt")).unwrap(),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_root.join("a/one.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_root.join("a/b/two.txt")).unwrap(),
+            "two"
+        );
+    }
+
+    /// A trivially-green `ChecksRunner` (`/bin/sh -c exit 0`) rooted at `cwd`, so
+    /// a scripted `finish(done)` verifies fast without invoking cargo.
+    fn green_checks(cwd: PathBuf) -> ChecksRunner {
+        ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            },
+            cwd,
+            Duration::from_secs(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn each_trial_gets_a_fresh_workspace_copy() {
+        // A source dir (with nested content) copied fresh into each trial.
+        let src = tempdir().expect("src tempdir");
+        std::fs::write(src.path().join("original.txt"), "seed").expect("write original");
+        std::fs::create_dir(src.path().join("nested")).expect("mkdir nested");
+        std::fs::write(src.path().join("nested/deep.txt"), "deep").expect("write deep");
+
+        // A persistent holder so each trial's workspace survives past `run_eval`
+        // for inspection (the recording factory below does NOT auto-clean).
+        let holder = tempdir().expect("holder tempdir");
+        let holder_path = holder.path().to_path_buf();
+        let src_path = src.path().to_path_buf();
+        let recorded: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&recorded);
+
+        let factory = move || {
+            let idx = rec.lock().expect("rec lock").len();
+            let ws_dir = holder_path.join(format!("trial-{idx}"));
+            copy_dir_recursive(&src_path, &ws_dir).expect("copy source into trial workspace");
+            let offload_dir = holder_path.join(format!("offload-{idx}"));
+            std::fs::create_dir_all(&offload_dir).expect("mkdir offload");
+            rec.lock().expect("rec lock").push(ws_dir.clone());
+
+            let workspace = Workspace::new(&ws_dir, Some(offload_dir.clone())).expect("workspace");
+            let offload_canon = offload_dir.canonicalize().expect("canon offload");
+            let ctx = ToolCtx::new(
+                Arc::new(workspace),
+                Arc::new(DiskOffloadSink::new(offload_canon)),
+            );
+            let checks = green_checks(ws_dir.canonicalize().expect("canon ws"));
+            let tools = standard_registry(Some(checks.clone()));
+            TrialEnv {
+                tools,
+                ctx,
+                checks: Some(checks),
+                _scratch: Vec::new(),
+            }
+        };
+
+        // Trial 1: create `marker.txt`, then finish(done) → checks green → Done.
+        // Trial 2: finish(done) immediately. A shared reused workspace would let
+        // trial 2 see trial 1's marker; fresh copies must not.
+        let backend = MockBackend::from_turns(vec![
+            edit_create_turn("c-edit", "marker.txt", "planted\n"),
+            finish_done_turn(),
+            finish_done_turn(),
+        ]);
+        // Reuse the real coding-fix predicate (Checks-verified Done).
+        let (task, _ignored_factory) = coding_fix_task(src.path());
+
+        let report = run_eval(&task, &backend, factory, 2, 3, |_, _| {}).await;
+        assert_eq!(report.passes, 2, "both trials verify green");
+
+        let dirs = recorded.lock().expect("rec lock").clone();
+        assert_eq!(dirs.len(), 2, "factory invoked exactly once per trial");
+        assert!(
+            dirs[0].join("marker.txt").exists(),
+            "trial 1 wrote its marker"
+        );
+        assert!(
+            !dirs[1].join("marker.txt").exists(),
+            "trial 2 got a FRESH copy — trial 1's marker must NOT be present"
+        );
+        // The fresh copy still carries the (recursively copied) source content.
+        assert!(dirs[1].join("original.txt").exists());
+        assert!(dirs[1].join("nested/deep.txt").exists());
+    }
+
+    #[test]
+    fn coding_fix_task_env_copies_fixture_and_wires_cargo_test_checks() {
+        // A stand-in fixture crate (never actually built here).
+        let src = tempdir().expect("src tempdir");
+        std::fs::write(
+            src.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nedition = \"2024\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir(src.path().join("src")).expect("mkdir src");
+        std::fs::write(src.path().join("src/lib.rs"), "// stub\n").expect("write lib");
+
+        let (task, factory) = coding_fix_task(src.path());
+        assert_eq!(task.name, "coding_fix");
+        assert!(task.task.to_lowercase().contains("fix"));
+
+        let env = factory();
+        // The fixture was copied into this trial's own workspace.
+        let root = env.ctx.workspace().root().to_path_buf();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "fixture Cargo.toml copied"
+        );
+        assert!(root.join("src/lib.rs").exists(), "fixture src copied");
+        // Checks are `cargo test`, rooted at the trial workspace.
+        let checks = env.checks.as_ref().expect("checks wired");
+        assert_eq!(checks.command().program, "cargo");
+        assert_eq!(checks.command().args, vec!["test".to_string()]);
+        assert_eq!(
+            checks.command_display(),
+            "cargo test",
+            "checks must be `cargo test`"
+        );
+        // run_checks is registered (the with-checks toolset).
+        assert!(env.tools.get("run_checks").is_some());
+
+        // A second invocation yields a DISTINCT, independent workspace.
+        let env2 = factory();
+        assert_ne!(
+            env.ctx.workspace().root(),
+            env2.ctx.workspace().root(),
+            "each trial gets its own scratch workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_fix_predicate_requires_harness_verified_done() {
+        let (task, _factory) = coding_fix_task(Path::new("/unused-for-predicate-only"));
+
+        // Accepts a Checks-verified GREEN Done — built via a REAL ChecksRunner on
+        // a trivially-green command (no cargo, no network).
+        let green = green_checks(PathBuf::from("/")).run(&ToolCtx::stub()).await;
+        assert!(green.passed);
+        assert!(
+            (task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+                summary: "fixed".to_string(),
+                verification: Verification::Checks(green),
+            })),
+            "a green Checks-verified Done must pass"
+        );
+
+        // Rejects the vacuous NoChecksConfigured Done — the whole point.
+        assert!(
+            !(task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+                summary: "claimed".to_string(),
+                verification: Verification::NoChecksConfigured,
+            })),
+            "an unverified (NoChecksConfigured) Done must NOT count"
+        );
+
+        // Rejects a RED Checks Done (checks ran but failed).
+        let red = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 1".to_string()],
+            },
+            PathBuf::from("/"),
+            Duration::from_secs(10),
+        )
+        .run(&ToolCtx::stub())
+        .await;
+        assert!(!red.passed);
+        assert!(
+            !(task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+                summary: "lie".to_string(),
+                verification: Verification::Checks(red),
+            })),
+            "a red Checks Done must NOT count"
+        );
+
+        // Rejects every non-Done terminal outcome.
+        assert!(!(task.success)(&LoopOutcome::Finished(
+            FinishDisposition::Failed {
+                summary: "boom".to_string(),
+            }
+        )));
+        assert!(!(task.success)(&LoopOutcome::Finished(
+            FinishDisposition::Blocked {
+                decision_needed: "which?".to_string(),
+            }
+        )));
+        assert!(!(task.success)(&LoopOutcome::MaxIterations));
+        assert!(!(task.success)(&LoopOutcome::StoppedWithoutFinish));
+    }
+
+    #[test]
+    fn fixture_crate_is_excluded_from_the_harness_workspace() {
+        // Prove `exclude = ["fixtures/*"]` took effect: the fixture package is
+        // NOT a member of the harness workspace, so the project's gates never
+        // build or test it. `cargo metadata` is offline (no compile, --no-deps).
+        let cargo = env!("CARGO");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("Cargo.toml");
+        let output = std::process::Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .output()
+            .expect("run cargo metadata");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse cargo metadata json");
+        let members = meta["workspace_members"]
+            .as_array()
+            .expect("workspace_members is an array");
+        assert!(
+            members
+                .iter()
+                .all(|m| !m.as_str().unwrap_or_default().contains("broken-adder")),
+            "fixture `broken-adder` must NOT be a workspace member; members: {members:?}"
+        );
+        // Sanity: the harness crate IS a member (proves metadata actually ran).
+        assert!(
+            members
+                .iter()
+                .any(|m| m.as_str().unwrap_or_default().contains("harness")),
+            "the harness crate should be a workspace member"
+        );
     }
 }
