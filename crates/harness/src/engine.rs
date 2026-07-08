@@ -1089,34 +1089,32 @@ async fn reconcile_crash_tail(
     store: &Arc<dyn RunStore>,
     run_id: &str,
 ) -> Result<Vec<Message>, StoreError> {
-    let events = store.list_events(run_id).await?;
-
-    // Dangling iff the last event is ToolCallStarted.
-    let dangling_name = match events.last() {
-        Some(Event::ToolCallStarted { name, .. }) => name.clone(),
-        _ => return Ok(record.messages.clone()), // clean tail — nothing to reconcile
+    // Gate on SNAPSHOT shape, not log-tail shape: reconciliation is needed
+    // exactly when the reloaded snapshot ends mid-turn — its last message is
+    // an Assistant turn carrying tool calls whose results never made it into
+    // `messages`. (After a clean end-of-iteration checkpoint the last message
+    // is the User results batch; a stopped-without-finish turn carries no
+    // tool calls.) Gating on `events.last()` being a `ToolCallStarted` is
+    // WRONG: a crash between a `ToolCallResult` and the next `Started` — or
+    // after the final result but before the end-of-iteration checkpoint —
+    // leaves the log ending in a Result while the snapshot still dangles,
+    // and an un-reconciled transcript ending in tool calls is a malformed
+    // request on every backend.
+    let last_assistant_calls: Vec<model::ToolCallRequest> = match record.messages.last() {
+        Some(Message::Assistant { content }) => content
+            .iter()
+            .filter_map(|b| match b {
+                model::ContentBlock::ToolCall(req) => Some(req.clone()),
+                model::ContentBlock::Text(_) | model::ContentBlock::Reasoning { .. } => None,
+            })
+            .collect(),
+        _ => return Ok(record.messages.clone()), // clean: ends with results batch
     };
+    if last_assistant_calls.is_empty() {
+        return Ok(record.messages.clone()); // assistant turn with no tool calls
+    }
 
-    // Collect tool calls from the last assistant turn in record.messages.
-    let last_assistant_calls: Vec<model::ToolCallRequest> = record
-        .messages
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            Message::Assistant { content } => Some(
-                content
-                    .iter()
-                    .filter_map(|b| match b {
-                        model::ContentBlock::ToolCall(req) => Some(req.clone()),
-                        model::ContentBlock::Text(_) | model::ContentBlock::Reasoning { .. } => {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            Message::User { .. } => None,
-        })
-        .unwrap_or_default();
+    let events = store.list_events(run_id).await?;
 
     // Isolate events after the last ModelCall (the current iteration's tail),
     // then filter to tool events only — ToolCallStarted and ToolCallResult.
@@ -1146,13 +1144,18 @@ async fn reconcile_crash_tail(
     // safety: an orphaned Result (no unmatched Started) is silently ignored;
     // a duplicate call_id in Started leaves the earlier entry unchanged.
     let mut completion_map: HashMap<String, Option<(bool, String)>> = HashMap::new();
+    let mut started_names: Vec<(String, String)> = Vec::new(); // (call_id, name)
     let mut pending_cid: Option<String> = None;
     for event in &tool_tail {
         match event {
-            Event::ToolCallStarted { call_id, .. } => {
+            Event::ToolCallStarted { call_id, name, .. } => {
                 // If a previous Started is still unmatched, leave it as None
-                // in the map. Update the pending slot.
+                // in the map. Update the pending slot. Record the name on
+                // first sighting only (duplicate call_ids degrade safely).
                 pending_cid = Some(call_id.clone());
+                if !completion_map.contains_key(call_id.as_str()) {
+                    started_names.push((call_id.clone(), name.clone()));
+                }
                 completion_map.entry(call_id.clone()).or_insert(None);
             }
             Event::ToolCallResult {
@@ -1172,6 +1175,12 @@ async fn reconcile_crash_tail(
     // turn, look up by call_id. Calls with a real logged Result keep it; calls
     // with no matching Result (dangling Started or never started) get the
     // synthetic is_error "interrupted by host restart" block.
+    //
+    // Known fidelity limit: the event log stores `ToolResult.summary` only
+    // (the audit record deliberately omits the full rendered detail), so a
+    // reconciled completed call feeds the model a terser — but true — result
+    // than an uninterrupted run would have. The model can re-read workspace
+    // state if it needs the detail.
     let mut results: Vec<UserBlock> = Vec::with_capacity(last_assistant_calls.len());
     for call in &last_assistant_calls {
         let completed = match completion_map.get(&call.id) {
@@ -1192,20 +1201,27 @@ async fn reconcile_crash_tail(
         });
     }
 
-    // Append a synthetic ToolCallResult for the dangling Started so the log
-    // is paired on the next resume (avoids double-reconciliation).
-    store
-        .append_event(
-            run_id,
-            Event::ToolCallResult {
-                seq: 0,
-                name: dangling_name,
-                is_error: true,
-                summary: "interrupted by host restart".to_string(),
-                offload_path: None,
-            },
-        )
-        .await?;
+    // Append a synthetic ToolCallResult for every unmatched Started so the
+    // log is paired on the next resume (avoids double-reconciliation). Calls
+    // that never reached a Started event have nothing to pair in the log;
+    // their transcript block above is synthesis enough, and re-running this
+    // reconciliation is idempotent.
+    for (call_id, name) in &started_names {
+        if matches!(completion_map.get(call_id.as_str()), Some(None)) {
+            store
+                .append_event(
+                    run_id,
+                    Event::ToolCallResult {
+                        seq: 0,
+                        name: name.clone(),
+                        is_error: true,
+                        summary: "interrupted by host restart".to_string(),
+                        offload_path: None,
+                    },
+                )
+                .await?;
+        }
+    }
 
     // Return the original messages + reconciliation user message.
     let mut messages = record.messages.clone();
@@ -4516,6 +4532,195 @@ mod tests {
             1,
             "panicky-tool must be invoked exactly once (leg 1 only, never re-executed on resume)"
         );
+    }
+
+    /// Builds the mid-turn snapshot + log shape shared by the entry-gate
+    /// regression tests: a record whose last message is an assistant turn
+    /// with the given tool calls, and a log of
+    /// `[ModelCall, BudgetTick, Started(a), Result(a)]` — i.e. call `a`
+    /// completed, and the log's LAST event is a `ToolCallResult`.
+    async fn seed_result_tail_store(
+        task_id: &str,
+        calls: &[(&str, &str)], // (call_id, name)
+    ) -> (RunRecord, Arc<dyn RunStore>, String) {
+        let run_id = format!("{task_id}:1");
+        let asst = Message::Assistant {
+            content: calls
+                .iter()
+                .map(|(id, name)| {
+                    ContentBlock::ToolCall(ToolCallRequest {
+                        id: (*id).to_string(),
+                        name: (*name).to_string(),
+                        input: serde_json::json!({}),
+                    })
+                })
+                .collect(),
+        };
+        let mut record = make_minimal_record(task_id, 1);
+        record.messages = vec![
+            Message::User {
+                content: vec![UserBlock::Text("do the task".to_string())],
+            },
+            asst,
+        ];
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        store
+            .checkpoint(&run_id, &record)
+            .await
+            .expect("checkpoint");
+        store
+            .append_event(
+                &run_id,
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+            )
+            .await
+            .expect("mc");
+        store
+            .append_event(
+                &run_id,
+                Event::BudgetTick {
+                    seq: 0,
+                    consumed: BudgetConsumed::default(),
+                },
+            )
+            .await
+            .expect("bt");
+        store
+            .append_event(
+                &run_id,
+                Event::ToolCallStarted {
+                    seq: 0,
+                    name: calls[0].1.to_string(),
+                    args: serde_json::json!({}),
+                    call_id: calls[0].0.to_string(),
+                },
+            )
+            .await
+            .expect("started-a");
+        store
+            .append_event(
+                &run_id,
+                Event::ToolCallResult {
+                    seq: 0,
+                    name: calls[0].1.to_string(),
+                    is_error: false,
+                    summary: "real output a".to_string(),
+                    offload_path: None,
+                },
+            )
+            .await
+            .expect("result-a");
+        (record, store, run_id)
+    }
+
+    // Entry-gate regression (review follow-up): a crash can land BETWEEN a
+    // ToolCallResult and the next ToolCallStarted. The log then ends in a
+    // Result, but the snapshot still dangles (assistant turn, no results
+    // batch). Gating on `events.last() == ToolCallStarted` skipped
+    // reconciliation here and returned a transcript ending in unanswered
+    // tool calls — malformed on every backend. The gate is snapshot-shape.
+    #[tokio::test]
+    async fn crash_between_result_and_next_started_reconciles() {
+        let (record, store, run_id) =
+            seed_result_tail_store("gate-task", &[("id-a", "work"), ("id-b", "work")]).await;
+        // Log deliberately ends at Result(a): call b never reached Started.
+
+        let msgs = super::reconcile_crash_tail(&record, &store, &run_id)
+            .await
+            .expect("reconcile");
+
+        assert_eq!(msgs.len(), 3, "seed + asst + reconciled results batch");
+        let Message::User { content } = &msgs[2] else {
+            panic!("third message must be User");
+        };
+        assert_eq!(content.len(), 2, "one block per assistant tool call");
+        match &content[0] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "id-a");
+                assert_eq!(
+                    content, "real output a",
+                    "completed call keeps its real result"
+                );
+                assert!(!is_error);
+            }
+            UserBlock::Text(_) => panic!("expected ToolResult"),
+        }
+        match &content[1] {
+            UserBlock::ToolResult {
+                call_id, is_error, ..
+            } => {
+                assert_eq!(call_id, "id-b");
+                assert!(*is_error, "never-started call gets synthetic is_error");
+            }
+            UserBlock::Text(_) => panic!("expected ToolResult"),
+        }
+    }
+
+    // Entry-gate regression, all-completed flavor: crash after the final
+    // Result but before the end-of-iteration checkpoint. Every call has a
+    // real logged result; reconciliation must rebuild the results batch with
+    // no synthetic blocks and append no synthetic log events.
+    #[tokio::test]
+    async fn crash_after_all_results_before_iteration_checkpoint_reconciles() {
+        let (record, store, run_id) =
+            seed_result_tail_store("gate-task-2", &[("id-a", "work")]).await;
+        let events_before = store.list_events(&run_id).await.expect("events").len();
+
+        let msgs = super::reconcile_crash_tail(&record, &store, &run_id)
+            .await
+            .expect("reconcile");
+
+        let Message::User { content } = &msgs[2] else {
+            panic!("third message must be User");
+        };
+        assert_eq!(content.len(), 1);
+        match &content[0] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "id-a");
+                assert_eq!(content, "real output a");
+                assert!(!is_error, "completed call must NOT be marked interrupted");
+            }
+            UserBlock::Text(_) => panic!("expected ToolResult"),
+        }
+        let events_after = store.list_events(&run_id).await.expect("events").len();
+        assert_eq!(
+            events_before, events_after,
+            "no synthetic event when nothing dangles"
+        );
+    }
+
+    // Entry-gate clean cases: a snapshot ending in a User results batch (the
+    // end-of-iteration checkpoint landed) or an assistant turn with NO tool
+    // calls must pass through untouched.
+    #[tokio::test]
+    async fn clean_snapshots_are_not_reconciled() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let mut record = make_minimal_record("clean-task", 1);
+        record.messages = vec![
+            Message::User {
+                content: vec![UserBlock::Text("do the task".to_string())],
+            },
+            Message::Assistant {
+                content: vec![ContentBlock::Text("thinking out loud".to_string())],
+            },
+        ];
+        let msgs = super::reconcile_crash_tail(&record, &store, "clean-task:1")
+            .await
+            .expect("reconcile");
+        assert_eq!(msgs, record.messages, "no-tool-call turn passes through");
     }
 
     // Malformed-tail protection: reconcile_crash_tail must not panic or
