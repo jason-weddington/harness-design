@@ -14,6 +14,7 @@ pub mod ollama;
 pub mod prompt;
 pub mod run_record;
 pub mod store;
+pub mod time;
 pub mod tool;
 pub mod tools;
 pub mod workspace;

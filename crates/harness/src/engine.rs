@@ -59,7 +59,9 @@
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
 
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -67,7 +69,12 @@ use serde_json::{Value, json};
 use crate::exec::{CheckReport, ChecksRunner};
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
-use crate::run_record::{Disposition, FailureMode, Verification};
+use crate::run_record::{
+    BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event, FailureMode, Phase,
+    ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
+};
+use crate::store::{RunStore, StoreError};
+use crate::time::format_rfc3339;
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
 
 /// The registered name of the finish tool — the loop recognizes termination by
@@ -131,6 +138,60 @@ impl RunConfig {
         self.max_tokens = max_tokens;
         self
     }
+}
+
+/// Run-specific persistence bundle passed to [`run_persisted`].
+///
+/// Kept separate from [`RunConfig`] because `Arc<dyn RunStore>` is not
+/// `Debug` (the [`RunStore`] trait has no `Debug` bound), so it cannot be
+/// placed in a `derive(Debug, Clone)` struct without breaking those derives on
+/// [`RunConfig`].
+pub struct Persistence {
+    /// Store to write events and checkpoints to.
+    pub store: Arc<dyn RunStore>,
+    /// Task id — used to compute the [`run_id`] and seed the [`RunRecord`].
+    pub task_id: String,
+    /// Which attempt number this is for the task (used in the run id).
+    pub attempt_n: u32,
+    /// Human-readable label for the model backend (e.g. `"claude-sonnet-4-6"`).
+    /// Carried on every [`Event::ModelCall`]; the model backend deliberately
+    /// does not expose its own id at the trait level.
+    pub model_label: String,
+}
+
+impl std::fmt::Debug for Persistence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Persistence")
+            .field("task_id", &self.task_id)
+            .field("attempt_n", &self.attempt_n)
+            .field("model_label", &self.model_label)
+            .field("store", &"<dyn RunStore>")
+            .finish()
+    }
+}
+
+/// Produce a run id from `task_id` and `attempt_n`.
+///
+/// The id is the plain join `"{task_id}:{attempt_n}"` — NOT a hash. Stable
+/// across restarts so the same attempt always addresses the same record
+/// (idempotent dispatch).
+///
+/// # Example
+///
+/// ```
+/// use harness::engine::run_id;
+/// assert_eq!(run_id("task-42", 1), "task-42:1");
+/// ```
+pub fn run_id(task_id: &str, attempt_n: u32) -> String {
+    format!("{task_id}:{attempt_n}")
+}
+
+/// Private in-loop persistence context — bundles the computed run id with the
+/// live [`RunRecord`] being mutated as the loop progresses. Only constructed
+/// (and used) when a [`Persistence`] is supplied to [`run_persisted`].
+struct RunPersist {
+    rid: String,
+    record: RunRecord,
 }
 
 /// A claim the model made in a `finish` call, parsed from its raw JSON input.
@@ -472,6 +533,17 @@ fn ack(call_id: &str) -> UserBlock {
 /// how each field is counted (in particular: an erroring last turn still
 /// contributes to `iterations` but not to the token totals).
 ///
+/// **No persistence:** this entry point passes `None` for the store, so no
+/// events are appended and no checkpoints are written. Use [`run_persisted`]
+/// when durability is needed.
+///
+/// # Panics
+///
+/// This function is infallible in practice, but internally calls `.expect()` on
+/// a `Result` that is structurally `Ok` when no persistence is wired in (no
+/// store calls are made). If that invariant were violated, the function would
+/// panic with a diagnostic message.
+///
 /// [`ChecksRunner::run`]: crate::exec::ChecksRunner::run
 pub async fn run(
     backend: &impl model::ModelBackend,
@@ -489,14 +561,56 @@ pub async fn run(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
     };
-    let outcome = run_loop_impl(backend, tools, ctx, config, &mut stats).await;
+    // No persistence — the Result::Err path is structurally unreachable when
+    // persistence is None (no store calls are made), so the expect is a
+    // compile-time invariant, not a runtime safety net.
+    let outcome = run_loop_impl(backend, tools, ctx, config, None, &mut stats)
+        .await
+        .expect("no-persistence run cannot produce a StoreError");
     stats.wall_clock = start.elapsed();
     RunResult { outcome, stats }
 }
 
-/// The engine loop body, split out of [`run`] so the outer function owns the
-/// `wall_clock` measurement and can finalize [`RunStats`] on every return
-/// path without every branch having to repeat the plumbing.
+/// Drive `backend` + `tools` with full durability: append events and write
+/// checkpoints to `persistence.store` as the loop progresses.
+///
+/// ## Persistence discipline
+///
+/// - A [`RunRecord`] is constructed at run start and kept current throughout.
+/// - After each successful model turn: [`Event::ModelCall`] then
+///   [`Event::BudgetTick`] are appended, followed by a mid-iteration
+///   checkpoint (snapshot includes the assistant turn in `messages`).
+/// - For each non-`finish` tool call: [`Event::ToolCallStarted`] (before
+///   execution) and [`Event::ToolCallResult`] (after execution) are appended.
+/// - At end of each loop iteration: a full checkpoint is written.
+/// - On every terminal path: [`Event::DispositionSet`] is appended, then a
+///   final checkpoint is written with `disposition` set.
+///
+/// The first [`StoreError`] from any append or checkpoint immediately aborts
+/// the loop and is returned as `Err`. The no-store [`run`] path keeps its
+/// bare `RunResult` return type unchanged.
+pub async fn run_persisted(
+    backend: &impl model::ModelBackend,
+    tools: &ToolRegistry,
+    ctx: &ToolCtx,
+    config: &RunConfig,
+    persistence: &Persistence,
+) -> Result<RunResult, StoreError> {
+    let start = Instant::now();
+    let mut stats = RunStats {
+        iterations: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        wall_clock: Duration::ZERO,
+    };
+    let outcome = run_loop_impl(backend, tools, ctx, config, Some(persistence), &mut stats).await?;
+    stats.wall_clock = start.elapsed();
+    Ok(RunResult { outcome, stats })
+}
+
+/// The engine loop body, split out of [`run`] / [`run_persisted`] so the outer
+/// functions own the `wall_clock` measurement and can finalize [`RunStats`] on
+/// every return path.
 ///
 /// `stats` is mutated in place as the loop progresses:
 /// - `iterations` is incremented BEFORE each `backend.turn` call — so a
@@ -504,13 +618,20 @@ pub async fn run(
 ///   "model turns actually drawn" contract in [`RunStats`].
 /// - `input_tokens` / `output_tokens` accumulate the SUCCESSFUL turn's
 ///   [`crate::model::Usage`] only; errored turns contribute nothing.
+///
+/// When `persistence` is `Some`, the loop appends events and writes
+/// checkpoints per the durability contract documented on [`run_persisted`].
+/// When `persistence` is `None`, no store calls are made and the function
+/// returns `Ok(outcome)` (the `Err` arm is structurally unreachable).
+#[allow(clippy::too_many_lines)]
 async fn run_loop_impl(
     backend: &impl model::ModelBackend,
     tools: &ToolRegistry,
     ctx: &ToolCtx,
     config: &RunConfig,
+    persistence: Option<&Persistence>,
     stats: &mut RunStats,
-) -> LoopOutcome {
+) -> Result<LoopOutcome, StoreError> {
     // Render both prompts ONCE and reuse verbatim every iteration. Both
     // functions are pure and byte-deterministic (see `prompt` module tests),
     // so the borrows below stay stable across the whole loop — the
@@ -535,6 +656,59 @@ async fn run_loop_impl(
         stop_sequences: Vec::new(),
     };
 
+    // Build the run-record if persistence is configured. This is kept as
+    // Option<RunPersist> so the non-persistent path has zero overhead.
+    let mut persist: Option<RunPersist> = if let Some(p) = persistence {
+        let rid = run_id(&p.task_id, p.attempt_n);
+        let wall_clock_start = format_rfc3339(SystemTime::now());
+
+        // run_checks: a single "checks" entry when a ChecksRunner is wired in,
+        // empty BTreeMap otherwise (D7 honesty: only what we actually know).
+        let run_checks = match &config.checks {
+            None => BTreeMap::new(),
+            Some(runner) => {
+                let mut m = BTreeMap::new();
+                m.insert("checks".to_string(), runner.command_display());
+                m
+            }
+        };
+
+        let record = RunRecord {
+            run_id: rid.clone(),
+            schema_version: SCHEMA_VERSION,
+            attempt_n: p.attempt_n,
+            task: Task {
+                task_id: p.task_id.clone(),
+                title: String::new(),
+                description: config.task.clone(),
+                acceptance_criteria: vec![],
+                files_in_scope: vec![],
+                scope_out: vec![],
+            },
+            project_config: ProjectConfig {
+                run_checks,
+                model_routing_hint: None,
+            },
+            phase: Phase::InnerLoop,
+            durable_facts: DurableFacts::default(),
+            budgets: Budgets {
+                consumed: BudgetConsumed::default(),
+                limits: BudgetLimits {
+                    iterations: config.max_iterations,
+                    tokens: 0,
+                    cost_micros: 0,
+                },
+                wall_clock_start,
+            },
+            last_gate_result: None,
+            disposition: None,
+            messages: messages.clone(),
+        };
+        Some(RunPersist { rid, record })
+    } else {
+        None
+    };
+
     for _ in 0..config.max_iterations {
         let req = TurnRequest {
             system: Some(&system),
@@ -548,21 +722,109 @@ async fn run_loop_impl(
         stats.iterations += 1;
         let turn = match backend.turn(&req).await {
             Ok(turn) => turn,
-            Err(err) => return LoopOutcome::BackendError(err),
+            Err(err) => {
+                // Terminal path: BackendError. Persist the disposition before
+                // returning — this path exits early, bypassing the normal
+                // end-of-iteration checkpoint.
+                if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                    let mode = if err.is_retryable() {
+                        FailureMode::TransientInfra
+                    } else {
+                        FailureMode::PersistentToolError
+                    };
+                    let disposition = Disposition::Failed {
+                        mode,
+                        summary: format!("backend error: {err:?}"),
+                    };
+                    ctx.record.budgets.consumed = BudgetConsumed {
+                        iterations: stats.iterations,
+                        tokens: stats.input_tokens + stats.output_tokens,
+                        cost_micros: 0,
+                    };
+                    ctx.record.messages.clone_from(&messages);
+                    ctx.record.disposition = Some(disposition.clone());
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::DispositionSet {
+                                seq: 0,
+                                disposition,
+                            },
+                        )
+                        .await?;
+                    p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+                }
+                return Ok(LoopOutcome::BackendError(err));
+            }
         };
 
-        // Successful turn — accumulate its `Usage` into the run totals.
-        // Per-turn `u32` values sum into `u64` so a long run can't overflow.
-        stats.input_tokens += u64::from(turn.usage.input_tokens);
-        stats.output_tokens += u64::from(turn.usage.output_tokens);
+        // Successful turn — capture per-turn usage BEFORE moving the turn
+        // into history (Message::from consumes it).
+        let per_turn_input = u64::from(turn.usage.input_tokens);
+        let per_turn_output = u64::from(turn.usage.output_tokens);
+
+        // Accumulate into run totals. Per-turn u32 values sum into u64 so a
+        // long run can't overflow.
+        stats.input_tokens += per_turn_input;
+        stats.output_tokens += per_turn_output;
 
         // Snapshot the calls before moving the turn into history (the `From`
         // impl consumes `turn.content`).
         let calls: Vec<_> = turn.tool_calls().into_iter().cloned().collect();
         messages.push(Message::from(turn));
 
+        // Append ModelCall + BudgetTick events, then write the mid-iteration
+        // checkpoint (after assistant turn, BEFORE any tools.invoke). This
+        // guarantees that a mid-iteration crash always leaves a snapshot whose
+        // messages include the in-flight assistant turn.
+        if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+            let consumed = BudgetConsumed {
+                iterations: stats.iterations,
+                tokens: stats.input_tokens + stats.output_tokens,
+                cost_micros: 0,
+            };
+            p.store
+                .append_event(
+                    &ctx.rid,
+                    Event::ModelCall {
+                        seq: 0,
+                        model: p.model_label.clone(),
+                        prompt_tokens: per_turn_input,
+                        completion_tokens: per_turn_output,
+                    },
+                )
+                .await?;
+            p.store
+                .append_event(&ctx.rid, Event::BudgetTick { seq: 0, consumed })
+                .await?;
+            // Mid-iteration checkpoint: assistant turn is in messages,
+            // tool calls have NOT been invoked yet.
+            ctx.record.budgets.consumed = consumed;
+            ctx.record.messages.clone_from(&messages);
+            p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+        }
+
         if calls.is_empty() {
-            return LoopOutcome::StoppedWithoutFinish;
+            // Terminal path: StoppedWithoutFinish.
+            if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                let disposition = Disposition::Failed {
+                    mode: FailureMode::StoppedWithoutFinish,
+                    summary: "agent stopped generating tool calls without calling finish"
+                        .to_string(),
+                };
+                ctx.record.disposition = Some(disposition.clone());
+                p.store
+                    .append_event(
+                        &ctx.rid,
+                        Event::DispositionSet {
+                            seq: 0,
+                            disposition,
+                        },
+                    )
+                    .await?;
+                p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+            }
+            return Ok(LoopOutcome::StoppedWithoutFinish);
         }
 
         // Execute every requested call in order, collecting fed-back tool
@@ -586,7 +848,43 @@ async fn run_loop_impl(
                 results.push(outcome.result);
                 finish = outcome.finish;
             } else {
+                // Non-finish tool call: append ToolCallStarted before invoke,
+                // ToolCallResult after invoke (log-then-snapshot discipline).
+                if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::ToolCallStarted {
+                                seq: 0,
+                                name: call.name.clone(),
+                                args: call.input.clone(),
+                                call_id: call.id.clone(),
+                            },
+                        )
+                        .await?;
+                }
+
                 let result = tools.invoke(&call.name, call.input.clone(), ctx).await;
+
+                if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::ToolCallResult {
+                                seq: 0,
+                                name: call.name.clone(),
+                                is_error: result.is_error,
+                                summary: result.summary.clone(),
+                                // summary only — detail is NOT concatenated (audit record)
+                                offload_path: result
+                                    .offload_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                            },
+                        )
+                        .await?;
+                }
+
                 results.push(UserBlock::ToolResult {
                     call_id: call.id.clone(),
                     content: render_tool_result(&result),
@@ -597,33 +895,231 @@ async fn run_loop_impl(
         messages.push(Message::User { content: results });
 
         if let Some(disposition) = finish {
-            return LoopOutcome::Finished(disposition);
+            // Terminal path: Finished. Write DispositionSet + terminal checkpoint.
+            if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                ctx.record.messages.clone_from(&messages);
+                ctx.record.budgets.consumed = BudgetConsumed {
+                    iterations: stats.iterations,
+                    tokens: stats.input_tokens + stats.output_tokens,
+                    cost_micros: 0,
+                };
+                ctx.record.disposition = Some(disposition.clone());
+                p.store
+                    .append_event(
+                        &ctx.rid,
+                        Event::DispositionSet {
+                            seq: 0,
+                            disposition: disposition.clone(),
+                        },
+                    )
+                    .await?;
+                p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+            }
+            return Ok(LoopOutcome::Finished(disposition));
+        }
+
+        // Non-terminal end of iteration: write the end-of-iteration checkpoint
+        // so a crash here loses at most the current iteration's tool results
+        // (already in messages).
+        if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+            ctx.record.messages.clone_from(&messages);
+            ctx.record.budgets.consumed = BudgetConsumed {
+                iterations: stats.iterations,
+                tokens: stats.input_tokens + stats.output_tokens,
+                cost_micros: 0,
+            };
+            p.store.checkpoint(&ctx.rid, &ctx.record).await?;
         }
     }
 
-    LoopOutcome::MaxIterations
+    // Terminal path: MaxIterations.
+    if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+        let disposition = Disposition::Failed {
+            mode: FailureMode::BudgetExhausted,
+            summary: "iteration cap reached before the agent finished".to_string(),
+        };
+        ctx.record.messages.clone_from(&messages);
+        ctx.record.budgets.consumed = BudgetConsumed {
+            iterations: stats.iterations,
+            tokens: stats.input_tokens + stats.output_tokens,
+            cost_micros: 0,
+        };
+        ctx.record.disposition = Some(disposition.clone());
+        p.store
+            .append_event(
+                &ctx.rid,
+                Event::DispositionSet {
+                    seq: 0,
+                    disposition,
+                },
+            )
+            .await?;
+        p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+    }
+
+    Ok(LoopOutcome::MaxIterations)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunConfig, RunResult, RunStats,
-        rejection_content, render_tool_result, run,
+        FINISH_TOOL_NAME, FinishTool, LoopOutcome, Persistence, RunConfig, RunResult, RunStats,
+        rejection_content, render_tool_result, run, run_id, run_persisted,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
         ToolCallRequest, Usage, UserBlock,
     };
-    use crate::run_record::{Disposition, FailureMode, Verification};
+    use crate::run_record::{
+        BudgetConsumed, Disposition, Event, FailureMode, RunRecord, Verification,
+    };
+    use crate::store::{RunStore, SqliteRunStore, StoreError};
     use crate::test_support::MockBackend;
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
     use crate::workspace::Workspace;
+    use async_trait::async_trait;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // ---- test-only store doubles ----------------------------------------
+
+    /// Enumerates the observable store operations. Used by [`RecordingStore`]
+    /// to verify log-then-snapshot ordering.
+    #[derive(Debug, Clone)]
+    enum StoreCall {
+        AppendEvent { kind: String },
+        Checkpoint,
+    }
+
+    /// A [`RunStore`] that delegates to an in-memory `SQLite` store and records
+    /// every call in order. Used to assert the log-then-snapshot ordering
+    /// discipline (events before checkpoints within each iteration).
+    struct RecordingStore {
+        inner: SqliteRunStore,
+        calls: Mutex<Vec<StoreCall>>,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: SqliteRunStore::open_in_memory().expect("in-memory SQLite"),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_calls(&self) -> Vec<StoreCall> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RunStore for RecordingStore {
+        async fn load(&self, rid: &str) -> Result<Option<RunRecord>, StoreError> {
+            self.inner.load(rid).await
+        }
+
+        async fn append_event(&self, rid: &str, event: Event) -> Result<u64, StoreError> {
+            let kind = match &event {
+                Event::ModelCall { .. } => "ModelCall",
+                Event::ToolCallStarted { .. } => "ToolCallStarted",
+                Event::ToolCallResult { .. } => "ToolCallResult",
+                Event::PhaseTransition { .. } => "PhaseTransition",
+                Event::BudgetTick { .. } => "BudgetTick",
+                Event::DispositionSet { .. } => "DispositionSet",
+            };
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(StoreCall::AppendEvent {
+                    kind: kind.to_string(),
+                });
+            self.inner.append_event(rid, event).await
+        }
+
+        async fn checkpoint(&self, rid: &str, record: &RunRecord) -> Result<(), StoreError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(StoreCall::Checkpoint);
+            self.inner.checkpoint(rid, record).await
+        }
+    }
+
+    /// A [`RunStore`] that captures every [`RunRecord`] snapshot passed to
+    /// [`RunStore::checkpoint`]. Used to inspect intermediate (mid-iteration)
+    /// checkpoint states that are overwritten by subsequent checkpoints.
+    struct SnapshotStore {
+        inner: SqliteRunStore,
+        snapshots: Mutex<Vec<RunRecord>>,
+    }
+
+    impl SnapshotStore {
+        fn new() -> Self {
+            Self {
+                inner: SqliteRunStore::open_in_memory().expect("in-memory SQLite"),
+                snapshots: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn all_snapshots(&self) -> Vec<RunRecord> {
+            self.snapshots.lock().expect("snapshots lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RunStore for SnapshotStore {
+        async fn load(&self, rid: &str) -> Result<Option<RunRecord>, StoreError> {
+            self.inner.load(rid).await
+        }
+
+        async fn append_event(&self, rid: &str, event: Event) -> Result<u64, StoreError> {
+            self.inner.append_event(rid, event).await
+        }
+
+        async fn checkpoint(&self, rid: &str, record: &RunRecord) -> Result<(), StoreError> {
+            self.snapshots
+                .lock()
+                .expect("snapshots lock")
+                .push(record.clone());
+            self.inner.checkpoint(rid, record).await
+        }
+    }
+
+    /// A [`RunStore`] whose [`RunStore::append_event`] always returns an error.
+    /// Used to assert that the first store error aborts [`run_persisted`].
+    struct FailingStore;
+
+    #[async_trait]
+    impl RunStore for FailingStore {
+        async fn load(&self, _rid: &str) -> Result<Option<RunRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_event(&self, _rid: &str, _event: Event) -> Result<u64, StoreError> {
+            Err(StoreError::LockPoisoned)
+        }
+
+        async fn checkpoint(&self, _rid: &str, _record: &RunRecord) -> Result<(), StoreError> {
+            Err(StoreError::LockPoisoned)
+        }
+    }
+
+    /// Build a [`Persistence`] backed by the given store.
+    fn make_persistence(store: Arc<dyn RunStore>) -> Persistence {
+        Persistence {
+            store,
+            task_id: "task-t".to_string(),
+            attempt_n: 1,
+            model_label: "test-model".to_string(),
+        }
+    }
+
+    // Expected run_id for the make_persistence fixture above.
+    const FIXTURE_RID: &str = "task-t:1";
 
     fn usage() -> Usage {
         Usage {
@@ -1633,5 +2129,555 @@ mod tests {
         assert!(with_checks.checks.is_some());
         let with_mt = RunConfig::new("t", 1).with_max_tokens(1234);
         assert_eq!(with_mt.max_tokens, 1234);
+    }
+
+    // =====================================================================
+    // Persistence tests (run identity + checkpoint wiring)
+    // =====================================================================
+
+    #[test]
+    fn run_id_helper_formats_task_id_colon_attempt_n() {
+        // Pinned vector: the join must be exactly "task-42:1", never a hash.
+        assert_eq!(run_id("task-42", 1_u32), "task-42:1");
+        // Also check the fixture we use throughout the persistence tests.
+        assert_eq!(run_id("task-t", 1), FIXTURE_RID);
+    }
+
+    #[tokio::test]
+    async fn run_persisted_produces_same_outcome_and_stats_as_run() {
+        // No-store parity: run() and run_persisted() on the same scripted
+        // trajectory should produce an identical LoopOutcome variant and
+        // identical RunStats (except wall_clock, which is timing-dependent
+        // and is not compared).
+        let script = || {
+            vec![
+                turn_with_usage(
+                    vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                    StopReason::ToolUse,
+                    usage_with(10, 5),
+                ),
+                finish_call(
+                    "cf",
+                    serde_json::json!({ "disposition": "done", "summary": "ok" }),
+                ),
+            ]
+        };
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult {
+            outcome: o1,
+            stats: s1,
+        } = run(&MockBackend::from_turns(script()), &tools, &ctx, &config).await;
+
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store);
+        let RunResult {
+            outcome: o2,
+            stats: s2,
+        } = run_persisted(
+            &MockBackend::from_turns(script()),
+            &tools,
+            &ctx,
+            &config,
+            &pers,
+        )
+        .await
+        .expect("run_persisted must succeed");
+
+        // LoopOutcome variant
+        assert!(
+            matches!(o1, LoopOutcome::Finished(Disposition::Done { .. })),
+            "run() outcome: {o1:?}"
+        );
+        assert!(
+            matches!(o2, LoopOutcome::Finished(Disposition::Done { .. })),
+            "run_persisted() outcome: {o2:?}"
+        );
+        // RunStats (not wall_clock)
+        assert_eq!(s1.iterations, s2.iterations, "iterations must match");
+        assert_eq!(s1.input_tokens, s2.input_tokens, "input_tokens must match");
+        assert_eq!(
+            s1.output_tokens, s2.output_tokens,
+            "output_tokens must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_events_recorded_before_and_after_invoke() {
+        // A scripted echo turn followed by finish. The event log must contain
+        // ToolCallStarted("echo") immediately before ToolCallResult("echo").
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "call-echo",
+                    "echo",
+                    serde_json::json!({ "x": 1 }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "call-finish",
+                serde_json::json!({ "disposition": "done", "summary": "done" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+
+        // Find the ToolCallStarted and ToolCallResult indices.
+        let started_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ToolCallStarted { name, .. } if name == "echo"))
+            .expect("ToolCallStarted(echo) must be in event log");
+        let result_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::ToolCallResult { name, .. } if name == "echo"))
+            .expect("ToolCallResult(echo) must be in event log");
+
+        assert!(
+            started_idx < result_idx,
+            "ToolCallStarted must precede ToolCallResult; started={started_idx}, result={result_idx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_started_event_carries_matching_call_id() {
+        // The ToolCallStarted.call_id must equal the ToolCallRequest.id from
+        // the model response — this is what resume pairs against.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "my-unique-call-id",
+                    "echo",
+                    serde_json::json!({ "x": 1 }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+        let started = events.iter().find_map(|e| {
+            if let Event::ToolCallStarted { name, call_id, .. } = e
+                && name == "echo"
+            {
+                return Some(call_id.clone());
+            }
+            None
+        });
+        assert_eq!(
+            started.as_deref(),
+            Some("my-unique-call-id"),
+            "ToolCallStarted.call_id must equal the model's ToolCallRequest.id"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_successful_turns_produce_exactly_two_model_call_and_budget_tick_events() {
+        // [echo turn, finish turn] = 2 model draws → 2 ModelCall + 2 BudgetTick.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "done" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list");
+        let model_calls = events
+            .iter()
+            .filter(|e| matches!(e, Event::ModelCall { .. }))
+            .count();
+        let budget_ticks = events
+            .iter()
+            .filter(|e| matches!(e, Event::BudgetTick { .. }))
+            .count();
+
+        assert_eq!(
+            model_calls, 2,
+            "expected 2 ModelCall events, got {model_calls}"
+        );
+        assert_eq!(
+            budget_ticks, 2,
+            "expected 2 BudgetTick events, got {budget_ticks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loaded_checkpoint_has_correct_run_id_schema_version_phase_and_run_checks() {
+        // Verifies RunRecord construction: run_id format, schema_version == 2,
+        // phase == InnerLoop, and run_checks populated from the ChecksRunner.
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let runner = passing_runner();
+        let runner_display = runner.command_display();
+        let config = RunConfig::new("do the task", 5).with_checks(runner);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = Persistence {
+            store: store.clone(),
+            task_id: "task-42".to_string(),
+            attempt_n: 1,
+            model_label: "test-model".to_string(),
+        };
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let rid = run_id("task-42", 1);
+        let rec = store.load(&rid).await.expect("load").expect("present");
+
+        assert_eq!(rec.run_id, "task-42:1", "run_id must be task_id:attempt_n");
+        assert_eq!(
+            rec.schema_version,
+            crate::run_record::SCHEMA_VERSION,
+            "schema_version must be SCHEMA_VERSION (= 2)"
+        );
+        assert_eq!(
+            rec.phase,
+            crate::run_record::Phase::InnerLoop,
+            "phase must be InnerLoop"
+        );
+        assert_eq!(
+            rec.project_config
+                .run_checks
+                .get("checks")
+                .map(String::as_str),
+            Some(runner_display.as_str()),
+            "run_checks['checks'] must equal runner.command_display()"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_done_produces_disposition_done_in_persisted_record() {
+        // A finish(done) terminal path must write a checkpoint whose
+        // disposition is Some(Disposition::Done{..}) and emit a DispositionSet
+        // event.
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "task complete" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(
+            matches!(rec.disposition, Some(Disposition::Done { .. })),
+            "disposition must be Done; got {:?}",
+            rec.disposition
+        );
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list");
+        let has_disposition_set = events
+            .iter()
+            .any(|e| matches!(e, Event::DispositionSet { .. }));
+        assert!(has_disposition_set, "DispositionSet event must be in log");
+    }
+
+    #[tokio::test]
+    async fn stopped_without_finish_produces_failed_stopped_without_finish_disposition() {
+        // A plain-text turn (no tool calls) stops as StoppedWithoutFinish.
+        // The persisted disposition must be Failed{mode: StoppedWithoutFinish}.
+        let backend = MockBackend::from_turns(vec![turn_with(
+            vec![ContentBlock::Text("I am just talking".to_string())],
+            StopReason::EndTurn,
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "outcome must be StoppedWithoutFinish; got {outcome:?}"
+        );
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(
+            matches!(
+                rec.disposition,
+                Some(Disposition::Failed {
+                    mode: FailureMode::StoppedWithoutFinish,
+                    ..
+                })
+            ),
+            "persisted disposition must be Failed{{StoppedWithoutFinish}}; got {:?}",
+            rec.disposition
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn log_then_snapshot_ordering_and_two_turn_iteration_count() {
+        // [echo turn, finish turn] = 2 model draws.
+        // Asserts:
+        //   1. The terminal DispositionSet event is recorded before the last
+        //      checkpoint (log-then-snapshot discipline).
+        //   2. No checkpoint is recorded before the first AppendEvent
+        //      (the very first call must be an event, not a checkpoint).
+        //   3. The loaded record's budgets.consumed.iterations == 2.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "done" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let recording = Arc::new(RecordingStore::new());
+        let pers = make_persistence(recording.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let calls = recording.recorded_calls();
+        assert!(!calls.is_empty(), "should have recorded some store calls");
+
+        // (2) First call must be AppendEvent.
+        assert!(
+            matches!(calls[0], StoreCall::AppendEvent { .. }),
+            "first call must be AppendEvent, not Checkpoint; got {:?}",
+            calls[0]
+        );
+
+        // (1) Last DispositionSet must precede last Checkpoint.
+        let last_ds = calls
+            .iter()
+            .rposition(|c| matches!(c, StoreCall::AppendEvent { kind } if kind == "DispositionSet"))
+            .expect("DispositionSet event must have been appended");
+        let last_ckpt = calls
+            .iter()
+            .rposition(|c| matches!(c, StoreCall::Checkpoint))
+            .expect("at least one Checkpoint must have been written");
+        assert!(
+            last_ds < last_ckpt,
+            "DispositionSet (idx {last_ds}) must precede the terminal Checkpoint (idx {last_ckpt})"
+        );
+
+        // (3) Final checkpoint has iterations == 2.
+        let rec = recording
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            rec.budgets.consumed.iterations, 2,
+            "loaded record must have iterations == 2; got {:?}",
+            rec.budgets.consumed
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_turn_checkpoint_contains_assistant_message_before_tool_execution() {
+        // LEAD ADDITION: the mid-iteration checkpoint (written after the
+        // assistant turn is appended to messages but BEFORE any tools.invoke)
+        // must have the assistant turn as its last message. Specifically, that
+        // assistant message must carry the ToolCallRequest with the started
+        // call's id.
+        //
+        // Script: [echo call], [finish]. The first checkpoint (snapshot 0) is
+        // the mid-iteration checkpoint of iteration 1.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "call-echo-123",
+                    "echo",
+                    serde_json::json!({ "x": 1 }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let snapshots = snap_store.all_snapshots();
+        assert!(
+            !snapshots.is_empty(),
+            "at least one checkpoint must have been written"
+        );
+
+        // Snapshot 0 is the mid-iteration checkpoint of iteration 1:
+        // messages = [task_seed_user, assistant_turn_with_echo_call]
+        let first = &snapshots[0];
+        let last_msg = first.messages.last().expect("messages must be non-empty");
+
+        match last_msg {
+            Message::Assistant { content } => {
+                let has_echo_call = content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolCall(ToolCallRequest { id, name, .. })
+                        if id == "call-echo-123" && name == "echo"
+                    )
+                });
+                assert!(
+                    has_echo_call,
+                    "first checkpoint's last message must be the assistant turn \
+                     carrying call_id 'call-echo-123'; got content: {content:?}"
+                );
+            }
+            other @ Message::User { .. } => {
+                panic!("first checkpoint's last message must be Message::Assistant; got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_store_causes_run_persisted_to_return_err() {
+        // The first store error (on append_event) must abort run_persisted
+        // and propagate as Err(StoreError).
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let pers = make_persistence(Arc::new(FailingStore));
+
+        let result = run_persisted(&backend, &tools, &ctx, &config, &pers).await;
+        assert!(
+            result.is_err(),
+            "run_persisted with a failing store must return Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_consumed_in_record_reflects_current_iteration() {
+        // The BudgetTick event and end-of-iteration checkpoint must carry
+        // budgets.consumed matching the loop's current running totals.
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({}))],
+                StopReason::ToolUse,
+                usage_with(100, 50),
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list");
+        // Second BudgetTick (iter 2, the finish turn) should have
+        // accumulated tokens from BOTH turns.
+        let budget_ticks: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let Event::BudgetTick { consumed, .. } = e {
+                    Some(consumed)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // iter 1 BudgetTick: iterations=1, tokens=100+50=150
+        let BudgetConsumed {
+            iterations: i1,
+            tokens: t1,
+            ..
+        } = budget_ticks[0];
+        assert_eq!(*i1, 1, "first BudgetTick iterations must be 1");
+        assert_eq!(*t1, 150, "first BudgetTick tokens must be 150 (100+50)");
     }
 }

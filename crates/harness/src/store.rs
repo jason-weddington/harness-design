@@ -4,8 +4,11 @@
 //! truth" and "Persistence interface"), the run record needs durable storage
 //! so the harness can:
 //!
-//! 1. **Crash-resume** — reload the snapshot, re-execute any interrupted step
-//!    (idempotency keyed off `seq`), and continue.
+//! 1. **Crash-resume** — reload the snapshot and continue from the last
+//!    checkpoint; interrupted steps are handled by synthesizing an
+//!    `is_error=true` result for each unpaired `ToolCallStarted` — the harness
+//!    **never re-executes** an interrupted call (side effects may have already
+//!    happened). The `seq` key makes each step idempotent on resume.
 //! 2. **Fresh-context restart** — drop `messages`, keep `durable_facts` /
 //!    `phase` / `budgets`, re-orient from git + filesystem.
 //!
@@ -13,8 +16,10 @@
 //!
 //! - `events(run_id, seq, ts, kind, payload)` — append-only audit trail and
 //!   source of truth for the trajectory. The `seq` is a per-run monotonic
-//!   counter; tool side effects key off it for idempotent replay (an
-//!   unpaired `ToolCallStarted` on resume means "re-execute this step").
+//!   counter; tool side effects key off it for idempotent replay. An
+//!   unpaired `ToolCallStarted` on resume means the call was interrupted:
+//!   the harness synthesizes an `is_error=true` `ToolCallResult` rather
+//!   than re-executing the call.
 //! - `runs(run_id, schema_version, state_blob, updated_at)` — materialized
 //!   snapshot. Derivable from the log in principle; materialized so resume is
 //!   a single read, not a full replay.
