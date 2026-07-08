@@ -38,7 +38,7 @@ and disposable context** — because there are two kinds of resume (below).
 
 ```
 RunRecord {
-  run_id          // deterministic: hash(task_id + attempt_n) — stable across restarts
+  run_id          // deterministic: {task_id}:{attempt_n} — stable across restarts
   schema_version
   attempt_n
 
@@ -196,20 +196,22 @@ Both fall out of the durable/disposable split for free.
 - **The landmine** (from `docs/research/05`): naive replay re-runs the step you
   crashed *inside*. If we crash mid-`edit_file` or mid-`run_command`, resume must
   not double-apply.
-- **v1 handling:** the event log records `tool_call_started{seq, name, args}`
-  *before* execution and `tool_call_result{seq, ...}` *after*. On resume, a
-  `started` with no matching `result` = an interrupted step → re-execute it,
-  leaning on **tool idempotency** (full-file writes, git ops, and most build
-  commands are naturally re-runnable). The `seq` is the idempotency key.
-- **Out of v1:** compensation/saga handlers for genuinely non-idempotent external
-  side effects. v1 build tasks are local and re-runnable; we record the started/
-  result markers now so the data is there if we need richer reconciliation later.
+- **v1 handling:** the event log records `ToolCallStarted{seq, name, args, call_id}`
+  *before* execution and `ToolCallResult{seq, ...}` *after*. On resume, a
+  `ToolCallStarted` with no matching `ToolCallResult` = an interrupted call →
+  the harness pairs it by `call_id` and synthesizes an `is_error=true`
+  `ToolCallResult`; **the call is NEVER re-executed** — side effects may have
+  already happened and re-execution is never safe. `seq` is a monotonic ordering
+  key for log reconstruction, not an idempotency key.
+- **Out of v1:** richer reconciliation for interrupted calls (e.g. checking
+  whether an edit actually landed before marking it errored). v1 conservatively
+  treats any unpaired start as an error and lets the agent self-correct.
 
 ## Determinism
 
 - `run_id` is deterministic from `(task_id, attempt_n)` so a re-dispatch of the
   same attempt addresses the same record (idempotent dispatch).
-- Each event carries a monotonic `seq`; tool side effects key off `seq`.
+- Each event carries a monotonic `seq` used for log ordering and reconstruction.
 - Record serialization is **deterministic** (`BTreeMap`/ordered structs) — same
   discipline that keeps the prompt cache hitting.
 

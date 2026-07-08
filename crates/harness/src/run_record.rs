@@ -321,10 +321,11 @@ pub struct DispositionReport {
 
 // ===== Event log =======================================================
 
-/// Append-only audit-trail entries. Each carries a monotonic `seq` — that
-/// `seq` is the idempotency key for resume, so a tool side effect attempted
-/// at `seq=N` will not be re-applied twice when the run resumes from an
-/// interrupted step.
+/// Append-only audit-trail entries. Each carries a monotonic `seq` that
+/// provides an ordering key for log reconstruction — `seq` is NOT an
+/// idempotency or replay key. On crash-resume, an interrupted tool call
+/// (unpaired `ToolCallStarted`) is NEVER re-executed; the harness pairs it
+/// by `call_id` and synthesizes an `is_error=true` `ToolCallResult` instead.
 ///
 /// `Eq` is not derived because [`Event::ToolCallStarted`] carries
 /// [`serde_json::Value`] (which can hold floats); `PartialEq` is enough for

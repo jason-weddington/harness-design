@@ -8,7 +8,7 @@
 //!    checkpoint; interrupted steps are handled by synthesizing an
 //!    `is_error=true` result for each unpaired `ToolCallStarted` — the harness
 //!    **never re-executes** an interrupted call (side effects may have already
-//!    happened). The `seq` key makes each step idempotent on resume.
+//!    happened). `seq` is a monotonic ordering key, not an idempotency key.
 //! 2. **Fresh-context restart** — drop `messages`, keep `durable_facts` /
 //!    `phase` / `budgets`, re-orient from git + filesystem.
 //!
@@ -16,7 +16,7 @@
 //!
 //! - `events(run_id, seq, ts, kind, payload)` — append-only audit trail and
 //!   source of truth for the trajectory. The `seq` is a per-run monotonic
-//!   counter; tool side effects key off it for idempotent replay. An
+//!   counter used for log ordering and reconstruction. An
 //!   unpaired `ToolCallStarted` on resume means the call was interrupted:
 //!   the harness synthesizes an `is_error=true` `ToolCallResult` rather
 //!   than re-executing the call.
