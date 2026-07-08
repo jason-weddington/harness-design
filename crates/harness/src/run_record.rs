@@ -22,10 +22,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::exec::CheckReport;
+use crate::model::Message;
+
 /// Current run-record schema version. Bump deliberately when the on-disk
 /// format changes; the value is carried on every [`RunRecord`] so a loader
 /// can migrate or refuse stale data.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ===== Top-level run record ============================================
 
@@ -36,9 +39,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `last_gate_result`, `disposition`) and **disposable context** (`messages`).
 /// That split is what lets the harness do a fresh-context restart before
 /// quality degrades, without losing task progress.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRecord {
-    /// Deterministic id: `hash(task_id + attempt_n)`. Stable across restarts,
+    /// Deterministic id: `{task_id}:{attempt_n}`. Stable across restarts,
     /// so re-dispatch of the same attempt addresses the same record
     /// (idempotent dispatch).
     pub run_id: String,
@@ -241,15 +244,45 @@ pub struct GateOutcome {
     pub failure_extract: Option<String>,
 }
 
+// ===== Verification ====================================================
+
+/// The evidence attached to a [`Disposition::Done`] — the justification for
+/// accepting the agent's claim that the task is complete.
+///
+/// The loop is the ONLY constructor of [`Disposition::Done`] and it only
+/// constructs it after a green harness-run verification (or explicitly records
+/// [`Self::NoChecksConfigured`] when the run had no checks wired in). This
+/// makes the "Done carries evidence" property a type-system invariant, not a
+/// documentation convention.
+///
+/// `Eq` is NOT derived because [`CheckReport`] derives `PartialEq` but not
+/// `Eq` — keeping the door open for a future field that isn't `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Verification {
+    /// The harness re-ran the configured checks and they passed. The full
+    /// [`CheckReport`] is attached as the evidence.
+    Checks(CheckReport),
+    /// No checks were configured for this run — there was nothing to verify
+    /// against, so the loop accepted the `done` claim on trust.
+    NoChecksConfigured,
+}
+
 // ===== Disposition =====================================================
 
 /// Terminal status of a run. The discriminator is "does running the same
 /// thing again have any chance of working?" — `Blocked` no, `Failed` maybe,
 /// `Done` already worked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is NOT derived because [`Verification::Checks`] wraps a
+/// [`CheckReport`] that is `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Disposition {
-    /// Gates green and every criterion `Verified`.
-    Done,
+    /// Gates green and every criterion `Verified`. Carries the outcome
+    /// summary and the verification evidence that justifies the claim.
+    Done {
+        summary: String,
+        verification: Verification,
+    },
     /// The spec or environment is the problem; retrying unchanged cannot
     /// help (ambiguous AC, missing access, out-of-scope ask).
     Blocked { decision_needed: String },
@@ -268,6 +301,10 @@ pub enum FailureMode {
     PersistentToolError,
     /// Network / infra blip; almost certainly worth retrying.
     TransientInfra,
+    /// The loop exited without the agent calling `finish` at all (e.g. the
+    /// model stopped generating tool calls). The task is the problem; retrying
+    /// unchanged is unlikely to help.
+    StoppedWithoutFinish,
 }
 
 /// Structured report attached to a disposition — also the eval-case seed
@@ -283,23 +320,6 @@ pub struct DispositionReport {
 }
 
 // ===== Event log =======================================================
-
-/// One message exchanged with the model. Disposable context: the loop can
-/// drop or compact this without losing durable progress.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
-}
-
-/// Conversational role of a [`Message`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
 
 /// Append-only audit-trail entries. Each carries a monotonic `seq` — that
 /// `seq` is the idempotency key for resume, so a tool side effect attempted
@@ -319,12 +339,17 @@ pub enum Event {
         completion_tokens: u64,
     },
     /// A tool call was started (recorded *before* execution — pairs with
-    /// `ToolCallResult` by `seq`; an unpaired `started` on resume means
-    /// "interrupted, re-run idempotently").
+    /// `ToolCallResult` by `call_id`). On crash-resume, an unpaired
+    /// `ToolCallStarted` means the call was interrupted: the harness
+    /// synthesizes an `is_error=true` `ToolCallResult` instead of re-executing
+    /// the call (re-execution is NEVER safe — side effects may have already
+    /// happened). `call_id` is the provider-assigned id from the
+    /// [`crate::model::ToolCallRequest`] that triggered this entry.
     ToolCallStarted {
         seq: u64,
         name: String,
         args: serde_json::Value,
+        call_id: String,
     },
     /// A tool call completed (success or steering error).
     ToolCallResult {
@@ -351,9 +376,13 @@ mod tests {
     use super::{
         AcceptanceCriterion, BudgetConsumed, BudgetLimits, Budgets, ChecklistItem, CriterionStatus,
         Disposition, DispositionReport, DurableFacts, Event, Evidence, FailureMode, GateOutcome,
-        GateResult, Message, Phase, ProjectConfig, Role, RunRecord, SCHEMA_VERSION, Task,
+        GateResult, Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
     };
+    use crate::exec::{CheckCommand, ChecksRunner};
+    use crate::model::{ContentBlock, Message, ToolCallRequest, UserBlock};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     fn sample_project_config() -> ProjectConfig {
         let mut run_checks = BTreeMap::new();
@@ -466,22 +495,34 @@ mod tests {
     }
 
     fn sample_messages() -> Vec<Message> {
+        // Exercise the load-bearing model::Message block types:
+        // User(Text) → Assistant(Reasoning+ToolCall) → User(ToolResult)
+        // The call_id "c1" pairs the ToolCall with the ToolResult so
+        // round_trip_run_record proves tool_call pairing and the Reasoning
+        // opaque blob survive RunRecord serde.
         vec![
-            Message {
-                role: Role::System,
-                content: "You are a build engine.".to_string(),
+            Message::User {
+                content: vec![UserBlock::Text("Do the task.".to_string())],
             },
-            Message {
-                role: Role::User,
-                content: "Do the task.".to_string(),
+            Message::Assistant {
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: "Let me think about this…".to_string(),
+                        opaque: Some("sig-abc123".to_string()),
+                    },
+                    ContentBlock::ToolCall(ToolCallRequest {
+                        id: "c1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({ "path": "src/lib.rs" }),
+                    }),
+                ],
             },
-            Message {
-                role: Role::Assistant,
-                content: "Calling tool...".to_string(),
-            },
-            Message {
-                role: Role::Tool,
-                content: "ok".to_string(),
+            Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: "c1".to_string(),
+                    content: "fn add(a: i32, b: i32) -> i32 { a + b }".to_string(),
+                    is_error: false,
+                }],
             },
         ]
     }
@@ -548,9 +589,29 @@ mod tests {
         round_trip(&CriterionStatus::Verified(Evidence::NeedsHuman));
     }
 
-    #[test]
-    fn round_trip_disposition_all_variants() {
-        round_trip(&Disposition::Done);
+    #[tokio::test]
+    async fn round_trip_disposition_all_variants() {
+        // Done — NoChecksConfigured (no CheckReport fixture needed)
+        round_trip(&Disposition::Done {
+            summary: "task complete".to_string(),
+            verification: Verification::NoChecksConfigured,
+        });
+
+        // Done — Checks (real CheckReport from a trivially-green runner)
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            },
+            PathBuf::from("/"),
+            Duration::from_secs(5),
+        );
+        let report = runner.run(&crate::tool::ToolCtx::stub()).await;
+        round_trip(&Disposition::Done {
+            summary: "checks green".to_string(),
+            verification: Verification::Checks(report),
+        });
+
         round_trip(&Disposition::Blocked {
             decision_needed: "Which API version?".to_string(),
         });
@@ -559,6 +620,7 @@ mod tests {
             FailureMode::BudgetExhausted,
             FailureMode::PersistentToolError,
             FailureMode::TransientInfra,
+            FailureMode::StoppedWithoutFinish,
         ] {
             round_trip(&Disposition::Failed {
                 mode,
@@ -594,6 +656,7 @@ mod tests {
                     "old_string": "foo",
                     "new_string": "bar",
                 }),
+                call_id: "tool-call-c2".to_string(),
             },
             Event::ToolCallResult {
                 seq: 3,
@@ -617,7 +680,10 @@ mod tests {
             },
             Event::DispositionSet {
                 seq: 6,
-                disposition: Disposition::Done,
+                disposition: Disposition::Done {
+                    summary: "task complete".to_string(),
+                    verification: Verification::NoChecksConfigured,
+                },
             },
         ];
         for ev in &events {
@@ -752,8 +818,36 @@ mod tests {
     }
 
     #[test]
+    fn done_missing_verification_fails_to_deserialize() {
+        // `Disposition::Done` now requires `verification`. A JSON payload that
+        // omits it must fail — the illegal-states-unrepresentable guarantee
+        // surfaced at the wire boundary.
+        let missing_verification = r#"{"Done":{"summary":"x"}}"#;
+        let res: Result<Disposition, _> = serde_json::from_str(missing_verification);
+        assert!(
+            res.is_err(),
+            "Done without `verification` must fail to deserialize, got Ok({:?})",
+            res.ok()
+        );
+
+        // And the valid form (NoChecksConfigured) parses fine.
+        let valid = r#"{"Done":{"summary":"x","verification":"NoChecksConfigured"}}"#;
+        let parsed: Disposition = serde_json::from_str(valid).expect("valid Done deserializes");
+        assert!(
+            matches!(
+                parsed,
+                Disposition::Done {
+                    verification: Verification::NoChecksConfigured,
+                    ..
+                }
+            ),
+            "parsed Done should carry NoChecksConfigured; got {parsed:?}"
+        );
+    }
+
+    #[test]
     fn schema_version_constant_is_what_we_publish() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
         // And the field on RunRecord defaults to this in our sample.
         assert_eq!(sample_run_record().schema_version, SCHEMA_VERSION);
     }
@@ -771,10 +865,6 @@ mod tests {
         let m = FailureMode::TransientInfra;
         let m2 = m;
         assert_eq!(m, m2);
-
-        let r = Role::Assistant;
-        let r2 = r;
-        assert_eq!(r, r2);
 
         let bc = BudgetConsumed {
             iterations: 1,

@@ -53,10 +53,11 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
-use harness::engine::{FinishDisposition, LoopOutcome, RunStats, Verification};
+use harness::engine::{LoopOutcome, RunStats};
 use harness::eval::{EvalReport, TrialResult, coding_fix_task, discover_fixtures, run_eval};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
+use harness::run_record::{Disposition, Verification};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5";
@@ -290,7 +291,7 @@ fn format_tokens_compact(n: u64) -> String {
 /// A terse, one-line description of a trial's terminal outcome for the live log.
 fn outcome_one_liner(outcome: &LoopOutcome) -> String {
     match outcome {
-        LoopOutcome::Finished(FinishDisposition::Done {
+        LoopOutcome::Finished(Disposition::Done {
             verification: Verification::Checks(report),
             ..
         }) => format!(
@@ -298,14 +299,14 @@ fn outcome_one_liner(outcome: &LoopOutcome) -> String {
             if report.passed { "GREEN" } else { "RED" },
             report.exit_code,
         ),
-        LoopOutcome::Finished(FinishDisposition::Done {
+        LoopOutcome::Finished(Disposition::Done {
             verification: Verification::NoChecksConfigured,
             ..
         }) => "Done — NO CHECKS (unverified)".to_string(),
-        LoopOutcome::Finished(FinishDisposition::Blocked { decision_needed }) => {
+        LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
             format!("Blocked — {decision_needed}")
         }
-        LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
+        LoopOutcome::Finished(Disposition::Failed { summary, .. }) => {
             format!("Failed — {summary}")
         }
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish".to_string(),

@@ -51,11 +51,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::engine::{
-    self, FinishDisposition, LoopOutcome, RunConfig, RunResult, RunStats, Verification,
-};
+use crate::engine::{self, LoopOutcome, RunConfig, RunResult, RunStats};
 use crate::exec::{CheckCommand, ChecksRunner};
 use crate::model::ModelBackend;
+use crate::run_record::{Disposition, Verification};
 use crate::tool::{ToolCtx, ToolRegistry};
 use crate::tools::standard_registry;
 use crate::workspace::{DiskOffloadSink, Workspace};
@@ -462,7 +461,7 @@ pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) 
         success: Box::new(|outcome| {
             matches!(
                 outcome,
-                LoopOutcome::Finished(FinishDisposition::Done {
+                LoopOutcome::Finished(Disposition::Done {
                     verification: Verification::Checks(report),
                     ..
                 }) if report.passed
@@ -491,10 +490,7 @@ pub fn finish_task() -> EvalTask {
         name: "finish".to_string(),
         task: "Acknowledge and finish.".to_string(),
         success: Box::new(|outcome| {
-            matches!(
-                outcome,
-                LoopOutcome::Finished(FinishDisposition::Done { .. })
-            )
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. }))
         }),
     }
 }
@@ -505,11 +501,10 @@ mod tests {
         EvalReport, EvalTask, TrialEnv, TrialResult, coding_fix_task, copy_dir_recursive,
         discover_fixtures, finish_env, finish_task, run_eval,
     };
-    use crate::engine::{
-        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, RunStats, Verification,
-    };
+    use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
     use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+    use crate::run_record::{Disposition, FailureMode, Verification};
     use crate::test_support::MockBackend;
     use crate::tool::{EchoTool, ToolCtx, ToolRegistry};
     use crate::tools::standard_registry;
@@ -685,20 +680,19 @@ mod tests {
         let task = finish_task();
 
         // NoChecksConfigured is the eval-path Done: verify it passes.
-        assert!((task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Done {
-                summary: "ok".to_string(),
-                verification: crate::engine::Verification::NoChecksConfigured,
-            }
-        )));
+        assert!((task.success)(&LoopOutcome::Finished(Disposition::Done {
+            summary: "ok".to_string(),
+            verification: Verification::NoChecksConfigured,
+        })));
 
         assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Blocked {
+            Disposition::Blocked {
                 decision_needed: "which API?".to_string(),
             }
         )));
         assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Failed {
+            Disposition::Failed {
+                mode: FailureMode::Loop,
                 summary: "tool errored".to_string(),
             }
         )));
@@ -731,12 +725,10 @@ mod tests {
         };
         assert_eq!(task.name, "custom");
         assert!((task.success)(&LoopOutcome::MaxIterations));
-        assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Done {
-                summary: String::new(),
-                verification: crate::engine::Verification::NoChecksConfigured,
-            }
-        )));
+        assert!(!(task.success)(&LoopOutcome::Finished(Disposition::Done {
+            summary: String::new(),
+            verification: Verification::NoChecksConfigured,
+        })));
     }
 
     #[test]
@@ -1186,7 +1178,7 @@ mod tests {
         let green = green_checks(PathBuf::from("/")).run(&ToolCtx::stub()).await;
         assert!(green.passed);
         assert!(
-            (task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+            (task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "fixed".to_string(),
                 verification: Verification::Checks(green),
             })),
@@ -1195,7 +1187,7 @@ mod tests {
 
         // Rejects the vacuous NoChecksConfigured Done — the whole point.
         assert!(
-            !(task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+            !(task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "claimed".to_string(),
                 verification: Verification::NoChecksConfigured,
             })),
@@ -1215,7 +1207,7 @@ mod tests {
         .await;
         assert!(!red.passed);
         assert!(
-            !(task.success)(&LoopOutcome::Finished(FinishDisposition::Done {
+            !(task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "lie".to_string(),
                 verification: Verification::Checks(red),
             })),
@@ -1224,12 +1216,13 @@ mod tests {
 
         // Rejects every non-Done terminal outcome.
         assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Failed {
+            Disposition::Failed {
+                mode: FailureMode::Loop,
                 summary: "boom".to_string(),
             }
         )));
         assert!(!(task.success)(&LoopOutcome::Finished(
-            FinishDisposition::Blocked {
+            Disposition::Blocked {
                 decision_needed: "which?".to_string(),
             }
         )));

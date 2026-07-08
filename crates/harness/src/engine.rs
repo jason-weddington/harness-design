@@ -28,14 +28,14 @@
 //! - [`FinishTool`] — the tool the model calls to end the run. Its schema is
 //!   what the model sees; the loop is what parses the input and (for `done`)
 //!   verifies it.
-//! - [`FinishDisposition`] / [`Verification`] — the parsed decision, plus the
-//!   evidence attached to a verified [`FinishDisposition::Done`].
+//! - [`LoopOutcome::into_disposition`] — converts a terminal outcome to a
+//!   [`crate::run_record::Disposition`] for storage.
 //!
 //! What does **not** live here yet (tracked separately): budget / token /
 //! wall-clock bounds, retry / backoff, loop / no-progress detection,
-//! persistence / checkpointing, context assembly / compaction, and wiring to
-//! [`crate::run_record::Disposition`]. The only stopping condition beyond the
-//! agent finishing is the hard `max_iterations` cap.
+//! persistence / checkpointing, and context assembly / compaction. The only
+//! stopping condition beyond the agent finishing is the hard `max_iterations`
+//! cap.
 //!
 //! ## Loop shape
 //!
@@ -67,6 +67,7 @@ use serde_json::{Value, json};
 use crate::exec::{CheckReport, ChecksRunner};
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
+use crate::run_record::{Disposition, FailureMode, Verification};
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
 
 /// The registered name of the finish tool — the loop recognizes termination by
@@ -92,7 +93,8 @@ pub struct RunConfig {
     /// ([`LoopOutcome::MaxIterations`]).
     pub max_iterations: u32,
     /// The checks the harness re-runs itself to verify a `finish(done)` claim.
-    /// `None` means no automated verification — see [`Verification::NoChecksConfigured`].
+    /// `None` means no automated verification — see
+    /// [`crate::run_record::Verification::NoChecksConfigured`].
     pub checks: Option<ChecksRunner>,
     /// Per-turn output cap threaded into [`SamplingParams::max_tokens`].
     pub max_tokens: u32,
@@ -129,62 +131,6 @@ impl RunConfig {
         self.max_tokens = max_tokens;
         self
     }
-}
-
-/// The evidence the loop attaches to a [`FinishDisposition::Done`] — the
-/// justification for accepting the claim.
-///
-/// The loop is the ONLY constructor of [`FinishDisposition::Done`] and it
-/// only constructs it after a green harness-run verification (or explicitly
-/// records [`Self::NoChecksConfigured`] when the run had no checks wired in).
-/// This makes the "Done carries evidence" property a type-system invariant,
-/// not a documentation convention.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Verification {
-    /// The harness re-ran the configured checks and they passed. The full
-    /// [`CheckReport`] is attached as the evidence.
-    Checks(CheckReport),
-    /// No checks were configured for this run — there was nothing to verify
-    /// against, so the loop accepted the `done` claim on trust.
-    NoChecksConfigured,
-}
-
-/// How the agent declared the run finished, parsed from the `finish` tool's
-/// input.
-///
-/// This is **loop-local** and intentionally distinct from
-/// [`crate::run_record::Disposition`] — wiring the two together is a later
-/// item. The discriminator mirrors the run-record one ("does running the same
-/// thing again have any chance of working?") but carries only what this slice
-/// needs.
-///
-/// [`Self::Done`] deliberately carries a [`Verification`]: the loop is the
-/// only constructor, and it only produces a `Done` after verifying the claim
-/// (or explicitly recording that there were no checks to verify against). A
-/// `Done` value in a [`LoopOutcome::Finished`] therefore carries the evidence
-/// that justifies it — you cannot get a `Done` without evidence in this API.
-///
-/// [`Eq`] is not derived because [`Verification::Checks`] wraps a
-/// [`CheckReport`], which is [`PartialEq`] but not [`Eq`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum FinishDisposition {
-    /// The agent reports the task done AND the harness has accepted the
-    /// claim: either the configured checks came back green
-    /// ([`Verification::Checks`]) or there were no checks to verify against
-    /// ([`Verification::NoChecksConfigured`]).
-    Done {
-        /// The short summary the model produced for the outcome.
-        summary: String,
-        /// The evidence that justifies accepting the claim.
-        verification: Verification,
-    },
-    /// The agent is blocked: the spec or environment is the problem and a
-    /// human decision is needed before retrying. Not verified — a model
-    /// declaring it can't proceed needs no proof.
-    Blocked { decision_needed: String },
-    /// The agent failed: the run is the problem (retrying might work). Not
-    /// verified — same rationale as [`Self::Blocked`].
-    Failed { summary: String },
 }
 
 /// A claim the model made in a `finish` call, parsed from its raw JSON input.
@@ -279,9 +225,9 @@ pub struct RunResult {
 #[derive(Debug)]
 pub enum LoopOutcome {
     /// The agent called the `finish` tool AND the harness accepted the
-    /// claim. Carries the post-verification [`FinishDisposition`]; a `Done`
+    /// claim. Carries the post-verification [`Disposition`]; a `Done`
     /// here has evidence by construction (see [`Verification`]).
-    Finished(FinishDisposition),
+    Finished(Disposition),
     /// A turn produced no tool calls (the model ended its turn without
     /// finishing). The loop has nothing to feed back, so it stops.
     StoppedWithoutFinish,
@@ -293,6 +239,41 @@ pub enum LoopOutcome {
     /// The backend returned an error. Surfaced as-is — the loop does not
     /// retry (retry / backoff lands with the budget work).
     BackendError(model::BackendError),
+}
+
+impl LoopOutcome {
+    /// Convert a terminal [`LoopOutcome`] into its [`Disposition`].
+    ///
+    /// Maps every loop-exit reason to the appropriate run-record disposition:
+    /// - `Finished(d)` → `d` (already a `Disposition`)
+    /// - `MaxIterations` → `Failed { mode: BudgetExhausted, .. }`
+    /// - `StoppedWithoutFinish` → `Failed { mode: StoppedWithoutFinish, .. }`
+    /// - `BackendError(e)` → `Failed { mode: TransientInfra }` if
+    ///   `e.is_retryable()`, else `Failed { mode: PersistentToolError }`
+    ///
+    /// The `into_` prefix (consuming `self` by value) satisfies
+    /// `clippy::wrong_self_convention` for a non-`Copy` type.
+    pub fn into_disposition(self) -> Disposition {
+        match self {
+            LoopOutcome::Finished(d) => d,
+            LoopOutcome::MaxIterations => Disposition::Failed {
+                mode: FailureMode::BudgetExhausted,
+                summary: "iteration cap reached before the agent finished".to_string(),
+            },
+            LoopOutcome::StoppedWithoutFinish => Disposition::Failed {
+                mode: FailureMode::StoppedWithoutFinish,
+                summary: "agent stopped generating tool calls without calling finish".to_string(),
+            },
+            LoopOutcome::BackendError(e) => Disposition::Failed {
+                mode: if e.is_retryable() {
+                    FailureMode::TransientInfra
+                } else {
+                    FailureMode::PersistentToolError
+                },
+                summary: format!("backend error: {e:?}"),
+            },
+        }
+    }
 }
 
 /// The `finish` tool: the agent calls it to end the run.
@@ -395,13 +376,13 @@ fn rejection_content(report: &CheckReport) -> String {
 
 /// One dispatched `finish` call's outcome from the loop's point of view: the
 /// fed-back [`UserBlock::ToolResult`] to hand back to the model, and — when
-/// the loop should terminate — the accepted [`FinishDisposition`].
+/// the loop should terminate — the accepted [`Disposition`].
 ///
 /// Extracted out of [`run`] so the main loop stays readable; keeps the
 /// per-call plumbing (call id, `is_error`, content wording) in one place.
 struct FinishOutcome {
     result: UserBlock,
-    finish: Option<FinishDisposition>,
+    finish: Option<Disposition>,
 }
 
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
@@ -409,7 +390,7 @@ struct FinishOutcome {
 /// terminate as declared with no verification.
 ///
 /// Returns the fed-back [`UserBlock::ToolResult`] plus, when the loop should
-/// terminate, the accepted [`FinishDisposition`]. A rejected `done` returns
+/// terminate, the accepted [`Disposition`]. A rejected `done` returns
 /// `finish = None`, an `is_error=true` result, and the loop continues.
 async fn handle_finish_call(
     call_id: &str,
@@ -424,7 +405,7 @@ async fn handle_finish_call(
                 if report.passed {
                     FinishOutcome {
                         result: ack(call_id),
-                        finish: Some(FinishDisposition::Done {
+                        finish: Some(Disposition::Done {
                             summary,
                             verification: Verification::Checks(report),
                         }),
@@ -442,7 +423,7 @@ async fn handle_finish_call(
             }
             None => FinishOutcome {
                 result: ack(call_id),
-                finish: Some(FinishDisposition::Done {
+                finish: Some(Disposition::Done {
                     summary,
                     verification: Verification::NoChecksConfigured,
                 }),
@@ -450,11 +431,14 @@ async fn handle_finish_call(
         },
         FinishClaim::Blocked { decision_needed } => FinishOutcome {
             result: ack(call_id),
-            finish: Some(FinishDisposition::Blocked { decision_needed }),
+            finish: Some(Disposition::Blocked { decision_needed }),
         },
         FinishClaim::Failed { summary } => FinishOutcome {
             result: ack(call_id),
-            finish: Some(FinishDisposition::Failed { summary }),
+            finish: Some(Disposition::Failed {
+                mode: FailureMode::Loop,
+                summary,
+            }),
         },
     }
 }
@@ -589,7 +573,7 @@ async fn run_loop_impl(
         // verification is fed back as an `is_error=true` result and the loop
         // CONTINUES with the remaining calls in the same batch.
         let mut results = Vec::with_capacity(calls.len());
-        let mut finish: Option<FinishDisposition> = None;
+        let mut finish: Option<Disposition> = None;
         for call in &calls {
             // Only the FIRST accepted finish in a batch gets to terminate;
             // a later finish (or a finish while one is already accepted)
@@ -623,14 +607,15 @@ async fn run_loop_impl(
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, RunConfig, RunResult,
-        RunStats, Verification, rejection_content, render_tool_result, run,
+        FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunConfig, RunResult, RunStats,
+        rejection_content, render_tool_result, run,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
         ToolCallRequest, Usage, UserBlock,
     };
+    use crate::run_record::{Disposition, FailureMode, Verification};
     use crate::test_support::MockBackend;
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
@@ -760,7 +745,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Done {
+            LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::NoChecksConfigured,
             }) => {
@@ -789,7 +774,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Done {
+            LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::Checks(report),
             }) => {
@@ -925,7 +910,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Blocked { decision_needed }) => {
+            LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
                 assert_eq!(decision_needed, "which API version?");
             }
             other => panic!("expected Finished(Blocked), got {other:?}"),
@@ -946,7 +931,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
+            LoopOutcome::Finished(Disposition::Failed { summary, .. }) => {
                 assert_eq!(summary, "tool kept erroring");
             }
             other => panic!("expected Finished(Failed), got {other:?}"),
@@ -1013,7 +998,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Done {
+            LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::Checks(report),
             }) => {
@@ -1108,7 +1093,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            LoopOutcome::Finished(FinishDisposition::Done { .. })
+            LoopOutcome::Finished(Disposition::Done { .. })
         ));
         // Two model turns: echo, then finish.
         assert_eq!(backend.calls(), 2, "echo turn then finish turn");
@@ -1142,7 +1127,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
         assert!(matches!(
             outcome,
-            LoopOutcome::Finished(FinishDisposition::Done { .. })
+            LoopOutcome::Finished(Disposition::Done { .. })
         ));
 
         // The most recent turn (finish) saw history ending in the fed-back
@@ -1266,7 +1251,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Blocked { decision_needed }) => {
+            LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
                 assert_eq!(decision_needed, "which API version?");
             }
             other => panic!("expected Finished(Blocked), got {other:?}"),
@@ -1287,7 +1272,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
+            LoopOutcome::Finished(Disposition::Failed { summary, .. }) => {
                 assert_eq!(summary, "tool kept erroring");
             }
             other => panic!("expected Finished(Failed), got {other:?}"),
@@ -1308,7 +1293,7 @@ mod tests {
         let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
-            LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
+            LoopOutcome::Finished(Disposition::Failed { summary, .. }) => {
                 assert_eq!(summary, "huh");
             }
             other => panic!("expected Finished(Failed) for unknown disposition, got {other:?}"),
@@ -1421,7 +1406,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            LoopOutcome::Finished(FinishDisposition::Done { .. })
+            LoopOutcome::Finished(Disposition::Done { .. })
         ));
         assert_eq!(stats.iterations, 3);
         assert_eq!(stats.input_tokens, 600);
@@ -1506,6 +1491,132 @@ mod tests {
         assert_eq!(a, b);
         let c = RunStats { iterations: 4, ..b };
         assert_ne!(a, c);
+    }
+
+    #[tokio::test]
+    async fn finish_failed_disposition_yields_failed_with_loop_mode() {
+        // A model that self-declares finish(failed) should yield
+        // Disposition::Failed { mode: FailureMode::Loop, .. } — the pinned
+        // default for "agent gave up / no productive progress".
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({ "disposition": "failed", "summary": "gave up" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
+                assert_eq!(
+                    mode,
+                    FailureMode::Loop,
+                    "model-declared failed must yield FailureMode::Loop"
+                );
+            }
+            other => panic!("expected Finished(Failed{{Loop}}), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_missing_disposition_yields_failed_with_loop_mode() {
+        // A malformed finish call (missing `disposition` field) is routed
+        // through FinishClaim::Failed — verify it produces Failed{{Loop}}.
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({ "summary": "no disposition field" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
+                assert_eq!(
+                    mode,
+                    FailureMode::Loop,
+                    "malformed finish (missing disposition) must yield FailureMode::Loop"
+                );
+            }
+            other => panic!("expected Finished(Failed{{Loop}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_disposition_maps_all_arms() {
+        use crate::model::{BackendError, TerminalKind, TransientKind};
+
+        // Finished(d) → d (pass-through)
+        let d = Disposition::Done {
+            summary: "ok".to_string(),
+            verification: Verification::NoChecksConfigured,
+        };
+        let out = LoopOutcome::Finished(d.clone()).into_disposition();
+        assert_eq!(out, d);
+
+        // MaxIterations → Failed { mode: BudgetExhausted }
+        let out = LoopOutcome::MaxIterations.into_disposition();
+        assert!(
+            matches!(
+                out,
+                Disposition::Failed {
+                    mode: FailureMode::BudgetExhausted,
+                    ..
+                }
+            ),
+            "MaxIterations must map to BudgetExhausted; got {out:?}"
+        );
+
+        // StoppedWithoutFinish → Failed { mode: StoppedWithoutFinish }
+        let out = LoopOutcome::StoppedWithoutFinish.into_disposition();
+        assert!(
+            matches!(
+                out,
+                Disposition::Failed {
+                    mode: FailureMode::StoppedWithoutFinish,
+                    ..
+                }
+            ),
+            "StoppedWithoutFinish must map to FailureMode::StoppedWithoutFinish; got {out:?}"
+        );
+
+        // BackendError(Transient) → Failed { mode: TransientInfra }
+        let out = LoopOutcome::BackendError(BackendError::Transient {
+            kind: TransientKind::RateLimit,
+            retry_after: None,
+        })
+        .into_disposition();
+        assert!(
+            matches!(
+                out,
+                Disposition::Failed {
+                    mode: FailureMode::TransientInfra,
+                    ..
+                }
+            ),
+            "Transient BackendError must map to TransientInfra; got {out:?}"
+        );
+
+        // BackendError(Terminal) → Failed { mode: PersistentToolError }
+        let out = LoopOutcome::BackendError(BackendError::Terminal {
+            kind: TerminalKind::Auth,
+            message: "no creds".to_string(),
+        })
+        .into_disposition();
+        assert!(
+            matches!(
+                out,
+                Disposition::Failed {
+                    mode: FailureMode::PersistentToolError,
+                    ..
+                }
+            ),
+            "Terminal BackendError must map to PersistentToolError; got {out:?}"
+        );
     }
 
     #[test]

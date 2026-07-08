@@ -267,7 +267,17 @@ fn with_seq(event: Event, seq: u64) -> Event {
             prompt_tokens,
             completion_tokens,
         },
-        Event::ToolCallStarted { name, args, .. } => Event::ToolCallStarted { seq, name, args },
+        Event::ToolCallStarted {
+            name,
+            args,
+            call_id,
+            ..
+        } => Event::ToolCallStarted {
+            seq,
+            name,
+            args,
+            call_id,
+        },
         Event::ToolCallResult {
             name,
             is_error,
@@ -374,10 +384,11 @@ impl RunStore for SqliteRunStore {
 #[cfg(test)]
 mod tests {
     use super::{RunStore, SqliteRunStore, StoreError, event_kind, with_seq};
+    use crate::model::{ContentBlock, Message, ToolCallRequest, UserBlock};
     use crate::run_record::{
         AcceptanceCriterion, BudgetConsumed, BudgetLimits, Budgets, ChecklistItem, CriterionStatus,
-        Disposition, DurableFacts, Event, Evidence, FailureMode, GateOutcome, GateResult, Message,
-        Phase, ProjectConfig, Role, RunRecord, SCHEMA_VERSION, Task,
+        Disposition, DurableFacts, Event, Evidence, FailureMode, GateOutcome, GateResult, Phase,
+        ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
     };
     use std::collections::BTreeMap;
 
@@ -450,13 +461,15 @@ mod tests {
             }),
             disposition: None,
             messages: vec![
-                Message {
-                    role: Role::System,
-                    content: "you are a harness".to_string(),
+                Message::User {
+                    content: vec![UserBlock::Text("do the task".to_string())],
                 },
-                Message {
-                    role: Role::Assistant,
-                    content: "calling tool".to_string(),
+                Message::Assistant {
+                    content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                        id: "c1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({ "path": "src/lib.rs" }),
+                    })],
                 },
             ],
         }
@@ -641,6 +654,7 @@ mod tests {
                     seq: 42,
                     name: "edit_file".to_string(),
                     args: serde_json::json!({"path": "src/lib.rs"}),
+                    call_id: "c-edit".to_string(),
                 },
             )
             .await
@@ -663,7 +677,10 @@ mod tests {
                 "run-a",
                 Event::DispositionSet {
                     seq: 42,
-                    disposition: Disposition::Done,
+                    disposition: Disposition::Done {
+                        summary: "done".to_string(),
+                        verification: Verification::NoChecksConfigured,
+                    },
                 },
             )
             .await
@@ -914,6 +931,7 @@ mod tests {
                     seq: 0,
                     name: "t".to_string(),
                     args: serde_json::Value::Null,
+                    call_id: "c-t".to_string(),
                 },
                 "ToolCallStarted",
             ),
@@ -945,7 +963,10 @@ mod tests {
             (
                 Event::DispositionSet {
                     seq: 0,
-                    disposition: Disposition::Done,
+                    disposition: Disposition::Done {
+                        summary: "done".to_string(),
+                        verification: Verification::NoChecksConfigured,
+                    },
                 },
                 "DispositionSet",
             ),
@@ -968,6 +989,7 @@ mod tests {
                 seq: 99,
                 name: "t".to_string(),
                 args: serde_json::json!({"x": 1}),
+                call_id: "c-with-seq".to_string(),
             },
             Event::ToolCallResult {
                 seq: 99,

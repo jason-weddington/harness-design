@@ -239,9 +239,9 @@ impl std::fmt::Display for CheckCommand {
 /// `excerpt` is the bounded tail for inline display. This is the evidence a
 /// later engine item attaches to a verified `Done`.
 ///
-/// [`PartialEq`] is derived so [`crate::engine::Verification`] — which wraps
-/// a report — can be equality-compared in tests; [`Eq`] is deliberately not
-/// implied here (no float-in-`Duration` reason today, but keeping the door
+/// [`PartialEq`] is derived so [`crate::run_record::Verification`] — which
+/// wraps a report — can be equality-compared in tests; [`Eq`] is deliberately
+/// not implied here (no float-in-`Duration` reason today, but keeping the door
 /// open for a future field that isn't `Eq`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckReport {
