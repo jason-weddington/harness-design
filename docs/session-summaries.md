@@ -90,3 +90,26 @@ under a big general harness complete 58–75% of small real tasks under this one
 directional evidence for the two-failure-modes thesis — and the opaque MaxIterations
 trials became the live argument for 0.3.0 durability. 0.2.0's capability claim is met;
 release ritual pending. Full write-up + handoff: **kb-02913**.
+
+---
+
+## Session 5 — 2026-07-08 — durability through the gate, and the gate earned it
+
+Shipped 0.3.0 end-to-end in a day: groomed four serial items via the draft→critic
+workflow (the critics caught the load-bearing seam at groom time — reconstructing an
+interrupted tool call's id needs both a `call_id` on the event and a post-model-turn
+checkpoint), rolled them out through a manage agent (4/4 clean per-item, 1h45m), and
+ran the eval follow-ups in parallel: haiku's "floor"-run scored **11/12** (the floor is
+the ceiling) and qwen3.6:35b **with think enabled** jumped 7→11/12 — the "20b > 35b"
+reading was a think-config artifact, and think is now a first-class routing knob
+(matrix v4: kb-02909). Decided **0.3.5 "first dogfood"** ahead of bounded autonomy:
+claim-vs-verify + repo gates are enough safety for supervised dispatch, so the harness
+starts building the harness after this release. Then the payoff moment:
+**review-against-intent returned does-not-meet** on the "100% green" wave —
+`reconcile_crash_tail` tripped over the loop's own `BudgetTick` and ignored the
+`call_id` contract entirely, masked by a hand-seeded test log the engine never emits
+and a single-call proof where wrong coincides with right. Remediation same session:
+dispatched fix from the review findings, plus a lead catch at merge review (the entry
+gate itself was still log-tail-shaped — now snapshot-shaped), doc sweep, test-strength
+batch. main @ 99998ea, 299 tests, capability claim true including the two-call
+discriminating case; release ritual pending. Full write-up + handoff: **kb-02931**.
