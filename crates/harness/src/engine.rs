@@ -2898,12 +2898,24 @@ mod tests {
         let calls = recording.recorded_calls();
         assert!(!calls.is_empty(), "should have recorded some store calls");
 
-        // (2) First call must be AppendEvent.
-        assert!(
-            matches!(calls[0], StoreCall::AppendEvent { .. }),
-            "first call must be AppendEvent, not Checkpoint; got {:?}",
-            calls[0]
-        );
+        // (2) For EVERY iteration (segment bounded by Checkpoint entries), the
+        // first call must be AppendEvent — not a Checkpoint.  Walk the full
+        // sequence rather than checking only calls[0] so a regression in any
+        // iteration (e.g. iteration 2 starting with a Checkpoint) would be caught.
+        {
+            let mut iteration_start_idx = 0usize;
+            for (idx, call) in calls.iter().enumerate() {
+                if matches!(call, StoreCall::Checkpoint) {
+                    let first_in_iter = &calls[iteration_start_idx];
+                    assert!(
+                        matches!(first_in_iter, StoreCall::AppendEvent { .. }),
+                        "iteration starting at call index {iteration_start_idx} must begin \
+                         with AppendEvent, not Checkpoint; got {first_in_iter:?}"
+                    );
+                    iteration_start_idx = idx + 1;
+                }
+            }
+        }
 
         // (1) Last DispositionSet must precede last Checkpoint.
         let last_ds = calls
@@ -3904,40 +3916,30 @@ mod tests {
         let db_path = db_dir.path().join("harness.db");
         let side_effect_counter = Arc::new(AtomicU32::new(0));
 
-        // Pre-compute the expected system prompt for the D9 byte-identity
-        // assertion. Both legs use identical tool registries (panicky-tool +
-        // finish), so the prompt rendered from this reference registry equals
-        // what each leg actually sends.
-        let runner_display = passing_runner().command_display();
-        let expected_system_prompt = {
-            let mut r = ToolRegistry::new();
-            r.register(
-                PANICKY_TOOL_NAME,
-                Arc::new(PanickyTool {
-                    counter: Arc::new(AtomicU32::new(0)), // dummy — schema only
-                }),
-            );
-            r.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
-            prompt::render_system_prompt(&prompt::tool_lines(&r), Some(runner_display.as_str()))
-        };
-
         // ---- Leg 1: run until crash (AC-2) -------------------------------
         // Drive leg 1 inside tokio::spawn so we can catch the panic.
         // D5 guarantees ToolCallStarted is appended BEFORE tools.invoke, so
         // the log ends with a dangling ToolCallStarted when the tool panics.
+        //
+        // The backend is created OUTSIDE the spawn and shared via Arc so that
+        // after the crash we can call leg1_backend.systems_seen() and compare
+        // it to leg 2 — asserting byte-identity against what leg 1 ACTUALLY
+        // sent, not against a fresh in-test reference render (D9 fix).
+        let leg1_backend = Arc::new(MockBackend::from_turns(vec![turn_with_usage(
+            vec![tool_call(
+                PANICKY_CALL_ID,
+                PANICKY_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            StopReason::ToolUse,
+            usage_with(INPUT_TOKENS, OUTPUT_TOKENS),
+        )]));
+        let leg1_backend_for_spawn = leg1_backend.clone();
+
         let db_path_for_spawn = db_path.clone();
         let counter_for_spawn = side_effect_counter.clone();
 
         let leg1_handle = tokio::spawn(async move {
-            let backend = MockBackend::from_turns(vec![turn_with_usage(
-                vec![tool_call(
-                    PANICKY_CALL_ID,
-                    PANICKY_TOOL_NAME,
-                    serde_json::json!({}),
-                )],
-                StopReason::ToolUse,
-                usage_with(INPUT_TOKENS, OUTPUT_TOKENS),
-            )]);
             let mut tools = ToolRegistry::new();
             tools.register(
                 PANICKY_TOOL_NAME,
@@ -3957,7 +3959,7 @@ mod tests {
                 model_label: "test-model".to_string(),
             };
             // PanickyTool::run() panics here; the spawned task catches it.
-            run_persisted(&backend, &tools, &ctx, &config, &pers).await
+            run_persisted(&*leg1_backend_for_spawn, &tools, &ctx, &config, &pers).await
         });
 
         // AC-2: Leg 1 must panic.
@@ -4246,9 +4248,18 @@ mod tests {
         );
 
         // ---- AC-7: D9 System prompt byte-identity across the restart -----
-        // The resume-leg backend must see the byte-identical system prompt to
-        // what leg 1 would have sent — both are re-rendered from the same
-        // config + tools (not read from the checkpoint).
+        // Leg 2's system prompt must be byte-identical to what leg 1 ACTUALLY
+        // sent — not to a fresh in-test reference render.  leg1_backend was
+        // captured via Arc before the spawn, so systems_seen() reflects the
+        // real bytes that the engine transmitted during leg 1.
+        let leg1_systems = leg1_backend.systems_seen();
+        assert!(
+            !leg1_systems.is_empty(),
+            "leg 1 must have sent at least one system prompt"
+        );
+        let leg1_first_system = leg1_systems[0]
+            .as_ref()
+            .expect("leg 1 turn 0 must send a non-None system prompt");
         let leg2_systems = backend_leg2.systems_seen();
         assert!(
             !leg2_systems.is_empty(),
@@ -4260,9 +4271,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("leg 2 turn {i} must send a non-None system prompt"));
             assert_eq!(
                 seen.as_bytes(),
-                expected_system_prompt.as_bytes(),
-                "leg 2 turn {i} system prompt must be byte-identical to the \
-                 pre-crash render (D9 prompt-cache invariant)"
+                leg1_first_system.as_bytes(),
+                "leg 2 turn {i} system prompt must be byte-identical to what \
+                 leg 1 ACTUALLY sent (D9 prompt-cache invariant)"
             );
         }
     }

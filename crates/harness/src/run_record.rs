@@ -766,6 +766,32 @@ mod tests {
         assert_eq!(s2, s3);
     }
 
+    #[test]
+    fn event_tool_call_started_serialization_is_byte_stable() {
+        // Event::ToolCallStarted carries a serde_json::Value (args) whose
+        // serialization must be byte-stable across calls — the invariant that
+        // keeps the prompt cache hitting.  The existing byte-stability test
+        // (run_record_serialization_is_byte_stable_across_calls) covers only
+        // sample_run_record(), which structurally cannot exercise Event because
+        // RunRecord contains no Event values.
+        let event = Event::ToolCallStarted {
+            seq: 42,
+            name: "edit_file".to_string(),
+            args: serde_json::json!({
+                "path": "crates/harness/src/lib.rs",
+                "old_string": "fn foo()",
+                "new_string": "fn bar()",
+            }),
+            call_id: "call-abc-123".to_string(),
+        };
+        let s1 = serde_json::to_string(&event).expect("serialize first time");
+        let s2 = serde_json::to_string(&event).expect("serialize second time");
+        assert_eq!(
+            s1, s2,
+            "Event::ToolCallStarted serialization must be byte-identical across calls"
+        );
+    }
+
     // ---- illegal states unrepresentable ----
 
     #[test]
