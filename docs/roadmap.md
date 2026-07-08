@@ -10,31 +10,18 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.1.0 (2026-07-07)
+## Where we are — v0.2.0 (2026-07-08)
 
-The harness autonomously completes a real coding task and **cannot be lied to
-about "done"**: `finish(done)` is a claim the harness verifies by running the
-project's checks itself, and a verified `Done` carries its evidence by
-construction. Model contract (Anthropic backend), confined workspace, six tools,
-templated prompts, pass^k eval with per-trial isolation, four fixture crates.
-Current eval: 12/12 with sonnet — saturated at this difficulty (the red test does
-the localization; see the eval-levers backlog).
-
-## 0.2.0 — a second backend (Ollama)
-
-**Theme: prove the abstraction.** The `ModelBackend` trait is the project's
-central bet — a normalized `AssistantTurn` out, each adapter an anti-corruption
-layer owning all wire translation. One backend can't validate a boundary; the
-second one is the test, and Ollama is deliberately the *hard* second: local
-models emit tool calls with varying fidelity, so this milestone brings the
-lenient/schema-aligned parsing idea lifted from BAML (`jsonish`-style coercion +
-parse-retry as steering) into the adapter where it belongs. Target models:
-GLM-5.2 first, Qwen3.6 as the small-host option. The capability claim: *the same
-loop, unchanged, completes the fixture suite on a local model* — and the eval
-suite tells us honestly how much worse (or not) that is.
-
-Includes from the eval backlog: per-trial metrics in `EvalReport` (iterations,
-tokens, wall-clock) — pass/fail alone can't compare backends once both pass.
+The same loop, unchanged, completes the fixture suite on non-Anthropic models —
+the `ModelBackend` anti-corruption boundary held in anger. v0.1.0 established
+claim-vs-verify (`finish(done)` is a claim the harness verifies itself; a
+verified `Done` carries its evidence by construction); v0.2.0 added the Ollama
+backend (one adapter for localhost + ollama.com) and per-trial metrics. The
+cross-backend matrix (kb-02909 v4): GLM-5.2 12/12; sonnet, haiku, and local
+qwen3.6:35b (think=on) all 11/12; gpt-oss:20b 9/12 — zero false dones in 60
+verified trials. The suite is pass-rate-saturated four models deep; iteration
+counts still discriminate (frontier 5.00 uniform, haiku ~7.9, qwen ~9.75).
+Think config is a first-class routing knob — record it on every eval row.
 
 ## 0.3.0 — durability (persist, resume, dispose)
 
@@ -44,6 +31,26 @@ loop-local `FinishDisposition` with `run_record::Disposition`, and implement the
 two resume modes from the design (crash-resume; fresh-context restart). The
 capability claim: *kill the harness mid-run, restart it, and the run completes* —
 the deployment-agnostic promise (Pi, container, spot instance) made real.
+
+## 0.3.5 — first dogfood (the harness builds the harness)
+
+**Theme: close the loop early.** Deliberately inserted ahead of full bounded
+autonomy: claim-vs-verify + the repo's own quality gates + the blunt
+`max_iterations` cap are enough safety for *supervised* dispatch of small,
+well-specified items. Three pieces: a `harness run` CLI binary (task spec JSON
+in; run record + disposition out; exit code reflects disposition), a
+task-prompt pass for the groomed-item shape (description + acceptance criteria,
+not just fix-the-failing-test), and a harness engine registered in
+agent-gtd-dispatch (the worker owns clone/branch/commit/push — the harness only
+edits, checks, and reports). The capability claim: *the harness, running as an
+Agent GTD build engine, ships a merged change to its own repo.*
+
+Engine roster comes straight from the eval data: haiku and local qwen3.6:35b
+(think=on) both clear 11/12 on exactly this task shape. Every dogfood run
+generates run records + dispatch-perf-log entries under `engine: harness-*` —
+the data the model-routing decision (#6) has been waiting on. First dogfood
+items must match the engine's strengths: small, crisply specified, mechanically
+checkable (no `search_code` yet — navigation is list+read, fine on this crate).
 
 ## 0.4.0 — bounded autonomy (budgets, retry, loop detection)
 
@@ -60,7 +67,8 @@ the target repo into the workspace, runs the loop with the project's check
 command, pushes a feature branch, and comments back — the harness as a real
 headless-dispatch build engine alongside Claude Code. Order matters: this lands
 *after* durability and bounds because dispatch hosts restart and nobody reviews a
-runaway.
+runaway. 0.3.5 front-runs the supervised version of this; 0.5.0 is the
+unsupervised completion — self-git, comment-back, and the full engine contract.
 
 ## Backlog (unscheduled, captured)
 
