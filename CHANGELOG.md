@@ -2,6 +2,19 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.2.0 - 2026-07-08
+#### Features
+- (**eval**) backend selection in coding_eval (EVAL_BACKEND=anthropic|ollama) - (4911790) - Jason Weddington
+- (**eval**) add per-trial run metrics (RunStats, TrialResult, aggregates) - (86575a2) - Jason Weddington
+- (**eval**) add three subtle-bug fixtures + multi-fixture coding_eval - (034b39c) - Jason Weddington
+- (**ollama**) add Ollama ModelBackend adapter (native /api/chat, local + cloud) - (1171c10) - Jason Weddington
+#### Documentation
+- add Session 4 summary (second backend + the four-model matrix) - (fd0776f) - Jason Weddington
+- add roadmap (capability-themed milestones to the GTD adapter) - (2d6a0e7) - Jason Weddington
+- add Session 3 summary (three seams, overnight waves, v0.1.0) - (d1c1dfa) - Jason Weddington
+
+- - -
+
 ## 0.1.0 - 2026-07-07
 #### Features
 - (**anthropic**) add non-streaming Anthropic ModelBackend adapter - (7667cd6) - Jason Weddington
