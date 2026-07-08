@@ -36,6 +36,12 @@ pub(crate) struct MockBackend {
     /// engine renders the system prompt ONCE and re-sends the byte-identical
     /// string every iteration — a prompt-cache correctness invariant.
     systems_seen: Mutex<Vec<Option<String>>>,
+    /// One entry per `turn` call, in order, capturing the full `messages`
+    /// slice passed that turn. Unlike [`Self::last_messages`] (which
+    /// overwrites on every call), this accumulates — so tests can assert on
+    /// the messages the loop sent on the FIRST turn of a multi-turn script,
+    /// which is the key assertion for crash-resume and fresh-context resume.
+    messages_seen: Mutex<Vec<Vec<Message>>>,
 }
 
 impl MockBackend {
@@ -47,6 +53,7 @@ impl MockBackend {
             calls: Mutex::new(0),
             last_messages: Mutex::new(Vec::new()),
             systems_seen: Mutex::new(Vec::new()),
+            messages_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -80,20 +87,36 @@ impl MockBackend {
             .expect("systems_seen lock poisoned")
             .clone()
     }
+
+    /// One entry per `turn` call, in order: the full `messages` slice the
+    /// loop sent that turn. Unlike [`Self::last_messages`], this accumulates
+    /// across turns so tests can assert on the FIRST turn's messages (the
+    /// key assertion for crash-resume and fresh-context resume).
+    pub(crate) fn messages_seen(&self) -> Vec<Vec<Message>> {
+        self.messages_seen
+            .lock()
+            .expect("messages_seen lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait]
 impl ModelBackend for MockBackend {
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         *self.calls.lock().expect("calls lock poisoned") += 1;
+        let msgs = req.messages.to_vec();
         *self
             .last_messages
             .lock()
-            .expect("last_messages lock poisoned") = req.messages.to_vec();
+            .expect("last_messages lock poisoned") = msgs.clone();
         self.systems_seen
             .lock()
             .expect("systems_seen lock poisoned")
             .push(req.system.map(str::to_string));
+        self.messages_seen
+            .lock()
+            .expect("messages_seen lock poisoned")
+            .push(msgs);
         let next = self
             .script
             .lock()

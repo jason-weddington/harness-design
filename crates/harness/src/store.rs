@@ -148,6 +148,10 @@ impl From<tokio::task::JoinError> for StoreError {
 ///   cache; the log is the source of truth. The caller writes the event log
 ///   first, then checkpoints, so a crash between the two reduces to "an
 ///   interrupted step" rather than lost state.
+/// - [`Self::list_events`] reads all events for `run_id` ordered by `seq`.
+///   Used by [`crate::engine::resume`] to inspect the log tail for dangling
+///   [`Event::ToolCallStarted`] entries (crash-reconciliation) and by tests
+///   that verify ordering.
 #[async_trait]
 pub trait RunStore: Send + Sync {
     /// Load the latest snapshot for `run_id`, or `None` if no checkpoint
@@ -163,6 +167,10 @@ pub trait RunStore: Send + Sync {
     /// Upsert the latest snapshot for `run_id`. Successive calls overwrite
     /// the previous snapshot — the event log carries history.
     async fn checkpoint(&self, run_id: &str, record: &RunRecord) -> Result<(), StoreError>;
+
+    /// Read all events for `run_id`, ordered by `seq`. Returns an empty
+    /// `Vec` if the run has no events yet.
+    async fn list_events(&self, run_id: &str) -> Result<Vec<Event>, StoreError>;
 }
 
 // ===== SQLite implementation =========================================
@@ -217,28 +225,6 @@ impl SqliteRunStore {
                  updated_at     TEXT    NOT NULL
              );",
         )
-    }
-
-    /// Read all events for `run_id`, ordered by `seq`. Decodes the JSON
-    /// payload back into [`Event`]. Useful for replay, the eval flywheel, and
-    /// tests that verify ordering.
-    pub async fn list_events(&self, run_id: &str) -> Result<Vec<Event>, StoreError> {
-        let conn = self.conn.clone();
-        let run_id = run_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Vec<Event>, StoreError> {
-            let guard = conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-            let mut stmt =
-                guard.prepare("SELECT payload FROM events WHERE run_id = ?1 ORDER BY seq ASC")?;
-            let rows = stmt.query_map(params![run_id], |r| r.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                let payload = row?;
-                let event: Event = serde_json::from_str(&payload)?;
-                out.push(event);
-            }
-            Ok(out)
-        })
-        .await?
     }
 }
 
@@ -377,6 +363,25 @@ impl RunStore for SqliteRunStore {
                 params![run_id, schema_version, blob],
             )?;
             Ok(())
+        })
+        .await?
+    }
+
+    async fn list_events(&self, run_id: &str) -> Result<Vec<Event>, StoreError> {
+        let conn = self.conn.clone();
+        let run_id = run_id.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Event>, StoreError> {
+            let guard = conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+            let mut stmt =
+                guard.prepare("SELECT payload FROM events WHERE run_id = ?1 ORDER BY seq ASC")?;
+            let rows = stmt.query_map(params![run_id], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let payload = row?;
+                let event: Event = serde_json::from_str(&payload)?;
+                out.push(event);
+            }
+            Ok(out)
         })
         .await?
     }

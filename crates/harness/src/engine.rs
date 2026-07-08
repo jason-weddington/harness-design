@@ -186,6 +186,62 @@ pub fn run_id(task_id: &str, attempt_n: u32) -> String {
     format!("{task_id}:{attempt_n}")
 }
 
+/// Mode of resume — how to reconstruct context on re-entry after an
+/// interruption.
+///
+/// This is a **runtime call argument**, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// **D6 — Crash**: reload `messages` from the last checkpoint and
+    /// reconcile any dangling [`Event::ToolCallStarted`] in the log tail.
+    /// For each interrupted (or never-started) call, a synthetic
+    /// `is_error=true` [`UserBlock::ToolResult`] with content
+    /// `"interrupted by host restart"` is fed back — the tool is **never
+    /// re-executed** (side effects may have already happened). Continues
+    /// checkpointing under the same `run_id`.
+    Crash,
+    /// **D7**: drop the reloaded `messages` and restart from a freshly-rendered
+    /// task seed (byte-identical to what [`run`] would produce). Carries
+    /// `phase`, `durable_facts`, and `budgets.consumed` forward. Checkpoints
+    /// under a new `run_id` = `"{task_id}:{attempt_n+1}"`, leaving the prior
+    /// record intact.
+    FreshContext,
+}
+
+/// Errors surfaced by [`resume`].
+#[derive(Debug)]
+pub enum ResumeError {
+    /// No checkpoint exists for the requested `run_id`. [`resume`] returns
+    /// this immediately — no [`model::ModelBackend::turn`] call is made.
+    UnknownRunId(String),
+    /// A store load, append, or checkpoint operation failed.
+    Store(StoreError),
+}
+
+impl std::fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownRunId(id) => write!(f, "no checkpoint found for run_id {id:?}"),
+            Self::Store(e) => write!(f, "store error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnknownRunId(_) => None,
+            Self::Store(e) => Some(e),
+        }
+    }
+}
+
+impl From<StoreError> for ResumeError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
 /// Private in-loop persistence context — bundles the computed run id with the
 /// live [`RunRecord`] being mutated as the loop progresses. Only constructed
 /// (and used) when a [`Persistence`] is supplied to [`run_persisted`].
@@ -561,12 +617,26 @@ pub async fn run(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
     };
+    let task_message = prompt::render_task_prompt(&config.task);
+    let initial_messages = vec![Message::User {
+        content: vec![UserBlock::Text(task_message)],
+    }];
     // No persistence — the Result::Err path is structurally unreachable when
     // persistence is None (no store calls are made), so the expect is a
     // compile-time invariant, not a runtime safety net.
-    let outcome = run_loop_impl(backend, tools, ctx, config, None, &mut stats)
-        .await
-        .expect("no-persistence run cannot produce a StoreError");
+    let outcome = run_loop_impl(
+        backend,
+        tools,
+        ctx,
+        config,
+        None,
+        &mut stats,
+        initial_messages,
+        BudgetConsumed::default(),
+        None,
+    )
+    .await
+    .expect("no-persistence run cannot produce a StoreError");
     stats.wall_clock = start.elapsed();
     RunResult { outcome, stats }
 }
@@ -603,14 +673,27 @@ pub async fn run_persisted(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
     };
-    let outcome = run_loop_impl(backend, tools, ctx, config, Some(persistence), &mut stats).await?;
+    let task_message = prompt::render_task_prompt(&config.task);
+    let initial_messages = vec![Message::User {
+        content: vec![UserBlock::Text(task_message)],
+    }];
+    let outcome = run_loop_impl(
+        backend,
+        tools,
+        ctx,
+        config,
+        Some(persistence),
+        &mut stats,
+        initial_messages,
+        BudgetConsumed::default(),
+        None,
+    )
+    .await?;
     stats.wall_clock = start.elapsed();
     Ok(RunResult { outcome, stats })
 }
 
-/// The engine loop body, split out of [`run`] / [`run_persisted`] so the outer
-/// functions own the `wall_clock` measurement and can finalize [`RunStats`] on
-/// every return path.
+/// The engine loop body, shared by [`run`], [`run_persisted`], and [`resume`].
 ///
 /// `stats` is mutated in place as the loop progresses:
 /// - `iterations` is incremented BEFORE each `backend.turn` call — so a
@@ -619,11 +702,23 @@ pub async fn run_persisted(
 /// - `input_tokens` / `output_tokens` accumulate the SUCCESSFUL turn's
 ///   [`crate::model::Usage`] only; errored turns contribute nothing.
 ///
+/// `initial_messages` is the starting conversation history (task seed for
+/// fresh runs; reloaded/reconciled messages for crash-resume; fresh task seed
+/// for fresh-context resume).
+///
+/// `initial_consumed` offsets all `budgets.consumed` computations — zero for
+/// fresh runs; the loaded record's consumed for resume (budget carry-over,
+/// accounting-only in 0.3.0).
+///
+/// `override_persist` when `Some` bypasses the record-construction step and
+/// uses the provided [`RunPersist`] directly — used by [`resume`] to inject
+/// a pre-loaded (and possibly reconciled) record.
+///
 /// When `persistence` is `Some`, the loop appends events and writes
 /// checkpoints per the durability contract documented on [`run_persisted`].
 /// When `persistence` is `None`, no store calls are made and the function
 /// returns `Ok(outcome)` (the `Err` arm is structurally unreachable).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_loop_impl(
     backend: &impl model::ModelBackend,
     tools: &ToolRegistry,
@@ -631,11 +726,12 @@ async fn run_loop_impl(
     config: &RunConfig,
     persistence: Option<&Persistence>,
     stats: &mut RunStats,
+    initial_messages: Vec<Message>,
+    initial_consumed: BudgetConsumed,
+    override_persist: Option<RunPersist>,
 ) -> Result<LoopOutcome, StoreError> {
-    // Render both prompts ONCE and reuse verbatim every iteration. Both
-    // functions are pure and byte-deterministic (see `prompt` module tests),
-    // so the borrows below stay stable across the whole loop — the
-    // prompt-cache correctness invariant.
+    // Render the system prompt ONCE and reuse verbatim every iteration —
+    // the prompt-cache correctness invariant (D9).
     let system = prompt::render_system_prompt(
         &prompt::tool_lines(tools),
         config
@@ -644,11 +740,8 @@ async fn run_loop_impl(
             .map(ChecksRunner::command_display)
             .as_deref(),
     );
-    let task_message = prompt::render_task_prompt(&config.task);
 
-    let mut messages: Vec<Message> = vec![Message::User {
-        content: vec![UserBlock::Text(task_message)],
-    }];
+    let mut messages = initial_messages;
     let tool_schemas = tools.list();
     let params = SamplingParams {
         max_tokens: config.max_tokens,
@@ -658,7 +751,11 @@ async fn run_loop_impl(
 
     // Build the run-record if persistence is configured. This is kept as
     // Option<RunPersist> so the non-persistent path has zero overhead.
-    let mut persist: Option<RunPersist> = if let Some(p) = persistence {
+    // When override_persist is Some (resume path), use it directly — the
+    // caller (resume) already loaded/constructed the record.
+    let mut persist: Option<RunPersist> = if let Some(pre) = override_persist {
+        Some(pre)
+    } else if let Some(p) = persistence {
         let rid = run_id(&p.task_id, p.attempt_n);
         let wall_clock_start = format_rfc3339(SystemTime::now());
 
@@ -737,9 +834,9 @@ async fn run_loop_impl(
                         summary: format!("backend error: {err:?}"),
                     };
                     ctx.record.budgets.consumed = BudgetConsumed {
-                        iterations: stats.iterations,
-                        tokens: stats.input_tokens + stats.output_tokens,
-                        cost_micros: 0,
+                        iterations: initial_consumed.iterations + stats.iterations,
+                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                        cost_micros: initial_consumed.cost_micros,
                     };
                     ctx.record.messages.clone_from(&messages);
                     ctx.record.disposition = Some(disposition.clone());
@@ -779,9 +876,9 @@ async fn run_loop_impl(
         // messages include the in-flight assistant turn.
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
             let consumed = BudgetConsumed {
-                iterations: stats.iterations,
-                tokens: stats.input_tokens + stats.output_tokens,
-                cost_micros: 0,
+                iterations: initial_consumed.iterations + stats.iterations,
+                tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                cost_micros: initial_consumed.cost_micros,
             };
             p.store
                 .append_event(
@@ -899,9 +996,9 @@ async fn run_loop_impl(
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 ctx.record.messages.clone_from(&messages);
                 ctx.record.budgets.consumed = BudgetConsumed {
-                    iterations: stats.iterations,
-                    tokens: stats.input_tokens + stats.output_tokens,
-                    cost_micros: 0,
+                    iterations: initial_consumed.iterations + stats.iterations,
+                    tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                    cost_micros: initial_consumed.cost_micros,
                 };
                 ctx.record.disposition = Some(disposition.clone());
                 p.store
@@ -924,9 +1021,9 @@ async fn run_loop_impl(
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
             ctx.record.messages.clone_from(&messages);
             ctx.record.budgets.consumed = BudgetConsumed {
-                iterations: stats.iterations,
-                tokens: stats.input_tokens + stats.output_tokens,
-                cost_micros: 0,
+                iterations: initial_consumed.iterations + stats.iterations,
+                tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                cost_micros: initial_consumed.cost_micros,
             };
             p.store.checkpoint(&ctx.rid, &ctx.record).await?;
         }
@@ -940,9 +1037,9 @@ async fn run_loop_impl(
         };
         ctx.record.messages.clone_from(&messages);
         ctx.record.budgets.consumed = BudgetConsumed {
-            iterations: stats.iterations,
-            tokens: stats.input_tokens + stats.output_tokens,
-            cost_micros: 0,
+            iterations: initial_consumed.iterations + stats.iterations,
+            tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+            cost_micros: initial_consumed.cost_micros,
         };
         ctx.record.disposition = Some(disposition.clone());
         p.store
@@ -960,19 +1057,258 @@ async fn run_loop_impl(
     Ok(LoopOutcome::MaxIterations)
 }
 
+// =============================================================================
+// Crash-resume helpers
+// =============================================================================
+
+/// Reconcile a potential dangling log tail for [`ResumeMode::Crash`].
+///
+/// Loads all events for `run_id`. If the last event is an
+/// [`Event::ToolCallStarted`] (the only reliable "interrupted mid-execution"
+/// signal — D5 appends Started then Result serially), this is a dangling tail:
+/// the call was started but its Result was never recorded.
+///
+/// Returns the reconstructed initial message history:
+///
+/// - **Clean tail** (last event is not `ToolCallStarted`): returns
+///   `record.messages` verbatim.
+/// - **Dangling tail**: returns `record.messages` plus a synthetic
+///   `Message::User` covering EVERY tool call in the last assistant turn, in
+///   call order. Calls whose (Started, Result) pair is in the log get the
+///   real `{is_error, summary}`; the interrupted call (and any that were never
+///   started) get a synthetic `is_error=true` result with content
+///   `"interrupted by host restart"`. Also appends one synthetic
+///   [`Event::ToolCallResult`] to the log for the dangling Started, so the log
+///   is clean on the next resume.
+async fn reconcile_crash_tail(
+    record: &RunRecord,
+    store: &Arc<dyn RunStore>,
+    run_id: &str,
+) -> Result<Vec<Message>, StoreError> {
+    let events = store.list_events(run_id).await?;
+
+    // Dangling iff the last event is ToolCallStarted.
+    let dangling_name = match events.last() {
+        Some(Event::ToolCallStarted { name, .. }) => name.clone(),
+        _ => return Ok(record.messages.clone()), // clean tail — nothing to reconcile
+    };
+
+    // Collect tool calls from the last assistant turn in record.messages.
+    let last_assistant_calls: Vec<model::ToolCallRequest> = record
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Assistant { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|b| match b {
+                        model::ContentBlock::ToolCall(req) => Some(req.clone()),
+                        model::ContentBlock::Text(_) | model::ContentBlock::Reasoning { .. } => {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Message::User { .. } => None,
+        })
+        .unwrap_or_default();
+
+    // Isolate events after the last ModelCall (the current iteration's tail).
+    // Pattern: [Started Result]* Started (dangling)
+    let post_model_idx = events
+        .iter()
+        .rposition(|e| matches!(e, Event::ModelCall { .. }))
+        .map_or(0, |i| i + 1);
+    let tail = &events[post_model_idx..];
+
+    // Walk calls in order, matching each to a (Started, Result?) pair in tail.
+    let mut results: Vec<UserBlock> = Vec::with_capacity(last_assistant_calls.len());
+    let mut ev = 0usize;
+
+    for call in &last_assistant_calls {
+        // Advance past the Started event for this call (if present).
+        let has_started = ev < tail.len() && matches!(tail[ev], Event::ToolCallStarted { .. });
+        if has_started {
+            ev += 1;
+        }
+        // Check for a following Result.
+        let completed = if has_started && ev < tail.len() {
+            if let Event::ToolCallResult {
+                is_error, summary, ..
+            } = &tail[ev]
+            {
+                let pair = (*is_error, summary.clone());
+                ev += 1;
+                Some(pair)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        results.push(match completed {
+            Some((is_error, summary)) => UserBlock::ToolResult {
+                call_id: call.id.clone(),
+                content: summary,
+                is_error,
+            },
+            None => UserBlock::ToolResult {
+                call_id: call.id.clone(),
+                content: "interrupted by host restart".to_string(),
+                is_error: true,
+            },
+        });
+    }
+
+    // Append a synthetic ToolCallResult for the dangling Started so the log
+    // is paired on the next resume (avoids double-reconciliation).
+    store
+        .append_event(
+            run_id,
+            Event::ToolCallResult {
+                seq: 0,
+                name: dangling_name,
+                is_error: true,
+                summary: "interrupted by host restart".to_string(),
+                offload_path: None,
+            },
+        )
+        .await?;
+
+    // Return the original messages + reconciliation user message.
+    let mut messages = record.messages.clone();
+    messages.push(Message::User { content: results });
+    Ok(messages)
+}
+
+/// Resume a previously-interrupted run from its last checkpoint.
+///
+/// Loads the [`RunRecord`] for `run_id` from `store`. If no checkpoint exists
+/// (`store.load` returns `Ok(None)`), returns
+/// [`ResumeError::UnknownRunId`] immediately — no [`model::ModelBackend::turn`]
+/// call is made.
+///
+/// See [`ResumeMode`] for the two resumption strategies (D6/D7).
+///
+/// The system and task prompts are **RE-RENDERED** from `config + tools` (not
+/// read from the record — D9 byte-identity invariant).
+///
+/// **Budget carry-over (0.3.0):** `budgets.consumed` accumulates across
+/// resume in the [`RunRecord`], but remaining-budget enforcement is deferred
+/// to 0.4.0. No enforcement logic is added here.
+pub async fn resume(
+    backend: &impl model::ModelBackend,
+    tools: &ToolRegistry,
+    ctx: &ToolCtx,
+    config: &RunConfig,
+    store: Arc<dyn RunStore>,
+    run_id_arg: &str,
+    mode: ResumeMode,
+) -> Result<RunResult, ResumeError> {
+    let start = Instant::now();
+    let mut stats = RunStats {
+        iterations: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        wall_clock: Duration::ZERO,
+    };
+
+    // Load the checkpoint. Return UnknownRunId immediately — no backend call —
+    // when no checkpoint exists for the requested run_id.
+    let Some(record) = store.load(run_id_arg).await.map_err(ResumeError::Store)? else {
+        return Err(ResumeError::UnknownRunId(run_id_arg.to_string()));
+    };
+
+    // Budget carry-over: accounting-only in 0.3.0.
+    let initial_consumed = record.budgets.consumed;
+
+    let (initial_messages, pre_persist) = match mode {
+        ResumeMode::Crash => {
+            // D6: reconcile log tail, continue under the same run_id.
+            let messages = reconcile_crash_tail(&record, &store, run_id_arg)
+                .await
+                .map_err(ResumeError::Store)?;
+            let pre = RunPersist {
+                rid: run_id_arg.to_string(),
+                record: {
+                    let mut r = record.clone();
+                    r.messages.clone_from(&messages);
+                    r
+                },
+            };
+            (messages, pre)
+        }
+        ResumeMode::FreshContext => {
+            // D7: drop messages, fresh task seed, new run_id = task_id:(attempt_n+1).
+            let task_message = prompt::render_task_prompt(&config.task);
+            let messages = vec![Message::User {
+                content: vec![UserBlock::Text(task_message)],
+            }];
+            let new_attempt_n = record.attempt_n + 1;
+            let new_rid = run_id(&record.task.task_id, new_attempt_n);
+            let pre = RunPersist {
+                rid: new_rid.clone(),
+                record: {
+                    let mut r = record.clone();
+                    r.run_id = new_rid;
+                    r.attempt_n = new_attempt_n;
+                    // Clear any prior terminal disposition — this is a new
+                    // attempt, even though it carries durable state forward.
+                    r.disposition = None;
+                    r.messages.clone_from(&messages);
+                    r
+                },
+            };
+            (messages, pre)
+        }
+    };
+
+    // Build a Persistence solely for store access inside run_loop_impl.
+    // task_id / attempt_n are only used to compute the run_id when
+    // override_persist is None; since we always pass Some(pre_persist),
+    // those fields are irrelevant and set to empty/zero.
+    let pers = Persistence {
+        store,
+        task_id: String::new(),
+        attempt_n: 0,
+        model_label: String::new(),
+    };
+
+    let outcome = run_loop_impl(
+        backend,
+        tools,
+        ctx,
+        config,
+        Some(&pers),
+        &mut stats,
+        initial_messages,
+        initial_consumed,
+        Some(pre_persist),
+    )
+    .await
+    .map_err(ResumeError::Store)?;
+
+    stats.wall_clock = start.elapsed();
+    Ok(RunResult { outcome, stats })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishTool, LoopOutcome, Persistence, RunConfig, RunResult, RunStats,
-        rejection_content, render_tool_result, run, run_id, run_persisted,
+        FINISH_TOOL_NAME, FinishTool, LoopOutcome, Persistence, ResumeError, ResumeMode, RunConfig,
+        RunResult, RunStats, rejection_content, render_tool_result, resume, run, run_id,
+        run_persisted,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
         ToolCallRequest, Usage, UserBlock,
     };
+    use crate::prompt;
     use crate::run_record::{
-        BudgetConsumed, Disposition, Event, FailureMode, RunRecord, Verification,
+        BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event, FailureMode,
+        Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
     };
     use crate::store::{RunStore, SqliteRunStore, StoreError};
     use crate::test_support::MockBackend;
@@ -980,6 +1316,7 @@ mod tests {
     use crate::tools::edit_file::EditFileTool;
     use crate::workspace::Workspace;
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1047,6 +1384,10 @@ mod tests {
                 .push(StoreCall::Checkpoint);
             self.inner.checkpoint(rid, record).await
         }
+
+        async fn list_events(&self, rid: &str) -> Result<Vec<Event>, StoreError> {
+            self.inner.list_events(rid).await
+        }
     }
 
     /// A [`RunStore`] that captures every [`RunRecord`] snapshot passed to
@@ -1087,6 +1428,10 @@ mod tests {
                 .push(record.clone());
             self.inner.checkpoint(rid, record).await
         }
+
+        async fn list_events(&self, rid: &str) -> Result<Vec<Event>, StoreError> {
+            self.inner.list_events(rid).await
+        }
     }
 
     /// A [`RunStore`] whose [`RunStore::append_event`] always returns an error.
@@ -1105,6 +1450,10 @@ mod tests {
 
         async fn checkpoint(&self, _rid: &str, _record: &RunRecord) -> Result<(), StoreError> {
             Err(StoreError::LockPoisoned)
+        }
+
+        async fn list_events(&self, _rid: &str) -> Result<Vec<Event>, StoreError> {
+            Ok(vec![])
         }
     }
 
@@ -2679,5 +3028,751 @@ mod tests {
         } = budget_ticks[0];
         assert_eq!(*i1, 1, "first BudgetTick iterations must be 1");
         assert_eq!(*t1, 150, "first BudgetTick tokens must be 150 (100+50)");
+    }
+
+    // =====================================================================
+    // Resume tests (AC-2 through AC-10)
+    // =====================================================================
+
+    /// Build a minimal [`RunRecord`] for resume tests — enough structure to
+    /// satisfy the type but no interesting content beyond what each test sets.
+    fn make_minimal_record(task_id: &str, attempt_n: u32) -> RunRecord {
+        RunRecord {
+            run_id: run_id(task_id, attempt_n),
+            schema_version: SCHEMA_VERSION,
+            attempt_n,
+            task: Task {
+                task_id: task_id.to_string(),
+                title: String::new(),
+                description: "test task".to_string(),
+                acceptance_criteria: vec![],
+                files_in_scope: vec![],
+                scope_out: vec![],
+            },
+            project_config: ProjectConfig {
+                run_checks: BTreeMap::new(),
+                model_routing_hint: None,
+            },
+            phase: Phase::InnerLoop,
+            durable_facts: DurableFacts::default(),
+            budgets: Budgets {
+                consumed: BudgetConsumed::default(),
+                limits: BudgetLimits {
+                    iterations: 10,
+                    tokens: 0,
+                    cost_micros: 0,
+                },
+                wall_clock_start: "2026-01-01T00:00:00Z".to_string(),
+            },
+            last_gate_result: None,
+            disposition: None,
+            messages: vec![],
+        }
+    }
+
+    // AC-3: UnknownRunId — no backend calls.
+    #[tokio::test]
+    async fn resume_unknown_run_id_returns_error_without_backend_calls() {
+        let backend = MockBackend::from_turns(vec![]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 5);
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let err = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "no-such-run",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect_err("unknown run_id must return Err");
+
+        assert!(
+            matches!(&err, ResumeError::UnknownRunId(id) if id == "no-such-run"),
+            "must be UnknownRunId(\"no-such-run\"); got {err:?}"
+        );
+        assert_eq!(
+            backend.calls(),
+            0,
+            "no backend turn must be drawn for an unknown run_id"
+        );
+    }
+
+    // AC-4: Crash mode clean tail — first turn sees exact reloaded messages.
+    #[tokio::test]
+    async fn crash_resume_clean_tail_first_turn_sees_exact_reloaded_messages() {
+        // Seed a record with a known two-message history (user task + assistant
+        // + user tool-result). The log's last event is NOT a ToolCallStarted
+        // (clean tail). The resumed run finishes in one turn.
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let asst = Message::Assistant {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-echo".to_string(),
+                name: "echo".to_string(),
+                input: serde_json::json!({}),
+            })],
+        };
+        let tool_result = Message::User {
+            content: vec![UserBlock::ToolResult {
+                call_id: "c-echo".to_string(),
+                content: "{}".to_string(),
+                is_error: false,
+            }],
+        };
+        let pre_messages = vec![task_seed.clone(), asst.clone(), tool_result.clone()];
+
+        let mut record = make_minimal_record("clean-task", 1);
+        record.messages = pre_messages.clone();
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        store
+            .checkpoint("clean-task:1", &record)
+            .await
+            .expect("checkpoint");
+        // Append a ModelCall (not ToolCallStarted) so the tail is clean.
+        store
+            .append_event(
+                "clean-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "test".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+            )
+            .await
+            .expect("append");
+
+        // One-turn script: finish immediately.
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        let result = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "clean-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // First turn must see EXACTLY the reloaded messages — no reconciliation
+        // message added on a clean tail.
+        let seen = backend.messages_seen();
+        assert!(!seen.is_empty(), "at least one turn was drawn");
+        assert_eq!(
+            seen[0], pre_messages,
+            "first turn must see exactly the reloaded messages (clean-tail crash resume)"
+        );
+        assert!(
+            matches!(
+                result.outcome,
+                LoopOutcome::Finished(Disposition::Done { .. })
+            ),
+            "outcome must be Done; got {:?}",
+            result.outcome
+        );
+    }
+
+    // AC-5: Crash mode dangling tail — two-call reconciliation.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn crash_resume_dangling_tail_reconciles_two_calls_no_reinvocation() {
+        // A record whose last assistant turn has TWO tool calls: "count1" and
+        // "count2". The event log has a ToolCallResult for call1 + a dangling
+        // ToolCallStarted for call2. Resume must:
+        //   (a) feed back a User message with 2 ToolResults (call1 real, call2 synthetic)
+        //   (b) not invoke either tool during reconciliation
+        //   (c) append a synthetic ToolCallResult for call2 to the log
+
+        // --- build a counting tool so we can assert 0 new invocations ---
+        struct CountingTool {
+            count: Mutex<u32>,
+        }
+        impl CountingTool {
+            fn invocations(&self) -> u32 {
+                *self.count.lock().unwrap()
+            }
+        }
+        #[async_trait]
+        impl Tool for CountingTool {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "name": "count",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] }
+                })
+            }
+            async fn run(&self, _input: serde_json::Value, _ctx: &ToolCtx) -> ToolResult {
+                *self.count.lock().unwrap() += 1;
+                ToolResult::ok("counted")
+            }
+        }
+
+        let counter = Arc::new(CountingTool {
+            count: Mutex::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register("count", counter.clone());
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+
+        // Build the interrupted record: task seed + assistant(call1, call2).
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let asst = Message::Assistant {
+            content: vec![
+                ContentBlock::ToolCall(ToolCallRequest {
+                    id: "id-call1".to_string(),
+                    name: "count".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                ContentBlock::ToolCall(ToolCallRequest {
+                    id: "id-call2".to_string(),
+                    name: "count".to_string(),
+                    input: serde_json::json!({}),
+                }),
+            ],
+        };
+        let mut record = make_minimal_record("dangling-task", 1);
+        record.messages = vec![task_seed.clone(), asst.clone()];
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        store
+            .checkpoint("dangling-task:1", &record)
+            .await
+            .expect("checkpoint");
+
+        // Log: ModelCall, ToolCallStarted(call1), ToolCallResult(call1), ToolCallStarted(call2) [dangling]
+        store
+            .append_event(
+                "dangling-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "test".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+            )
+            .await
+            .expect("mc");
+        store
+            .append_event(
+                "dangling-task:1",
+                Event::ToolCallStarted {
+                    seq: 0,
+                    name: "count".to_string(),
+                    args: serde_json::json!({}),
+                    call_id: "id-call1".to_string(),
+                },
+            )
+            .await
+            .expect("started1");
+        store
+            .append_event(
+                "dangling-task:1",
+                Event::ToolCallResult {
+                    seq: 0,
+                    name: "count".to_string(),
+                    is_error: false,
+                    summary: "counted".to_string(),
+                    offload_path: None,
+                },
+            )
+            .await
+            .expect("result1");
+        store
+            .append_event(
+                "dangling-task:1",
+                Event::ToolCallStarted {
+                    seq: 0,
+                    name: "count".to_string(),
+                    args: serde_json::json!({}),
+                    call_id: "id-call2".to_string(),
+                },
+            )
+            .await
+            .expect("started2_dangling");
+
+        // Resume script: one turn that calls finish immediately (so the loop
+        // doesn't re-invoke count after reconciliation).
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        let _result = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store.clone(),
+            "dangling-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // (a) First turn must see task seed + assistant + reconciled user msg
+        //     (2 ToolResults: call1 real, call2 synthetic is_error).
+        let seen = backend.messages_seen();
+        assert!(!seen.is_empty());
+        let first_turn = &seen[0];
+        // messages[0] = task seed, [1] = assistant, [2] = reconciled user
+        assert_eq!(
+            first_turn.len(),
+            3,
+            "task_seed + asst + reconciled user; got {} msgs",
+            first_turn.len()
+        );
+        let reconciled_user = &first_turn[2];
+        match reconciled_user {
+            Message::User { content } => {
+                assert_eq!(content.len(), 2, "must have 2 ToolResult blocks");
+                // call1: real result (not error, summary = "counted")
+                match &content[0] {
+                    UserBlock::ToolResult {
+                        call_id,
+                        content: c,
+                        is_error,
+                    } => {
+                        assert_eq!(call_id, "id-call1");
+                        assert!(!is_error, "call1 was completed successfully");
+                        assert_eq!(c, "counted");
+                    }
+                    other @ UserBlock::Text(_) => {
+                        panic!("expected ToolResult block 0; got {other:?}")
+                    }
+                }
+                // call2: synthetic is_error=true
+                match &content[1] {
+                    UserBlock::ToolResult {
+                        call_id,
+                        content: c,
+                        is_error,
+                    } => {
+                        assert_eq!(call_id, "id-call2");
+                        assert!(is_error, "call2 must be is_error=true (interrupted)");
+                        assert_eq!(c, "interrupted by host restart");
+                    }
+                    other @ UserBlock::Text(_) => {
+                        panic!("expected ToolResult block 1; got {other:?}")
+                    }
+                }
+            }
+            other @ Message::Assistant { .. } => {
+                panic!("expected User message for reconciled results; got {other:?}")
+            }
+        }
+
+        // (b) CountingTool must not have been invoked during reconciliation.
+        assert_eq!(
+            counter.invocations(),
+            0,
+            "counting tool must not be invoked during reconciliation"
+        );
+
+        // (c) The log must contain a synthetic ToolCallResult(is_error=true, name="count")
+        //     appended during reconciliation (the exact position is after the dangling
+        //     Started; more events may follow from the resumed run itself).
+        let events = store.list_events("dangling-task:1").await.expect("list");
+        let synthetic = events.iter().find(|e| {
+            matches!(
+                e,
+                Event::ToolCallResult {
+                    is_error: true,
+                    summary,
+                    name,
+                    ..
+                }
+                if summary == "interrupted by host restart" && name == "count"
+            )
+        });
+        assert!(
+            synthetic.is_some(),
+            "synthetic ToolCallResult(is_error=true, summary='interrupted by host restart') \
+             must be in the event log; events: {events:?}"
+        );
+    }
+
+    // AC-6: FreshContext drops messages and carries budgets.consumed forward.
+    #[tokio::test]
+    async fn fresh_context_resume_drops_messages_carries_consumed() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        // Build a record with non-empty messages and non-zero consumed.
+        let old_msg = Message::User {
+            content: vec![UserBlock::Text("old context".to_string())],
+        };
+        let pre_consumed = BudgetConsumed {
+            iterations: 7,
+            tokens: 500,
+            cost_micros: 100,
+        };
+        let mut record = make_minimal_record("fc-task", 1);
+        record.messages = vec![old_msg.clone()];
+        record.budgets.consumed = pre_consumed;
+        record
+            .durable_facts
+            .findings
+            .push("prior finding".to_string());
+
+        store
+            .checkpoint("fc-task:1", &record)
+            .await
+            .expect("checkpoint");
+
+        // One-turn script: finish immediately.
+        let snap = Arc::new(SnapshotStore::new());
+        // We need a combined store so we can observe snapshots AND have the
+        // same data available for load. Use a wrapper.
+        // For simplicity, use an SqliteStore for load and a SnapshotStore for
+        // observing snapshots. But they need to share data...
+        // Instead: manually checkpoint into the SnapshotStore's inner store.
+        snap.inner
+            .checkpoint("fc-task:1", &record)
+            .await
+            .expect("snap checkpoint");
+
+        let store2: Arc<dyn RunStore> = snap.clone();
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store2,
+            "fc-task:1",
+            ResumeMode::FreshContext,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // First turn must see ONLY the fresh task seed (old messages absent).
+        let seen = backend.messages_seen();
+        assert!(!seen.is_empty());
+        let first = &seen[0];
+        assert_eq!(first.len(), 1, "only task seed; old messages absent");
+        match &first[0] {
+            Message::User { content } => match &content[0] {
+                UserBlock::Text(t) => assert!(
+                    !t.contains("old context"),
+                    "old context must not appear in fresh seed"
+                ),
+                other @ UserBlock::ToolResult { .. } => {
+                    panic!("expected Text; got {other:?}")
+                }
+            },
+            other @ Message::Assistant { .. } => {
+                panic!("expected User message; got {other:?}")
+            }
+        }
+
+        // The checkpointed record must carry the pre-restart consumed value.
+        let snaps = snap.all_snapshots();
+        assert!(!snaps.is_empty(), "at least one checkpoint written");
+        let final_snap = snaps.last().unwrap();
+        assert!(
+            final_snap.budgets.consumed.iterations >= pre_consumed.iterations,
+            "consumed.iterations must carry forward (>= pre-restart value); got {:?}",
+            final_snap.budgets.consumed
+        );
+        // The durable finding from before the restart must still be there.
+        assert!(
+            final_snap
+                .durable_facts
+                .findings
+                .contains(&"prior finding".to_string()),
+            "durable_facts.findings must carry forward; got {:?}",
+            final_snap.durable_facts.findings
+        );
+    }
+
+    // AC-7: FreshContext run identity — new run_id, old intact.
+    #[tokio::test]
+    async fn fresh_context_run_identity_new_run_id_old_intact() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let mut record = make_minimal_record("id-task", 1);
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("old".to_string())],
+        }];
+        record.durable_facts.findings.push("carried".to_string());
+
+        let old_rid = "id-task:1";
+        store.checkpoint(old_rid, &record).await.expect("cp");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store.clone(),
+            old_rid,
+            ResumeMode::FreshContext,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // old run_id must still hold the original record (unchanged).
+        let old_rec = store.load(old_rid).await.expect("load").expect("present");
+        assert_eq!(
+            old_rec.messages, record.messages,
+            "prior run_id messages must be unmodified by FreshContext resume"
+        );
+
+        // new run_id = "id-task:2" must hold the continued record.
+        let new_rid = "id-task:2";
+        let new_rec = store
+            .load(new_rid)
+            .await
+            .expect("load")
+            .expect("new run_id must be checkpointed");
+        assert_eq!(new_rec.attempt_n, 2, "new record must have attempt_n == 2");
+        assert!(
+            new_rec
+                .durable_facts
+                .findings
+                .contains(&"carried".to_string()),
+            "new record must carry durable_facts forward"
+        );
+    }
+
+    // AC-7 complement: Crash resume checkpoints under the SAME run_id only.
+    #[tokio::test]
+    async fn crash_resume_checkpoints_under_same_run_id_only() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let mut record = make_minimal_record("crash-id-task", 1);
+        // Minimal messages so reconcile finds no dangling tail.
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }];
+        store
+            .checkpoint("crash-id-task:1", &record)
+            .await
+            .expect("cp");
+        // Append a non-ToolCallStarted event so the tail is clean.
+        store
+            .append_event(
+                "crash-id-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                },
+            )
+            .await
+            .expect("mc");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store.clone(),
+            "crash-id-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // Only the original run_id should have a checkpoint.
+        let orig = store
+            .load("crash-id-task:1")
+            .await
+            .expect("load")
+            .expect("original run_id must still be checkpointed");
+        assert_eq!(orig.attempt_n, 1, "same attempt_n on crash resume");
+
+        // No new run_id must have been created.
+        let new_rid = store.load("crash-id-task:2").await.expect("load");
+        assert!(
+            new_rid.is_none(),
+            "crash resume must not create a new run_id; found: {new_rid:?}"
+        );
+    }
+
+    // AC-8: Prompt byte-identity on resume — system prompt rendered fresh.
+    #[tokio::test]
+    async fn resume_system_prompt_byte_identical_to_fresh_run() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let mut record = make_minimal_record("prompt-task", 1);
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }];
+        store
+            .checkpoint("prompt-task:1", &record)
+            .await
+            .expect("cp");
+        store
+            .append_event(
+                "prompt-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                },
+            )
+            .await
+            .expect("mc");
+
+        // Use a non-trivial tools setup and a checks runner so the system
+        // prompt includes the check command display.
+        let tools = registry_with_finish_and_echo();
+        let runner = passing_runner();
+        let runner_display = runner.command_display();
+        let config = RunConfig::new("do the task", 5).with_checks(runner);
+
+        // Three-turn script so we see multiple system-prompt entries.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+        let ctx = ToolCtx::stub();
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "prompt-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        let systems = backend.systems_seen();
+        assert!(!systems.is_empty(), "at least one turn drawn");
+
+        // The expected system prompt: re-rendered from the same tools + checks.
+        let expected = prompt::render_system_prompt(
+            &prompt::tool_lines(&tools),
+            Some(runner_display.as_str()),
+        );
+
+        for (i, entry) in systems.iter().enumerate() {
+            let s = entry.as_ref().expect("system prompt must be sent");
+            assert_eq!(
+                s.as_bytes(),
+                expected.as_bytes(),
+                "turn {i} system prompt must be byte-identical to fresh render"
+            );
+        }
+    }
+
+    // AC-10: Crash resume happy path reaches verified Done.
+    #[tokio::test]
+    async fn crash_resume_happy_path_reaches_verified_done() {
+        // Seed a record with a clean log tail, then resume. The script ends
+        // with finish(done) against a passing ChecksRunner, proving the
+        // claim-vs-verify loop still fires on resume.
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let mut record = make_minimal_record("happy-task", 1);
+        record.messages = vec![task_seed.clone()];
+        store.checkpoint("happy-task:1", &record).await.expect("cp");
+        // Clean tail.
+        store
+            .append_event(
+                "happy-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                },
+            )
+            .await
+            .expect("mc");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "task complete" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_checks(passing_runner());
+
+        let result = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "happy-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        // Must reach a verified Done — the claim-vs-verify loop fired.
+        assert!(
+            matches!(
+                result.outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: crate::run_record::Verification::Checks(_),
+                    ..
+                })
+            ),
+            "crash resume must reach Finished(Done{{Checks(green)}}); got {:?}",
+            result.outcome
+        );
     }
 }
