@@ -14,16 +14,35 @@
 //! verify that this file *compiles*; run it by hand:
 //!
 //! ```text
+//! # Anthropic (default backend)
 //! ANTHROPIC_API_KEY=sk-... cargo run --example coding_eval
 //! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-4-6 CODING_EVAL_K=5 \
 //!   cargo run --example coding_eval
+//! # Ollama cloud (GLM-5.2)
+//! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_MODEL=glm-5.2:cloud \
+//!   cargo run --example coding_eval
+//! # Ollama localhost (small local models; num_ctx defaults to 32768 locally)
+//! EVAL_BACKEND=ollama OLLAMA_MODEL=qwen3.6:35b cargo run --example coding_eval
 //! # narrow to a single fixture directory name
 //! ANTHROPIC_API_KEY=sk-... CODING_EVAL_FIXTURE=lru-cache cargo run --example coding_eval
 //! ```
 //!
 //! Environment:
-//! - `ANTHROPIC_API_KEY`     (required) — passed through to the backend.
+//! - `EVAL_BACKEND`          (optional) — `anthropic` (default) or `ollama`.
+//! - `ANTHROPIC_API_KEY`     (required for anthropic) — passed to the backend.
 //! - `ANTHROPIC_MODEL`       (optional) — defaults to `claude-haiku-4-5`.
+//! - `OLLAMA_MODEL`          (required for ollama) — e.g. `glm-5.2:cloud`,
+//!   `qwen3.6:35b`, `gpt-oss:20b`. Never hardcoded.
+//! - `OLLAMA_BASE_URL`       (optional) — defaults to `http://localhost:11434`;
+//!   set `https://ollama.com` for Ollama cloud.
+//! - `OLLAMA_API_KEY`        (optional) — attached as a Bearer token when set
+//!   (required in practice for Ollama cloud).
+//! - `OLLAMA_NUM_CTX`        (optional) — context window. When unset it
+//!   defaults to `32768` for localhost (local defaults are VRAM-tiered and
+//!   overflow truncates SILENTLY — never rely on them) and stays unset for
+//!   remote hosts (cloud models default to their max context).
+//! - `OLLAMA_THINK`          (optional) — `off|on|low|medium|high|max`
+//!   (gpt-oss ignores plain booleans; GLM-5.2 supports high/max).
 //! - `CODING_EVAL_K`         (optional) — number of trials; defaults to 3.
 //! - `CODING_EVAL_FIXTURE`   (optional) — narrows the run to the single named
 //!   fixture directory under `fixtures/` (e.g. `lru-cache`). When unset, every
@@ -32,12 +51,94 @@
 use std::env;
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::engine::{FinishDisposition, LoopOutcome, RunStats, Verification};
 use harness::eval::{EvalReport, TrialResult, coding_fix_task, discover_fixtures, run_eval};
+use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
+use harness::ollama::{OllamaBackend, ThinkLevel};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+
+/// Default `num_ctx` for LOCALHOST Ollama runs when `OLLAMA_NUM_CTX` is unset.
+/// Local defaults are VRAM-tiered (4k on small GPUs) and overflow truncates
+/// silently, so an explicit value is mandatory hygiene; remote/cloud hosts get
+/// no default (cloud models run at their max context).
+const DEFAULT_LOCAL_NUM_CTX: u32 = 32_768;
+
+/// Example-local backend selection: one enum over the concrete backends so the
+/// generic `run_eval(&impl ModelBackend, ...)` call site stays monomorphic.
+enum Backend {
+    Anthropic(AnthropicBackend),
+    Ollama(OllamaBackend),
+}
+
+#[async_trait]
+impl ModelBackend for Backend {
+    async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
+        match self {
+            Backend::Anthropic(b) => b.turn(req).await,
+            Backend::Ollama(b) => b.turn(req).await,
+        }
+    }
+}
+
+/// Build the backend from the environment (see the module docs for the
+/// variables). Returns the backend plus a human-readable description line for
+/// the run header — model, endpoint, and the knobs that affect comparability.
+fn backend_from_env() -> (Backend, String) {
+    match env::var("EVAL_BACKEND").as_deref() {
+        Ok("ollama") => {
+            let model = env::var("OLLAMA_MODEL")
+                .expect("OLLAMA_MODEL must be set when EVAL_BACKEND=ollama");
+            let base_url =
+                env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+            let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+            let num_ctx = env::var("OLLAMA_NUM_CTX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .or(is_local.then_some(DEFAULT_LOCAL_NUM_CTX));
+            let think = env::var("OLLAMA_THINK").ok().map(|v| match v.as_str() {
+                "off" => ThinkLevel::Off,
+                "on" => ThinkLevel::On,
+                "low" => ThinkLevel::Low,
+                "medium" => ThinkLevel::Medium,
+                "high" => ThinkLevel::High,
+                "max" => ThinkLevel::Max,
+                other => panic!("OLLAMA_THINK must be off|on|low|medium|high|max, got `{other}`"),
+            });
+
+            let mut backend = OllamaBackend::new(&model, &base_url);
+            if let Ok(key) = env::var("OLLAMA_API_KEY") {
+                backend = backend.with_api_key(key);
+            }
+            if let Some(n) = num_ctx {
+                backend = backend.with_num_ctx(n);
+            }
+            if let Some(level) = think {
+                backend = backend.with_think(level);
+            }
+            let desc = format!(
+                "ollama `{model}` @ {base_url} (num_ctx={}, think={})",
+                num_ctx.map_or("default".into(), |n| n.to_string()),
+                env::var("OLLAMA_THINK").unwrap_or_else(|_| "unset".into()),
+            );
+            (Backend::Ollama(backend), desc)
+        }
+        Ok("anthropic") | Err(_) => {
+            let api_key = env::var("ANTHROPIC_API_KEY")
+                .expect("ANTHROPIC_API_KEY must be set in the environment");
+            let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+            let desc = format!("anthropic `{model}`");
+            (
+                Backend::Anthropic(AnthropicBackend::new(&model, api_key)),
+                desc,
+            )
+        }
+        Ok(other) => panic!("EVAL_BACKEND must be `anthropic` or `ollama`, got `{other}`"),
+    }
+}
 
 /// Default trial count when `CODING_EVAL_K` is not set (env-overridable).
 const DEFAULT_K: u32 = 3;
@@ -48,9 +149,7 @@ const MAX_ITERATIONS: u32 = 12;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let api_key =
-        env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set in the environment");
-    let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let (backend, backend_desc) = backend_from_env();
     let k = env::var("CODING_EVAL_K")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -60,8 +159,6 @@ async fn main() {
     let fixture_filter = env::var("CODING_EVAL_FIXTURE")
         .ok()
         .filter(|s| !s.is_empty());
-
-    let backend = AnthropicBackend::new(&model, api_key);
 
     // The fixtures live at the REPO ROOT under `fixtures/`. This example's
     // manifest dir is `crates/harness`, so climb two levels.
@@ -89,7 +186,7 @@ async fn main() {
     );
 
     println!(
-        "running coding_fix eval across {} fixture(s) (k={k}) against model `{model}` \
+        "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
          (max_iterations={MAX_ITERATIONS})",
         fixtures.len(),
     );
