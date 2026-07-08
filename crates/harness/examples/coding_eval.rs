@@ -33,8 +33,8 @@ use std::env;
 use std::path::PathBuf;
 
 use harness::anthropic::AnthropicBackend;
-use harness::engine::{FinishDisposition, LoopOutcome, Verification};
-use harness::eval::{EvalReport, coding_fix_task, discover_fixtures, run_eval};
+use harness::engine::{FinishDisposition, LoopOutcome, RunStats, Verification};
+use harness::eval::{EvalReport, TrialResult, coding_fix_task, discover_fixtures, run_eval};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5";
@@ -120,7 +120,14 @@ async fn main() {
             env_factory,
             k,
             MAX_ITERATIONS,
-            |i, outcome| println!("  trial {}: {}", i + 1, outcome_one_liner(outcome)),
+            |trial: &TrialResult| {
+                println!(
+                    "  trial {}: {} | {}",
+                    trial.trial + 1,
+                    outcome_one_liner(&trial.outcome),
+                    stats_one_liner(&trial.stats),
+                );
+            },
         )
         .await;
 
@@ -129,7 +136,9 @@ async fn main() {
     }
 
     // Final one-line-per-fixture summary table. Widths are computed so the
-    // fixture-name column exactly fits the longest name (no truncation).
+    // fixture-name column exactly fits the longest name (no truncation). The
+    // extra `mean_iters` and `total_tokens` columns surface the per-trial
+    // detail collapsed into a compare-across-fixtures view.
     let name_col = summary
         .iter()
         .map(|(n, _)| n.len())
@@ -139,16 +148,46 @@ async fn main() {
 
     println!("\n=== SUMMARY ===");
     println!(
-        "{:<name_col$}  {:>9}  {:>10}",
-        "fixture", "passes/k", "pass_rate",
+        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}",
+        "fixture", "passes/k", "pass_rate", "mean_iters", "total_tokens",
     );
     for (name, r) in &summary {
+        let total_tokens = r.total_input_tokens() + r.total_output_tokens();
         println!(
-            "{name:<name_col$}  {:>9}  {:>10.3}",
+            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}",
             format!("{}/{}", r.passes, r.trials),
             r.pass_rate,
+            r.mean_iterations(),
+            format_tokens_compact(total_tokens),
         );
     }
+}
+
+/// A terse one-line summary of a trial's [`RunStats`] for the per-trial log
+/// line — iterations, in/out tokens, and wall-clock. Wall-clock is rendered
+/// in whole seconds (small runs might round to 0s, which is fine).
+fn stats_one_liner(stats: &RunStats) -> String {
+    format!(
+        "{} iters | {} in / {} out | {}s",
+        stats.iterations,
+        format_tokens_compact(stats.input_tokens),
+        format_tokens_compact(stats.output_tokens),
+        stats.wall_clock.as_secs(),
+    )
+}
+
+/// Render a token count compactly: below `1_000` as a bare integer, otherwise as
+/// `NN.Nk`. Keeps the per-trial log line short without hiding order of
+/// magnitude.
+fn format_tokens_compact(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    // `u64 → f64` loses precision above 2^53, but token totals for a single
+    // eval run are nowhere near that; the pedantic-clippy `as` is fine here.
+    #[allow(clippy::cast_precision_loss)]
+    let k = n as f64 / 1_000.0;
+    format!("{k:.1}k")
 }
 
 /// A terse, one-line description of a trial's terminal outcome for the live log.

@@ -51,7 +51,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::engine::{self, FinishDisposition, LoopOutcome, RunConfig, Verification};
+use crate::engine::{
+    self, FinishDisposition, LoopOutcome, RunConfig, RunResult, RunStats, Verification,
+};
 use crate::exec::{CheckCommand, ChecksRunner};
 use crate::model::ModelBackend;
 use crate::tool::{ToolCtx, ToolRegistry};
@@ -86,9 +88,45 @@ pub struct EvalTask {
     pub success: SuccessPredicate,
 }
 
+/// One trial's per-trial detail: which trial, whether it passed the task's
+/// success predicate, and the mechanical [`RunStats`] the engine accumulated
+/// alongside its terminal [`LoopOutcome`].
+///
+/// This is what [`EvalReport::trial_results`] carries — the per-trial fidelity
+/// the aggregate `passes / trials` collapses away. A comparable-across-runs
+/// number (`pass_rate`) stays on [`EvalReport`]; the per-trial detail lets
+/// callers compare backends/models on iterations and tokens spent, not just
+/// pass/fail.
+///
+/// Not `PartialEq` — inherited from [`LoopOutcome`], whose
+/// [`crate::model::BackendError`] variant is a runtime error that doesn't
+/// compare.
+#[derive(Debug)]
+pub struct TrialResult {
+    /// Zero-based trial index — matches the `i` in `run_eval`'s trial loop.
+    pub trial: u32,
+    /// Whether [`EvalTask::success`] accepted this trial's terminal outcome.
+    pub passed: bool,
+    /// The engine's terminal [`LoopOutcome`] for this trial.
+    pub outcome: LoopOutcome,
+    /// Mechanical stats the engine accumulated over this trial's run.
+    pub stats: RunStats,
+}
+
 /// The result of an eval run. "Pass^k" framing: `passes` out of `trials = k`,
 /// plus `pass_rate = passes / trials` for cross-`k` comparison.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The per-trial detail — one [`TrialResult`] per trial, in order — is
+/// preserved on [`Self::trial_results`]. Aggregate views over the per-trial
+/// stats are exposed as accessor methods
+/// ([`Self::mean_iterations`], [`Self::min_iterations`],
+/// [`Self::max_iterations`], [`Self::total_input_tokens`],
+/// [`Self::total_output_tokens`], [`Self::total_wall_clock`]) rather than
+/// baked-in fields, so the source of truth is one place (`trial_results`).
+///
+/// Not `PartialEq` — inherited from [`TrialResult`] and [`LoopOutcome`], whose
+/// [`crate::model::BackendError`] variant doesn't compare.
+#[derive(Debug)]
 pub struct EvalReport {
     /// Copy of [`EvalTask::name`] — so a report can be printed in isolation.
     pub task_name: String,
@@ -99,6 +137,69 @@ pub struct EvalReport {
     /// `passes / trials` as an f64. `0.0` when `trials == 0` (no division by
     /// zero in the report).
     pub pass_rate: f64,
+    /// Per-trial detail — one entry per trial, in order (trial index matches
+    /// the vec position). Aggregate accessors on this struct derive from this
+    /// vec, so it stays the single source of truth.
+    pub trial_results: Vec<TrialResult>,
+}
+
+impl EvalReport {
+    /// Mean iterations across every trial. Returns `0.0` for an empty report
+    /// (no trials) so the accessor never yields `NaN`.
+    #[must_use]
+    pub fn mean_iterations(&self) -> f64 {
+        if self.trial_results.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self
+            .trial_results
+            .iter()
+            .map(|t| u64::from(t.stats.iterations))
+            .sum();
+        // `u64` → `f64` and `usize` → `f64`: an eval with hundreds of trials
+        // can't approach `f64`'s precision limit; the pedantic-clippy-clean
+        // form `as` for the divisor is fine here for a stats mean.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            sum as f64 / self.trial_results.len() as f64
+        }
+    }
+
+    /// Minimum iterations across every trial. `None` when no trials ran.
+    #[must_use]
+    pub fn min_iterations(&self) -> Option<u32> {
+        self.trial_results.iter().map(|t| t.stats.iterations).min()
+    }
+
+    /// Maximum iterations across every trial. `None` when no trials ran.
+    #[must_use]
+    pub fn max_iterations(&self) -> Option<u32> {
+        self.trial_results.iter().map(|t| t.stats.iterations).max()
+    }
+
+    /// Sum of every trial's `input_tokens`.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> u64 {
+        self.trial_results
+            .iter()
+            .map(|t| t.stats.input_tokens)
+            .sum()
+    }
+
+    /// Sum of every trial's `output_tokens`.
+    #[must_use]
+    pub fn total_output_tokens(&self) -> u64 {
+        self.trial_results
+            .iter()
+            .map(|t| t.stats.output_tokens)
+            .sum()
+    }
+
+    /// Sum of every trial's `wall_clock`.
+    #[must_use]
+    pub fn total_wall_clock(&self) -> Duration {
+        self.trial_results.iter().map(|t| t.stats.wall_clock).sum()
+    }
 }
 
 /// One trial's fresh, isolated execution environment.
@@ -130,9 +231,11 @@ pub struct TrialEnv {
 /// [`TrialEnv`] (see the module docs on per-trial isolation); the trial then
 /// runs [`engine::run`] with a [`RunConfig`] carrying the task's seed prompt,
 /// the given `max_iterations`, and the env's checks. Trials are **sequential**.
-/// `on_trial` is called with each trial's index and terminal
-/// [`LoopOutcome`] as it completes — the live example uses it to stream
-/// per-trial one-liners; pass `|_, _| {}` to ignore it.
+///
+/// `on_trial` is called with each trial's [`TrialResult`] as it completes —
+/// the live example uses it to stream per-trial one-liners that include the
+/// [`RunStats`]. Pass `|_| {}` to ignore it. The full per-trial vec is also
+/// preserved on [`EvalReport::trial_results`] for downstream aggregate work.
 ///
 /// `pass_rate` is `0.0` when `k == 0` so a misuse never produces `NaN`; the
 /// trial loop runs zero times, so neither the factory nor the backend is
@@ -143,20 +246,33 @@ pub async fn run_eval(
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
-    mut on_trial: impl FnMut(u32, &LoopOutcome),
+    mut on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
     let mut passes: u32 = 0;
+    let mut trial_results: Vec<TrialResult> = Vec::with_capacity(k as usize);
     for i in 0..k {
         let env = env_factory();
         let mut config = RunConfig::new(task.task.clone(), max_iterations);
         if let Some(checks) = env.checks.clone() {
             config = config.with_checks(checks);
         }
-        let outcome = engine::run(backend, &env.tools, &env.ctx, &config).await;
-        if (task.success)(&outcome) {
+        let RunResult { outcome, stats } =
+            engine::run(backend, &env.tools, &env.ctx, &config).await;
+        // Bind the per-trial boolean to a name distinct from `passes` so
+        // clippy's `similar_names` lint has no bait; the struct field stays
+        // `passed` on the way in.
+        let is_pass = (task.success)(&outcome);
+        if is_pass {
             passes += 1;
         }
-        on_trial(i, &outcome);
+        let trial = TrialResult {
+            trial: i,
+            passed: is_pass,
+            outcome,
+            stats,
+        };
+        on_trial(&trial);
+        trial_results.push(trial);
         // `env` — and with it this trial's scratch workspace — drops here.
     }
     let pass_rate = if k == 0 {
@@ -170,6 +286,7 @@ pub async fn run_eval(
         trials: k,
         passes,
         pass_rate,
+        trial_results,
     }
 }
 
@@ -385,11 +502,11 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalReport, EvalTask, TrialEnv, coding_fix_task, copy_dir_recursive, discover_fixtures,
-        finish_env, finish_task, run_eval,
+        EvalReport, EvalTask, TrialEnv, TrialResult, coding_fix_task, copy_dir_recursive,
+        discover_fixtures, finish_env, finish_task, run_eval,
     };
     use crate::engine::{
-        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, Verification,
+        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, RunStats, Verification,
     };
     use crate::exec::{CheckCommand, ChecksRunner};
     use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
@@ -479,7 +596,7 @@ mod tests {
         let backend = MockBackend::from_turns(script);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, k, 10, |_, _| {}).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, 10, |_| {}).await;
 
         assert_eq!(report.task_name, task.name);
         assert_eq!(report.trials, k);
@@ -500,7 +617,7 @@ mod tests {
         let backend = MockBackend::from_turns(script);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_, _| {}).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_| {}).await;
 
         assert_eq!(report.task_name, "finish");
         assert_eq!(report.trials, k);
@@ -526,11 +643,23 @@ mod tests {
         let task = finish_task();
 
         let k: u32 = 4;
-        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_, _| {}).await;
+        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_| {}).await;
 
         assert_eq!(report.trials, k);
         assert_eq!(report.passes, 2);
         assert!((report.pass_rate - 0.5).abs() < f64::EPSILON);
+
+        // Per-trial detail: one entry per trial in order, with correct
+        // passed-flag alternation and the trial index matching the vec
+        // position.
+        assert_eq!(report.trial_results.len(), k as usize);
+        let flags: Vec<bool> = report.trial_results.iter().map(|t| t.passed).collect();
+        assert_eq!(flags, vec![true, false, true, false]);
+        for (i, t) in report.trial_results.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let expected: u32 = i as u32;
+            assert_eq!(t.trial, expected, "trial index matches vec position");
+        }
     }
 
     #[tokio::test]
@@ -540,7 +669,7 @@ mod tests {
         let backend = MockBackend::from_turns(vec![]);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, 0, 5, |_, _| {}).await;
+        let report = run_eval(&task, &backend, echo_finish_env, 0, 5, |_| {}).await;
 
         assert_eq!(report.trials, 0);
         assert_eq!(report.passes, 0);
@@ -611,18 +740,225 @@ mod tests {
     }
 
     #[test]
-    fn eval_report_is_debug_clone_and_partial_eq() {
+    fn eval_report_is_debug_and_carries_trial_results() {
+        // `EvalReport` no longer derives `Clone`/`PartialEq` — its
+        // `trial_results` field carries a `LoopOutcome` whose `BackendError`
+        // variant is a runtime error that doesn't compare. Debug is what a
+        // caller actually needs for logging; the per-trial vec is what the
+        // aggregate accessors derive from.
         let r = EvalReport {
             task_name: "finish".to_string(),
             trials: 3,
             passes: 1,
             pass_rate: 1.0 / 3.0,
+            trial_results: Vec::new(),
         };
         let printed = format!("{r:?}");
         assert!(printed.contains("EvalReport"));
         assert!(printed.contains("task_name"));
-        let cloned = r.clone();
-        assert_eq!(r, cloned);
+        assert!(printed.contains("trial_results"));
+    }
+
+    /// A finish(done) turn with an explicit non-zero `Usage` — for tests that
+    /// pin per-trial `RunStats` values through the eval harness.
+    fn finish_done_turn_with_usage(input_tokens: u32, output_tokens: u32) -> AssistantTurn {
+        AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-finish".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: json!({ "disposition": "done", "summary": "ok" }),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_report_aggregates_pin_mean_min_max_iterations_and_token_totals() {
+        // Three trials, each drawing a KNOWN, distinct number of turns and
+        // token counts. After the eval finishes we assert every aggregate
+        // accessor on the report matches the hand-computed values exactly.
+        //
+        // Trial layout (each trial is one script prefix):
+        //   trial 0: echo, echo, finish   → 3 iterations
+        //     usage per turn:  (10, 1), (20, 2), (30, 3)
+        //   trial 1: echo, finish         → 2 iterations
+        //     usage per turn:  (40, 4), (50, 5)
+        //   trial 2: finish               → 1 iteration
+        //     usage per turn:  (60, 6)
+        //
+        // Totals:
+        //   iterations: [3, 2, 1] → mean 2.0, min 1, max 3
+        //   input_tokens per trial: [60, 90, 60] → total 210
+        //   output_tokens per trial: [6, 9, 6]   → total 21
+        let script = vec![
+            // trial 0
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({ "i": 1 }),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c2".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({ "i": 2 }),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 20,
+                    output_tokens: 2,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+            finish_done_turn_with_usage(30, 3),
+            // trial 1
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({ "i": 3 }),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 40,
+                    output_tokens: 4,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+            finish_done_turn_with_usage(50, 5),
+            // trial 2
+            finish_done_turn_with_usage(60, 6),
+        ];
+        let backend = MockBackend::from_turns(script);
+        let task = finish_task();
+
+        // Callback receives every TrialResult in order — verify by recording.
+        let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            3,
+            5,
+            move |t: &TrialResult| {
+                seen_c.lock().expect("seen lock").push(t.trial);
+            },
+        )
+        .await;
+
+        // pass_rate is unchanged shape — every trial passes here (finish tool
+        // is available), so passes = 3, pass_rate = 1.0.
+        assert_eq!(report.trials, 3);
+        assert_eq!(report.passes, 3);
+        assert!((report.pass_rate - 1.0).abs() < f64::EPSILON);
+
+        // Per-trial detail: exact order, exact per-trial stats.
+        assert_eq!(report.trial_results.len(), 3);
+        assert_eq!(
+            report
+                .trial_results
+                .iter()
+                .map(|t| t.trial)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+        assert_eq!(report.trial_results[0].stats.iterations, 3);
+        assert_eq!(report.trial_results[0].stats.input_tokens, 60);
+        assert_eq!(report.trial_results[0].stats.output_tokens, 6);
+        assert_eq!(report.trial_results[1].stats.iterations, 2);
+        assert_eq!(report.trial_results[1].stats.input_tokens, 90);
+        assert_eq!(report.trial_results[1].stats.output_tokens, 9);
+        assert_eq!(report.trial_results[2].stats.iterations, 1);
+        assert_eq!(report.trial_results[2].stats.input_tokens, 60);
+        assert_eq!(report.trial_results[2].stats.output_tokens, 6);
+
+        // Aggregate accessors match the hand-computed values EXACTLY.
+        assert!((report.mean_iterations() - 2.0).abs() < f64::EPSILON);
+        assert_eq!(report.min_iterations(), Some(1));
+        assert_eq!(report.max_iterations(), Some(3));
+        assert_eq!(report.total_input_tokens(), 60 + 90 + 60);
+        assert_eq!(report.total_output_tokens(), 6 + 9 + 6);
+        // total_wall_clock sums the three per-trial durations. We can't pin an
+        // exact value, but it must equal `sum(trial.stats.wall_clock)` — the
+        // accessor's contract.
+        let expected_total: Duration = report
+            .trial_results
+            .iter()
+            .map(|t| t.stats.wall_clock)
+            .sum();
+        assert_eq!(report.total_wall_clock(), expected_total);
+
+        // Callback ordering: every trial's index was observed, in order,
+        // exactly once.
+        assert_eq!(*seen.lock().expect("seen lock"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn eval_report_aggregate_accessors_handle_empty_trial_results() {
+        // A k=0 (or otherwise empty) report is a valid, in-band state: the
+        // aggregates must not `NaN`, panic, or `unwrap` — the same contract
+        // `pass_rate = 0.0` already implements for the pass fraction.
+        let empty = EvalReport {
+            task_name: "empty".to_string(),
+            trials: 0,
+            passes: 0,
+            pass_rate: 0.0,
+            trial_results: Vec::new(),
+        };
+        assert!(
+            (empty.mean_iterations() - 0.0).abs() < f64::EPSILON,
+            "empty mean is 0.0, not NaN"
+        );
+        assert_eq!(empty.min_iterations(), None);
+        assert_eq!(empty.max_iterations(), None);
+        assert_eq!(empty.total_input_tokens(), 0);
+        assert_eq!(empty.total_output_tokens(), 0);
+        assert_eq!(empty.total_wall_clock(), Duration::ZERO);
+    }
+
+    #[test]
+    fn trial_result_is_debug_and_carries_run_stats() {
+        // TrialResult carries the engine's RunStats verbatim — pin the shape
+        // via Debug so downstream logging never silently loses a field.
+        let t = TrialResult {
+            trial: 7,
+            passed: true,
+            outcome: LoopOutcome::MaxIterations,
+            stats: RunStats {
+                iterations: 4,
+                input_tokens: 111,
+                output_tokens: 22,
+                wall_clock: Duration::from_millis(50),
+            },
+        };
+        let printed = format!("{t:?}");
+        assert!(printed.contains("TrialResult"));
+        assert!(printed.contains("trial: 7"));
+        assert!(printed.contains("passed: true"));
+        assert!(printed.contains("MaxIterations"));
+        assert!(printed.contains("RunStats"));
     }
 
     #[test]
@@ -778,7 +1114,7 @@ mod tests {
         // Reuse the real coding-fix predicate (Checks-verified Done).
         let (task, _ignored_factory) = coding_fix_task(src.path());
 
-        let report = run_eval(&task, &backend, factory, 2, 3, |_, _| {}).await;
+        let report = run_eval(&task, &backend, factory, 2, 3, |_| {}).await;
         assert_eq!(report.passes, 2, "both trials verify green");
 
         let dirs = recorded.lock().expect("rec lock").clone();

@@ -59,6 +59,8 @@
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -224,6 +226,50 @@ impl FinishClaim {
             },
         }
     }
+}
+
+/// Mechanical statistics accumulated by the loop, carried alongside every
+/// [`LoopOutcome`] on the [`RunResult`] a call to [`run`] returns.
+///
+/// - `iterations`: how many model turns the loop actually drew — a
+///   [`LoopOutcome::BackendError`] on the FIRST turn yields `iterations = 1`
+///   (the erroring draw counts). [`LoopOutcome::MaxIterations`] always yields
+///   `iterations == config.max_iterations`.
+/// - `input_tokens` / `output_tokens`: the sum of
+///   [`AssistantTurn.usage.input_tokens`](crate::model::Usage::input_tokens) /
+///   [`output_tokens`](crate::model::Usage::output_tokens) across every
+///   SUCCESSFUL turn. Turns that returned a
+///   [`BackendError`](crate::model::BackendError) contribute nothing. Per-turn
+///   `u32` values sum into `u64` so a long run can't overflow.
+/// - `wall_clock`: measured across the whole [`run`] call — from just before
+///   the loop starts to just after it returns.
+///
+/// Deliberately NOT `serde`: persistence wiring
+/// (into [`crate::run_record`]) is a later milestone; this type is the
+/// in-memory shape the loop hands its caller today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStats {
+    /// Model turns actually drawn — includes an erroring last turn.
+    pub iterations: u32,
+    /// Sum of `usage.input_tokens` across successful turns.
+    pub input_tokens: u64,
+    /// Sum of `usage.output_tokens` across successful turns.
+    pub output_tokens: u64,
+    /// Wall-clock elapsed across the whole [`run`] call.
+    pub wall_clock: Duration,
+}
+
+/// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
+/// mechanical [`RunStats`] carried alongside it.
+///
+/// Not `PartialEq` — inherited from [`LoopOutcome`], whose
+/// [`model::BackendError`] variant is a runtime error that doesn't compare.
+#[derive(Debug)]
+pub struct RunResult {
+    /// Why the loop stopped.
+    pub outcome: LoopOutcome,
+    /// Mechanical stats accumulated over the run.
+    pub stats: RunStats,
 }
 
 /// Why the agent loop stopped.
@@ -437,12 +483,49 @@ fn ack(call_id: &str) -> UserBlock {
 /// `config.checks` is `Some`; see the module docs for the full claim-vs-verify
 /// contract.
 ///
+/// The returned [`RunResult`] pairs the terminal [`LoopOutcome`] with the
+/// mechanical [`RunStats`] accumulated over the run — see [`RunStats`] for
+/// how each field is counted (in particular: an erroring last turn still
+/// contributes to `iterations` but not to the token totals).
+///
 /// [`ChecksRunner::run`]: crate::exec::ChecksRunner::run
 pub async fn run(
     backend: &impl model::ModelBackend,
     tools: &ToolRegistry,
     ctx: &ToolCtx,
     config: &RunConfig,
+) -> RunResult {
+    // `wall_clock` covers the whole call (prompt rendering included, since
+    // that's real work the loop did). `stats` is threaded into the loop by
+    // mut-ref so every termination path picks up the same in-progress totals.
+    let start = Instant::now();
+    let mut stats = RunStats {
+        iterations: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        wall_clock: Duration::ZERO,
+    };
+    let outcome = run_loop_impl(backend, tools, ctx, config, &mut stats).await;
+    stats.wall_clock = start.elapsed();
+    RunResult { outcome, stats }
+}
+
+/// The engine loop body, split out of [`run`] so the outer function owns the
+/// `wall_clock` measurement and can finalize [`RunStats`] on every return
+/// path without every branch having to repeat the plumbing.
+///
+/// `stats` is mutated in place as the loop progresses:
+/// - `iterations` is incremented BEFORE each `backend.turn` call — so a
+///   backend error on the first draw yields `iterations = 1`, matching the
+///   "model turns actually drawn" contract in [`RunStats`].
+/// - `input_tokens` / `output_tokens` accumulate the SUCCESSFUL turn's
+///   [`crate::model::Usage`] only; errored turns contribute nothing.
+async fn run_loop_impl(
+    backend: &impl model::ModelBackend,
+    tools: &ToolRegistry,
+    ctx: &ToolCtx,
+    config: &RunConfig,
+    stats: &mut RunStats,
 ) -> LoopOutcome {
     // Render both prompts ONCE and reuse verbatim every iteration. Both
     // functions are pure and byte-deterministic (see `prompt` module tests),
@@ -476,10 +559,18 @@ pub async fn run(
             params: &params,
         };
 
+        // Count the draw BEFORE the call so an error on the first turn still
+        // shows up as `iterations = 1` in `stats`.
+        stats.iterations += 1;
         let turn = match backend.turn(&req).await {
             Ok(turn) => turn,
             Err(err) => return LoopOutcome::BackendError(err),
         };
+
+        // Successful turn — accumulate its `Usage` into the run totals.
+        // Per-turn `u32` values sum into `u64` so a long run can't overflow.
+        stats.input_tokens += u64::from(turn.usage.input_tokens);
+        stats.output_tokens += u64::from(turn.usage.output_tokens);
 
         // Snapshot the calls before moving the turn into history (the `From`
         // impl consumes `turn.content`).
@@ -532,8 +623,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, RunConfig, Verification,
-        rejection_content, render_tool_result, run,
+        FINISH_TOOL_NAME, FinishDisposition, FinishTool, LoopOutcome, RunConfig, RunResult,
+        RunStats, Verification, rejection_content, render_tool_result, run,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -559,6 +650,19 @@ mod tests {
         }
     }
 
+    /// Build a [`Usage`] with the given `input_tokens`/`output_tokens` and
+    /// every optional field cleared — the smallest thing tests need to script
+    /// known per-turn token amounts.
+    fn usage_with(input_tokens: u32, output_tokens: u32) -> Usage {
+        Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
     fn tool_call(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
         ContentBlock::ToolCall(ToolCallRequest {
             id: id.to_string(),
@@ -572,6 +676,20 @@ mod tests {
             content,
             stop_reason,
             usage: usage(),
+        }
+    }
+
+    /// Like [`turn_with`], but with an explicit [`Usage`] — for tests that
+    /// pin the accumulated [`RunStats`] token totals.
+    fn turn_with_usage(
+        content: Vec<ContentBlock>,
+        stop_reason: StopReason,
+        usage: Usage,
+    ) -> AssistantTurn {
+        AssistantTurn {
+            content,
+            stop_reason,
+            usage,
         }
     }
 
@@ -639,7 +757,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Done {
@@ -651,6 +769,11 @@ mod tests {
             other => panic!("expected Finished(Done{{NoChecksConfigured}}), got {other:?}"),
         }
         assert_eq!(backend.calls(), 1, "should finish in a single iteration");
+        // The Finished variant carries stats too: one drawn turn, zero tokens
+        // (the mock's usage() helper is all zeros).
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.input_tokens, 0);
+        assert_eq!(stats.output_tokens, 0);
     }
 
     #[tokio::test]
@@ -663,7 +786,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 10).with_checks(passing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Done {
@@ -677,6 +800,7 @@ mod tests {
             other => panic!("expected Finished(Done{{Checks(green)}}), got {other:?}"),
         }
         assert_eq!(backend.calls(), 1);
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -698,7 +822,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 5).with_checks(failing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         // With the second turn being a non-finish call and no third turn
         // scripted, the loop hits the over-draw path — the important
@@ -743,6 +867,9 @@ mod tests {
             content.contains("FAIL_DETAIL"),
             "content must include the check excerpt; got:\n{content}"
         );
+        // The BackendError variant carries stats too. The mock overdraws on
+        // the third turn, so `iterations` counts all three drawn turns.
+        assert_eq!(stats.iterations, 3);
     }
 
     #[tokio::test]
@@ -763,7 +890,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 2).with_checks(failing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(
             matches!(outcome, LoopOutcome::MaxIterations),
@@ -774,6 +901,8 @@ mod tests {
             2,
             "drew exactly max_iterations turns before giving up"
         );
+        // MaxIterations carries stats — iterations equals the cap exactly.
+        assert_eq!(stats.iterations, 2);
     }
 
     #[tokio::test]
@@ -793,7 +922,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 5).with_checks(failing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Blocked { decision_needed }) => {
@@ -801,6 +930,7 @@ mod tests {
             }
             other => panic!("expected Finished(Blocked), got {other:?}"),
         }
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -813,7 +943,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 5).with_checks(failing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
@@ -821,6 +951,7 @@ mod tests {
             }
             other => panic!("expected Finished(Failed), got {other:?}"),
         }
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -879,7 +1010,7 @@ mod tests {
 
         let config = RunConfig::new("plant the flag", 5).with_checks(runner);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Done {
@@ -905,6 +1036,7 @@ mod tests {
             root_path.join("flag").exists(),
             "flag file should have been created by edit_file"
         );
+        assert_eq!(stats.iterations, 3, "rejected claim, edit, verified claim");
     }
 
     #[tokio::test]
@@ -930,7 +1062,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("do the task", 3).with_checks(passing_runner());
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
         assert!(matches!(outcome, LoopOutcome::MaxIterations));
         assert_eq!(backend.calls(), 3);
 
@@ -949,6 +1081,7 @@ mod tests {
                 "turn {i} system prompt drifted from turn 0 — prompt cache invariant broken"
             );
         }
+        assert_eq!(stats.iterations, 3);
     }
 
     #[tokio::test]
@@ -971,7 +1104,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(matches!(
             outcome,
@@ -979,6 +1112,7 @@ mod tests {
         ));
         // Two model turns: echo, then finish.
         assert_eq!(backend.calls(), 2, "echo turn then finish turn");
+        assert_eq!(stats.iterations, 2);
     }
 
     #[tokio::test]
@@ -1005,7 +1139,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
         assert!(matches!(
             outcome,
             LoopOutcome::Finished(FinishDisposition::Done { .. })
@@ -1030,6 +1164,7 @@ mod tests {
             },
             Message::Assistant { .. } => panic!("expected User message"),
         }
+        assert_eq!(stats.iterations, 2);
     }
 
     #[tokio::test]
@@ -1047,10 +1182,11 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 3);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(matches!(outcome, LoopOutcome::MaxIterations));
         assert_eq!(backend.calls(), 3, "drew exactly max_iterations turns");
+        assert_eq!(stats.iterations, 3);
     }
 
     #[tokio::test]
@@ -1063,11 +1199,16 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(matches!(outcome, LoopOutcome::BackendError(_)));
         // Surfaced on the first call — no retry.
         assert_eq!(backend.calls(), 1);
+        // BackendError-on-first-turn: iterations = 1 (the erroring draw counts),
+        // both token totals stay zero (errored turns contribute nothing).
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.input_tokens, 0);
+        assert_eq!(stats.output_tokens, 0);
     }
 
     #[tokio::test]
@@ -1080,10 +1221,11 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
         assert_eq!(backend.calls(), 1);
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -1098,10 +1240,13 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         assert!(matches!(outcome, LoopOutcome::BackendError(_)));
         assert_eq!(backend.calls(), 2, "second draw over-draws the script");
+        // Both draws count: the successful echo turn AND the second-draw
+        // over-draw error.
+        assert_eq!(stats.iterations, 2);
     }
 
     #[tokio::test]
@@ -1118,7 +1263,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Blocked { decision_needed }) => {
@@ -1126,6 +1271,7 @@ mod tests {
             }
             other => panic!("expected Finished(Blocked), got {other:?}"),
         }
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -1138,7 +1284,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
@@ -1146,6 +1292,7 @@ mod tests {
             }
             other => panic!("expected Finished(Failed), got {other:?}"),
         }
+        assert_eq!(stats.iterations, 1);
     }
 
     #[tokio::test]
@@ -1158,7 +1305,7 @@ mod tests {
         let ctx = ToolCtx::stub();
         let config = RunConfig::new("task", 10);
 
-        let outcome = run(&backend, &tools, &ctx, &config).await;
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
 
         match outcome {
             LoopOutcome::Finished(FinishDisposition::Failed { summary }) => {
@@ -1166,6 +1313,7 @@ mod tests {
             }
             other => panic!("expected Finished(Failed) for unknown disposition, got {other:?}"),
         }
+        assert_eq!(stats.iterations, 1);
     }
 
     #[test]
@@ -1233,6 +1381,131 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.summary.contains("finish"));
+    }
+
+    #[tokio::test]
+    async fn run_stats_accumulate_exact_per_turn_usage_across_a_scripted_run() {
+        // Three scripted turns, each with a KNOWN, distinct `Usage`. After the
+        // run finishes we assert `stats` sums those exact per-turn values.
+        // - turn 1: echo call, usage(input=100, output=10)
+        // - turn 2: echo call, usage(input=200, output=20)
+        // - turn 3: finish(done), usage(input=300, output=30)
+        // Expected: iterations = 3, input_tokens = 600, output_tokens = 60.
+        let script = vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(100, 10),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with(200, 20),
+            ),
+            turn_with_usage(
+                vec![tool_call(
+                    "c-finish",
+                    FINISH_TOOL_NAME,
+                    serde_json::json!({ "disposition": "done", "summary": "ok" }),
+                )],
+                StopReason::ToolUse,
+                usage_with(300, 30),
+            ),
+        ];
+        let backend = MockBackend::from_turns(script);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(FinishDisposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 3);
+        assert_eq!(stats.input_tokens, 600);
+        assert_eq!(stats.output_tokens, 60);
+    }
+
+    #[tokio::test]
+    async fn run_stats_errored_turn_contributes_no_tokens_but_counts_the_iteration() {
+        // Two turns: (1) a successful echo with non-zero usage, (2) a terminal
+        // backend error. `iterations` counts both draws (2); `input_tokens` /
+        // `output_tokens` include ONLY the first (successful) turn — errored
+        // turns contribute nothing.
+        let script: Vec<Result<AssistantTurn, BackendError>> = vec![
+            Ok(turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(500, 50),
+            )),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "second turn boom".to_string(),
+            }),
+        ];
+        let backend = MockBackend::new(script);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(outcome, LoopOutcome::BackendError(_)));
+        assert_eq!(
+            stats.iterations, 2,
+            "both draws count, including the erroring one"
+        );
+        assert_eq!(
+            stats.input_tokens, 500,
+            "only the successful turn's usage sums"
+        );
+        assert_eq!(stats.output_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn run_stats_wall_clock_populated_across_the_run() {
+        // The `wall_clock` field must always be populated (non-zero after any
+        // real call) — pin the invariant that it's finalized on every return
+        // path. A single finish turn is the smallest case that still measures
+        // real elapsed time.
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("t", 5);
+
+        let RunResult { outcome: _, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        // Wall clock is monotonic Instant-based, so any real call produces a
+        // duration strictly greater than zero.
+        assert!(
+            stats.wall_clock > Duration::ZERO,
+            "wall_clock must be measured across the run; got {:?}",
+            stats.wall_clock,
+        );
+    }
+
+    #[test]
+    fn run_stats_is_debug_clone_and_eq() {
+        // RunStats derives Clone / Debug / PartialEq / Eq — a value can be
+        // moved into a report, cloned into a log line, and compared exactly.
+        // The task spec explicitly requires these traits.
+        let a = RunStats {
+            iterations: 3,
+            input_tokens: 100,
+            output_tokens: 10,
+            wall_clock: Duration::from_millis(250),
+        };
+        let printed = format!("{a:?}");
+        assert!(printed.contains("RunStats"));
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = RunStats { iterations: 4, ..b };
+        assert_ne!(a, c);
     }
 
     #[test]

@@ -46,15 +46,7 @@ async fn main() {
     );
 
     // `finish_env` wires no `ChecksRunner`, so a `finish(done)` here yields the
-    // NoChecksConfigured verification path. `|_, _| {}` ignores per-trial output.
-    let report = run_eval(
-        &task,
-        &backend,
-        finish_env,
-        TRIALS,
-        MAX_ITERATIONS,
-        |_, _| {},
-    )
-    .await;
+    // NoChecksConfigured verification path. `|_| {}` ignores per-trial output.
+    let report = run_eval(&task, &backend, finish_env, TRIALS, MAX_ITERATIONS, |_| {}).await;
     println!("{report:#?}");
 }
