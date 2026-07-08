@@ -59,7 +59,7 @@
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1073,13 +1073,17 @@ async fn run_loop_impl(
 /// - **Clean tail** (last event is not `ToolCallStarted`): returns
 ///   `record.messages` verbatim.
 /// - **Dangling tail**: returns `record.messages` plus a synthetic
-///   `Message::User` covering EVERY tool call in the last assistant turn, in
-///   call order. Calls whose (Started, Result) pair is in the log get the
-///   real `{is_error, summary}`; the interrupted call (and any that were never
-///   started) get a synthetic `is_error=true` result with content
-///   `"interrupted by host restart"`. Also appends one synthetic
-///   [`Event::ToolCallResult`] to the log for the dangling Started, so the log
-///   is clean on the next resume.
+///   `Message::User` covering EVERY tool call in the last assistant turn.
+///   Pairing is by `call_id` (D6): each [`Event::ToolCallStarted`]'s `call_id`
+///   is matched against the [`model::ToolCallRequest`] ids in the snapshot's
+///   in-flight assistant turn. Calls with a real logged
+///   [`Event::ToolCallResult`] keep that real `{is_error, summary}`; the
+///   interrupted call (and any that were never started) get a synthetic
+///   `is_error=true` result with content `"interrupted by host restart"`.
+///   Non-tool events between [`Event::ModelCall`] and the first
+///   [`Event::ToolCallStarted`] (e.g. [`Event::BudgetTick`]) are filtered out
+///   before the walk. Also appends one synthetic [`Event::ToolCallResult`] to
+///   the log for the dangling Started, so the log is clean on the next resume.
 async fn reconcile_crash_tail(
     record: &RunRecord,
     store: &Arc<dyn RunStore>,
@@ -1114,38 +1118,65 @@ async fn reconcile_crash_tail(
         })
         .unwrap_or_default();
 
-    // Isolate events after the last ModelCall (the current iteration's tail).
-    // Pattern: [Started Result]* Started (dangling)
+    // Isolate events after the last ModelCall (the current iteration's tail),
+    // then filter to tool events only — ToolCallStarted and ToolCallResult.
+    // This skips BudgetTick and any other non-tool events the engine emits
+    // between ModelCall and the first ToolCallStarted (e.g. the BudgetTick
+    // appended at engine.rs:895 before tool dispatch begins).
     let post_model_idx = events
         .iter()
         .rposition(|e| matches!(e, Event::ModelCall { .. }))
         .map_or(0, |i| i + 1);
-    let tail = &events[post_model_idx..];
+    let tool_tail: Vec<&Event> = events[post_model_idx..]
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::ToolCallStarted { .. } | Event::ToolCallResult { .. }
+            )
+        })
+        .collect();
 
-    // Walk calls in order, matching each to a (Started, Result?) pair in tail.
-    let mut results: Vec<UserBlock> = Vec::with_capacity(last_assistant_calls.len());
-    let mut ev = 0usize;
-
-    for call in &last_assistant_calls {
-        // Advance past the Started event for this call (if present).
-        let has_started = ev < tail.len() && matches!(tail[ev], Event::ToolCallStarted { .. });
-        if has_started {
-            ev += 1;
-        }
-        // Check for a following Result.
-        let completed = if has_started && ev < tail.len() {
-            if let Event::ToolCallResult {
-                is_error, summary, ..
-            } = &tail[ev]
-            {
-                let pair = (*is_error, summary.clone());
-                ev += 1;
-                Some(pair)
-            } else {
-                None
+    // Build a map: call_id → Option<(is_error, summary)>.
+    //   None  = ToolCallStarted seen, no matching Result yet (dangling).
+    //   Some  = both Started + Result seen (call completed).
+    //
+    // ToolCallResult carries no call_id field; pair it positionally with the
+    // most-recently-unmatched ToolCallStarted (pending_cid). Malformed-tail
+    // safety: an orphaned Result (no unmatched Started) is silently ignored;
+    // a duplicate call_id in Started leaves the earlier entry unchanged.
+    let mut completion_map: HashMap<String, Option<(bool, String)>> = HashMap::new();
+    let mut pending_cid: Option<String> = None;
+    for event in &tool_tail {
+        match event {
+            Event::ToolCallStarted { call_id, .. } => {
+                // If a previous Started is still unmatched, leave it as None
+                // in the map. Update the pending slot.
+                pending_cid = Some(call_id.clone());
+                completion_map.entry(call_id.clone()).or_insert(None);
             }
-        } else {
-            None
+            Event::ToolCallResult {
+                is_error, summary, ..
+            } => {
+                if let Some(cid) = pending_cid.take() {
+                    // Pair this Result to the most-recently-unmatched Started.
+                    completion_map.insert(cid, Some((*is_error, summary.clone())));
+                }
+                // Orphaned Result (no unmatched Started): degrade safely, ignore.
+            }
+            _ => {} // unreachable after filter; never panic on edge cases
+        }
+    }
+
+    // Build the reconciled UserBlock list: for each call in the last assistant
+    // turn, look up by call_id. Calls with a real logged Result keep it; calls
+    // with no matching Result (dangling Started or never started) get the
+    // synthetic is_error "interrupted by host restart" block.
+    let mut results: Vec<UserBlock> = Vec::with_capacity(last_assistant_calls.len());
+    for call in &last_assistant_calls {
+        let completed = match completion_map.get(&call.id) {
+            Some(Some((is_error, summary))) => Some((*is_error, summary.clone())),
+            _ => None, // not started at all, or started but no Result (dangling)
         };
         results.push(match completed {
             Some((is_error, summary)) => UserBlock::ToolResult {
@@ -3260,7 +3291,12 @@ mod tests {
             .await
             .expect("checkpoint");
 
-        // Log: ModelCall, ToolCallStarted(call1), ToolCallResult(call1), ToolCallStarted(call2) [dangling]
+        // Log seeds the REAL engine-emitted tail shape:
+        //   ModelCall → BudgetTick → Started1(call_id=id-call1) → Result1 → Started2(call_id=id-call2) [dangling]
+        // The BudgetTick is what the engine always emits (engine.rs:895) between
+        // ModelCall and the first ToolCallStarted. The old test omitted it,
+        // which caused the positional walk to never advance and mark EVERY call
+        // as interrupted — this rewrite closes that seam.
         store
             .append_event(
                 "dangling-task:1",
@@ -3273,6 +3309,20 @@ mod tests {
             )
             .await
             .expect("mc");
+        store
+            .append_event(
+                "dangling-task:1",
+                Event::BudgetTick {
+                    seq: 0,
+                    consumed: BudgetConsumed {
+                        iterations: 1,
+                        tokens: 2,
+                        cost_micros: 0,
+                    },
+                },
+            )
+            .await
+            .expect("budget_tick");
         store
             .append_event(
                 "dangling-task:1",
@@ -4198,6 +4248,453 @@ mod tests {
                 "leg 2 turn {i} system prompt must be byte-identical to the \
                  pre-crash render (D9 prompt-cache invariant)"
             );
+        }
+    }
+
+    // Two-call interrupted turn: first call completes (real result logged),
+    // crash before the second call's result. Post-resume the completed call's
+    // REAL result content survives in the transcript; the second call gets
+    // exactly one synthetic is_error result. Run completes Done{Checks(green)}.
+    //
+    // This is the sibling of kill_and_resume_proof_deterministic_integration
+    // extended to the two-tool-call scenario that the original test skipped
+    // (a single-call turn where the buggy all-synthetic output coincides with
+    // the correct output — the bug was invisible).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn kill_and_resume_two_call_interrupted_turn() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // ---- Test-local panicky tool (always panics on invocation) ---------
+        struct PanickyTool {
+            counter: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Tool for PanickyTool {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "panicky-tool"
+            }
+
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "name": "panicky-tool",
+                    "description": "test tool that always panics (two-call kill-resume proof)",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] }
+                })
+            }
+
+            async fn run(&self, _input: serde_json::Value, _ctx: &ToolCtx) -> ToolResult {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                panic!("simulated host kill — two-call crash-resume proof");
+            }
+        }
+
+        // ---- Constants ---------------------------------------------------
+        const TASK_ID: &str = "two-call-kill-resume-task";
+        const ATTEMPT_N: u32 = 1;
+        const RUN_ID_LITERAL: &str = "two-call-kill-resume-task:1";
+        const ECHO_CALL_ID: &str = "c-echo-1";
+        const PANICKY_CALL_ID: &str = "c-panicky-1";
+        const PANICKY_TOOL_NAME: &str = "panicky-tool";
+        // EchoTool returns input.to_string() as its summary.
+        // Called with json!({}) the summary stored in the event is "{}".
+        const ECHO_EXPECTED_SUMMARY: &str = "{}";
+
+        // ---- Setup -------------------------------------------------------
+        let db_dir = TempDir::new().expect("create temp dir");
+        let db_path = db_dir.path().join("harness.db");
+        let panicky_counter = Arc::new(AtomicU32::new(0));
+
+        // ---- Leg 1: run until crash ----------------------------------------
+        // Model turn: [echo-call, panicky-call]. EchoTool completes; PanickyTool panics.
+        let db_path_for_spawn = db_path.clone();
+        let counter_for_spawn = panicky_counter.clone();
+
+        let leg1_handle = tokio::spawn(async move {
+            let backend = MockBackend::from_turns(vec![turn_with(
+                vec![
+                    tool_call(ECHO_CALL_ID, "echo", serde_json::json!({})),
+                    tool_call(PANICKY_CALL_ID, PANICKY_TOOL_NAME, serde_json::json!({})),
+                ],
+                StopReason::ToolUse,
+            )]);
+            let mut tools = ToolRegistry::new();
+            tools.register("echo", Arc::new(EchoTool));
+            tools.register(
+                PANICKY_TOOL_NAME,
+                Arc::new(PanickyTool {
+                    counter: counter_for_spawn,
+                }),
+            );
+            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+            let ctx = ToolCtx::stub();
+            let config = RunConfig::new("do the task", 10).with_checks(passing_runner());
+            let store: Arc<dyn RunStore> =
+                Arc::new(SqliteRunStore::open(&db_path_for_spawn).expect("open SQLite for leg 1"));
+            let pers = Persistence {
+                store,
+                task_id: TASK_ID.to_string(),
+                attempt_n: ATTEMPT_N,
+                model_label: "test-model".to_string(),
+            };
+            run_persisted(&backend, &tools, &ctx, &config, &pers).await
+        });
+
+        // Leg 1 must panic (PanickyTool always panics).
+        let leg1_join = leg1_handle.await;
+        assert!(leg1_join.is_err(), "leg 1 must return Err (panicked task)");
+        assert!(
+            leg1_join.unwrap_err().is_panic(),
+            "leg 1 JoinError must be a panic"
+        );
+
+        // ---- Verify crash state ------------------------------------------
+        // Log must end with a dangling ToolCallStarted for panicky-tool.
+        let store_post_crash: Arc<dyn RunStore> =
+            Arc::new(SqliteRunStore::open(&db_path).expect("open post-crash"));
+        let events_pre_resume = store_post_crash
+            .list_events(RUN_ID_LITERAL)
+            .await
+            .expect("list events");
+        let last_pre_crash = events_pre_resume.last().expect("non-empty log after crash");
+        assert!(
+            matches!(
+                last_pre_crash,
+                Event::ToolCallStarted { name, .. } if name == PANICKY_TOOL_NAME
+            ),
+            "last event after crash must be ToolCallStarted({PANICKY_TOOL_NAME}); \
+             got {last_pre_crash:?}"
+        );
+
+        // The echo call must have a ToolCallResult with is_error=false in the log.
+        let echo_result_in_log = events_pre_resume.iter().any(|e| {
+            matches!(
+                e,
+                Event::ToolCallResult {
+                    name,
+                    is_error: false,
+                    ..
+                } if name == "echo"
+            )
+        });
+        assert!(
+            echo_result_in_log,
+            "echo ToolCallResult(is_error=false) must be in log before resume; \
+             events: {events_pre_resume:?}"
+        );
+
+        // ---- Leg 2: crash-resume -----------------------------------------
+        let store_leg2: Arc<dyn RunStore> =
+            Arc::new(SqliteRunStore::open(&db_path).expect("open SQLite for leg 2"));
+
+        let backend_leg2 = MockBackend::from_turns(vec![turn_with(
+            vec![tool_call(
+                "c-finish-resume",
+                FINISH_TOOL_NAME,
+                serde_json::json!({
+                    "disposition": "done",
+                    "summary": "task complete after two-call crash-resume"
+                }),
+            )],
+            StopReason::ToolUse,
+        )]);
+
+        let mut tools_leg2 = ToolRegistry::new();
+        tools_leg2.register("echo", Arc::new(EchoTool));
+        tools_leg2.register(
+            PANICKY_TOOL_NAME,
+            Arc::new(PanickyTool {
+                counter: panicky_counter.clone(),
+            }),
+        );
+        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+
+        let ctx_leg2 = ToolCtx::stub();
+        let config_leg2 = RunConfig::new("do the task", 10).with_checks(passing_runner());
+
+        let resume_result = resume(
+            &backend_leg2,
+            &tools_leg2,
+            &ctx_leg2,
+            &config_leg2,
+            store_leg2,
+            RUN_ID_LITERAL,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("crash-resume must succeed");
+
+        // Terminal disposition must be Done{Checks(green)}.
+        let is_verified_done = matches!(
+            &resume_result.outcome,
+            LoopOutcome::Finished(Disposition::Done {
+                verification: Verification::Checks(report),
+                ..
+            }) if report.passed
+        );
+        assert!(
+            is_verified_done,
+            "two-call crash-resume must terminate in Done{{Checks(green)}}; \
+             got {:?}",
+            resume_result.outcome
+        );
+
+        // First leg-2 turn must see the reconciled user message with two blocks:
+        //   [0] echo-call: REAL result (content = ECHO_EXPECTED_SUMMARY, is_error=false)
+        //   [1] panicky-call: synthetic is_error=true, content contains "interrupted"
+        let leg2_messages = backend_leg2.messages_seen();
+        assert!(
+            !leg2_messages.is_empty(),
+            "leg 2 must draw at least one turn"
+        );
+        let first_turn = &leg2_messages[0];
+
+        // Find the reconciled User message (last User before the first Assistant).
+        let reconciled_user = first_turn
+            .iter()
+            .find(|m| {
+                matches!(m, Message::User { content }
+                    if content.iter().any(|b| matches!(b, UserBlock::ToolResult { .. })))
+            })
+            .expect("first leg-2 turn must include a User message with ToolResult blocks");
+
+        let Message::User { content: blocks } = reconciled_user else {
+            panic!("expected User message");
+        };
+        assert_eq!(
+            blocks.len(),
+            2,
+            "reconciled User must have exactly 2 ToolResult blocks; got {blocks:?}"
+        );
+
+        // Block 0: echo-call, real result.
+        match &blocks[0] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, ECHO_CALL_ID, "block[0] call_id must be echo");
+                assert!(
+                    !is_error,
+                    "echo call completed successfully — is_error must be false"
+                );
+                assert_eq!(
+                    content, ECHO_EXPECTED_SUMMARY,
+                    "echo call must carry its REAL result content, not synthetic"
+                );
+            }
+            UserBlock::Text(_) => panic!("expected ToolResult block 0; got Text"),
+        }
+
+        // Block 1: panicky-call, synthetic is_error.
+        match &blocks[1] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, PANICKY_CALL_ID, "block[1] call_id must be panicky");
+                assert!(
+                    *is_error,
+                    "panicky call was interrupted — is_error must be true"
+                );
+                assert!(
+                    content.contains("interrupted"),
+                    "panicky call content must contain 'interrupted'; got {content:?}"
+                );
+            }
+            UserBlock::Text(_) => panic!("expected ToolResult block 1; got Text"),
+        }
+
+        // PanickyTool must have been invoked exactly once (leg 1).
+        // Resume does NOT re-execute it.
+        assert_eq!(
+            panicky_counter.load(Ordering::SeqCst),
+            1,
+            "panicky-tool must be invoked exactly once (leg 1 only, never re-executed on resume)"
+        );
+    }
+
+    // Malformed-tail protection: reconcile_crash_tail must not panic or
+    // index-out-of-bounds when the log contains:
+    //   (a) a ToolCallResult with no preceding ToolCallStarted (orphaned result)
+    //   (b) duplicate call_ids in ToolCallStarted events
+    //
+    // In both cases the reconciler must degrade safely and return a valid
+    // (possibly all-synthetic) message list.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reconcile_crash_tail_malformed_tail_no_panic() {
+        // Build a record with one assistant tool call.
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let asst = Message::Assistant {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "id-a".to_string(),
+                name: "work".to_string(),
+                input: serde_json::json!({}),
+            })],
+        };
+        let mut record = make_minimal_record("malformed-task", 1);
+        record.messages = vec![task_seed, asst];
+
+        // ---- Case (a): orphaned ToolCallResult (no matching Started) -------
+        // Log ends with ToolCallStarted (so dangling check fires) but before it
+        // there's a ToolCallResult with no Started. The reconciler must not panic.
+        {
+            let store: Arc<dyn RunStore> =
+                Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+            store
+                .checkpoint("malformed-task:1", &record)
+                .await
+                .expect("checkpoint");
+
+            // Seed an orphaned ToolCallResult followed by a dangling Started.
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ModelCall {
+                        seq: 0,
+                        model: "t".to_string(),
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                    },
+                )
+                .await
+                .expect("mc");
+            // Orphaned result — no Started before it.
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ToolCallResult {
+                        seq: 0,
+                        name: "work".to_string(),
+                        is_error: false,
+                        summary: "orphaned".to_string(),
+                        offload_path: None,
+                    },
+                )
+                .await
+                .expect("orphaned result");
+            // Dangling Started — makes events.last() a ToolCallStarted.
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ToolCallStarted {
+                        seq: 0,
+                        name: "work".to_string(),
+                        args: serde_json::json!({}),
+                        call_id: "id-a".to_string(),
+                    },
+                )
+                .await
+                .expect("dangling started");
+
+            // Must not panic.
+            let msgs = super::reconcile_crash_tail(&record, &store, "malformed-task:1")
+                .await
+                .expect("reconcile must not fail on orphaned result");
+
+            // Should return task_seed + asst + reconciled user (all-synthetic for id-a).
+            assert_eq!(
+                msgs.len(),
+                3,
+                "must return 3 messages (seed + asst + reconciled)"
+            );
+            let Message::User { content } = &msgs[2] else {
+                panic!("third message must be User");
+            };
+            assert_eq!(content.len(), 1, "one ToolResult block for id-a");
+            match &content[0] {
+                UserBlock::ToolResult {
+                    call_id, is_error, ..
+                } => {
+                    assert_eq!(call_id, "id-a");
+                    // The orphaned result is ignored; the dangling Started has
+                    // call_id=id-a with no matching Result → synthetic is_error.
+                    assert!(
+                        *is_error,
+                        "id-a must be synthetic is_error (dangling Started)"
+                    );
+                }
+                UserBlock::Text(_) => panic!("expected ToolResult block"),
+            }
+        }
+
+        // ---- Case (b): duplicate call_ids in ToolCallStarted ---------------
+        {
+            let store: Arc<dyn RunStore> =
+                Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+            store
+                .checkpoint("malformed-task:1", &record)
+                .await
+                .expect("checkpoint");
+
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ModelCall {
+                        seq: 0,
+                        model: "t".to_string(),
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                    },
+                )
+                .await
+                .expect("mc");
+            // First Started(id-a).
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ToolCallStarted {
+                        seq: 0,
+                        name: "work".to_string(),
+                        args: serde_json::json!({}),
+                        call_id: "id-a".to_string(),
+                    },
+                )
+                .await
+                .expect("started1");
+            // Duplicate Started(id-a) — makes events.last() a ToolCallStarted.
+            store
+                .append_event(
+                    "malformed-task:1",
+                    Event::ToolCallStarted {
+                        seq: 0,
+                        name: "work".to_string(),
+                        args: serde_json::json!({}),
+                        call_id: "id-a".to_string(),
+                    },
+                )
+                .await
+                .expect("started2_duplicate");
+
+            // Must not panic.
+            let msgs = super::reconcile_crash_tail(&record, &store, "malformed-task:1")
+                .await
+                .expect("reconcile must not fail on duplicate call_id");
+
+            assert_eq!(msgs.len(), 3, "must return 3 messages");
+            let Message::User { content } = &msgs[2] else {
+                panic!("third message must be User");
+            };
+            assert_eq!(content.len(), 1, "one ToolResult block for id-a");
+            match &content[0] {
+                UserBlock::ToolResult {
+                    call_id, is_error, ..
+                } => {
+                    assert_eq!(call_id, "id-a");
+                    assert!(
+                        *is_error,
+                        "id-a must be synthetic is_error with duplicate Started"
+                    );
+                }
+                UserBlock::Text(_) => panic!("expected ToolResult block"),
+            }
         }
     }
 }
