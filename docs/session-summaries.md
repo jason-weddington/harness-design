@@ -67,3 +67,26 @@ quality misses. Morning boundary ritual: **3/3 pass^k** — haiku found and fixe
 planted bug and the harness verified `cargo test` green itself — then `./release.sh` cut
 **v0.1.0** with the first CHANGELOG and pushed to GitHub. Full write-up + handoff:
 **kb-02899**.
+
+---
+
+## Session 4 — 2026-07-07 → 07-08 — the second backend and the four-model matrix
+
+Hardened the eval, then took the 0.2.0 Ollama milestone end-to-end in a day. Three
+subtle-bug fixtures (boundary semantics, stateful omission, encoding panic) landed —
+and sonnet swept them 12/12, the **saturation finding**: a red test does the
+localization, so bug subtlety doesn't discriminate at frontier tier. Captured the
+levers on the board, wrote `docs/roadmap.md` (capability-themed milestones), then
+researched the current Ollama API against live docs: the real impedance seam is **no
+tool-call IDs** (name+order matching), not the parse-from-text problem we'd predicted;
+cloud and local are wire-identical, so **one adapter serves both**. One design
+correction en route: the planned post-hoc truncation check would false-positive on
+Ollama's KV-cache reuse — flipped to a pre-flight client-side guard. A two-item
+parallel wave (OllamaBackend + per-trial RunStats/metrics, both clean) unlocked the
+experiment: the same loop, byte-identical prompts, four models. **Sonnet 11/12 and
+GLM-5.2 12/12 at a uniform 5.00 iterations; gpt-oss:20b (think=high) 9/12; qwen3.6:35b
+7/12 — zero false dones in 36 verified trials.** Local models that completed ~nothing
+under a big general harness complete 58–75% of small real tasks under this one —
+directional evidence for the two-failure-modes thesis — and the opaque MaxIterations
+trials became the live argument for 0.3.0 durability. 0.2.0's capability claim is met;
+release ritual pending. Full write-up + handoff: **kb-02913**.
