@@ -3775,4 +3775,429 @@ mod tests {
             result.outcome
         );
     }
+
+    // 0.3.0-4: Kill-and-resume proof — the release-gate deterministic integration test.
+    //
+    // This test proves the crash-resume capability introduced by items 0.3.0-1/2/3.
+    // It runs WITHOUT #[ignore] and WITHOUT an env-var gate — it is always in CI.
+    //
+    // Trajectory:
+    //   Leg 1 (pre-crash):  model calls panicky-tool → tool panics → process "dies"
+    //   Leg 2 (post-resume): resume() reconciles the dangling tail, model calls finish
+    //
+    // All storage is FILE-BACKED (tempfile::TempDir + SqliteRunStore::open).
+    // No live model, no network.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn kill_and_resume_proof_deterministic_integration() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // ---- Test-local panicking tool ------------------------------------
+        // Follows the EchoTool test pattern (tool.rs:~388).
+        // On its FIRST invocation it increments a shared counter then panics,
+        // simulating a host crash mid-tool-execution.
+        struct PanickyTool {
+            counter: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Tool for PanickyTool {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "panicky-tool"
+            }
+
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "name": "panicky-tool",
+                    "description": "test tool that panics on first invocation (kill-resume proof)",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] }
+                })
+            }
+
+            async fn run(&self, _input: serde_json::Value, _ctx: &ToolCtx) -> ToolResult {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                panic!("simulated host kill — crash-resume proof leg 1");
+            }
+        }
+
+        // ---- Constants ---------------------------------------------------
+        // run_id format is {task_id}:{attempt_n} (D4).
+        const TASK_ID: &str = "kill-resume-task";
+        const ATTEMPT_N: u32 = 1;
+        const RUN_ID_LITERAL: &str = "kill-resume-task:1";
+        const PANICKY_TOOL_NAME: &str = "panicky-tool";
+        const PANICKY_CALL_ID: &str = "c-panicky-1";
+        // Per-turn token amounts (pinned so totals are computable constants).
+        const INPUT_TOKENS: u32 = 100;
+        const OUTPUT_TOKENS: u32 = 10;
+        const TOKENS_PER_TURN: u64 = (INPUT_TOKENS + OUTPUT_TOKENS) as u64; // 110
+
+        // ---- Setup: file-backed store + shared side-effect counter -------
+        let db_dir = TempDir::new().expect("create temp dir for SQLite DB");
+        let db_path = db_dir.path().join("harness.db");
+        let side_effect_counter = Arc::new(AtomicU32::new(0));
+
+        // Pre-compute the expected system prompt for the D9 byte-identity
+        // assertion. Both legs use identical tool registries (panicky-tool +
+        // finish), so the prompt rendered from this reference registry equals
+        // what each leg actually sends.
+        let runner_display = passing_runner().command_display();
+        let expected_system_prompt = {
+            let mut r = ToolRegistry::new();
+            r.register(
+                PANICKY_TOOL_NAME,
+                Arc::new(PanickyTool {
+                    counter: Arc::new(AtomicU32::new(0)), // dummy — schema only
+                }),
+            );
+            r.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+            prompt::render_system_prompt(&prompt::tool_lines(&r), Some(runner_display.as_str()))
+        };
+
+        // ---- Leg 1: run until crash (AC-2) -------------------------------
+        // Drive leg 1 inside tokio::spawn so we can catch the panic.
+        // D5 guarantees ToolCallStarted is appended BEFORE tools.invoke, so
+        // the log ends with a dangling ToolCallStarted when the tool panics.
+        let db_path_for_spawn = db_path.clone();
+        let counter_for_spawn = side_effect_counter.clone();
+
+        let leg1_handle = tokio::spawn(async move {
+            let backend = MockBackend::from_turns(vec![turn_with_usage(
+                vec![tool_call(
+                    PANICKY_CALL_ID,
+                    PANICKY_TOOL_NAME,
+                    serde_json::json!({}),
+                )],
+                StopReason::ToolUse,
+                usage_with(INPUT_TOKENS, OUTPUT_TOKENS),
+            )]);
+            let mut tools = ToolRegistry::new();
+            tools.register(
+                PANICKY_TOOL_NAME,
+                Arc::new(PanickyTool {
+                    counter: counter_for_spawn,
+                }),
+            );
+            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+            let ctx = ToolCtx::stub();
+            let config = RunConfig::new("do the task", 10).with_checks(passing_runner());
+            let store: Arc<dyn RunStore> =
+                Arc::new(SqliteRunStore::open(&db_path_for_spawn).expect("open SQLite for leg 1"));
+            let pers = Persistence {
+                store,
+                task_id: TASK_ID.to_string(),
+                attempt_n: ATTEMPT_N,
+                model_label: "test-model".to_string(),
+            };
+            // PanickyTool::run() panics here; the spawned task catches it.
+            run_persisted(&backend, &tools, &ctx, &config, &pers).await
+        });
+
+        // AC-2: Leg 1 must panic.
+        let leg1_join = leg1_handle.await;
+        assert!(
+            leg1_join.is_err(),
+            "leg 1 tokio::spawn must return Err (panicked task)"
+        );
+        assert!(
+            leg1_join.unwrap_err().is_panic(),
+            "leg 1 JoinError must be a panic, not a cancellation"
+        );
+
+        // ---- Verify crash state: log ends with dangling ToolCallStarted --
+        // Open a FRESH handle — simulates the harness opening the DB after
+        // a process restart.
+        let store_post_crash: Arc<dyn RunStore> =
+            Arc::new(SqliteRunStore::open(&db_path).expect("open SQLite post-crash"));
+        let events_pre_resume = store_post_crash
+            .list_events(RUN_ID_LITERAL)
+            .await
+            .expect("list events after crash");
+        assert!(
+            !events_pre_resume.is_empty(),
+            "event log must not be empty after leg 1 crash"
+        );
+        let last_pre_crash = events_pre_resume.last().expect("non-empty — just asserted");
+        // AC-2: the LAST event in list_events at crash time is ToolCallStarted.
+        assert!(
+            matches!(
+                last_pre_crash,
+                Event::ToolCallStarted { name, .. } if name == PANICKY_TOOL_NAME
+            ),
+            "last event after crash must be ToolCallStarted({PANICKY_TOOL_NAME}); \
+             got {last_pre_crash:?}"
+        );
+        let pre_crash_last_seq = match last_pre_crash {
+            Event::ToolCallStarted { seq, .. } => *seq,
+            _ => unreachable!("just matched above"),
+        };
+
+        // ---- Leg 2: crash-resume (AC-3) ----------------------------------
+        // Fresh store handle over the same file — durability proof: no in-memory dodge.
+        let store_leg2: Arc<dyn RunStore> =
+            Arc::new(SqliteRunStore::open(&db_path).expect("open SQLite for leg 2"));
+
+        // Scripted backend for leg 2: after reconcile feeds the synthetic
+        // ToolResult back, the model calls finish immediately.
+        let backend_leg2 = MockBackend::from_turns(vec![turn_with_usage(
+            vec![tool_call(
+                "c-finish-resume",
+                FINISH_TOOL_NAME,
+                serde_json::json!({
+                    "disposition": "done",
+                    "summary": "task complete after crash-resume"
+                }),
+            )],
+            StopReason::ToolUse,
+            usage_with(INPUT_TOKENS, OUTPUT_TOKENS),
+        )]);
+
+        // Same tool registry as leg 1 — D9 byte-identity requires identical
+        // tool_lines. Including panicky-tool here: its schema must match so
+        // the system prompt is byte-identical. The scripted backend does NOT
+        // call it in leg 2, so the counter stays at 1.
+        let mut tools_leg2 = ToolRegistry::new();
+        tools_leg2.register(
+            PANICKY_TOOL_NAME,
+            Arc::new(PanickyTool {
+                counter: side_effect_counter.clone(),
+            }),
+        );
+        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+
+        let ctx_leg2 = ToolCtx::stub();
+        let config_leg2 = RunConfig::new("do the task", 10).with_checks(passing_runner());
+
+        let resume_result = resume(
+            &backend_leg2,
+            &tools_leg2,
+            &ctx_leg2,
+            &config_leg2,
+            store_leg2,
+            RUN_ID_LITERAL,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("crash-resume must succeed without error");
+
+        // AC-3: Terminal disposition must be Done{Checks(green)}.
+        // A Blocked or Failed terminal fails the test.
+        let is_verified_done = matches!(
+            &resume_result.outcome,
+            LoopOutcome::Finished(Disposition::Done {
+                verification: Verification::Checks(report),
+                ..
+            }) if report.passed
+        );
+        assert!(
+            is_verified_done,
+            "crash-resume must terminate in Done{{Checks(green)}}; got {:?}",
+            resume_result.outcome
+        );
+
+        // ---- AC-4a: Resume-leg transcript contains synthetic ToolResult --
+        // D6: reconcile feeds a model::UserBlock::ToolResult{is_error=true,
+        // content contains "interrupted"} for the panicky call.
+        // The `content` field (not summary) is the assertion target.
+        let leg2_messages_seen = backend_leg2.messages_seen();
+        assert!(
+            !leg2_messages_seen.is_empty(),
+            "leg 2 must draw at least one model turn"
+        );
+        let first_turn = &leg2_messages_seen[0];
+        let synthetic_in_transcript = first_turn.iter().any(|msg| match msg {
+            Message::User { content } => content.iter().any(|b| {
+                matches!(
+                    b,
+                    UserBlock::ToolResult {
+                        is_error: true,
+                        call_id,
+                        content: c,
+                        ..
+                    } if call_id == PANICKY_CALL_ID && c.contains("interrupted")
+                )
+            }),
+            Message::Assistant { .. } => false,
+        });
+        assert!(
+            synthetic_in_transcript,
+            "first turn of leg 2 must include \
+             UserBlock::ToolResult{{is_error=true, call_id={PANICKY_CALL_ID:?}, \
+             content contains 'interrupted'}} (D6); messages: {first_turn:?}"
+        );
+
+        // ---- Collect final event log for remaining assertions ------------
+        let store_final: Arc<dyn RunStore> =
+            Arc::new(SqliteRunStore::open(&db_path).expect("open SQLite for final assertions"));
+        let all_events = store_final
+            .list_events(RUN_ID_LITERAL)
+            .await
+            .expect("list all events after both legs");
+
+        // ---- AC-4b: Exactly ONE synthetic ToolCallResult (is_error=true, "interrupted") --
+        // reconcile_crash_tail appends exactly one synthetic ToolCallResult for
+        // the dangling ToolCallStarted.
+        let synthetic_results: Vec<_> = all_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ToolCallResult {
+                        is_error: true,
+                        name,
+                        summary,
+                        ..
+                    } if name == PANICKY_TOOL_NAME && summary.contains("interrupted")
+                )
+            })
+            .collect();
+        assert_eq!(
+            synthetic_results.len(),
+            1,
+            "event log must contain exactly ONE synthetic ToolCallResult \
+             (is_error=true, name={PANICKY_TOOL_NAME:?}, summary contains 'interrupted'); \
+             found {}: {synthetic_results:?}",
+            synthetic_results.len()
+        );
+
+        // ---- AC-4c: Side-effect counter == 1 (no blind re-execution) ----
+        assert_eq!(
+            side_effect_counter.load(Ordering::SeqCst),
+            1,
+            "panicky-tool side-effect counter must be exactly 1 after both legs; \
+             the interrupted call must never be blindly re-executed"
+        );
+
+        // ---- AC-4d: Every ToolCallStarted has a matching ToolCallResult --
+        // After reconcile, the final log has no unpaired ToolCallStarted events:
+        // every Started is followed by a Result before the next ModelCall or
+        // end-of-log. Walk the events to verify.
+        {
+            let mut dangling: Option<&str> = None;
+            for event in &all_events {
+                match event {
+                    Event::ToolCallStarted { name, .. } => {
+                        assert!(
+                            dangling.is_none(),
+                            "ToolCallStarted({name}) found while {dangling:?} is still unpaired"
+                        );
+                        dangling = Some(name.as_str());
+                    }
+                    Event::ToolCallResult { name, .. } => {
+                        assert!(
+                            dangling.is_some(),
+                            "ToolCallResult({name}) has no matching ToolCallStarted"
+                        );
+                        dangling = None;
+                    }
+                    Event::ModelCall { .. } => {
+                        assert!(
+                            dangling.is_none(),
+                            "ModelCall arrived while ToolCallStarted({dangling:?}) is still unpaired"
+                        );
+                    }
+                    Event::PhaseTransition { .. }
+                    | Event::BudgetTick { .. }
+                    | Event::DispositionSet { .. } => {}
+                }
+            }
+            assert!(
+                dangling.is_none(),
+                "event log ends with an unpaired ToolCallStarted: {dangling:?}"
+            );
+        }
+
+        // ---- AC-5: Budget continuity — pinned integer literals -----------
+        // Leg 1: 1 turn × (INPUT + OUTPUT) tokens = TOKENS_PER_TURN, 1 iteration.
+        // Leg 2: 1 turn × (INPUT + OUTPUT) tokens = TOKENS_PER_TURN, 1 iteration.
+        // Total: iterations = 2, tokens = 2 × TOKENS_PER_TURN = 220, cost_micros = 0.
+        // item 0.3.0-3 wires no pricing, so cost_micros == 0.
+        let final_record = store_final
+            .load(RUN_ID_LITERAL)
+            .await
+            .expect("load final record")
+            .expect("record must exist after both legs");
+        assert_eq!(
+            final_record.budgets.consumed.iterations, 2,
+            "consumed.iterations must be exactly 2 (1 pre-crash + 1 post-resume); \
+             got {:?}",
+            final_record.budgets.consumed
+        );
+        assert_eq!(
+            final_record.budgets.consumed.tokens,
+            2 * TOKENS_PER_TURN,
+            "consumed.tokens must be exactly {} ({}×{} per turn × 2 turns); got {:?}",
+            2 * TOKENS_PER_TURN,
+            INPUT_TOKENS + OUTPUT_TOKENS,
+            2,
+            final_record.budgets.consumed
+        );
+        assert_eq!(
+            final_record.budgets.consumed.cost_micros, 0,
+            "consumed.cost_micros must be 0 (no pricing wired in 0.3.0); \
+             got {:?}",
+            final_record.budgets.consumed
+        );
+
+        // ---- AC-6: Seq monotonicity — no reset at the resume boundary ----
+        // Extract the monotonic seq from every event in the final log.
+        let seqs: Vec<u64> = all_events
+            .iter()
+            .map(|e| match e {
+                Event::ModelCall { seq, .. }
+                | Event::ToolCallStarted { seq, .. }
+                | Event::ToolCallResult { seq, .. }
+                | Event::PhaseTransition { seq, .. }
+                | Event::BudgetTick { seq, .. }
+                | Event::DispositionSet { seq, .. } => *seq,
+            })
+            .collect();
+
+        // Strictly increasing — no duplicates, no resets at the resume boundary.
+        for (i, window) in seqs.windows(2).enumerate() {
+            assert!(
+                window[1] > window[0],
+                "seq is not strictly increasing at position {i}: {} -> {}; \
+                 full seq list: {seqs:?}",
+                window[0],
+                window[1]
+            );
+        }
+
+        // The first event appended by the resumed loop has seq exactly one
+        // greater than the last event persisted before the crash.
+        // grounded in store.rs:322-323 (COALESCE(MAX(seq),-1)+1 per run).
+        // events_pre_resume.len() events were written in leg 1;
+        // seqs[events_pre_resume.len()] is the first seq added during resume.
+        let first_resumed_seq = seqs[events_pre_resume.len()];
+        assert_eq!(
+            first_resumed_seq,
+            pre_crash_last_seq + 1,
+            "first event appended by resumed loop (seq={first_resumed_seq}) must be \
+             exactly one greater than the last pre-crash event \
+             (seq={pre_crash_last_seq})"
+        );
+
+        // ---- AC-7: D9 System prompt byte-identity across the restart -----
+        // The resume-leg backend must see the byte-identical system prompt to
+        // what leg 1 would have sent — both are re-rendered from the same
+        // config + tools (not read from the checkpoint).
+        let leg2_systems = backend_leg2.systems_seen();
+        assert!(
+            !leg2_systems.is_empty(),
+            "leg 2 must observe at least one system prompt"
+        );
+        for (i, entry) in leg2_systems.iter().enumerate() {
+            let seen = entry
+                .as_ref()
+                .unwrap_or_else(|| panic!("leg 2 turn {i} must send a non-None system prompt"));
+            assert_eq!(
+                seen.as_bytes(),
+                expected_system_prompt.as_bytes(),
+                "leg 2 turn {i} system prompt must be byte-identical to the \
+                 pre-crash render (D9 prompt-cache invariant)"
+            );
+        }
+    }
 }
