@@ -1,0 +1,25 @@
+[package]
+name = "talos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Talos agent runner — executes a TaskSpec and reports outcome + exit code."
+
+[[bin]]
+name = "talos"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+harness = { path = "../harness" }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

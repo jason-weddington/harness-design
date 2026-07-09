@@ -2,7 +2,7 @@
 # adapter) get added to `members` as the harness grows.
 [workspace]
 resolver = "3"
-members = ["crates/harness"]
+members = ["crates/harness", "crates/talos"]
 # `fixtures/*` are self-contained cargo packages used as eval inputs (e.g.
 # `fixtures/broken-adder`, committed deliberately red). Excluding them keeps the
 # project's own gates from ever building, testing, or linting fixture code —
@@ -24,6 +24,8 @@ authors = ["Jason Weddington"]
 # strings. MIT OR Apache-2.0.
 askama = "0.16"
 async-trait = "0.1"
+# clap: command-line argument parsing with derive macros. MIT OR Apache-2.0.
+clap = { version = "4", features = ["derive"] }
 # reqwest pinned to the rustls (ring) TLS backend — no system OpenSSL, no
 # native-tls. `default-features = false` drops the native-tls baseline; we
 # only opt back into the bits we actually need (`json` for body
