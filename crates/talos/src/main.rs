@@ -393,9 +393,18 @@ fn read_spec_json(args: &RunArgs) -> Result<String, String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // 1. Parse CLI — clap usage errors → exit 1 + JSON error (NOT clap's default exit 2).
+    //    `--help`/`--version` also surface as `Err` from try_parse but are not
+    //    usage errors: print them plainly and exit 0.
     let cli = match <Cli as clap::Parser>::try_parse() {
         Ok(c) => c,
         Err(e) => {
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                std::process::exit(0);
+            }
             stderr_json_error(&e.to_string());
             std::process::exit(1);
         }

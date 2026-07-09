@@ -208,3 +208,31 @@ async fn backend_error_via_refused_port_writes_store_record() {
         record.disposition
     );
 }
+
+// ============================================================================
+// (d) --help is not a usage error: plain help on stdout, exit 0
+// ============================================================================
+
+/// `--help` surfaces as `Err` from `try_parse` but must NOT take the
+/// JSON-error exit-1 path — help goes to stdout plainly with exit 0.
+#[test]
+fn help_flag_exits_0_with_plain_help() {
+    let output = Command::new(TALOS_BIN)
+        .args(["run", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(output.status.code(), Some(0), "--help must exit 0");
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout_str.contains("--workspace"),
+        "help text must be on stdout; got: {stdout_str:?}"
+    );
+    assert!(
+        !stdout_str.trim_start().starts_with('{'),
+        "help must be plain text, not a JSON error object"
+    );
+}
