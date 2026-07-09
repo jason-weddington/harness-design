@@ -2,6 +2,24 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.3.0 - 2026-07-08
+#### Features
+- (**engine**) crash-resume + fresh-context restart - (3dea195) - Claude Haiku 4.5
+- (**engine**) run identity + checkpoint wiring into the loop - (688fc4f) - Claude Haiku 4.5
+- (**run_record**) schema v2 + disposition unification - (bb17d2b) - Claude Haiku 4.5
+#### Bug Fixes
+- (**engine**) reconcile on snapshot shape, not log-tail shape - (7e31d2b) - Jason Weddington
+- (**engine**) crash-resume reconciliation — filter tail to tool events, pair by call_id - (9ca028d) - Jason Weddington
+#### Documentation
+- add Session 5 summary (durability through the review gate) - (80474c9) - Jason Weddington
+- purge surviving pre-D6 idempotency/replay language - (01b72a1) - Jason Weddington
+- insert 0.3.5 first-dogfood milestone; bring roadmap current to v0.2.0 - (5ae3dd1) - Jason Weddington
+#### Tests
+- (**engine**) kill-and-resume proof deterministic integration test - (5c55fd6) - Claude Haiku 4.5
+- strengthen event byte-stability, per-iteration ordering, D9 observed-prompt assertions - (99998ea) - Jason Weddington
+
+- - -
+
 ## 0.2.0 - 2026-07-08
 #### Features
 - (**eval**) backend selection in coding_eval (EVAL_BACKEND=anthropic|ollama) - (4911790) - Jason Weddington
