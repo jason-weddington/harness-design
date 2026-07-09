@@ -32,10 +32,13 @@
 //!   tolerating schemas that omit `description`.
 //! - [`render_system_prompt`] — render the system prompt.
 //! - [`render_task_prompt`] — render the task-framing prompt.
+//! - [`render_task_prompt_from_spec`] — render the task prompt from a groomed
+//!   [`crate::task_spec::TaskSpec`], producing the `{{ task }}` slot content.
 
 use askama::Template;
 use serde_json::Value;
 
+use crate::task_spec::{FileToModify, TaskSpec};
 use crate::tool::ToolRegistry;
 
 /// One entry in the system prompt's tool listing: the tool's registered name
@@ -105,6 +108,20 @@ struct TaskPromptTemplate<'a> {
     task: &'a str,
 }
 
+/// The groomed-item task-spec template. Renders a [`TaskSpec`] into the
+/// content of the `{{ task }}` slot — the engine wraps it under `# Task`
+/// via [`render_task_prompt`]. `escape = "none"` is pinned so prompt text
+/// with `"`, `<`, `>`, or `&` passes through untouched.
+#[derive(Template)]
+#[template(path = "task_spec_prompt.md", escape = "none")]
+struct TaskSpecPromptTemplate<'a> {
+    title: &'a str,
+    description: &'a str,
+    acceptance_criteria: &'a [String],
+    files_to_modify: &'a [FileToModify],
+    gate_command: &'a str,
+}
+
 /// Render the system prompt.
 ///
 /// - `tools` is the ordered listing (typically from [`tool_lines`]).
@@ -142,10 +159,46 @@ pub fn render_task_prompt(task: &str) -> String {
         .expect("task_prompt.md is a static template that renders infallibly for owned inputs")
 }
 
+/// Render the task-spec prompt from a groomed GTD [`TaskSpec`].
+///
+/// Returns the content of the `{{ task }}` slot — the engine wraps it under
+/// a `# Task` heading via [`render_task_prompt`] when it wires the spec into
+/// a [`crate::engine::RunConfig`]. The output therefore begins with a
+/// `##`-level heading (the title) rather than a top-level `# `, so the
+/// two-level nesting composes correctly.
+///
+/// The rendered output covers all five [`TaskSpec`] fields: title (heading),
+/// description (prose), acceptance criteria (bullet list), files to modify
+/// (bullet list with navigation framing), and the gate command (verbatim
+/// shell command). Both list sections loop over their entire collections, so
+/// zero-element lists render without error.
+///
+/// The render is a pure function of its inputs and is byte-deterministic —
+/// re-rendering with the same [`TaskSpec`] produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_task_prompt_from_spec(spec: &TaskSpec) -> String {
+    TaskSpecPromptTemplate {
+        title: &spec.title,
+        description: &spec.description,
+        acceptance_criteria: &spec.acceptance_criteria,
+        files_to_modify: &spec.files_to_modify,
+        gate_command: &spec.gate_command,
+    }
+    .render()
+    .expect("task_spec_prompt.md is a static template that renders infallibly for owned inputs")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ToolLine, render_system_prompt, render_task_prompt, tool_lines};
+    use super::{
+        ToolLine, render_system_prompt, render_task_prompt, render_task_prompt_from_spec,
+        tool_lines,
+    };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
+    use crate::task_spec::{FileToModify, TaskSpec};
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use serde_json::{Value, json};
@@ -412,5 +465,168 @@ mod tests {
         assert!(rendered.contains("echo"));
         assert!(rendered.contains(FINISH_TOOL_NAME));
         assert!(rendered.contains("End the run"));
+    }
+
+    // --- render_task_prompt_from_spec tests ----------------------------------
+
+    fn sentinel_spec() -> TaskSpec {
+        TaskSpec {
+            title: "SENTINEL_TITLE".to_string(),
+            description: "SENTINEL_DESC".to_string(),
+            acceptance_criteria: vec!["SENTINEL_AC_1".to_string(), "SENTINEL_AC_2".to_string()],
+            files_to_modify: vec![
+                FileToModify {
+                    path: "SENTINEL_PATH_1".to_string(),
+                    change: "SENTINEL_CHANGE_1".to_string(),
+                },
+                FileToModify {
+                    path: "SENTINEL_PATH_2".to_string(),
+                    change: "SENTINEL_CHANGE_2".to_string(),
+                },
+            ],
+            gate_command: "SENTINEL_GATE".to_string(),
+        }
+    }
+
+    /// Pinned "no field silently dropped" test (the 0.3.0 lesson): all nine
+    /// sentinel substrings must appear in the rendered output. Askama's
+    /// compile-time check catches "template references missing struct field"
+    /// but NOT "struct field never referenced by template" — this runtime
+    /// test closes that gap. It also catches list fields rendered by indexing
+    /// `[0]` instead of a loop (only the second entry would be absent).
+    #[test]
+    fn render_task_prompt_from_spec_nine_sentinels() {
+        let spec = sentinel_spec();
+        let rendered = render_task_prompt_from_spec(&spec);
+
+        assert!(rendered.contains("SENTINEL_TITLE"), "title must appear");
+        assert!(
+            rendered.contains("SENTINEL_DESC"),
+            "description must appear"
+        );
+        assert!(rendered.contains("SENTINEL_AC_1"), "AC 1 must appear");
+        assert!(rendered.contains("SENTINEL_AC_2"), "AC 2 must appear");
+        assert!(rendered.contains("SENTINEL_PATH_1"), "path 1 must appear");
+        assert!(
+            rendered.contains("SENTINEL_CHANGE_1"),
+            "change 1 must appear"
+        );
+        assert!(rendered.contains("SENTINEL_PATH_2"), "path 2 must appear");
+        assert!(
+            rendered.contains("SENTINEL_CHANGE_2"),
+            "change 2 must appear"
+        );
+        assert!(
+            rendered.contains("SENTINEL_GATE"),
+            "gate_command must appear"
+        );
+    }
+
+    /// Empty collections must not panic and must still render the scalar fields.
+    #[test]
+    fn render_task_prompt_from_spec_empty_collections_no_panic() {
+        let spec = TaskSpec {
+            title: "TITLE_SENTINEL".to_string(),
+            description: "DESC_SENTINEL".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "GATE_SENTINEL".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+        assert!(
+            rendered.contains("TITLE_SENTINEL"),
+            "title still renders with empty collections"
+        );
+        assert!(
+            rendered.contains("DESC_SENTINEL"),
+            "description still renders with empty collections"
+        );
+        assert!(
+            rendered.contains("GATE_SENTINEL"),
+            "gate_command still renders with empty collections"
+        );
+    }
+
+    /// The prompt cache is byte-comparison sensitive. Rendering the same
+    /// `TaskSpec` twice must produce identical bytes.
+    #[test]
+    fn render_task_prompt_from_spec_byte_deterministic() {
+        let spec = sentinel_spec();
+        let first = render_task_prompt_from_spec(&spec);
+        let second = render_task_prompt_from_spec(&spec);
+        assert_eq!(
+            first.as_bytes(),
+            second.as_bytes(),
+            "same TaskSpec must produce byte-identical output"
+        );
+    }
+
+    /// HTML escaping must be off: `"`, `<`, `>`, `&` in any field pass
+    /// through untouched. Mirrors `special_characters_pass_through_unescaped`.
+    #[test]
+    fn render_task_prompt_from_spec_unescaped_passthrough() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: r#"handles "quotes" & <angles>"#.to_string(),
+            acceptance_criteria: vec![r#"AC with "quotes" & <angles>"#.to_string()],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+
+        assert!(
+            rendered.contains(r#""quotes""#),
+            "double quotes pass through"
+        );
+        assert!(rendered.contains("<angles>"), "angle brackets pass through");
+        assert!(rendered.contains(" & "), "ampersand passes through");
+        assert!(
+            !rendered.contains("&quot;"),
+            "should not HTML-escape quotes"
+        );
+        assert!(!rendered.contains("&lt;"), "should not HTML-escape <");
+        assert!(!rendered.contains("&gt;"), "should not HTML-escape >");
+    }
+
+    /// The `files_to_modify` section must carry navigation framing text
+    /// containing the literal substring `no search tool` (case-insensitive)
+    /// so a later wording pass cannot silently delete the framing.
+    #[test]
+    fn render_task_prompt_from_spec_no_search_tool_framing() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+        assert!(
+            rendered.to_lowercase().contains("no search tool"),
+            "files_to_modify section must contain framing text with 'no search tool'; \
+             got:\n{rendered}"
+        );
+    }
+
+    /// SLOT-CONTENT contract: the rendered output must not contain any line
+    /// that starts with `# ` (a top-level heading). The engine wraps the
+    /// slot content under `# Task`; emitting another top-level heading would
+    /// break the document structure. Title must use `##` or lower.
+    #[test]
+    fn render_task_prompt_from_spec_no_top_level_heading() {
+        let spec = sentinel_spec();
+        let rendered = render_task_prompt_from_spec(&spec);
+        for line in rendered.lines() {
+            assert!(
+                line != "# Task",
+                "rendered slot content must not contain a line exactly equal to '# Task'; \
+                 got:\n{rendered}"
+            );
+            assert!(
+                !line.starts_with("# "),
+                "rendered slot content must not contain a top-level '# ' heading; \
+                 offending line: {line:?}; full output:\n{rendered}"
+            );
+        }
     }
 }
