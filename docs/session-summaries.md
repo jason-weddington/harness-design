@@ -134,6 +134,19 @@ could see (talos absent from the sudoers NOPASSWD allowlist; `secure_path`
 missing `.cargo/bin`). Verified live on both hosts: installer twice each
 (second run byte-identical), sudo-boundary probes green, cold gate 22s (x86) /
 115s (Pi 5) — inside the 300s ChecksRunner default. First patrol staged:
-`gate_command` set, two talos-shaped items ready on `talos-haiku`. The
-capability claim — *the harness ships a merged change to its own repo* — is one
-supervised dispatch away. Full write-up + handoff: **kb-02956**.
+`gate_command` set, two talos-shaped items ready on `talos-haiku`.
+
+Then, next morning with Jason watching, the patrols ran — and **the capability
+claim came true**: two Talos-authored commits merged to this repo (f49dbac
+`--version`, f9153cd `--file` tests, author `talos-haiku@agent-gtd-dispatch`).
+The first attempt failed *instructively*: haiku finished and verified the work
+by iteration 6, then spent six iterations re-verifying acceptance criteria one
+at a time and hit `MaxIterations` one call short of `finish(done)` — a context
+failure in our own prompt layer, diagnosed entirely from the 0.3.0 run record,
+fixed with a finish-discipline line in the task template (pinned by test) plus
+12→24 iteration headroom, redeployed fleet-wide via one installer re-run, and
+verified Done ten minutes after failing. Patrol 2 passed first-shot and
+surfaced the session's other keeper: `gate_command` (nextest-only) was weaker
+than the repo's commit gate, so "verified Done" shipped lint debt — the
+project's gate is now the full fmt+clippy+nextest chain, making Done mean
+merge-ready. Full write-up + handoff: **kb-02956**.
