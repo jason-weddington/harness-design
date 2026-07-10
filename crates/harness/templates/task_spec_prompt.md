@@ -21,3 +21,8 @@ these files (and nothing else unless the description above says otherwise).
 Run the following command to verify the task is complete:
 
     {{ gate_command }}
+
+As soon as this command passes, call finish(done) immediately. Do not re-verify
+individual acceptance criteria with extra reads or commands after a passing
+check — the passing check IS the verification, and every additional step spends
+your iteration budget without adding evidence.

@@ -608,6 +608,29 @@ mod tests {
         );
     }
 
+    /// The verification section must carry finish-discipline framing containing
+    /// the literal substring `finish(done) immediately` — added after the first
+    /// dogfood run, where the model completed and verified the task by
+    /// iteration 6 and then exhausted the remaining budget re-verifying
+    /// individual acceptance criteria instead of finishing. A wording pass must
+    /// not silently delete this instruction.
+    #[test]
+    fn render_task_prompt_from_spec_finish_discipline_framing() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+        assert!(
+            rendered.contains("finish(done) immediately"),
+            "verification section must instruct the model to call finish(done) \
+             immediately after a passing check; got:\n{rendered}"
+        );
+    }
+
     /// SLOT-CONTENT contract: the rendered output must not contain any line
     /// that starts with `# ` (a top-level heading). The engine wraps the
     /// slot content under `# Task`; emitting another top-level heading would

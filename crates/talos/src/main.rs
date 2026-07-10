@@ -96,7 +96,12 @@ struct RunArgs {
     attempt: u32,
 
     /// Hard cap on agent-loop iterations.
-    #[arg(long, default_value_t = 12u32)]
+    ///
+    /// Default raised from 12 after the first dogfood run: a groomed item's
+    /// AC list invites per-criterion re-verification, and haiku exhausted 12
+    /// iterations one call short of finish(done) on a task it had already
+    /// completed and verified at iteration 6.
+    #[arg(long, default_value_t = 24u32)]
     max_iterations: u32,
 
     /// Timeout for the gate command, in seconds.
