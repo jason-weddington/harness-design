@@ -113,3 +113,27 @@ dispatched fix from the review findings, plus a lead catch at merge review (the 
 gate itself was still log-tail-shaped — now snapshot-shaped), doc sweep, test-strength
 batch. main @ 99998ea, 299 tests, capability claim true including the two-call
 discriminating case; release ritual pending. Full write-up + handoff: **kb-02931**.
+
+---
+
+## Session 6 — 2026-07-09/10 — the 0.3.5 epic: Talos becomes a build engine
+
+Planned and shipped the whole first-dogfood milestone in one (overnight-extended)
+session. Named the harness **Talos**; locked the no-MCP engine contract (worker
+serializes the groomed item + `gate_command` into TaskSpec JSON on stdin;
+disposition-mapped exit codes out, read from `LoopOutcome` so engine-broke never
+collapses into task-failed; worker owns all git and comment-back — a verified
+Done carries mechanical evidence, stronger than any agent self-report). Four
+dispatched builds across three repos landed clean: TaskSpec + groomed-item
+prompt (d9cb7cc), the `talos` CLI (0d69997 + a4c5b88 lead fix), the
+`talos-{haiku,sonnet,opus,qwen,glm}` engine family in agent-gtd-dispatch
+(deployed; all five advertising on both hosts), and a fully idempotent
+`setup-dispatch-host.sh --with-talos` — whose groom included **read-only ssh
+recon of the live hosts**, catching the two ship-blockers no repo-only groom
+could see (talos absent from the sudoers NOPASSWD allowlist; `secure_path`
+missing `.cargo/bin`). Verified live on both hosts: installer twice each
+(second run byte-identical), sudo-boundary probes green, cold gate 22s (x86) /
+115s (Pi 5) — inside the 300s ChecksRunner default. First patrol staged:
+`gate_command` set, two talos-shaped items ready on `talos-haiku`. The
+capability claim — *the harness ships a merged change to its own repo* — is one
+supervised dispatch away. Full write-up + handoff: **kb-02956**.
