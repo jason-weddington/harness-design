@@ -150,3 +150,32 @@ surfaced the session's other keeper: `gate_command` (nextest-only) was weaker
 than the repo's commit gate, so "verified Done" shipped lint debt — the
 project's gate is now the full fmt+clippy+nextest chain, making Done mean
 merge-ready. Full write-up + handoff: **kb-02956**.
+
+---
+
+## Session 7 — 2026-07-10 — eval hardening: the fixture ladder + sealed holdouts
+
+The saturated eval got its teeth back. Two structural upgrades: new fixtures are
+**TaskSpec-shaped** (fixture-root `task.json` routes through the production
+`render_task_prompt_from_spec` path, so the eval finally measures the prompt
+shape real dispatches use) and carry a **sealed `holdout/`** the agent under
+eval never sees — after each trial the gate re-runs with holdout tests copied
+in, making the false-done rate (self-gate green, holdout red) a first-class
+metric. Four new fixtures form a graded ladder: csv-ledger (tier 2 cross-file
+bugfix + distractor), walrus (tier 3 implement-to-spec), taskdeck (tier 4,
+committed gate GREEN by design — the agent writes its own tests, holdout is the
+truth), calc (tier 5, right-associative `^` across three coupled files). Groomed
+via workflow (critics caught an exact-list test that would have reddened main on
+the first fixture merge), shipped as one 5-item rollout in 32.5 min, manager
+merged everything.
+
+Then review-against-intent earned its keep a second time: **meets-with-gaps on
+a 100%-green board** — csv-ledger had shipped with the answer key workspace-
+visible (a `// BUG:` comment on the planted line, module docs naming the bug's
+file, the distractor disclaiming itself). Build agents write code optimized for
+review transparency, which is exactly backwards for adversarial eval content;
+the ban is now explicit convention (kb-02965) and the spoilers are stripped
+(329ad50). First data on the hardened suite (kb-02971): haiku 24/24, zero false
+dones, but tier-4/5 cost ~2x the iterations and ~3x the tokens of the legacy
+fixtures — discrimination lives on the cost axes until the local models weigh
+in. Full write-up + handoff: **kb-02972**.
