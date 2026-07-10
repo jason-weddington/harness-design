@@ -179,3 +179,18 @@ the ban is now explicit convention (kb-02965) and the spoilers are stripped
 dones, but tier-4/5 cost ~2x the iterations and ~3x the tokens of the legacy
 fixtures — discrimination lives on the cost axes until the local models weigh
 in. Full write-up + handoff: **kb-02972**.
+
+**Session 7, second sitting (same day):** The full five-model matrix landed:
+glm-5.2 24/24 (most efficient — calc at 4.0 mean iterations vs haiku's 13.0),
+qwen3.6:35b+think 24/24, haiku 24/24, sonnet 23/24, and gpt-oss:20b **11/24 —
+the ladder's first kill**, with holdout cleanly separating capability failures
+(calc/taskdeck 0/3 at the cap) from finish-discipline failures (csv-ledger:
+bug fixed, holdout green, `finish` never called). Zero false dones in 120
+trials; finish discipline is the universal residual failure and the prime
+0.4.0 input. The copy-in-hardening patrol failed identically on talos-haiku
+AND talos-sonnet (MaxIterations at ~2.3s/iteration in a 1,600-line file) —
+two different models failing the same way means a harness gap, not a model
+gap: the talos toolset has no search tool (captured as GTD c5836f1c); the
+lead landed the item inline. A `mean_wall` column joined the eval summary.
+Released as **v0.3.6** — a meaningfully more robust eval suite is the
+boundary. Matrix rows: kb-02971/02973/02976; updated handoff: kb-02972.
