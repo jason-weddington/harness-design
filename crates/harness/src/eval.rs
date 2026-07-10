@@ -473,9 +473,13 @@ pub fn finish_env() -> TrialEnv {
 }
 
 /// Copy the contents of a fixture source dir into a trial workspace, excluding
-/// two entries AT THE FIXTURE ROOT ONLY: the file `task.json` and the directory
-/// `holdout/`. Entries nested deeper in the tree (e.g. `src/task.json`) are
-/// copied verbatim — the exclusion is scoped to the top level.
+/// four entries AT THE FIXTURE ROOT ONLY: the eval-only `task.json` and
+/// `holdout/` (sealed from the agent under eval), plus the on-disk build
+/// artifacts `target/` and `Cargo.lock` (running `cargo test` inside a
+/// committed fixture leaves both behind; copying them would bloat every trial
+/// workspace and leak host build state). Entries nested deeper in the tree
+/// (e.g. `src/task.json`) are copied verbatim — the exclusion is scoped to the
+/// top level.
 ///
 /// # Errors
 /// Propagates any `std::fs` error (unreadable source, unwritable destination).
@@ -484,9 +488,10 @@ fn copy_fixture_into_workspace(fixture_src: &Path, workspace_root: &Path) -> std
     for entry in std::fs::read_dir(fixture_src)? {
         let entry = entry?;
         let name = entry.file_name();
-        // Skip top-level task.json (eval-only spec) and holdout/ (sealed
-        // holdout dir — the agent under eval must never see it).
-        if name == "task.json" || name == "holdout" {
+        // Skip top-level task.json (eval-only spec), holdout/ (sealed holdout
+        // dir — the agent under eval must never see it), and local build
+        // artifacts (target/, Cargo.lock).
+        if name == "task.json" || name == "holdout" || name == "target" || name == "Cargo.lock" {
             continue;
         }
         let dst_path = workspace_root.join(&name);
@@ -1408,6 +1413,10 @@ mod tests {
         // Nested src/task.json — must NOT be excluded (only root is excluded)
         std::fs::write(src.path().join("src/task.json"), "// nested\n")
             .expect("write src/task.json");
+        // Top-level build artifacts — must be excluded from workspace
+        std::fs::create_dir_all(src.path().join("target/debug")).expect("mkdir target/debug");
+        std::fs::write(src.path().join("target/debug/junk.bin"), "junk\n").expect("write junk");
+        std::fs::write(src.path().join("Cargo.lock"), "# lock\n").expect("write Cargo.lock");
 
         let env = build_coding_env(src.path());
         let root = env.ctx.workspace().root().to_path_buf();
@@ -1419,6 +1428,14 @@ mod tests {
         assert!(
             !root.join("holdout").exists(),
             "top-level holdout/ must be excluded from workspace"
+        );
+        assert!(
+            !root.join("target").exists(),
+            "top-level target/ build dir must be excluded from workspace"
+        );
+        assert!(
+            !root.join("Cargo.lock").exists(),
+            "top-level Cargo.lock must be excluded from workspace"
         );
         assert!(
             root.join("src/lib.rs").exists(),
@@ -1582,7 +1599,9 @@ mod tests {
     }
 
     /// Schema-validation: every `fixtures/*/task.json` must deserialize to
-    /// `TaskSpec`. Passes vacuously today (no task.json files exist yet).
+    /// `TaskSpec`. Non-vacuous since the task-spec-shaped fixture wave landed
+    /// (four task.json files at time of writing); also guards every future
+    /// fixture's task.json at the merge gate.
     #[test]
     fn fixture_task_json_files_are_valid_task_specs() {
         let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR"))
