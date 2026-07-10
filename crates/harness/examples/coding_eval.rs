@@ -247,8 +247,9 @@ async fn main() {
 
     // Final one-line-per-fixture summary table. Widths are computed so the
     // fixture-name column exactly fits the longest name (no truncation). The
-    // extra `mean_iters`, `total_tokens`, `false_dones`, and `holdout` columns
-    // surface per-trial detail collapsed into a compare-across-fixtures view.
+    // extra `mean_iters`, `total_tokens`, `mean_wall`, `holdout`, and
+    // `false_dn` columns surface per-trial detail collapsed into a
+    // compare-across-fixtures view.
     let name_col = summary
         .iter()
         .map(|(n, _)| n.len())
@@ -256,13 +257,38 @@ async fn main() {
         .unwrap_or(0)
         .max("fixture".len());
 
+    print_summary(&summary, name_col);
+}
+
+/// Render the final one-line-per-fixture summary table.
+fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
     println!("\n=== SUMMARY ===");
     println!(
-        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>11}  {:>8}",
-        "fixture", "passes/k", "pass_rate", "mean_iters", "total_tokens", "holdout", "false_dn",
+        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}",
+        "fixture",
+        "passes/k",
+        "pass_rate",
+        "mean_iters",
+        "total_tokens",
+        "mean_wall",
+        "holdout",
+        "false_dn",
     );
-    for (name, r) in &summary {
+    for (name, r) in summary {
         let total_tokens = r.total_input_tokens() + r.total_output_tokens();
+        // Mean per-trial wall-clock in seconds (0.0 for an empty report).
+        // `usize` → `f64` for the divisor: trial counts can't approach f64's
+        // precision limit — same rationale as `EvalReport::mean_iterations`.
+        #[allow(clippy::cast_precision_loss)]
+        let mean_wall = if r.trial_results.is_empty() {
+            0.0
+        } else {
+            r.trial_results
+                .iter()
+                .map(|t| t.stats.wall_clock.as_secs_f64())
+                .sum::<f64>()
+                / r.trial_results.len() as f64
+        };
         // Count trials that had a holdout re-gate (holdout_passed.is_some()).
         let holdout_n: u32 = r
             .trial_results
@@ -276,11 +302,12 @@ async fn main() {
             format!("{}/{}", r.holdout_passes(), holdout_n)
         };
         println!(
-            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>11}  {:>8}",
+            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>8.1}s  {:>11}  {:>8}",
             format!("{}/{}", r.passes, r.trials),
             r.pass_rate,
             r.mean_iterations(),
             format_tokens_compact(total_tokens),
+            mean_wall,
             holdout_col,
             r.false_dones(),
         );
