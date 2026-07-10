@@ -47,6 +47,9 @@
 //! - `CODING_EVAL_FIXTURE`   (optional) — narrows the run to the single named
 //!   fixture directory under `fixtures/` (e.g. `lru-cache`). When unset, every
 //!   directory under `fixtures/` is discovered and run in sorted order.
+//! - `CODING_EVAL_MAX_ITERATIONS` (optional) — per-trial agent-loop cap;
+//!   defaults to 12. The task-spec-shaped tiers (taskdeck, calc) benefit from
+//!   more headroom on small models — 24 matches the talos dispatch default.
 
 use std::env;
 use std::path::PathBuf;
@@ -144,17 +147,26 @@ fn backend_from_env() -> (Backend, String) {
 /// Default trial count when `CODING_EVAL_K` is not set (env-overridable).
 const DEFAULT_K: u32 = 3;
 
-/// Per-trial hard cap on agent-loop iterations. A fix-one-bug task needs a few
-/// read/edit/verify rounds, so this is a generous safety margin.
-const MAX_ITERATIONS: u32 = 12;
+/// Default per-trial hard cap on agent-loop iterations when
+/// `CODING_EVAL_MAX_ITERATIONS` is not set (env-overridable). A fix-one-bug
+/// task needs a few read/edit/verify rounds; the harder task-spec-shaped
+/// fixtures (implement-to-spec, write-your-own-tests) need more headroom.
+const DEFAULT_MAX_ITERATIONS: u32 = 12;
+
+/// Read a `u32` from the environment, falling back to `default` when the
+/// variable is unset or unparsable.
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let (backend, backend_desc) = backend_from_env();
-    let k = env::var("CODING_EVAL_K")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_K);
+    let k = env_u32("CODING_EVAL_K", DEFAULT_K);
+    let max_iterations = env_u32("CODING_EVAL_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS);
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears
     // the narrow-to-one-fixture override.
     let fixture_filter = env::var("CODING_EVAL_FIXTURE")
@@ -188,7 +200,7 @@ async fn main() {
 
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
-         (max_iterations={MAX_ITERATIONS})",
+         (max_iterations={max_iterations})",
         fixtures.len(),
     );
 
@@ -217,7 +229,7 @@ async fn main() {
             &backend,
             env_factory,
             k,
-            MAX_ITERATIONS,
+            max_iterations,
             |trial: &TrialResult| {
                 println!(
                     "  trial {}: {} | {}",
