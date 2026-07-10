@@ -46,6 +46,11 @@ loop-detection → continue. Termination is mechanical (gates green) **and** bou
 
 ## Tool inventory (v1)
 
+> **Rename note (2026-07-10):** the shell tool was renamed `run_command` → `bash`
+> (commit e80de7f) and switched to a single `command` string executed via `sh -c`,
+> rather than an argv array. Live references below use `bash`; dated decision-log
+> entries that still say `run_command` are kept verbatim as a historical record.
+
 The smallest high-leverage set for a build engine. Consolidated, not granular API
 coverage.
 
@@ -55,14 +60,14 @@ coverage.
 | `list_files` | Glob / directory listing | `glob` or `dir` | paths (capped) + total count |
 | `search_code` | ripgrep content search | `pattern`, `path_glob?` | `file:line` + matched line, capped, "N more in `<path>`" |
 | `edit_file` | Exact string-replace edit; creates file if absent | `path`, `old_string`, `new_string` (or `content` for new file) | ok + lines changed, **or** a steering error (no-unique-match → candidate locations) |
-| `run_command` | Bounded shell workhorse (add a dep, run a script, `git diff`, `ls`) | `command` (argv) | exit code + bounded stdout/stderr extract + full-log offload path |
+| `bash` | Bounded shell workhorse (add a dep, run a script, `git diff`, `ls`) | `command` (a single shell command string, passed to `sh -c`) | exit code + bounded stdout/stderr extract + full-log offload path |
 | `run_checks` | Run the project's declared quality gates | *(none — reads project config)* | structured per-gate pass/fail + failure extracts. **The done-oracle.** |
 | `comment` | Progress / disposition note to the task tracker | `body` | ok |
 | `finish` | Terminate with a structured disposition | `status: done\|blocked\|failed`, `report` | ends the run; `done` triggers final gate validation |
 
 Notes: `write_file` is folded into `edit_file` (absent file ⇒ create). **Git
 writes are not a tool** — the outer harness owns `commit`/`push` after gates pass;
-the agent only mutates the working tree (and may *read* git via `run_command`).
+the agent only mutates the working tree (and may *read* git via `bash`).
 
 ## Tool shape & contract
 
