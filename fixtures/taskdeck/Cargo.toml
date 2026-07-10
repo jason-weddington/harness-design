@@ -1,0 +1,15 @@
+[package]
+name = "taskdeck"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Zero dependencies on purpose: this fixture is copied into a throwaway temp
+# dir and built offline by the coding-task eval, so it must be self-contained.
+[dependencies]
+
+# An empty `[workspace]` table makes this fixture its OWN workspace root, so
+# `cargo test` (run standalone, or from the eval's temp-dir copy) never tries to
+# attach to the parent harness workspace. The parent also `exclude`s
+# `fixtures/*`; together the fixture is fully decoupled from the project's gates.
+[workspace]

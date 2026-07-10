@@ -1,0 +1,17 @@
+{
+  "title": "Finish the task-tracker CLI (complete + purge)",
+  "description": "The crate builds and tests pass in their committed state, but `complete` and `purge` in `src/commands.rs` are unimplemented stubs (`todo!()`). Implement them correctly and add tests that cover both functions.",
+  "acceptance_criteria": [
+    "Implement `complete(&mut self, id: u64) -> Result<(), CommandError>` in `src/commands.rs`: find the task by id and mark it done, returning `Ok(())`. If no task has that id, return `Err(CommandError::NotFound(id))`. Calling `complete` on an already-done task returns `Ok(())` (idempotent — no error).",
+    "Implement `purge(&mut self) -> usize` in `src/commands.rs`: remove every task whose `done` field is `true`, preserve the relative order of surviving (not-done) tasks, and return the count of tasks removed. A second call when no done tasks remain returns 0.",
+    "Add tests (inline `#[cfg(test)]` in `src/commands.rs` or another source file) that cover: `complete` returning `Err(CommandError::NotFound(_))` for a nonexistent id; `purge` retaining not-done tasks in their original insertion order; `purge` returning the correct removed count and returning 0 on a second call.",
+    "`cargo test` exits 0 with all tests passing."
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/commands.rs",
+      "change": "Replace the `todo!()` bodies in `complete` and `purge` with correct implementations, and add inline tests."
+    }
+  ],
+  "gate_command": "cargo test"
+}
