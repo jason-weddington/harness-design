@@ -1,0 +1,29 @@
+{
+  "title": "Add the ^ power operator to the Pratt-parser calculator",
+  "description": "The calc crate is a three-file Pratt-parser calculator (src/lexer.rs, src/parser.rs, src/eval.rs) supporting + - * / and unary minus. Your task is to add the ^ (caret) exponentiation operator.\n\nOperator semantics — these equalities define the required behaviour:\n- eval_str(\"2^3^2\") == 512  (^ is right-associative: 2^(3^2) = 2^9 = 512)\n- eval_str(\"-2^2\") == -4   (unary minus applies to the whole power: -(2^2))\n- eval_str(\"2^-1\") == 0.5  (unary minus is permitted in the exponent)\n- eval_str(\"2*3^2\") == 18  (^ binds tighter than * and /: 2*(3^2) = 18)\n\nTwo prose statements that must also hold:\n- ^ is right-associative\n- ^ binds tighter than * and /\n\nThe committed state is RED on exactly one test (`power_basic`, which asserts eval_str(\"2^3\") == Ok(8.0)) because the lexer does not yet recognise the `^` character — it returns Err on unknown tokens, so no compile error, just a runtime test failure.",
+  "acceptance_criteria": [
+    "src/lexer.rs: add a Caret token variant to Token and handle the `^` character in tokenize (currently the `^` character falls through to the unknown-token Err branch)",
+    "src/parser.rs: add a Pow(Box<Expr>, Box<Expr>) variant to Expr; add a right-associative binding-power entry for Caret (left_bp > right_bp so the right-hand recursive call accepts the same level again); add the Pow arm in parse_expr",
+    "src/eval.rs: add a Pow(base, exp) arm that evaluates to eval(base)?.powf(eval(exp)?)",
+    "^ is right-associative: eval_str(\"2^3^2\") == 512",
+    "^ binds tighter than * and /: eval_str(\"2*3^2\") == 18",
+    "eval_str(\"-2^2\") == -4  (unary minus applies after the power, not before)",
+    "eval_str(\"2^-1\") == 0.5  (unary minus is valid in the exponent position)",
+    "eval_str(\"(2^3)^2\") == 64  (explicit left grouping overrides right-associativity)"
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/lexer.rs",
+      "change": "Add a Caret variant to the Token enum and handle the `^` character in the tokenize match (currently `^` hits the catch-all unknown-token Err branch)."
+    },
+    {
+      "path": "src/parser.rs",
+      "change": "Add a Pow(Box<Expr>, Box<Expr>) variant to the Expr enum; add a right-associative binding-power pair for the Caret token in infix_bp where left_bp > right_bp (e.g. (7, 6)) placing ^ above * and /; add the Pow arm in the infix match inside parse_expr."
+    },
+    {
+      "path": "src/eval.rs",
+      "change": "Add an arm for Expr::Pow(base, exp) that returns Ok(eval(base)?.powf(eval(exp)?))."
+    }
+  ],
+  "gate_command": "cargo test"
+}
