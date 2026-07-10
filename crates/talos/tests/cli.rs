@@ -236,3 +236,27 @@ fn help_flag_exits_0_with_plain_help() {
         "help must be plain text, not a JSON error object"
     );
 }
+
+/// `--version` surfaces as `Err` from `try_parse` but must NOT take the
+/// JSON-error exit-1 path — version goes to stdout plainly with exit 0.
+#[test]
+fn version_flag_exits_0_with_plain_version() {
+    let output = Command::new(TALOS_BIN)
+        .args(["--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(output.status.code(), Some(0), "--version must exit 0");
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout_str.contains(env!("CARGO_PKG_VERSION")),
+        "version text must contain CARGO_PKG_VERSION; got: {stdout_str:?}"
+    );
+    assert!(
+        !stdout_str.trim_start().starts_with('{'),
+        "version must be plain text, not a JSON error object"
+    );
+}
