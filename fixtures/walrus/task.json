@@ -1,0 +1,22 @@
+{
+  "title": "Implement compact() for the WalrusStore append-only KV store",
+  "description": "The `WalrusStore` in `src/lib.rs` is an append-only in-memory key–value store with `String` keys and `i64` values.\n\nEvery `put` and `delete` appends a record to an internal `Vec` log. The log is the source of truth for both value lookups and ordering. A `HashMap` index maps each key to its latest log position so `get` is O(1).\n\n`put`, `get`, `delete`, and `records()` are fully implemented. `compact()` is left as `todo!()` — your task is to implement it.\n\n**compact() specification:**\n\n1. **Live-latest-per-key.** Walk the log and determine, for each key, whether its *latest* record is a put (`Some(v)`) or a tombstone (`None`). A key is *live* if its latest record is a put; it is *dead* if its latest record is a tombstone.\n\n2. **Drop dead keys entirely.** Keys whose latest record is a tombstone must be completely absent from the compacted log — no tombstone entry, no live entry.\n\n3. **Preserve the original append order of latest records.** The surviving records are ordered by the **position of each key's latest record** in the pre-compaction log (smallest position first). If a key was deleted and then re-inserted, its position is the position of that final re-insertion, not the original insertion.\n\n4. **Index consistency.** After `compact()`, every `get(key)` must return the same value as immediately before `compact()`. Rebuild the internal index so it maps each live key to its new position in the compacted log.\n\n5. **`records()` reflects the compacted log.** After `compact()`, `records()` returns the compacted log in append order — one entry per live key, all values `Some(v)` (no tombstones remain). Do NOT change the signature of `records()`.\n\n**Hints:**\n- The `index` maps each key to the position of its *latest* record in `log`. Use it to identify live keys and their latest values, but note that iterating a `HashMap` does not preserve order — you need the positional information from the log itself to determine the correct output order.\n- The `crc32` function in this file computes a checksum and is available for external integrity checks (e.g., verifying that live values are unchanged across compaction). It is NOT required by `compact()` itself.\n- After a correct compaction, `records()` will contain exactly one `Some(v)` entry per live key, in the order dictated by each key's latest log position.",
+  "acceptance_criteria": [
+    "compact() is implemented (body is not todo!()) and passes the visible test compact_keeps_live_latest.",
+    "After compact(), records() returns exactly one entry per live key (no tombstones, no duplicates), with all values Some(v).",
+    "After compact(), records() entries are ordered by the position of each key's LATEST record in the pre-compaction log (earliest latest-position first).",
+    "A key whose latest record is a tombstone (delete) is completely absent from records() after compact() — neither a Some entry nor a None entry.",
+    "A key that was deleted and then re-inserted appears at the position of its LATEST put, not its original put position, in the compacted log.",
+    "After compact(), get(key) returns the same value as immediately before compact() for every key.",
+    "Calling compact() twice in a row produces the same records() result as calling it once (idempotence).",
+    "compact() on an empty store does not panic; records() returns an empty Vec.",
+    "The signatures of records(), get(), put(), and delete() are unchanged."
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/lib.rs",
+      "change": "Implement the compact() method body (currently todo!()). Replace todo!() with a correct implementation. Do not modify put(), get(), delete(), records(), crc32(), or any existing test."
+    }
+  ],
+  "gate_command": "cargo test"
+}
