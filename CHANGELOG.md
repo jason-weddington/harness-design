@@ -2,6 +2,26 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.3.6 - 2026-07-10
+#### Features
+- (**eval**) walrus fixture — implement compact() in append-only KV store (tier 3) - (672f5d2) - Claude Agent
+- (**eval**) calc fixture — right-associative power operator (tier 5) - (bb17d4e) - Claude Agent
+- (**eval**) csv-ledger fixture — cross-file bug fix with distractor (tier 2) - (dfc0b28) - Claude Agent
+- (**eval**) taskdeck fixture — finish a half-built task-tracker CLI (tier 4) - (8d6bbe5) - Claude Agent
+- (**eval**) TaskSpec-shaped fixture prompts + sealed holdout re-gate - (ef920f1) - Claude Agent
+#### Bug Fixes
+- (**eval**) exclude fixture-root target/ and Cargo.lock from trial copy-in - (df085f4) - Jason Weddington
+- (**eval**) strip answer-key spoilers from csv-ledger, fix taskdeck file set - (329ad50) - Jason Weddington
+#### Documentation
+- Session 7 second sitting — 5-model matrix, talos search-tool finding - (b7e0688) - Jason Weddington
+- Session 7 summary — eval hardening, holdout re-gate, fixture ladder - (a25bf32) - Jason Weddington
+#### Miscellaneous Chores
+- (**eval**) add mean_wall column to the coding_eval summary table - (bd7fb82) - Jason Weddington
+- (**eval**) make coding_eval iteration cap env-overridable - (d4e33ef) - Jason Weddington
+- (**eval**) relax fixture-discovery test to containment - (c10e501) - Jason Weddington
+
+- - -
+
 ## 0.3.5 - 2026-07-10
 #### Features
 - (**talos**) support --version (clap version flag) - (f49dbac) - Jason Weddington, *talos-haiku*
