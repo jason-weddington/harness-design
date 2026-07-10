@@ -11,6 +11,10 @@
     {
       "path": "src/commands.rs",
       "change": "Replace the `todo!()` bodies in `complete` and `purge` with correct implementations, and add inline tests."
+    },
+    {
+      "path": "src/store.rs",
+      "change": "If the implementations need access to the store's internals beyond the current public API, expose what they need here (e.g. a crate-visible accessor) — keep the existing public surface unchanged."
     }
   ],
   "gate_command": "cargo test"

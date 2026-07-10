@@ -61,7 +61,7 @@ pub fn parse_csv(csv: &str) -> Result<Vec<Transaction>, String> {
 
         // Sign convention: credits are positive, debits are negative.
         let signed = match kind {
-            "credit" => -amount_cents, // BUG: should be `+amount_cents`
+            "credit" => -amount_cents,
             "debit" => -amount_cents,
             _ => {
                 return Err(format!(

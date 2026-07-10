@@ -1,8 +1,8 @@
 //! Ledger: orders and holds a list of [`Transaction`]s.
 //!
-//! This module is correct — no bug lives here.  It sorts the raw parsed
-//! transactions into chronological order so downstream callers receive a
-//! deterministic sequence regardless of the order rows appear in the CSV.
+//! Sorts the raw parsed transactions into chronological order so downstream
+//! callers receive a deterministic sequence regardless of the order rows
+//! appear in the CSV.
 
 use crate::parser::Transaction;
 

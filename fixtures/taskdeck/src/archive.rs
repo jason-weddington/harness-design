@@ -1,11 +1,7 @@
 #![allow(dead_code)]
-//! Archive module — an alternative approach to handling completed tasks.
-//!
-//! Instead of removing done tasks in place, `archive_done` moves them to a
-//! separate archive buffer. This is NOT the intended `purge` strategy: archived
-//! tasks are relocated to a secondary store rather than simply deleted, and the
-//! archive grows unboundedly. Do not confuse this with `commands::purge`, which
-//! discards done tasks entirely.
+//! Archive module — moves tasks out of the main store into a secondary
+//! archive buffer, preserving them for later inspection. The archive grows
+//! unboundedly; nothing placed in it is ever deleted.
 
 use crate::model::Task;
 

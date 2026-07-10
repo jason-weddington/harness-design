@@ -1,10 +1,5 @@
 //! Currency display helpers — converts integer cents to a human-readable
 //! dollar string.
-//!
-//! **This module is NOT on the arithmetic path.**  All ledger totals are
-//! stored and compared as `i64` cents; this module is only for rendering
-//! values to a human-readable form.  No change to this file is needed to fix
-//! the failing test.
 
 /// Format a signed cent amount as a dollar string.
 ///

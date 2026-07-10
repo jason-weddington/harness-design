@@ -1,8 +1,6 @@
 //! Monthly-totals report over a ledger of transactions.
 //!
-//! This module is correct — no bug lives here.  The single visible failing
-//! test is in this module; it is RED in the committed state solely because of
-//! the sign bug in `src/parser.rs`, not because of any defect here.
+//! Aggregates parsed transactions into per-month net totals for display.
 
 use crate::parser::Transaction;
 use std::collections::BTreeMap;
