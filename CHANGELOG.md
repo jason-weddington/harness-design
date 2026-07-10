@@ -2,6 +2,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.3.5 - 2026-07-10
+#### Features
+- (**talos**) support --version (clap version flag) - (f49dbac) - Jason Weddington, *talos-haiku*
+- (**talos**) add talos CLI — task spec in, disposition-mapped exit code out - (0d69997) - Jason Weddington, *Claude Fable 5*
+- (**task_spec**) add TaskSpec wire type and groomed-item task prompt - (d9cb7cc) - Jason Weddington, *Claude Fable 5*
+#### Bug Fixes
+- (**prompt**) finish-discipline framing + max-iterations headroom for groomed items - (5a7107e) - Jason Weddington, *Claude Fable 5*
+- (**talos**) --help/--version exit 0 with plain output, not JSON error - (a4c5b88) - Jason Weddington, *Claude Fable 5*
+#### Documentation
+- complete Session 6 summary — first patrols merged, capability claim true - (d5fb086) - Jason Weddington, *Claude Fable 5*
+- add Session 6 summary (the 0.3.5 epic — Talos becomes a build engine) - (ef0a7fa) - Jason Weddington, *Claude Fable 5*
+#### Tests
+- (**talos**) integration coverage for --file spec input - (f9153cd) - Jason Weddington, *talos-haiku*
+
+- - -
+
 ## 0.3.0 - 2026-07-08
 #### Features
 - (**engine**) crash-resume + fresh-context restart - (3dea195) - Claude Haiku 4.5
