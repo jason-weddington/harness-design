@@ -260,3 +260,166 @@ fn version_flag_exits_0_with_plain_version() {
         "version must be plain text, not a JSON error object"
     );
 }
+
+// ============================================================================
+// (e) --file spec input tests
+// ============================================================================
+
+/// Valid spec via `--file` with deterministic `BackendError` via refused-port Ollama.
+/// Asserts:
+/// - exit code 1 (`BackendError` → 1)
+/// - stdout summary is valid JSON with `outcome == "BackendError"`
+/// - spec is read from file, NOT stdin (stdin set to `Stdio::null()`)
+#[test]
+fn valid_spec_via_file_input_backend_error_via_refused_port() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    let spec_file = dir.path().join("spec.json");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    // Write valid spec to a temp file
+    std::fs::write(&spec_file, valid_spec_json()).expect("write spec file");
+
+    let task_id = "file-input-test";
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--file",
+            spec_file.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            task_id,
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "BackendError via --file must exit 1"
+    );
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let summary: serde_json::Value = serde_json::from_str(stdout_str.trim()).unwrap_or_else(|_| {
+        panic!("stdout must be valid JSON summary; got: {stdout_str:?}");
+    });
+    assert_eq!(
+        summary.get("outcome").and_then(serde_json::Value::as_str),
+        Some("BackendError"),
+        "summary outcome must be \"BackendError\"; got: {summary}"
+    );
+}
+
+/// Malformed JSON in `--file` exits 1; stderr is a one-line JSON `{"error": ...}`;
+/// no store record is written (store file must not exist).
+#[test]
+fn malformed_spec_file_exits_1_with_json_error_no_record() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    let spec_file = dir.path().join("malformed.json");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    // Write invalid JSON to a temp file
+    std::fs::write(&spec_file, "this is not valid json at all").expect("write spec file");
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--file",
+            spec_file.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed --file must exit 1"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr_str.trim()).unwrap_or_else(|_| {
+        panic!("stderr must be valid JSON; got: {stderr_str:?}");
+    });
+    assert!(
+        parsed.get("error").is_some(),
+        "stderr JSON must have an `error` key; got: {parsed}"
+    );
+
+    // Spec parsing fails before the store is opened → the store file must
+    // not exist.
+    assert!(
+        !store_path.exists(),
+        "no store file must be written when spec parsing fails"
+    );
+}
+
+/// Nonexistent `--file` path exits 1; stderr is a one-line JSON `{"error": ...}`.
+#[test]
+fn nonexistent_file_path_exits_1_with_json_error() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    let nonexistent_file = dir.path().join("does_not_exist.json");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--file",
+            nonexistent_file.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "nonexistent --file must exit 1"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr_str.trim()).unwrap_or_else(|_| {
+        panic!("stderr must be valid JSON; got: {stderr_str:?}");
+    });
+    assert!(
+        parsed.get("error").is_some(),
+        "stderr JSON must have an `error` key; got: {parsed}"
+    );
+}
