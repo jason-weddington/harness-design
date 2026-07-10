@@ -146,7 +146,7 @@ fn short_type_name(v: &Value) -> &'static str {
 fn create_file(display_path: &str, resolved: &Path, new_string: &str) -> ToolResult {
     if resolved.exists() {
         return ToolResult::error(format!(
-            "`{display_path}` already exists — pass a non-empty `old_string` to edit it, or delete it first via run_command if you truly need to overwrite"
+            "`{display_path}` already exists — pass a non-empty `old_string` to edit it, or delete it first via bash if you truly need to overwrite"
         ));
     }
     if let Some(parent) = resolved.parent()
@@ -220,7 +220,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The write goes to a sibling temp file in the same directory and is then
 /// renamed over `target`. Rationale: a crash (or `kill -9`, or an OOM) mid-write
 /// must not leave a truncated source file for the next `run_checks` /
-/// `run_command` to trip over — the harness would then chase a phantom "the
+/// `bash` to trip over — the harness would then chase a phantom "the
 /// build broke" instead of the real regression. Same-directory rename is
 /// atomic on Linux (POSIX `rename(2)` on a single filesystem), which is our
 /// only deployment target (see `workspace.rs`).

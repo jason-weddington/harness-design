@@ -6,7 +6,7 @@
 //! Two layers live here:
 //!
 //! - [`ExecSpec`] / [`ExecOutcome`] / [`run`] — the raw exec primitive. Every
-//!   model-driven command (`run_command`) and the project's quality gates
+//!   model-driven command (`bash`) and the project's quality gates
 //!   (`run_checks`) go through this one place, so the creds-hygiene guarantee
 //!   below is enforced once.
 //! - [`CheckCommand`] / [`CheckReport`] / [`ChecksRunner`] — the declared

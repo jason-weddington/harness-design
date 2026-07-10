@@ -11,21 +11,21 @@ use std::sync::Arc;
 use crate::engine::{FINISH_TOOL_NAME, FinishTool};
 use crate::exec::ChecksRunner;
 use crate::tool::ToolRegistry;
+use crate::tools::bash::BashTool;
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::list_files::ListFilesTool;
 use crate::tools::read_file::{READ_FILE_TOOL_NAME, ReadFileTool};
 use crate::tools::run_checks::RunChecksTool;
-use crate::tools::run_command::RunCommandTool;
 
+pub mod bash;
 pub mod edit_file;
 pub mod list_files;
 pub mod read_file;
 pub mod run_checks;
-pub mod run_command;
 
 /// Build the standard v1 [`ToolRegistry`]: the file-editing suite
 /// (`read_file`, `list_files`, `edit_file`), the shell workhorse
-/// (`run_command`), the loop's [`FinishTool`], and — when a [`ChecksRunner`]
+/// (`bash`), the loop's [`FinishTool`], and — when a [`ChecksRunner`]
 /// is supplied — the `run_checks` tool.
 ///
 /// Order-of-registration does not matter for the model-facing schema list:
@@ -40,7 +40,7 @@ pub fn standard_registry(checks: Option<ChecksRunner>) -> ToolRegistry {
     registry.register(READ_FILE_TOOL_NAME, Arc::new(ReadFileTool));
     registry.register("list_files", Arc::new(ListFilesTool));
     registry.register("edit_file", Arc::new(EditFileTool));
-    registry.register("run_command", Arc::new(RunCommandTool));
+    registry.register("bash", Arc::new(BashTool));
     registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
     if let Some(runner) = checks {
         registry.register("run_checks", Arc::new(RunChecksTool::new(runner)));
@@ -87,11 +87,11 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "bash".to_string(),
                 "edit_file".to_string(),
                 FINISH_TOOL_NAME.to_string(),
                 "list_files".to_string(),
                 "read_file".to_string(),
-                "run_command".to_string(),
             ],
             "no-checks registry excludes run_checks"
         );
@@ -104,12 +104,12 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "bash".to_string(),
                 "edit_file".to_string(),
                 FINISH_TOOL_NAME.to_string(),
                 "list_files".to_string(),
                 "read_file".to_string(),
                 "run_checks".to_string(),
-                "run_command".to_string(),
             ],
             "with-checks registry includes run_checks"
         );
@@ -122,7 +122,7 @@ mod tests {
             "read_file",
             "list_files",
             "edit_file",
-            "run_command",
+            "bash",
             FINISH_TOOL_NAME,
             "run_checks",
         ] {

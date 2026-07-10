@@ -588,11 +588,13 @@ mod tests {
         assert!(!rendered.contains("&gt;"), "should not HTML-escape >");
     }
 
-    /// The `files_to_modify` section must carry navigation framing text
-    /// containing the literal substring `no search tool` (case-insensitive)
-    /// so a later wording pass cannot silently delete the framing.
+    /// The `files_to_modify` section must carry affirmative navigation guidance
+    /// directing the model to use the bash tool (grep/find) to locate code.
+    /// The old denial phrase "No search tool" must be gone — replacing it was
+    /// the whole point of this template change (post-mortem kb-02977). A wording
+    /// pass that re-introduces the denial or removes the bash guidance fails here.
     #[test]
-    fn render_task_prompt_from_spec_no_search_tool_framing() {
+    fn render_task_prompt_from_spec_bash_navigation_guidance() {
         let spec = TaskSpec {
             title: "T".to_string(),
             description: "D".to_string(),
@@ -602,8 +604,13 @@ mod tests {
         };
         let rendered = render_task_prompt_from_spec(&spec);
         assert!(
-            rendered.to_lowercase().contains("no search tool"),
-            "files_to_modify section must contain framing text with 'no search tool'; \
+            rendered.contains("bash tool"),
+            "files_to_modify section must contain affirmative bash-tool navigation guidance; \
+             got:\n{rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("no search tool"),
+            "files_to_modify section must NOT contain the old denial phrase 'No search tool'; \
              got:\n{rendered}"
         );
     }

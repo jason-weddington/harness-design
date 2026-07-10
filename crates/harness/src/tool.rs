@@ -3,7 +3,7 @@
 //! [`ToolCtx`] that carries per-run plumbing (the offload sink) into a tool's
 //! `run`.
 //!
-//! This is the *shape* only — no concrete tools (`read_file`, `run_command`,
+//! This is the *shape* only — no concrete tools (`read_file`, `bash`,
 //! …) live here; those land in later items. The pieces here establish the
 //! contract every tool obeys:
 //!
