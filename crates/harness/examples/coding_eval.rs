@@ -235,8 +235,8 @@ async fn main() {
 
     // Final one-line-per-fixture summary table. Widths are computed so the
     // fixture-name column exactly fits the longest name (no truncation). The
-    // extra `mean_iters` and `total_tokens` columns surface the per-trial
-    // detail collapsed into a compare-across-fixtures view.
+    // extra `mean_iters`, `total_tokens`, `false_dones`, and `holdout` columns
+    // surface per-trial detail collapsed into a compare-across-fixtures view.
     let name_col = summary
         .iter()
         .map(|(n, _)| n.len())
@@ -246,17 +246,31 @@ async fn main() {
 
     println!("\n=== SUMMARY ===");
     println!(
-        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}",
-        "fixture", "passes/k", "pass_rate", "mean_iters", "total_tokens",
+        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>11}  {:>8}",
+        "fixture", "passes/k", "pass_rate", "mean_iters", "total_tokens", "holdout", "false_dn",
     );
     for (name, r) in &summary {
         let total_tokens = r.total_input_tokens() + r.total_output_tokens();
+        // Count trials that had a holdout re-gate (holdout_passed.is_some()).
+        let holdout_n: u32 = r
+            .trial_results
+            .iter()
+            .filter(|t| t.holdout_passed.is_some())
+            .map(|_| 1u32)
+            .sum();
+        let holdout_col = if holdout_n == 0 {
+            "-".to_string()
+        } else {
+            format!("{}/{}", r.holdout_passes(), holdout_n)
+        };
         println!(
-            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}",
+            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>11}  {:>8}",
             format!("{}/{}", r.passes, r.trials),
             r.pass_rate,
             r.mean_iterations(),
             format_tokens_compact(total_tokens),
+            holdout_col,
+            r.false_dones(),
         );
     }
 }

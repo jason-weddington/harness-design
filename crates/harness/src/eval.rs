@@ -106,6 +106,11 @@ pub struct TrialResult {
     pub trial: u32,
     /// Whether [`EvalTask::success`] accepted this trial's terminal outcome.
     pub passed: bool,
+    /// Result of the out-of-band holdout re-gate run after the trial loop
+    /// terminated. `None` means no holdout re-gate ran (either the fixture had
+    /// no top-level `holdout/` dir, or the trial env carried no
+    /// [`ChecksRunner`]). `Some(true)` / `Some(false)` is the re-gate outcome.
+    pub holdout_passed: Option<bool>,
     /// The engine's terminal [`LoopOutcome`] for this trial.
     pub outcome: LoopOutcome,
     /// Mechanical stats the engine accumulated over this trial's run.
@@ -199,6 +204,59 @@ impl EvalReport {
     pub fn total_wall_clock(&self) -> Duration {
         self.trial_results.iter().map(|t| t.stats.wall_clock).sum()
     }
+
+    /// Count of trials where the holdout re-gate ran and passed
+    /// (`holdout_passed == Some(true)`). Returns `0` for an empty report.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use harness::eval::EvalReport;
+    /// let report = EvalReport {
+    ///     task_name: "t".to_string(),
+    ///     trials: 0,
+    ///     passes: 0,
+    ///     pass_rate: 0.0,
+    ///     trial_results: Vec::new(),
+    /// };
+    /// assert_eq!(report.holdout_passes(), 0);
+    /// ```
+    #[must_use]
+    pub fn holdout_passes(&self) -> u32 {
+        self.trial_results
+            .iter()
+            .filter(|t| t.holdout_passed == Some(true))
+            .map(|_| 1u32)
+            .sum()
+    }
+
+    /// Count of trials where the self-gate passed (`passed == true`) but the
+    /// holdout re-gate failed (`holdout_passed == Some(false)`). These are
+    /// trials the agent claimed done and the in-workspace gate accepted, yet
+    /// the sealed holdout exposed as incomplete. Returns `0` for an empty
+    /// report.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use harness::eval::EvalReport;
+    /// let report = EvalReport {
+    ///     task_name: "t".to_string(),
+    ///     trials: 0,
+    ///     passes: 0,
+    ///     pass_rate: 0.0,
+    ///     trial_results: Vec::new(),
+    /// };
+    /// assert_eq!(report.false_dones(), 0);
+    /// ```
+    #[must_use]
+    pub fn false_dones(&self) -> u32 {
+        self.trial_results
+            .iter()
+            .filter(|t| t.passed && t.holdout_passed == Some(false))
+            .map(|_| 1u32)
+            .sum()
+    }
 }
 
 /// One trial's fresh, isolated execution environment.
@@ -218,6 +276,11 @@ pub struct TrialEnv {
     /// cwd pointing at this trial's own workspace. `None` disables verification
     /// (a `finish(done)` then yields [`Verification::NoChecksConfigured`]).
     pub checks: Option<ChecksRunner>,
+    /// The fixture's `holdout/` source dir to copy into the trial workspace
+    /// after the agent loop terminates, so the out-of-band holdout re-gate can
+    /// run. `None` when the fixture has no top-level `holdout/` directory (the
+    /// common case for legacy fixtures; holdout re-gate is skipped entirely).
+    pub holdout_src: Option<PathBuf>,
     /// Scratch dirs kept alive for the trial and removed on drop. Private
     /// because callers never inspect it — they build a `TrialEnv` via a factory.
     _scratch: Vec<ScratchDir>,
@@ -239,6 +302,12 @@ pub struct TrialEnv {
 /// `pass_rate` is `0.0` when `k == 0` so a misuse never produces `NaN`; the
 /// trial loop runs zero times, so neither the factory nor the backend is
 /// touched in that case.
+///
+/// # Panics
+/// Panics if the holdout re-gate copy fails (broken-host semantics — the trial
+/// workspace or holdout source directory is unreadable/unwritable after the
+/// agent loop ran). This condition indicates a broken host, not a recoverable
+/// eval failure.
 pub async fn run_eval(
     task: &EvalTask,
     backend: &impl ModelBackend,
@@ -264,9 +333,24 @@ pub async fn run_eval(
         if is_pass {
             passes += 1;
         }
+        // Holdout re-gate: copy the sealed holdout dir into the trial workspace
+        // and re-run the gate out-of-band.  Runs BEFORE TrialResult is
+        // constructed and BEFORE on_trial is called, so the callback always
+        // observes the final holdout_passed value.  Skipped (→ None) when the
+        // fixture had no holdout/ dir or the env carries no ChecksRunner.
+        let holdout_passed =
+            if let (Some(holdout_src), Some(checks)) = (&env.holdout_src, &env.checks) {
+                copy_dir_recursive(holdout_src, env.ctx.workspace().root())
+                    .expect("copy holdout/ contents into trial workspace");
+                let report = checks.run(&env.ctx).await;
+                Some(report.passed)
+            } else {
+                None
+            };
         let trial = TrialResult {
             trial: i,
             passed: is_pass,
+            holdout_passed,
             outcome,
             stats,
         };
@@ -383,13 +467,42 @@ pub fn finish_env() -> TrialEnv {
         tools: standard_registry(None),
         ctx: ToolCtx::stub(),
         checks: None,
+        holdout_src: None,
         _scratch: Vec::new(),
     }
 }
 
+/// Copy the contents of a fixture source dir into a trial workspace, excluding
+/// two entries AT THE FIXTURE ROOT ONLY: the file `task.json` and the directory
+/// `holdout/`. Entries nested deeper in the tree (e.g. `src/task.json`) are
+/// copied verbatim — the exclusion is scoped to the top level.
+///
+/// # Errors
+/// Propagates any `std::fs` error (unreadable source, unwritable destination).
+fn copy_fixture_into_workspace(fixture_src: &Path, workspace_root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(workspace_root)?;
+    for entry in std::fs::read_dir(fixture_src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // Skip top-level task.json (eval-only spec) and holdout/ (sealed
+        // holdout dir — the agent under eval must never see it).
+        if name == "task.json" || name == "holdout" {
+            continue;
+        }
+        let dst_path = workspace_root.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Build one fresh coding-fix trial environment: copy the fixture into a new
-/// scratch workspace, wire a fresh offload dir + [`ToolCtx`], and a `cargo test`
-/// [`ChecksRunner`] whose cwd IS this trial's workspace.
+/// scratch workspace (excluding top-level `task.json` and `holdout/`), wire a
+/// fresh offload dir + [`ToolCtx`], and a `cargo test` [`ChecksRunner`] whose
+/// cwd IS this trial's workspace.
 ///
 /// # Panics
 /// Panics if the scratch dirs cannot be created, the fixture cannot be copied,
@@ -398,7 +511,7 @@ pub fn finish_env() -> TrialEnv {
 fn build_coding_env(fixture_src: &Path) -> TrialEnv {
     let workspace_scratch =
         ScratchDir::new("workspace").expect("create trial workspace scratch dir");
-    copy_dir_recursive(fixture_src, workspace_scratch.path())
+    copy_fixture_into_workspace(fixture_src, workspace_scratch.path())
         .expect("copy fixture into trial workspace");
     let offload_scratch = ScratchDir::new("offload").expect("create trial offload scratch dir");
 
@@ -430,10 +543,19 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
     );
     let tools = standard_registry(Some(checks.clone()));
 
+    // Set holdout_src iff the fixture carries a top-level `holdout/` dir —
+    // after the agent loop the contents will be merged into the workspace for
+    // the out-of-band holdout re-gate.
+    let holdout_src = {
+        let d = fixture_src.join("holdout");
+        d.is_dir().then_some(d)
+    };
+
     TrialEnv {
         tools,
         ctx,
         checks: Some(checks),
+        holdout_src,
         _scratch: vec![workspace_scratch, offload_scratch],
     }
 }
@@ -444,20 +566,42 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
 ///
 /// Returns the [`EvalTask`] plus a per-trial environment factory (pass it
 /// straight to [`run_eval`]). Each factory call copies `fixture_src` into a
-/// fresh scratch workspace and wires a `cargo test` [`ChecksRunner`] rooted
-/// there — so a trial's edits are isolated and its verification is real.
+/// fresh scratch workspace (excluding top-level `task.json` and `holdout/`) and
+/// wires a `cargo test` [`ChecksRunner`] rooted there — so a trial's edits are
+/// isolated and its verification is real.
+///
+/// **Prompt routing:** if `fixture_src/task.json` exists it is deserialized into
+/// a [`crate::task_spec::TaskSpec`] and the prompt is rendered via
+/// [`crate::prompt::render_task_prompt_from_spec`] (the production path); otherwise
+/// the legacy literal prompt is used. Both routes share the same success
+/// predicate.
 ///
 /// The success predicate accepts **only** a
 /// [`LoopOutcome::Finished`]`(`[`FinishDisposition::Done`]`)` whose verification
 /// is [`Verification::Checks`] with `report.passed == true`. The vacuous
 /// [`Verification::NoChecksConfigured`] path does NOT count — an unverified
 /// `done` claim is a failure here, by design.
+///
+/// # Panics
+/// Panics if `fixture_src/task.json` exists but cannot be read or is not valid
+/// [`crate::task_spec::TaskSpec`] JSON — a broken fixture is a broken host.
 pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) {
+    let task_json_path = fixture_src.join("task.json");
+    let task_prompt = if task_json_path.exists() {
+        let json_str = std::fs::read_to_string(&task_json_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", task_json_path.display()));
+        let spec: crate::task_spec::TaskSpec = serde_json::from_str(&json_str)
+            .unwrap_or_else(|e| panic!("parse {} as TaskSpec: {e}", task_json_path.display()));
+        crate::prompt::render_task_prompt_from_spec(&spec)
+    } else {
+        "The test suite in this Rust crate fails. Find the bug, fix it, \
+               and make the tests pass."
+            .to_string()
+    };
+
     let task = EvalTask {
         name: "coding_fix".to_string(),
-        task: "The test suite in this Rust crate fails. Find the bug, fix it, \
-               and make the tests pass."
-            .to_string(),
+        task: task_prompt,
         success: Box::new(|outcome| {
             matches!(
                 outcome,
@@ -498,8 +642,8 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalReport, EvalTask, TrialEnv, TrialResult, coding_fix_task, copy_dir_recursive,
-        discover_fixtures, finish_env, finish_task, run_eval,
+        EvalReport, EvalTask, TrialEnv, TrialResult, build_coding_env, coding_fix_task,
+        copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -523,6 +667,7 @@ mod tests {
             tools: registry(),
             ctx: ToolCtx::stub(),
             checks: None,
+            holdout_src: None,
             _scratch: Vec::new(),
         }
     }
@@ -937,6 +1082,7 @@ mod tests {
         let t = TrialResult {
             trial: 7,
             passed: true,
+            holdout_passed: Some(false),
             outcome: LoopOutcome::MaxIterations,
             stats: RunStats {
                 iterations: 4,
@@ -949,6 +1095,7 @@ mod tests {
         assert!(printed.contains("TrialResult"));
         assert!(printed.contains("trial: 7"));
         assert!(printed.contains("passed: true"));
+        assert!(printed.contains("holdout_passed: Some(false)"));
         assert!(printed.contains("MaxIterations"));
         assert!(printed.contains("RunStats"));
     }
@@ -1094,6 +1241,7 @@ mod tests {
                 tools,
                 ctx,
                 checks: Some(checks),
+                holdout_src: None,
                 _scratch: Vec::new(),
             }
         };
@@ -1231,6 +1379,318 @@ mod tests {
         )));
         assert!(!(task.success)(&LoopOutcome::MaxIterations));
         assert!(!(task.success)(&LoopOutcome::StoppedWithoutFinish));
+    }
+
+    // ── NEW TESTS: holdout mechanics, task.json routing, schema validation ──
+
+    /// `build_coding_env` must exclude top-level `task.json` and `holdout/`
+    /// from the workspace copy, but NOT exclude nested `src/task.json`.
+    /// `holdout_src` must be `Some` iff the fixture has a top-level `holdout/`.
+    #[test]
+    fn build_coding_env_excludes_root_entries_but_not_nested() {
+        let src = tempdir().expect("src tempdir");
+        // Top-level task.json — must be excluded from workspace
+        let valid_spec = r#"{
+            "title": "T",
+            "description": "D",
+            "acceptance_criteria": [],
+            "files_to_modify": [],
+            "gate_command": "cargo test"
+        }"#;
+        std::fs::write(src.path().join("task.json"), valid_spec).expect("write task.json");
+        // Top-level holdout/ — must be excluded from workspace
+        std::fs::create_dir_all(src.path().join("holdout/tests")).expect("mkdir holdout/tests");
+        std::fs::write(src.path().join("holdout/tests/holdout.rs"), "// holdout\n")
+            .expect("write holdout.rs");
+        // Regular source — must be present
+        std::fs::create_dir_all(src.path().join("src")).expect("mkdir src");
+        std::fs::write(src.path().join("src/lib.rs"), "// lib\n").expect("write lib.rs");
+        // Nested src/task.json — must NOT be excluded (only root is excluded)
+        std::fs::write(src.path().join("src/task.json"), "// nested\n")
+            .expect("write src/task.json");
+
+        let env = build_coding_env(src.path());
+        let root = env.ctx.workspace().root().to_path_buf();
+
+        assert!(
+            !root.join("task.json").exists(),
+            "top-level task.json must be excluded from workspace"
+        );
+        assert!(
+            !root.join("holdout").exists(),
+            "top-level holdout/ must be excluded from workspace"
+        );
+        assert!(
+            root.join("src/lib.rs").exists(),
+            "src/lib.rs must be present in workspace"
+        );
+        assert!(
+            root.join("src/task.json").exists(),
+            "nested src/task.json must NOT be excluded from workspace"
+        );
+        assert!(
+            env.holdout_src.is_some(),
+            "holdout_src must be Some when fixture has a holdout/ dir"
+        );
+    }
+
+    /// Without a top-level `holdout/`, `holdout_src` must be `None`.
+    #[test]
+    fn build_coding_env_holdout_src_is_none_when_no_holdout_dir() {
+        let src = tempdir().expect("src tempdir");
+        std::fs::write(src.path().join("dummy.txt"), "x\n").expect("write dummy");
+        let env = build_coding_env(src.path());
+        assert!(
+            env.holdout_src.is_none(),
+            "holdout_src must be None when fixture has no holdout/ dir"
+        );
+    }
+
+    /// `coding_fix_task` routes the prompt through `render_task_prompt_from_spec`
+    /// when `task.json` exists, and uses the legacy literal otherwise.
+    #[test]
+    fn coding_fix_task_routes_prompt_by_task_json_presence() {
+        // With task.json: prompt must contain the spec's title + an AC sentinel.
+        let src_with = tempdir().expect("src with task.json");
+        let spec_json = r#"{
+            "title": "Sentinel Task Title",
+            "description": "Does something.",
+            "acceptance_criteria": ["sentinel-acceptance-criterion"],
+            "files_to_modify": [],
+            "gate_command": "cargo test"
+        }"#;
+        std::fs::write(src_with.path().join("task.json"), spec_json).expect("write task.json");
+        let (task_with, _) = coding_fix_task(src_with.path());
+        assert!(
+            task_with.task.contains("Sentinel Task Title"),
+            "spec-routed prompt must contain the spec title; got:\n{}",
+            task_with.task,
+        );
+        assert!(
+            task_with.task.contains("sentinel-acceptance-criterion"),
+            "spec-routed prompt must contain the acceptance criterion; got:\n{}",
+            task_with.task,
+        );
+
+        // Without task.json: must use the exact legacy literal.
+        let src_without = tempdir().expect("src without task.json");
+        let (task_without, _) = coding_fix_task(src_without.path());
+        assert_eq!(
+            task_without.task,
+            "The test suite in this Rust crate fails. Find the bug, fix it, \
+               and make the tests pass.",
+            "without task.json the legacy literal must be used verbatim"
+        );
+    }
+
+    /// A malformed (non-TaskSpec) `task.json` must cause a panic whose message
+    /// names the fixture path (or the task.json path).
+    #[test]
+    #[should_panic(expected = "task.json")]
+    fn coding_fix_task_panics_on_malformed_task_json() {
+        let src = tempdir().expect("src tempdir");
+        std::fs::write(src.path().join("task.json"), "{ not valid json {{{{")
+            .expect("write malformed task.json");
+        // `let _ =` discards the (never-reached) return value; the panic
+        // propagates before any result is produced.
+        let _ = coding_fix_task(src.path());
+    }
+
+    /// For a task.json-bearing fixture, `env.checks.command_display()` must
+    /// still be `"cargo test"` — `spec.gate_command` is rendered into the
+    /// prompt only, never parsed or executed.
+    #[test]
+    fn coding_fix_task_env_uses_cargo_test_for_spec_fixture() {
+        let src = tempdir().expect("src tempdir");
+        // gate_command is a different command to confirm it is NOT used.
+        let spec_json = r#"{
+            "title": "T",
+            "description": "D",
+            "acceptance_criteria": [],
+            "files_to_modify": [],
+            "gate_command": "cargo nextest run --workspace"
+        }"#;
+        std::fs::write(src.path().join("task.json"), spec_json).expect("write task.json");
+        let (_, factory) = coding_fix_task(src.path());
+        let env = factory();
+        let checks = env.checks.as_ref().expect("checks must be wired");
+        assert_eq!(
+            checks.command_display(),
+            "cargo test",
+            "trial ChecksRunner must always be `cargo test`, never the spec's gate_command"
+        );
+    }
+
+    /// Exact-count matrix for `holdout_passes()` and `false_dones()`.
+    #[test]
+    fn eval_report_holdout_accessor_exact_count_matrix() {
+        // Build TrialResults covering all relevant combinations:
+        //  (passed=true,  holdout=Some(true))  → holdout_passes: +1; false_dones: 0
+        //  (passed=true,  holdout=Some(false)) → holdout_passes:  0; false_dones: +1
+        //  (passed=false, holdout=Some(false)) → holdout_passes:  0; false_dones:  0
+        //  (passed=false, holdout=Some(true))  → holdout_passes: +1; false_dones:  0
+        //  (passed=true,  holdout=None)        → holdout_passes:  0; false_dones:  0
+        let mk = |trial: u32, passed: bool, holdout_passed: Option<bool>| TrialResult {
+            trial,
+            passed,
+            holdout_passed,
+            outcome: LoopOutcome::MaxIterations,
+            stats: RunStats {
+                iterations: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                wall_clock: Duration::ZERO,
+            },
+        };
+        let report = EvalReport {
+            task_name: "matrix".to_string(),
+            trials: 5,
+            passes: 3,
+            pass_rate: 0.6,
+            trial_results: vec![
+                mk(0, true, Some(true)),
+                mk(1, true, Some(false)),
+                mk(2, false, Some(false)),
+                mk(3, false, Some(true)),
+                mk(4, true, None),
+            ],
+        };
+        assert_eq!(
+            report.holdout_passes(),
+            2,
+            "holdout_passes must count Some(true) regardless of passed"
+        );
+        assert_eq!(
+            report.false_dones(),
+            1,
+            "false_dones must count passed==true AND holdout==Some(false)"
+        );
+    }
+
+    /// Empty `EvalReport` → both new accessors return 0.
+    #[test]
+    fn eval_report_holdout_accessors_zero_for_empty_report() {
+        let empty = EvalReport {
+            task_name: "empty".to_string(),
+            trials: 0,
+            passes: 0,
+            pass_rate: 0.0,
+            trial_results: Vec::new(),
+        };
+        assert_eq!(empty.holdout_passes(), 0);
+        assert_eq!(empty.false_dones(), 0);
+    }
+
+    /// Schema-validation: every `fixtures/*/task.json` must deserialize to
+    /// `TaskSpec`. Passes vacuously today (no task.json files exist yet).
+    #[test]
+    fn fixture_task_json_files_are_valid_task_specs() {
+        let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures");
+        let dirs = discover_fixtures(&fixtures_root).expect("discover fixtures");
+        for dir in &dirs {
+            let task_json = dir.join("task.json");
+            if task_json.exists() {
+                let json_str = std::fs::read_to_string(&task_json)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", task_json.display()));
+                let result = serde_json::from_str::<crate::task_spec::TaskSpec>(&json_str);
+                assert!(
+                    result.is_ok(),
+                    "task.json at {} must be a valid TaskSpec: {:?}",
+                    task_json.display(),
+                    result.unwrap_err(),
+                );
+            }
+        }
+    }
+
+    /// Backward-compat: a fixture without `task.json` or `holdout/` must yield
+    /// `holdout_passed == None` in every trial, and `on_trial` must observe
+    /// `None` (proving the callback fires AFTER the re-gate decision).
+    #[tokio::test]
+    async fn holdout_passed_is_none_for_fixture_without_holdout() {
+        // echo_finish_env has holdout_src = None and checks = None → None.
+        let backend = MockBackend::from_turns(vec![finish_done_turn()]);
+        let task = finish_task();
+
+        let observed: Arc<Mutex<Vec<Option<bool>>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs_c = Arc::clone(&observed);
+        let report = run_eval(&task, &backend, echo_finish_env, 1, 5, move |t| {
+            obs_c.lock().expect("lock").push(t.holdout_passed);
+        })
+        .await;
+
+        assert_eq!(
+            report.trial_results[0].holdout_passed, None,
+            "holdout_passed must be None when env has no holdout_src"
+        );
+        assert_eq!(
+            *observed.lock().expect("lock"),
+            vec![None],
+            "on_trial must observe holdout_passed=None"
+        );
+    }
+
+    /// Holdout re-gate: when `env.holdout_src` is set and `env.checks` is a
+    /// green runner, the re-gate runs BEFORE `on_trial` and
+    /// `holdout_passed == Some(true)`. The holdout content is merged into the
+    /// workspace before the gate fires.
+    #[tokio::test]
+    async fn holdout_re_gate_runs_and_on_trial_observes_result() {
+        use super::ScratchDir;
+
+        // Build a "holdout source" dir with one canary file.
+        let holdout_holder = tempdir().expect("holdout holder");
+        let holdout_src_dir = holdout_holder.path().join("holdout");
+        std::fs::create_dir(&holdout_src_dir).expect("mkdir holdout");
+        std::fs::write(holdout_src_dir.join("canary.txt"), "canary").expect("write canary");
+
+        let holdout_src_path = holdout_src_dir.clone();
+        let factory = move || {
+            let ws_scratch = ScratchDir::new("holdout-gate-ws").expect("ws scratch");
+            let off_scratch = ScratchDir::new("holdout-gate-off").expect("off scratch");
+            let workspace =
+                Workspace::new(ws_scratch.path(), Some(off_scratch.path().to_path_buf()))
+                    .expect("workspace");
+            let ws_root = workspace.root().to_path_buf();
+            let off_canon = off_scratch.path().canonicalize().expect("canon offload");
+            let ctx = ToolCtx::new(
+                Arc::new(workspace),
+                Arc::new(DiskOffloadSink::new(off_canon)),
+            );
+            let checks = green_checks(ws_root);
+            let tools = standard_registry(Some(checks.clone()));
+            TrialEnv {
+                tools,
+                ctx,
+                checks: Some(checks),
+                holdout_src: Some(holdout_src_path.clone()),
+                _scratch: vec![ws_scratch, off_scratch],
+            }
+        };
+
+        let task = finish_task();
+        let backend = MockBackend::from_turns(vec![finish_done_turn()]);
+
+        let observed: Arc<Mutex<Option<Option<bool>>>> = Arc::new(Mutex::new(None));
+        let obs_c = Arc::clone(&observed);
+        let report = run_eval(&task, &backend, factory, 1, 5, move |t| {
+            *obs_c.lock().expect("lock") = Some(t.holdout_passed);
+        })
+        .await;
+
+        assert_eq!(
+            report.trial_results[0].holdout_passed,
+            Some(true),
+            "holdout re-gate must have run (green checks) → Some(true)"
+        );
+        assert_eq!(
+            *observed.lock().expect("lock"),
+            Some(Some(true)),
+            "on_trial must observe holdout_passed AFTER the re-gate ran"
+        );
     }
 
     #[test]
