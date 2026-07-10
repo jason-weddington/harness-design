@@ -994,7 +994,9 @@ mod tests {
     fn discover_fixtures_finds_the_four_committed_fixtures() {
         // The repo's real `fixtures/` root, discovered from this crate's
         // manifest dir. The four v1 fixtures (`broken-adder`, `interval-merge`,
-        // `lru-cache`, `text-preview`) must be present, sorted, in dir form.
+        // `lru-cache`, `text-preview`) must be present, in dir form. The suite
+        // grows over time, so extra fixtures are permitted — containment, not
+        // exact equality (sortedness is pinned by the tempdir test above).
         let fixtures_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -1004,16 +1006,17 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "broken-adder".to_string(),
-                "interval-merge".to_string(),
-                "lru-cache".to_string(),
-                "text-preview".to_string(),
-            ],
-            "the four v1 fixtures must be discovered in sorted order",
-        );
+        for expected in [
+            "broken-adder",
+            "interval-merge",
+            "lru-cache",
+            "text-preview",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "v1 fixture `{expected}` missing from discovered set {names:?}",
+            );
+        }
     }
 
     #[test]
