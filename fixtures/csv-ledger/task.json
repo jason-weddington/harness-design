@@ -1,0 +1,21 @@
+{
+  "title": "Fix incorrect monthly totals in the expense ledger",
+  "description": "The csv-ledger expense tracker produces wrong monthly net totals when credit transactions are present. The existing test in src/report.rs fails: the reported January net total does not match the expected value. Investigate the full pipeline — parse_csv in src/parser.rs feeds build_ledger in src/ledger.rs which feeds monthly_totals in src/report.rs — and fix the defect so that monthly totals correctly reflect credits received and debits paid out.",
+  "acceptance_criteria": [
+    "Monthly totals for credit transactions carry the correct positive sign (money received increases the net balance).",
+    "Monthly totals for debit transactions carry the correct negative sign (money paid out decreases the net balance).",
+    "The existing test monthly_net_totals_are_correct in src/report.rs passes.",
+    "The gate command `cargo test` exits zero with no test failures."
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/parser.rs",
+      "change": "Review the sign applied to each transaction kind and ensure credits and debits are stored with the correct sign per the doc-comment convention."
+    },
+    {
+      "path": "src/report.rs",
+      "change": "The failing test lives here; confirm the monthly accumulation logic is correct or adjust it if the investigation reveals a defect."
+    }
+  ],
+  "gate_command": "cargo test"
+}
