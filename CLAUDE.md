@@ -118,6 +118,21 @@ Bump both upward as coverage improves; never regress it. Licenses are restricted
 
 ## Release
 
-Decoupled from deploy (matches the Python projects). At a meaningful boundary:
-`./release.sh` runs `cog bump --auto` → tag → `git push origin main --tags`. No
-crates.io publish.
+Decoupled from deploy (matches the Python projects). At a meaningful boundary run `./release.sh`: it cuts the version (`cog bump --auto` — trust it; type commits honestly, `fix:` vs `feat:`, and don't hand-pin the version), tags, **publishes a fresh talos fleet binary** (`scripts/publish-talos.sh`, run between the bump and the push, so a release ships an artifact by definition), then `git push origin main --tags`. No crates.io publish.
+
+## Talos fleet binary (build + push without a release)
+
+Talos is self-hosting — the binary changes every wave — so the dispatch hosts run a *published* binary rather than compiling it themselves. A release republishes it automatically (above). To push a fresh binary **mid-work, without cutting a release** — e.g. you just merged a talos-affecting change and want the fleet on it before the next dispatch — run the two-step flow by hand:
+
+```bash
+# 1. Build both arches on this box (the i9 has the aarch64 cross-toolchain) and
+#    publish to the pi-04 artifact host. Requires a CLEAN tree — the version token
+#    embeds HEAD's short SHA, so commit first. Runs the gate before it ships.
+./scripts/publish-talos.sh
+
+# 2. Pull the just-published binary onto both dispatch hosts. No service restart
+#    (talos is a fresh subprocess per dispatch run — the next run picks it up).
+cd ~/git/agent-gtd-dispatch && ./talos-update.sh
+```
+
+`publish-talos.sh` advances `pi-04:/srv/talos/latest` to the new token only after both arches upload (artifacts are immutable per token); `talos-update.sh` reads that `latest` via pi-04's Caddy and installs on each host in `DISPATCH_HOSTS` (default `pironman01 r7-research`), skipping any host already current. The version token is `0.1.0-g<short-sha>`; to verify, both hosts' installed token should carry the same `<short-sha>` as `git rev-parse --short HEAD`.
