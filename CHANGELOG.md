@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.3.7 - 2026-07-11
+#### Features
+- (**tools**) rename run_command to bash with single command-string interface - (e80de7f) - Jason Weddington
+#### Documentation
+- (**design**) sync tool inventory to run_command → bash rename - (03ffa66) - Jason Weddington, *talos-glm*
+- Session 7 third sitting — bash tool + talos-glm dispatch unblock - (dbb668f) - Jason Weddington
+
+- - -
+
 ## 0.3.6 - 2026-07-10
 #### Features
 - (**eval**) walrus fixture — implement compact() in append-only KV store (tier 3) - (672f5d2) - Claude Agent
