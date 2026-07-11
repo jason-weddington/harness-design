@@ -97,11 +97,16 @@ struct RunArgs {
 
     /// Hard cap on agent-loop iterations.
     ///
-    /// Default raised from 12 after the first dogfood run: a groomed item's
+    /// History: 12 → 24 after the first (small) dogfood run — a groomed item's
     /// AC list invites per-criterion re-verification, and haiku exhausted 12
-    /// iterations one call short of finish(done) on a task it had already
-    /// completed and verified at iteration 6.
-    #[arg(long, default_value_t = 24u32)]
+    /// iterations one call short of finish(done). 24 → 500 after a 0.4.0 wave
+    /// item (18 ACs, 5 files) exhausted 24 in ~48s without reaching a verify
+    /// cycle: 24 is calibrated for single-crate dogfood work, far too low for
+    /// multi-file changes. With the gate timeout (and the upcoming wall-clock
+    /// budget) as the real bounds, a high iteration cap is a backstop, not the
+    /// primary limit. 500 mirrors the GTD `max_turns` convention; the eventual
+    /// fix is to plumb the dispatch `max_turns` through to this flag.
+    #[arg(long, default_value_t = 500u32)]
     max_iterations: u32,
 
     /// Timeout for the gate command, in seconds.
