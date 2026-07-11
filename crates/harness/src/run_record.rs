@@ -67,6 +67,11 @@ pub struct RunRecord {
     pub last_gate_result: Option<GateResult>,
     /// `None` until the run terminates with a disposition.
     pub disposition: Option<Disposition>,
+    /// Telemetry from the finish-recovery protocol — `None` unless the run
+    /// reached the recovery terminal (gates green but the agent never called
+    /// `finish` after N nudges). See [`RecoveryFacts`].
+    #[serde(default)]
+    pub recovery_facts: Option<RecoveryFacts>,
 
     // ---- DISPOSABLE CONTEXT (scratch; may be dropped/compacted) ----
     /// Current model context window. Rebuildable from the event log on
@@ -305,6 +310,12 @@ pub enum FailureMode {
     /// model stopped generating tool calls). The task is the problem; retrying
     /// unchanged is unlikely to help.
     StoppedWithoutFinish,
+    /// Gates went green but the agent never called `finish` after N nudges —
+    /// a probably-done run the harness force-terminated. Distinct from
+    /// [`FailureMode::Loop`] (which is a model-declared `finish(failed)`) so
+    /// the outer harness can recognize the recovery terminal on the
+    /// non-persistent `run` path too.
+    FinishDiscipline,
 }
 
 /// Structured report attached to a disposition — also the eval-case seed
@@ -317,6 +328,37 @@ pub struct DispositionReport {
     pub budget_spent: BudgetConsumed,
     /// Pointer to the trajectory in the event log.
     pub event_log_ref: String,
+}
+
+/// Telemetry captured by the finish-recovery protocol — written on a
+/// [`FailureMode::FinishDiscipline`] terminal, `None` on every other outcome.
+///
+/// The three fields record what the loop observed at the recovery terminal so
+/// the outer harness (or a reviewer) can recognize a probably-done-but-unclaimed
+/// run and decide whether to push it forward. All three are loop-local views,
+/// NOT a model self-report: `gates_green_at_exit` is the last `run_checks`
+/// `is_error` flag, `tree_dirty` is whether any successful `edit_file`/`bash`
+/// call executed over the run, and `nudge_statuses` is the ordered one-sentence
+/// model replies captured from turns that followed a nudge without producing
+/// an accepted `finish(done)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFacts {
+    /// The loop-local `last_gate_green` value at the recovery terminal. `true`
+    /// means the last `run_checks` returned `is_error=false` and no successful
+    /// mutating tool call has invalidated it since — i.e. the gates were green
+    /// at the moment the harness force-terminated.
+    #[serde(default)]
+    pub gates_green_at_exit: bool,
+    /// At least one successful mutating tool call (`edit_file` or `bash` with
+    /// `!is_error`) executed over the run. A tree that was never touched is
+    /// unlikely to be a "probably done" run.
+    #[serde(default)]
+    pub tree_dirty: bool,
+    /// The ordered one-sentence model replies captured from turns that followed
+    /// a nudge without producing an accepted `finish(done)`. May be empty for a
+    /// tool-calls-only turn.
+    #[serde(default)]
+    pub nudge_statuses: Vec<String>,
 }
 
 // ===== Event log =======================================================
@@ -377,7 +419,8 @@ mod tests {
     use super::{
         AcceptanceCriterion, BudgetConsumed, BudgetLimits, Budgets, ChecklistItem, CriterionStatus,
         Disposition, DispositionReport, DurableFacts, Event, Evidence, FailureMode, GateOutcome,
-        GateResult, Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
+        GateResult, Phase, ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task,
+        Verification,
     };
     use crate::exec::{CheckCommand, ChecksRunner};
     use crate::model::{ContentBlock, Message, ToolCallRequest, UserBlock};
@@ -540,6 +583,7 @@ mod tests {
             budgets: sample_budgets(),
             last_gate_result: Some(sample_gate_result()),
             disposition: None,
+            recovery_facts: None,
             messages: sample_messages(),
         }
     }
@@ -622,6 +666,7 @@ mod tests {
             FailureMode::PersistentToolError,
             FailureMode::TransientInfra,
             FailureMode::StoppedWithoutFinish,
+            FailureMode::FinishDiscipline,
         ] {
             round_trip(&Disposition::Failed {
                 mode,
@@ -877,6 +922,79 @@ mod tests {
         assert_eq!(SCHEMA_VERSION, 2);
         // And the field on RunRecord defaults to this in our sample.
         assert_eq!(sample_run_record().schema_version, SCHEMA_VERSION);
+    }
+
+    // ---- recovery_facts backward-compat + round-trip ----
+
+    /// A pre-existing v2 `RunRecord` JSON that OMITS the `recovery_facts` key
+    /// (every record written before this field existed) must deserialize with
+    /// `recovery_facts == None`. This is the `#[serde(default)]` guarantee
+    /// surfaced at the wire boundary — the field is additive, no migration
+    /// needed, no `SCHEMA_VERSION` bump.
+    #[test]
+    fn recovery_facts_omitted_key_deserializes_to_none() {
+        // Serialize a sample record, strip the `recovery_facts` key from the
+        // JSON, and deserialize — must yield `recovery_facts == None`.
+        let r = sample_run_record();
+        let json = serde_json::to_string(&r).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as Value");
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.remove("recovery_facts");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let parsed: RunRecord = serde_json::from_str(&stripped).expect("deserialize");
+        assert_eq!(
+            parsed.recovery_facts, None,
+            "omitted recovery_facts key must default to None (pre-additive v2 records)"
+        );
+        // And the rest of the record is unchanged.
+        assert_eq!(parsed.run_id, r.run_id);
+        assert_eq!(parsed.schema_version, r.schema_version);
+    }
+
+    /// A `RunRecord` carrying `Some(RecoveryFacts{ .. })` must round-trip through
+    /// serde without loss — the additive field is safe under the
+    /// equality-based `round_trip` helper (serialize → deserialize → `assert_eq`).
+    #[test]
+    fn recovery_facts_some_round_trips() {
+        let mut r = sample_run_record();
+        r.recovery_facts = Some(RecoveryFacts {
+            gates_green_at_exit: true,
+            tree_dirty: true,
+            nudge_statuses: vec!["still writing the failing-case test".to_string()],
+        });
+        round_trip(&r);
+    }
+
+    /// `RecoveryFacts` itself round-trips with all fields populated, including
+    /// an empty `nudge_statuses` vector (the tool-calls-only-after-nudge case).
+    #[test]
+    fn recovery_facts_struct_round_trips() {
+        let full = RecoveryFacts {
+            gates_green_at_exit: true,
+            tree_dirty: false,
+            nudge_statuses: vec!["status one".to_string(), "status two".to_string()],
+        };
+        round_trip(&full);
+
+        let empty_statuses = RecoveryFacts {
+            gates_green_at_exit: false,
+            tree_dirty: false,
+            nudge_statuses: vec![],
+        };
+        round_trip(&empty_statuses);
+    }
+
+    /// `RecoveryFacts` deserializes from JSON that omits every field — the
+    /// `#[serde(default)]` on each field makes the bare `{}` form valid, which
+    /// is the contract a forward-compatible loader relies on.
+    #[test]
+    fn recovery_facts_empty_object_deserializes_to_defaults() {
+        let bare = "{}";
+        let parsed: RecoveryFacts = serde_json::from_str(bare).expect("bare object is valid");
+        assert!(!parsed.gates_green_at_exit);
+        assert!(!parsed.tree_dirty);
+        assert!(parsed.nudge_statuses.is_empty());
     }
 
     // ---- copy/clone/derive smoke ----

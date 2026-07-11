@@ -71,7 +71,7 @@ use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
 use crate::run_record::{
     BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event, FailureMode, Phase,
-    ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
+    ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task, Verification,
 };
 use crate::store::{RunStore, StoreError};
 use crate::time::format_rfc3339;
@@ -105,11 +105,33 @@ pub struct RunConfig {
     pub checks: Option<ChecksRunner>,
     /// Per-turn output cap threaded into [`SamplingParams::max_tokens`].
     pub max_tokens: u32,
+    /// Static-tree threshold K for finish-recovery: how many consecutive
+    /// non-mutating iterations must accumulate AFTER a green `run_checks`
+    /// before the harness considers the run "done-but-unclaimed" and injects
+    /// a nudge. A successful `edit_file`/`bash` resets the counter. See
+    /// [`DEFAULT_STATIC_TREE_K`].
+    pub static_tree_k: u32,
+    /// Maximum nudges the harness will inject before taking the recovery
+    /// terminal ([`FailureMode::FinishDiscipline`]). `0` DISABLES
+    /// finish-recovery entirely — no nudge is ever injected and the recovery
+    /// terminal is never taken. See [`DEFAULT_MAX_NUDGES`].
+    pub max_nudges: u32,
 }
 
 /// The default per-turn output cap. Budget-aware sizing lands with the budget
 /// work; this is a fixed value for the thin slice.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Default static-tree threshold K — a starting guess, to be tuned against
+/// 0.4.0 run data. After K consecutive non-mutating iterations with a green
+/// gate, the harness considers the run probably-done-but-unclaimed.
+pub const DEFAULT_STATIC_TREE_K: u32 = 3;
+
+/// Default nudge cap N — a starting guess, to be tuned against 0.4.0 run
+/// data. After N nudges the harness force-terminates via
+/// [`FailureMode::FinishDiscipline`]. Setting `max_nudges == 0` disables
+/// finish-recovery entirely.
+pub const DEFAULT_MAX_NUDGES: u32 = 2;
 
 impl RunConfig {
     /// Build a config with the given `task` and iteration cap. Defaults
@@ -121,6 +143,8 @@ impl RunConfig {
             max_iterations,
             checks: None,
             max_tokens: DEFAULT_MAX_TOKENS,
+            static_tree_k: DEFAULT_STATIC_TREE_K,
+            max_nudges: DEFAULT_MAX_NUDGES,
         }
     }
 
@@ -136,6 +160,22 @@ impl RunConfig {
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the static-tree threshold K ([`DEFAULT_STATIC_TREE_K`] by
+    /// default). See [`RunConfig::static_tree_k`].
+    #[must_use]
+    pub fn with_static_tree_k(mut self, static_tree_k: u32) -> Self {
+        self.static_tree_k = static_tree_k;
+        self
+    }
+
+    /// Override the nudge cap N ([`DEFAULT_MAX_NUDGES`] by default). `0`
+    /// disables finish-recovery entirely. See [`RunConfig::max_nudges`].
+    #[must_use]
+    pub fn with_max_nudges(mut self, max_nudges: u32) -> Self {
+        self.max_nudges = max_nudges;
         self
     }
 }
@@ -799,12 +839,33 @@ async fn run_loop_impl(
             },
             last_gate_result: None,
             disposition: None,
+            recovery_facts: None,
             messages: messages.clone(),
         };
         Some(RunPersist { rid, record })
     } else {
         None
     };
+
+    // ---- finish-recovery detection state (loop-local) ----
+    // The done-oracle is `last_gate_green`, driven ONLY by `run_checks`'s
+    // `is_error` flag (never a model self-report). A successful mutating tool
+    // call (`edit_file`/`bash` with `!is_error`) invalidates the green — this
+    // closes the stale-green false-trip window so a nudge's "gates are
+    // currently green" is always true at trip time. `iters_since_tree_change`
+    // counts consecutive non-mutating iterations; reset wins over increment
+    // when a mutation and the per-iteration tick collide. `nudges_fired`
+    // bounds how many times the harness will nudge before force-terminating;
+    // `max_nudges == 0` disables the feature entirely (no nudge is ever
+    // injected and the recovery terminal is never taken). `nudge_awaiting_status`
+    // gates telemetry capture of the assistant reply text from the turn that
+    // follows a nudge without producing an accepted `finish(done)`.
+    let mut last_gate_green: bool = false;
+    let mut iters_since_tree_change: u32 = 0;
+    let mut tree_dirty: bool = false;
+    let mut nudges_fired: u32 = 0;
+    let mut nudge_awaiting_status: bool = false;
+    let mut nudge_statuses: Vec<String> = Vec::new();
 
     for _ in 0..config.max_iterations {
         let req = TurnRequest {
@@ -868,6 +929,12 @@ async fn run_loop_impl(
         // Snapshot the calls before moving the turn into history (the `From`
         // impl consumes `turn.content`).
         let calls: Vec<_> = turn.tool_calls().into_iter().cloned().collect();
+        // Capture the assistant reply text BEFORE `Message::from(turn)`
+        // consumes the turn. `AssistantTurn::text` concatenates every
+        // `ContentBlock::Text` in order (skipping Reasoning/ToolCall) — used
+        // for nudge-status telemetry if this turn follows a nudge without
+        // producing an accepted finish(done).
+        let turn_text = turn.text();
         messages.push(Message::from(turn));
 
         // Append ModelCall + BudgetTick events, then write the mid-iteration
@@ -933,6 +1000,10 @@ async fn run_loop_impl(
         // CONTINUES with the remaining calls in the same batch.
         let mut results = Vec::with_capacity(calls.len());
         let mut finish: Option<Disposition> = None;
+        // Per-iteration mutation flag — reset before the per-call loop. A
+        // successful `edit_file`/`bash` latches it (driving the end-of-iteration
+        // tree-counter reset) AND clears `last_gate_green`.
+        let mut mutated_this_iter: bool = false;
         for call in &calls {
             // Only the FIRST accepted finish in a batch gets to terminate;
             // a later finish (or a finish while one is already accepted)
@@ -987,9 +1058,42 @@ async fn run_loop_impl(
                     content: render_tool_result(&result),
                     is_error: result.is_error,
                 });
+
+                // Observe the actual tool ToolResult for finish-recovery
+                // detection — the done-oracle is `run_checks`'s `is_error`
+                // flag (the run_checks tool sets is_error = !report.passed),
+                // NEVER a model self-report. A successful mutating tool call
+                // (`edit_file`/`bash` with `!is_error`) latches `tree_dirty`,
+                // marks `mutated_this_iter`, and CLEARS `last_gate_green` — a
+                // mutation after a green check invalidates the green, closing
+                // the stale-green false-trip window so the nudge's "gates are
+                // currently green" is always true at trip time.
+                let is_error = result.is_error;
+                if call.name == "run_checks" {
+                    last_gate_green = !is_error;
+                } else if (call.name == "edit_file" || call.name == "bash") && !is_error {
+                    mutated_this_iter = true;
+                    tree_dirty = true;
+                    last_gate_green = false;
+                }
             }
         }
         messages.push(Message::User { content: results });
+
+        // Nudge-status telemetry: this turn followed a nudge iff
+        // `nudge_awaiting_status` was set. If the turn produced an accepted
+        // `finish(done)` the loop terminates normally below — clear the flag
+        // without pushing (a Done-after-nudge stays a clean success; its
+        // nudge_statuses are recoverable from the event log/messages if later
+        // wanted). Otherwise push the (possibly empty for a tool-calls-only
+        // turn) captured text and clear.
+        if nudge_awaiting_status {
+            let is_done = matches!(finish, Some(Disposition::Done { .. }));
+            if !is_done {
+                nudge_statuses.push(turn_text);
+            }
+            nudge_awaiting_status = false;
+        }
 
         if let Some(disposition) = finish {
             // Terminal path: Finished. Write DispositionSet + terminal checkpoint.
@@ -1013,6 +1117,91 @@ async fn run_loop_impl(
                 p.store.checkpoint(&ctx.rid, &ctx.record).await?;
             }
             return Ok(LoopOutcome::Finished(disposition));
+        }
+
+        // End-of-iteration tree-counter update — reached only when `finish`
+        // was None. Reset wins over increment when a mutation and the
+        // per-iteration tick collide.
+        if mutated_this_iter {
+            iters_since_tree_change = 0;
+        } else {
+            iters_since_tree_change += 1;
+        }
+
+        // Detection / high-precision trip — evaluated after the counter
+        // update, only when finish-recovery is enabled (`max_nudges > 0`).
+        // A RED gate (`last_gate_green == false`) MUST NOT trip — that case
+        // falls through unchanged to the existing MaxIterations cap.
+        if config.max_nudges > 0
+            && last_gate_green
+            && iters_since_tree_change >= config.static_tree_k
+        {
+            if nudges_fired < config.max_nudges {
+                // Inject the nudge by APPENDING a `UserBlock::Text` onto the
+                // content vec of the EXISTING tool-results `Message::User`
+                // (the `results` batch just pushed above) — NOT a new
+                // `Message::User`. `anthropic::map_message` maps each
+                // `Message` 1:1 with NO same-role merge, so two adjacent
+                // `Message::User` reach the wire as two `role:"user"` blocks
+                // and 400. Appending keeps the conversation a single user
+                // turn from the API's view.
+                let nudge_text = prompt::render_nudge_prompt();
+                if let Some(Message::User { content }) = messages.last_mut() {
+                    content.push(UserBlock::Text(nudge_text));
+                }
+                nudges_fired += 1;
+                nudge_awaiting_status = true;
+                // Reset so K static iterations must re-accumulate before the
+                // next trip.
+                iters_since_tree_change = 0;
+            } else {
+                // Recovery terminal: gates green but agent did not call
+                // `finish` after `max_nudges` nudges. Mirror the MaxIterations
+                // block's persistence discipline (messages, budgets.consumed,
+                // disposition, DispositionSet, checkpoint) AND write
+                // `recovery_facts`. The harness NEVER constructs Done here —
+                // claim-vs-verify is preserved; the loop is the sole Done
+                // constructor (only after a green Verification::Checks via
+                // handle_finish_call).
+                let summary = format!(
+                    "gates green but agent did not call finish after {} nudges",
+                    config.max_nudges
+                );
+                let disposition = Disposition::Failed {
+                    mode: FailureMode::FinishDiscipline,
+                    summary,
+                };
+                if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                    ctx.record.messages.clone_from(&messages);
+                    ctx.record.budgets.consumed = BudgetConsumed {
+                        iterations: initial_consumed.iterations + stats.iterations,
+                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                        cost_micros: initial_consumed.cost_micros,
+                    };
+                    ctx.record.recovery_facts = Some(RecoveryFacts {
+                        gates_green_at_exit: last_gate_green,
+                        tree_dirty,
+                        nudge_statuses: nudge_statuses.clone(),
+                    });
+                    ctx.record.disposition = Some(disposition.clone());
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::DispositionSet {
+                                seq: 0,
+                                disposition: disposition.clone(),
+                            },
+                        )
+                        .await?;
+                    p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+                }
+                // When persistence is None (the `run` path), the facts are
+                // computed but there is no record to write (acceptable — `run`
+                // returns only LoopOutcome/RunStats). The returned
+                // `Finished(Failed{FinishDiscipline})` still distinguishes the
+                // recovery terminal from a model finish(failed) by its `mode`.
+                return Ok(LoopOutcome::Finished(disposition));
+            }
         }
 
         // Non-terminal end of iteration: write the end-of-iteration checkpoint
@@ -1361,6 +1550,7 @@ mod tests {
     use crate::test_support::MockBackend;
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
+    use crate::tools::standard_registry;
     use crate::workspace::Workspace;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -3125,6 +3315,7 @@ mod tests {
             },
             last_gate_result: None,
             disposition: None,
+            recovery_facts: None,
             messages: vec![],
         }
     }
@@ -4912,5 +5103,461 @@ mod tests {
                 UserBlock::Text(_) => panic!("expected ToolResult block"),
             }
         }
+    }
+
+    // =====================================================================
+    // Finish-recovery protocol tests (detection, nudge, recovery terminal)
+    // =====================================================================
+
+    /// The exact nudge wording the harness injects — pinned by a test so a
+    /// wording pass that drifts fails loudly. Must match
+    /// `crates/harness/templates/nudge_prompt.md` verbatim.
+    const NUDGE_TEXT: &str = "The quality gates are currently green. \
+        If the acceptance criteria are met, call `finish(done)` now. \
+        If they are not yet met, reply with a one-sentence status: \
+        what remains, and why you are still working.";
+
+    /// Count how many `UserBlock::Text` blocks in `messages` carry the nudge
+    /// text — the harness injects the nudge by APPENDING onto the existing
+    /// tool-results `Message::User`, so this counts nudge injections (not new
+    /// messages).
+    fn count_nudge_injections(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content
+                    .iter()
+                    .filter(|b| matches!(b, UserBlock::Text(t) if t == NUDGE_TEXT))
+                    .count(),
+                Message::Assistant { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// Assert no two adjacent `Message::User` appear in `messages` — the
+    /// nudge must be APPENDED onto the existing tool-results `Message::User`,
+    /// never pushed as a new `Message::User` (which would hit the Anthropic
+    /// wire as two `role:"user"` blocks and 400).
+    fn assert_no_adjacent_user_messages(messages: &[Message]) {
+        for i in 0..messages.len().saturating_sub(1) {
+            let a = matches!(messages[i], Message::User { .. });
+            let b = matches!(messages[i + 1], Message::User { .. });
+            assert!(
+                !(a && b),
+                "two adjacent Message::User at indices {i} and {} — nudge \
+                 must be appended, not pushed as a new message",
+                i + 1
+            );
+        }
+    }
+
+    /// A turn that calls `run_checks` (the done-oracle). Used to drive the
+    /// green/red gate signal in detection tests.
+    fn run_checks_turn(id: &str) -> AssistantTurn {
+        turn_with(
+            vec![tool_call(id, "run_checks", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )
+    }
+
+    /// A turn that emits a one-sentence status text and a non-mutating echo
+    /// call — the post-nudge "status reply" (no green re-observation).
+    fn status_echo_turn(id: &str, status: &str) -> AssistantTurn {
+        turn_with(
+            vec![
+                ContentBlock::Text(status.to_string()),
+                tool_call(id, "echo", serde_json::json!({})),
+            ],
+            StopReason::ToolUse,
+        )
+    }
+
+    /// A non-mutating echo turn (no text — `turn.text()` is empty).
+    fn echo_turn(id: &str) -> AssistantTurn {
+        turn_with(
+            vec![tool_call(id, "echo", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )
+    }
+
+    // AC-1 detection test: green run_checks then K static non-mutating
+    // iterations -> exactly one nudge appended (pinned text appears once,
+    // no two adjacent Message::User).
+    #[tokio::test]
+    async fn green_static_spin_injects_exactly_one_nudge_with_pinned_text() {
+        // K = DEFAULT_STATIC_TREE_K = 3. The counter increments every
+        // non-mutating iteration; the run_checks iteration counts as one.
+        //   iter 1: run_checks (green) — iters 0->1
+        //   iter 2: echo — iters 1->2
+        //   iter 3: echo — iters 2->3 -> trip, nudge injected (nudges_fired 0->1)
+        //   iter 4: echo — iters 0->1 (post-nudge; nudge_awaiting_status cleared)
+        //   max_iterations=4 -> MaxIterations
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            echo_turn("c4"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        // The nudge is NOT a terminal — after one nudge the loop continues and
+        // hits MaxIterations (no finish, cap reached).
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "one-nudge spin should hit MaxIterations, not the recovery terminal; got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let nudge_count = count_nudge_injections(&rec.messages);
+        assert_eq!(
+            nudge_count, 1,
+            "exactly one nudge should be injected; got {nudge_count}"
+        );
+        assert_no_adjacent_user_messages(&rec.messages);
+        // recovery_facts is only written on the FinishDiscipline terminal,
+        // which was NOT taken here.
+        assert_eq!(rec.recovery_facts, None);
+    }
+
+    // AC-2 detection test: finish(done) on the turn after a nudge -> the run
+    // terminates as a NORMAL Finished(Done{..}) through the existing
+    // handle_finish_call path. The recovery terminal is NOT taken, and
+    // recovery_facts stays None (a Done-after-nudge is a clean success).
+    #[tokio::test]
+    async fn finish_done_after_nudge_terminates_normally_without_recovery() {
+        //   iter 1: run_checks (green) — iters 0->1
+        //   iter 2: echo — iters 1->2
+        //   iter 3: echo — iters 2->3 -> trip, nudge injected. nudge_awaiting_status=true.
+        //   iter 4: finish(done) — accepted (green checks). nudge_awaiting_status
+        //          cleared WITHOUT pushing (is_done). Terminal: Finished(Done).
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(runner)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            finish_call(
+                "c4",
+                serde_json::json!({ "disposition": "done", "summary": "done after nudge" }),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { summary, .. }) => {
+                assert_eq!(summary, "done after nudge");
+            }
+            other => panic!("expected Finished(Done), got {other:?}"),
+        }
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(rec.recovery_facts, None);
+        assert!(
+            matches!(rec.disposition, Some(Disposition::Done { .. })),
+            "persisted disposition must be Done; got {:?}",
+            rec.disposition
+        );
+        // The nudge was injected (once) before the finish.
+        assert_eq!(count_nudge_injections(&rec.messages), 1);
+    }
+
+    // AC-3 detection test: N nudges then a further K static-green iterations
+    // with no finish -> LoopOutcome::Finished(Disposition::Failed{
+    // FinishDiscipline }) and record.recovery_facts == Some(RecoveryFacts{
+    // gates_green_at_exit: true, tree_dirty: <reflects edits>, nudge_statuses:
+    // <non-empty> }).
+    #[tokio::test]
+    async fn n_nudges_then_static_green_spin_takes_recovery_terminal() {
+        // N = DEFAULT_MAX_NUDGES = 2, K = DEFAULT_STATIC_TREE_K = 3.
+        //   iter 1: run_checks (green) — iters 0->1
+        //   iter 2: echo — iters 1->2
+        //   iter 3: echo — iters 2->3 -> trip, nudge 1. iters=0. awaiting=true.
+        //   iter 4: status+echo — push status. iters 0->1. awaiting=false.
+        //   iter 5: echo — iters 1->2.
+        //   iter 6: echo — iters 2->3 -> trip, nudge 2. iters=0. awaiting=true.
+        //   iter 7: status+echo — push status. iters 0->1. awaiting=false.
+        //   iter 8: echo — iters 1->2.
+        //   iter 9: echo — iters 2->3 -> trip. nudges_fired(2)==max(2) -> RECOVERY TERMINAL.
+        //   max_iterations=10 (never reached — recovery returns at iter 9).
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10)
+            .with_checks(runner)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            status_echo_turn("c4", "still writing the failing-case test"),
+            echo_turn("c5"),
+            echo_turn("c6"),
+            status_echo_turn("c7", "still fixing the off-by-one"),
+            echo_turn("c8"),
+            echo_turn("c9"),
+            // iter 10 would over-draw; recovery returns at iter 9 before this.
+            echo_turn("c10"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(
+                    mode,
+                    FailureMode::FinishDiscipline,
+                    "recovery terminal must be FinishDiscipline; got {mode:?}"
+                );
+                assert!(
+                    summary.contains("gates green but agent did not call finish"),
+                    "summary must name the recovery; got {summary}"
+                );
+                assert!(
+                    summary.contains("2 nudges"),
+                    "summary must name the nudge count; got {summary}"
+                );
+            }
+            other => panic!("expected Finished(Failed{{FinishDiscipline}}), got {other:?}"),
+        }
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("recovery_facts must be Some on the FinishDiscipline terminal");
+        assert!(
+            facts.gates_green_at_exit,
+            "gates were green at the recovery terminal"
+        );
+        assert!(
+            !facts.tree_dirty,
+            "no edit_file/bash was called in this script, so tree_dirty must be false"
+        );
+        assert!(
+            !facts.nudge_statuses.is_empty(),
+            "nudge_statuses must be non-empty (one status per nudge that didn't finish)"
+        );
+        assert_eq!(
+            facts.nudge_statuses.len(),
+            2,
+            "exactly two status replies (one per nudge); got {:?}",
+            facts.nudge_statuses
+        );
+        assert_eq!(count_nudge_injections(&rec.messages), 2);
+        assert_no_adjacent_user_messages(&rec.messages);
+    }
+
+    // AC-4 detection test: a successful edit_file between green-static iters
+    // resets iters_since_tree_change AND clears last_gate_green, so no nudge
+    // fires until a fresh green run_checks is observed post-edit.
+    #[tokio::test]
+    async fn edit_file_resets_counter_and_clears_green_until_fresh_run_checks() {
+        //   iter 1: run_checks (green) — iters 0->1
+        //   iter 2: edit_file (success) — mutated=true, tree_dirty=true,
+        //           last_gate_green=false. iters reset to 0.
+        //   iter 3: echo — iters 0->1. green=false -> no trip.
+        //   iter 4: echo — iters 1->2. green=false -> no trip.
+        //   iter 5: echo — iters 2->3. green=false -> no trip (stale-green window closed).
+        //   iter 6: run_checks (green) — last_gate_green=true. iters 3->4. trip! nudge.
+        //   iter 7: echo — iters 0->1 (post-nudge).
+        //   max_iterations=7 -> MaxIterations
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let config = RunConfig::new("do the task", 7)
+            .with_checks(runner)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![tool_call(
+                    "c2",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "flag",
+                        "old_string": "",
+                        "new_string": "planted\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            echo_turn("c3"),
+            echo_turn("c4"),
+            echo_turn("c5"),
+            run_checks_turn("c6"),
+            echo_turn("c7"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "expected MaxIterations (only one nudge, no recovery); got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        // Exactly one nudge — fired at iter 6 (the fresh green run_checks),
+        // NOT at iter 5 (where iters=3 but green=false after the edit).
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            1,
+            "exactly one nudge, fired only after the fresh green run_checks"
+        );
+        assert_no_adjacent_user_messages(&rec.messages);
+        assert_eq!(rec.recovery_facts, None);
+        assert!(
+            root_path.join("flag").exists(),
+            "edit_file must have created the flag file"
+        );
+    }
+
+    // AC-5 detection test: RED run_checks + spin does NOT nudge and
+    // terminates MaxIterations.
+    #[tokio::test]
+    async fn red_run_checks_spin_does_not_nudge_and_terminates_max_iterations() {
+        //   iter 1: run_checks (RED) — last_gate_green=false. iters 0->1. no trip.
+        //   iter 2-5: echo — iters 1->2->3->4->5. green=false -> never trips.
+        //   max_iterations=5 -> MaxIterations.
+        let runner = failing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(runner)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            echo_turn("c4"),
+            echo_turn("c5"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "red-gate spin must fall through to MaxIterations; got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "red gate must never inject a nudge"
+        );
+        assert_eq!(rec.recovery_facts, None);
+    }
+
+    // AC-6 detection test: max_nudges == 0 disables the feature entirely —
+    // no nudge is ever injected and the recovery terminal is never taken;
+    // a green-gates + static-tree spin falls through to MaxIterations.
+    #[tokio::test]
+    async fn max_nudges_zero_disables_finish_recovery_entirely() {
+        //   iter 1: run_checks (green) — iters 0->1. max_nudges=0 -> no trip.
+        //   iter 2-4: echo — iters 1->2->3->4. no trip (feature off).
+        //   max_iterations=4 -> MaxIterations.
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_max_nudges(0);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            echo_turn("c4"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "max_nudges=0 must fall through to MaxIterations; got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "max_nudges=0 must never inject a nudge"
+        );
+        assert_eq!(rec.recovery_facts, None);
     }
 }

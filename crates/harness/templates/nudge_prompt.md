@@ -1,0 +1,1 @@
+The quality gates are currently green. If the acceptance criteria are met, call `finish(done)` now. If they are not yet met, reply with a one-sentence status: what remains, and why you are still working.

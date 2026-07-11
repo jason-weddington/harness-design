@@ -122,6 +122,14 @@ struct TaskSpecPromptTemplate<'a> {
     gate_command: &'a str,
 }
 
+/// The synthetic-nudge template — a variable-free string the finish-recovery
+/// protocol appends onto the existing tool-results `Message::User` when it
+/// detects a green-gates + static-tree spin. `escape = "none"` is pinned
+/// explicitly so the backticks around `finish(done)` pass through untouched.
+#[derive(Template)]
+#[template(path = "nudge_prompt.md", escape = "none")]
+struct NudgePromptTemplate;
+
 /// Render the system prompt.
 ///
 /// - `tools` is the ordered listing (typically from [`tool_lines`]).
@@ -191,15 +199,34 @@ pub fn render_task_prompt_from_spec(spec: &TaskSpec) -> String {
     .expect("task_spec_prompt.md is a static template that renders infallibly for owned inputs")
 }
 
+/// Render the synthetic-nudge steering text — the variable-free string the
+/// finish-recovery protocol appends onto the existing tool-results
+/// `Message::User` when it detects a green-gates + static-tree spin. The
+/// exact wording is pinned by an engine test
+/// (`green_static_spin_injects_exactly_one_nudge_with_pinned_text`).
+///
+/// The render is a pure function of its (empty) inputs and is
+/// byte-deterministic — re-rendering produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_nudge_prompt() -> String {
+    NudgePromptTemplate
+        .render()
+        .expect("nudge_prompt.md is a static variable-free template that renders infallibly")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolLine, render_system_prompt, render_task_prompt, render_task_prompt_from_spec,
-        tool_lines,
+        NudgePromptTemplate, ToolLine, render_nudge_prompt, render_system_prompt,
+        render_task_prompt, render_task_prompt_from_spec, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
     use crate::task_spec::{FileToModify, TaskSpec};
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
+    use askama::Template;
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -658,5 +685,49 @@ mod tests {
                  offending line: {line:?}; full output:\n{rendered}"
             );
         }
+    }
+
+    // --- render_nudge_prompt tests ------------------------------------------
+
+    /// The nudge wording is load-bearing — an engine detection test pins it
+    /// against `record.messages`. Pin the exact text at the prompt layer too
+    /// so a template edit that drifts fails here before it reaches the
+    /// engine.
+    #[test]
+    fn render_nudge_prompt_pins_exact_wording() {
+        let rendered = render_nudge_prompt();
+        let expected = "The quality gates are currently green. \
+            If the acceptance criteria are met, call `finish(done)` now. \
+            If they are not yet met, reply with a one-sentence status: \
+            what remains, and why you are still working.";
+        assert_eq!(
+            rendered, expected,
+            "nudge wording must match the pinned text exactly; got:\n{rendered}"
+        );
+    }
+
+    /// The nudge is a variable-free template — rendering it twice must
+    /// produce byte-identical output (prompt-cache correctness).
+    #[test]
+    fn render_nudge_prompt_is_byte_deterministic() {
+        let a = render_nudge_prompt();
+        let b = render_nudge_prompt();
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "same (empty) inputs must produce byte-identical nudge output"
+        );
+    }
+
+    /// `NudgePromptTemplate` is a unit struct with no fields — its `render`
+    /// must succeed via the askama derive (a compile-time check) and return
+    /// the same bytes as the free function.
+    #[test]
+    fn nudge_prompt_template_renders_via_derive() {
+        let via_struct = NudgePromptTemplate
+            .render()
+            .expect("variable-free template renders infallibly");
+        let via_fn = render_nudge_prompt();
+        assert_eq!(via_struct, via_fn);
     }
 }
