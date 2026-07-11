@@ -2,6 +2,16 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.4.1 - 2026-07-11
+#### Features
+- (**harness**) capture recovery_facts on a green-static MaxIterations - (f02f0e9) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+#### Documentation
+- bring roadmap current to v0.4.0 + make roadmap upkeep a session-log step - (bc06eda) - Jason Weddington, *Claude Opus 4.8*
+#### Miscellaneous Chores
+- release.sh publishes fleet artifact before pushing the tag - (3a58014) - Jason Weddington, *Claude Opus 4.8*
+
+- - -
+
 ## 0.4.0 - 2026-07-11
 #### Features
 - (**harness**) wall-clock budget — graceful self-termination with recovery facts - (e1cd5b5) - Jason Weddington, *claude-code-sonnet*, *Claude Opus 4.8*
