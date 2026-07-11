@@ -194,3 +194,20 @@ gap: the talos toolset has no search tool (captured as GTD c5836f1c); the
 lead landed the item inline. A `mean_wall` column joined the eval summary.
 Released as **v0.3.6** — a meaningfully more robust eval suite is the
 boundary. Matrix rows: kb-02971/02973/02976; updated handoff: kb-02972.
+
+**Session 7, third sitting:** Turned the talos-patrol post-mortem into two shipped
+fixes and unblocked cheap autonomous dispatch. The copy-in patrol had failed twice
+(both "haiku" and "sonnet") — but reading the run record showed grep was reachable
+all along via `run_command`'s `sh -c` escape; the failure was our own task template
+saying *"No search tool exists"* plus a program+args tool shape that fought the bash
+training prior. Fix: reshape `run_command` → **`bash`** (single command string, honest
+confinement doc) with an affirmative template (pinned test). Then the first-ever
+talos-glm dispatch exposed a bigger latent bug: the dispatch-svc→agent sudo hop runs
+`env_reset`, and the sudoers `env_keep` list omitted `TALOS_BACKEND`/`ANTHROPIC_MODEL`/
+`OLLAMA_*` — so glm/qwen failed outright and **talos-sonnet/opus had been silently
+running as haiku** (which retroactively corrected the "sonnet patrol" record). One
+`env_keep` fix (live on both hosts, durable in the dispatch repo) unblocked all four
+engines. Re-dispatched glm → **verified Done, 8 iterations, gate green, zero Anthropic
+spend** — the harness can now build the harness on Ollama credits, protecting the
+control-plane session budget. Released as **v0.3.7**. Root-cause KB: kb-02979 (sudoers),
+kb-02980 (glm run), kb-02977 (corrected). Handoff: kb-02972.
