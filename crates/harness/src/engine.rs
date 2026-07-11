@@ -1447,6 +1447,23 @@ async fn run_loop_impl(
             tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
             cost_micros: initial_consumed.cost_micros,
         };
+        // Recovery facts: a GREEN-static MaxIterations (gates green, tree
+        // static, model never called finish — and finish-recovery disabled via
+        // `max_nudges == 0` OR the FinishDiscipline terminal simply did not
+        // trip) carries WIP the recovery feature exists to preserve. Mirror
+        // the FinishDiscipline and BudgetExhausted terminals exactly so the
+        // outer harness sees a consistent shape. A RED gate
+        // (`last_gate_green == false`) has nothing worth preserving, so the
+        // write is conditioned on `last_gate_green` — not unconditional. The
+        // disposition, FailureMode, LoopOutcome, and exit-code mapping are
+        // UNCHANGED; this adds recovery_facts ONLY.
+        if last_gate_green {
+            ctx.record.recovery_facts = Some(RecoveryFacts {
+                gates_green_at_exit: last_gate_green,
+                tree_dirty,
+                nudge_statuses: nudge_statuses.clone(),
+            });
+        }
         ctx.record.disposition = Some(disposition.clone());
         p.store
             .append_event(
@@ -5750,9 +5767,22 @@ mod tests {
             "exactly one nudge should be injected; got {nudge_count}"
         );
         assert_no_adjacent_user_messages(&rec.messages);
-        // recovery_facts is only written on the FinishDiscipline terminal,
-        // which was NOT taken here.
-        assert_eq!(rec.recovery_facts, None);
+        // GREEN-static MaxIterations now captures recovery_facts (hardened):
+        // finish-recovery was on but only one nudge fired, so the
+        // FinishDiscipline terminal did NOT trip and the loop fell through to
+        // MaxIterations on a green gate. The WIP is preserved.
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("green-static MaxIterations must capture recovery_facts");
+        assert!(
+            facts.gates_green_at_exit,
+            "gates_green_at_exit must be true on a green-static MaxIterations"
+        );
+        assert!(
+            !facts.tree_dirty,
+            "only echo turns ran, so tree_dirty must be false"
+        );
     }
 
     // AC-2 detection test: finish(done) on the turn after a nudge -> the run
@@ -5979,7 +6009,23 @@ mod tests {
             "exactly one nudge, fired only after the fresh green run_checks"
         );
         assert_no_adjacent_user_messages(&rec.messages);
-        assert_eq!(rec.recovery_facts, None);
+        // GREEN-static MaxIterations now captures recovery_facts (hardened):
+        // the last iteration before the cap was a fresh green run_checks
+        // (iter 6) followed by a non-mutating echo (iter 7), so
+        // last_gate_green is true at the terminal. tree_dirty is true because
+        // a successful edit_file ran at iter 2.
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("green-static MaxIterations must capture recovery_facts");
+        assert!(
+            facts.gates_green_at_exit,
+            "gates_green_at_exit must be true on a green-static MaxIterations"
+        );
+        assert!(
+            facts.tree_dirty,
+            "an edit_file ran, so tree_dirty must be true"
+        );
         assert!(
             root_path.join("flag").exists(),
             "edit_file must have created the flag file"
@@ -6030,7 +6076,27 @@ mod tests {
             0,
             "red gate must never inject a nudge"
         );
-        assert_eq!(rec.recovery_facts, None);
+        // Symmetric guard: a RED-gate MaxIterations yields recovery_facts ==
+        // None — the recovery_facts write is conditioned on last_gate_green,
+        // NOT unconditional. A red gate has nothing worth preserving.
+        assert_eq!(
+            rec.recovery_facts, None,
+            "red-gate MaxIterations must NOT capture recovery_facts"
+        );
+        let disp = rec
+            .disposition
+            .as_ref()
+            .expect("persisted record must carry a disposition at MaxIterations");
+        assert!(
+            matches!(
+                disp,
+                Disposition::Failed {
+                    mode: FailureMode::BudgetExhausted,
+                    ..
+                }
+            ),
+            "MaxIterations disposition must be Failed{{BudgetExhausted}}; got {disp:?}"
+        );
     }
 
     // AC-6 detection test: max_nudges == 0 disables the feature entirely —
@@ -6077,7 +6143,34 @@ mod tests {
             0,
             "max_nudges=0 must never inject a nudge"
         );
-        assert_eq!(rec.recovery_facts, None);
+        // GREEN-static MaxIterations now captures recovery_facts (hardened):
+        // the WIP the recovery feature exists to preserve is no longer silently
+        // forfeited when finish-recovery is disabled and a green-static spin
+        // reaches the iteration cap.
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("green-static MaxIterations must capture recovery_facts");
+        assert!(
+            facts.gates_green_at_exit,
+            "gates_green_at_exit must be true on a green-static MaxIterations"
+        );
+        // The disposition is unchanged by the hardening — still
+        // Failed{BudgetExhausted}, outcome MaxIterations.
+        let disp = rec
+            .disposition
+            .as_ref()
+            .expect("persisted record must carry a disposition at MaxIterations");
+        assert!(
+            matches!(
+                disp,
+                Disposition::Failed {
+                    mode: FailureMode::BudgetExhausted,
+                    ..
+                }
+            ),
+            "MaxIterations disposition must be Failed{{BudgetExhausted}}; got {disp:?}"
+        );
     }
 
     // ---- retry / backoff tests ------------------------------------------

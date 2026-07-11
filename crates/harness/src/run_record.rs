@@ -345,11 +345,16 @@ pub struct DispositionReport {
 /// static tree, nudges exhausted) OR the wall-clock
 /// [`FailureMode::BudgetExhausted`]-on-timeout terminal — both build it from the
 /// same loop-locals. `None` on every other outcome: `Done`, `Blocked`,
-/// `BackendError`, and (notably) `MaxIterations`. So `recovery_facts.is_some()`
-/// means "a recovery terminal fired", NOT specifically `FinishDiscipline`; and a
-/// green-static done-but-unclaimed spin that reaches `MaxIterations` — e.g. with
-/// finish-recovery disabled via `max_nudges == 0` — forfeits capture (a
-/// MaxIterations-hardening follow-up is tracked to close that window).
+/// `BackendError`. A GREEN-static `MaxIterations` (gates green, tree static,
+/// model never called finish — and finish-recovery disabled via `max_nudges == 0`
+/// OR the `FinishDiscipline` terminal simply did not trip before the cap) also
+/// captures recovery facts, so the WIP the recovery feature exists to preserve
+/// is no longer silently forfeited. The residual forfeit window is narrowed to
+/// a RED-gate `MaxIterations` (including finish-recovery disabled via
+/// `max_nudges == 0` that reaches the cap on a red gate), which leaves
+/// `recovery_facts = None` — a red gate has nothing worth preserving. So
+/// `recovery_facts.is_some()` means "a recovery terminal fired OR a
+/// green-static `MaxIterations` was reached", NOT specifically `FinishDiscipline`.
 ///
 /// The three fields record what the loop observed at the recovery terminal so
 /// the outer harness (or a reviewer) can recognize a probably-done-but-unclaimed
