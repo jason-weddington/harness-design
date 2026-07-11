@@ -7,7 +7,7 @@
 //! |------|---------|
 //! | 0    | Task verified Done |
 //! | 10   | Task Blocked |
-//! | 20   | Task Failed, `StoppedWithoutFinish`, or `MaxIterations` |
+//! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
 //!
 //! The code is read from [`harness::engine::LoopOutcome`], **not** from the
@@ -25,6 +25,10 @@
 //! - `OLLAMA_API_KEY` — optional bearer token
 //! - `OLLAMA_NUM_CTX` — optional `u32`; defaults to 32 768 for localhost
 //! - `OLLAMA_THINK` — `off|on|low|medium|high|max`
+//! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; `0` or unset = unbounded
+//!   wall-clock budget. Overridden by `--wall-clock-secs` when the flag is
+//!   present. The harness self-terminates gracefully before the worker's hard
+//!   kill when this budget is reached.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -112,6 +116,18 @@ struct RunArgs {
     /// Timeout for the gate command, in seconds.
     #[arg(long, default_value_t = 300u64)]
     gate_timeout_secs: u64,
+
+    /// Wall-clock budget in seconds. `0` or absent = unbounded.
+    ///
+    /// When set, the harness self-terminates gracefully with recovery facts
+    /// before the worker's hard timeout. Can also be set via the environment
+    /// variable `TALOS_WALL_CLOCK_SECS` (flag takes precedence over env).
+    ///
+    /// Note: the `env` feature is NOT enabled for this project's clap
+    /// dependency, so `#[arg(env = ...)]` cannot be used — the env fallback
+    /// is resolved manually in `main()` via the `env_accessor` closure.
+    #[arg(long)]
+    wall_clock_secs: Option<u64>,
 }
 
 // ============================================================================
@@ -159,6 +175,7 @@ impl ModelBackend for Backend {
 /// | `Finished(Failed{..})` | 20 |
 /// | `StoppedWithoutFinish` | 20 |
 /// | `MaxIterations` | 20 |
+/// | `BudgetExhausted` | 20 |
 /// | `BackendError(_)` | 1 |
 fn exit_code(outcome: &LoopOutcome) -> i32 {
     match outcome {
@@ -166,7 +183,8 @@ fn exit_code(outcome: &LoopOutcome) -> i32 {
         LoopOutcome::Finished(Disposition::Blocked { .. }) => 10,
         LoopOutcome::Finished(Disposition::Failed { .. })
         | LoopOutcome::StoppedWithoutFinish
-        | LoopOutcome::MaxIterations => 20,
+        | LoopOutcome::MaxIterations
+        | LoopOutcome::BudgetExhausted { .. } => 20,
         LoopOutcome::BackendError(_) => 1,
     }
 }
@@ -182,6 +200,7 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
         LoopOutcome::Finished(_) => "Finished",
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish",
         LoopOutcome::MaxIterations => "MaxIterations",
+        LoopOutcome::BudgetExhausted { .. } => "BudgetExhausted",
         LoopOutcome::BackendError(_) => "BackendError",
     }
 }
@@ -237,7 +256,8 @@ fn stderr_json_error(message: &str) {
 #[derive(Serialize)]
 struct RunSummary {
     /// Closed [`LoopOutcome`] discriminant — one of
-    /// `"Finished"`, `"StoppedWithoutFinish"`, `"MaxIterations"`, `"BackendError"`.
+    /// `"Finished"`, `"StoppedWithoutFinish"`, `"MaxIterations"`,
+    /// `"BudgetExhausted"`, `"BackendError"`.
     outcome: &'static str,
     /// The run's terminal [`Disposition`] (derived from the `LoopOutcome`).
     disposition: Disposition,
@@ -510,10 +530,21 @@ async fn main() {
     // 10. Render the seed prompt — byte-for-byte from the renderer, never
     //     hand-formatted.
     let seed = make_run_seed(&spec);
+
+    // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env > 0 (unbounded).
+    // The `env` clap feature is NOT enabled (Cargo.toml features=['derive'] only),
+    // so the env fallback is resolved here via the env_accessor closure.
+    let wall_clock_secs = args
+        .wall_clock_secs
+        .or_else(|| env_accessor("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0);
+
     let config = if let Some(runner) = checks {
-        RunConfig::new(seed, args.max_iterations).with_checks(runner)
-    } else {
         RunConfig::new(seed, args.max_iterations)
+            .with_checks(runner)
+            .with_wall_clock_secs(wall_clock_secs)
+    } else {
+        RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
     };
 
     // 11. Assemble persistence bundle and run.
@@ -605,6 +636,17 @@ mod tests {
     }
 
     #[test]
+    fn exit_code_budget_exhausted_is_20() {
+        assert_eq!(
+            exit_code(&LoopOutcome::BudgetExhausted {
+                summary: "x".into()
+            }),
+            20,
+            "BudgetExhausted must map to exit code 20"
+        );
+    }
+
+    #[test]
     fn exit_code_backend_error_is_1() {
         let outcome = LoopOutcome::BackendError(BackendError::Transient {
             kind: TransientKind::Network,
@@ -613,10 +655,10 @@ mod tests {
         assert_eq!(exit_code(&outcome), 1, "BackendError must be 1, never 20");
     }
 
-    // ---- outcome_str: all 4 literals -----------------------------------
+    // ---- outcome_str: all 5 literals -----------------------------------
 
     #[test]
-    fn outcome_str_covers_all_four_literals() {
+    fn outcome_str_covers_all_five_literals() {
         assert_eq!(
             outcome_str(&LoopOutcome::Finished(Disposition::Done {
                 summary: String::new(),
@@ -629,6 +671,12 @@ mod tests {
             "StoppedWithoutFinish"
         );
         assert_eq!(outcome_str(&LoopOutcome::MaxIterations), "MaxIterations");
+        assert_eq!(
+            outcome_str(&LoopOutcome::BudgetExhausted {
+                summary: "wall-clock budget exhausted".into()
+            }),
+            "BudgetExhausted"
+        );
         assert_eq!(
             outcome_str(&LoopOutcome::BackendError(BackendError::Terminal {
                 kind: TerminalKind::Auth,
@@ -872,8 +920,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_outcome_covers_all_four_literals() {
-        // Verify all four LoopOutcome discriminants appear in outcome_str.
+    fn summary_outcome_covers_all_five_literals() {
+        // Verify all five LoopOutcome discriminants appear in outcome_str.
         let cases: &[(&'static str, LoopOutcome)] = &[
             (
                 "Finished",
@@ -884,6 +932,12 @@ mod tests {
             ),
             ("StoppedWithoutFinish", LoopOutcome::StoppedWithoutFinish),
             ("MaxIterations", LoopOutcome::MaxIterations),
+            (
+                "BudgetExhausted",
+                LoopOutcome::BudgetExhausted {
+                    summary: "wall-clock budget exhausted".into(),
+                },
+            ),
             (
                 "BackendError",
                 LoopOutcome::BackendError(BackendError::Terminal {
@@ -928,5 +982,55 @@ mod tests {
         let _clone = runner.clone();
         // If this compiles and runs, ChecksRunner is Clone. ✓
         assert_eq!(runner.command().program, "/bin/sh");
+    }
+
+    // ---- wall_clock_secs: flag > env > default 0 -------------------------
+
+    /// Helper that simulates the `wall_clock_secs` resolution logic from `main()`:
+    ///   `flag > TALOS_WALL_CLOCK_SECS env > default 0`
+    fn resolve_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
+        flag.or_else(|| env("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn wall_clock_secs_flag_beats_env() {
+        let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "999")]);
+        assert_eq!(
+            resolve_wall_clock_secs(Some(42), &env),
+            42,
+            "explicit flag must take precedence over env"
+        );
+    }
+
+    #[test]
+    fn wall_clock_secs_env_beats_default() {
+        let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "300")]);
+        assert_eq!(
+            resolve_wall_clock_secs(None, &env),
+            300,
+            "env must beat the default 0"
+        );
+    }
+
+    #[test]
+    fn wall_clock_secs_both_unset_yields_zero() {
+        let env = env_with(&[]);
+        assert_eq!(
+            resolve_wall_clock_secs(None, &env),
+            0,
+            "both-unset must yield the sentinel 0 (unbounded)"
+        );
+    }
+
+    #[test]
+    fn wall_clock_secs_invalid_env_value_falls_back_to_zero() {
+        // A non-u64 env value must not panic — it falls through to default 0.
+        let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "not-a-number")]);
+        assert_eq!(
+            resolve_wall_clock_secs(None, &env),
+            0,
+            "invalid env value must fall back to 0 (unbounded)"
+        );
     }
 }

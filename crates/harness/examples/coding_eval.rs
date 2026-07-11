@@ -364,6 +364,7 @@ fn outcome_one_liner(outcome: &LoopOutcome) -> String {
         }
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish".to_string(),
         LoopOutcome::MaxIterations => "MaxIterations".to_string(),
+        LoopOutcome::BudgetExhausted { summary } => format!("BudgetExhausted — {summary}"),
         LoopOutcome::BackendError(err) => format!("BackendError — {err:?}"),
     }
 }

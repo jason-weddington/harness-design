@@ -223,6 +223,16 @@ pub struct BudgetLimits {
     pub iterations: u32,
     pub tokens: u64,
     pub cost_micros: u64,
+    /// Wall-clock budget in seconds. `0` means unbounded. The harness
+    /// self-terminates gracefully when elapsed seconds ≥ this value, writing
+    /// recovery facts before the worker's hard kill arrives.
+    ///
+    /// `#[serde(default)]` is MANDATORY for backward-compatible deserialization
+    /// of pre-existing `run.sqlite` records that were written before this field
+    /// existed — they deserialize with `wall_clock_secs = 0` (unbounded).
+    /// [`SCHEMA_VERSION`] stays 2; no migration is required.
+    #[serde(default)]
+    pub wall_clock_secs: u64,
 }
 
 // ===== Gate result =====================================================
@@ -509,6 +519,7 @@ mod tests {
                 iterations: 50,
                 tokens: 1_000_000,
                 cost_micros: 5_000_000,
+                wall_clock_secs: 0,
             },
             wall_clock_start: "2026-06-22T00:00:00Z".to_string(),
         }
@@ -1023,6 +1034,7 @@ mod tests {
             iterations: 10,
             tokens: 20,
             cost_micros: 30,
+            wall_clock_secs: 0,
         };
         let bl2 = bl;
         assert_eq!(bl, bl2);

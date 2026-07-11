@@ -451,6 +451,7 @@ mod tests {
                     iterations: 100,
                     tokens: 1_000_000,
                     cost_micros: 10_000_000,
+                    wall_clock_secs: 0,
                 },
                 wall_clock_start: "2026-06-22T00:00:00Z".to_string(),
             },

@@ -15,6 +15,112 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// =======================================================================
+// Clock seam
+// =======================================================================
+
+/// Seam for wall-clock reads: everything that reads "now" inside the harness
+/// goes through this trait so tests can drive time deterministically.
+///
+/// The `Debug + Send + Sync` supertrait bounds are REQUIRED so that
+/// `std::sync::Arc<dyn Clock>` can live inside `RunConfig`'s
+/// `#[derive(Debug, Clone)]`: `Arc<T>` is `Clone` unconditionally, `Debug`
+/// requires `T: Debug`, and `Send + Sync` let the `Arc` cross thread
+/// boundaries safely.
+pub trait Clock: std::fmt::Debug + Send + Sync {
+    /// Return the current wall-clock instant as a [`SystemTime`].
+    fn now(&self) -> SystemTime;
+}
+
+/// Production implementation of [`Clock`]: delegates to [`SystemTime::now`].
+#[derive(Debug, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+// =======================================================================
+// Test-only advanceable clock
+// =======================================================================
+
+/// Test-only advanceable clock. Available only when `cfg(test)`.
+///
+/// Supports two advance modes:
+/// - **Manual**: call [`FakeClock::advance`] to move the clock forward
+///   explicitly. The clock stays fixed between `advance` calls (each call to
+///   [`Clock::now`] returns the same value until the next `advance`).
+/// - **Auto-advance**: construct with [`FakeClock::new_auto_advance`]; every
+///   call to [`Clock::now`] automatically advances the clock by `step`, then
+///   returns the pre-advance value. This lets loop tests drive a breach without
+///   external synchronisation — set `step > wall_clock_secs` to fire on the
+///   first iteration.
+///
+/// Interior mutability via `Mutex<(SystemTime, step)>` so both methods accept
+/// `&self`.
+#[cfg(test)]
+pub struct FakeClock {
+    inner: std::sync::Mutex<(SystemTime, Duration)>,
+}
+
+#[cfg(test)]
+impl FakeClock {
+    /// Create a [`FakeClock`] anchored at `start` with no auto-advance (the
+    /// clock stays fixed until [`FakeClock::advance`] is called).
+    pub fn new(start: SystemTime) -> Self {
+        Self {
+            inner: std::sync::Mutex::new((start, Duration::ZERO)),
+        }
+    }
+
+    /// Create a [`FakeClock`] that automatically advances by `step` on every
+    /// call to [`Clock::now`]. The pre-advance value is returned, so the first
+    /// call returns `start`, the second `start + step`, and so on.
+    ///
+    /// Useful for wall-clock breach tests where the loop runs in a single
+    /// async task and there is no opportunity to call `advance` mid-loop.
+    pub fn new_auto_advance(start: SystemTime, step: Duration) -> Self {
+        Self {
+            inner: std::sync::Mutex::new((start, step)),
+        }
+    }
+
+    /// Advance the clock forward by `d`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another test thread panicked
+    /// while holding the lock).
+    pub fn advance(&self, d: Duration) {
+        let mut guard = self.inner.lock().expect("FakeClock mutex poisoned");
+        guard.0 += d;
+    }
+}
+
+#[cfg(test)]
+impl Clock for FakeClock {
+    fn now(&self) -> SystemTime {
+        let mut guard = self.inner.lock().expect("FakeClock mutex poisoned");
+        let t = guard.0;
+        let step = guard.1;
+        guard.0 += step; // no-op when step == Duration::ZERO
+        t
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for FakeClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.inner.lock().expect("FakeClock mutex poisoned");
+        f.debug_struct("FakeClock")
+            .field("current", &guard.0)
+            .field("step", &guard.1)
+            .finish()
+    }
+}
+
 /// Format `t` as a UTC RFC 3339 timestamp of the form
 /// `"YYYY-MM-DDTHH:MM:SSZ"`.
 ///
@@ -68,7 +174,8 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_rfc3339;
+    use super::{Clock, FakeClock, SystemClock, format_rfc3339};
+    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -83,5 +190,84 @@ mod tests {
         // Verified with `date -u -d @1700000000`: 2023-11-14 22:13:20 UTC.
         let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         assert_eq!(format_rfc3339(t), "2023-11-14T22:13:20Z");
+    }
+
+    // ---- Clock / SystemClock -------------------------------------------
+
+    #[test]
+    fn system_clock_now_is_after_epoch() {
+        let clock = SystemClock;
+        // SystemClock::now() must return something after the Unix epoch.
+        assert!(
+            clock.now() > UNIX_EPOCH,
+            "SystemClock::now() should be after the Unix epoch"
+        );
+    }
+
+    #[test]
+    fn system_clock_is_debug_send_sync() {
+        fn assert_debug_send_sync<T: std::fmt::Debug + Send + Sync>() {}
+        assert_debug_send_sync::<SystemClock>();
+    }
+
+    #[test]
+    fn system_clock_arc_dyn_clock_is_clone_and_debug() {
+        let c: Arc<dyn Clock> = Arc::new(SystemClock);
+        // Arc<dyn Clock> must be Clone (Arc::clone).
+        let _c2 = c.clone();
+        // dyn Clock must be Debug via the supertrait.
+        let _ = format!("{c:?}");
+    }
+
+    // ---- FakeClock --------------------------------------------------------
+
+    #[test]
+    fn fake_clock_starts_at_given_time() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
+        let clock = FakeClock::new(t0);
+        assert_eq!(clock.now(), t0);
+        // Second call returns the same value (no auto-advance).
+        assert_eq!(clock.now(), t0);
+    }
+
+    #[test]
+    fn fake_clock_advance_moves_time_forward() {
+        let t0 = UNIX_EPOCH;
+        let clock = FakeClock::new(t0);
+        clock.advance(Duration::from_secs(42));
+        assert_eq!(
+            clock.now(),
+            t0 + Duration::from_secs(42),
+            "advance must move the clock forward by the given duration"
+        );
+    }
+
+    #[test]
+    fn fake_clock_advance_is_cumulative() {
+        let t0 = UNIX_EPOCH;
+        let clock = FakeClock::new(t0);
+        clock.advance(Duration::from_secs(10));
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(clock.now(), t0 + Duration::from_secs(15));
+    }
+
+    #[test]
+    fn fake_clock_implements_clock_trait() {
+        let clock = FakeClock::new(UNIX_EPOCH + Duration::from_secs(500));
+        let dyn_clock: &dyn Clock = &clock;
+        assert_eq!(dyn_clock.now(), UNIX_EPOCH + Duration::from_secs(500));
+    }
+
+    #[test]
+    fn fake_clock_auto_advance_per_now_call() {
+        let t0 = UNIX_EPOCH;
+        let step = Duration::from_secs(10);
+        let clock = FakeClock::new_auto_advance(t0, step);
+        // First call returns t0 (pre-advance value), then advances to t0+10s.
+        assert_eq!(clock.now(), t0);
+        // Second call returns t0+10s, then advances to t0+20s.
+        assert_eq!(clock.now(), t0 + Duration::from_secs(10));
+        // Third call returns t0+20s.
+        assert_eq!(clock.now(), t0 + Duration::from_secs(20));
     }
 }
