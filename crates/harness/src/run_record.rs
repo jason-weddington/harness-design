@@ -340,8 +340,16 @@ pub struct DispositionReport {
     pub event_log_ref: String,
 }
 
-/// Telemetry captured by the finish-recovery protocol — written on a
-/// [`FailureMode::FinishDiscipline`] terminal, `None` on every other outcome.
+/// Telemetry captured by the harness's recovery terminals — written on EITHER
+/// a [`FailureMode::FinishDiscipline`] terminal (finish-recovery: green gates +
+/// static tree, nudges exhausted) OR the wall-clock
+/// [`FailureMode::BudgetExhausted`]-on-timeout terminal — both build it from the
+/// same loop-locals. `None` on every other outcome: `Done`, `Blocked`,
+/// `BackendError`, and (notably) `MaxIterations`. So `recovery_facts.is_some()`
+/// means "a recovery terminal fired", NOT specifically `FinishDiscipline`; and a
+/// green-static done-but-unclaimed spin that reaches `MaxIterations` — e.g. with
+/// finish-recovery disabled via `max_nudges == 0` — forfeits capture (a
+/// MaxIterations-hardening follow-up is tracked to close that window).
 ///
 /// The three fields record what the loop observed at the recovery terminal so
 /// the outer harness (or a reviewer) can recognize a probably-done-but-unclaimed

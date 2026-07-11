@@ -8,7 +8,8 @@ Three mechanisms, one of them design-heavy:
 
 1. **Finish-recovery protocol** (the centerpiece) — detect a done-but-not-claimed
    spin, nudge, and *never silently discard work*.
-2. **Budget enforcement** — the `BudgetLimits` types already exist; enforce them.
+2. **Wall-clock budget** — self-terminate gracefully before the worker's hard
+   kill (token/cost caps deferred — see Budget enforcement).
 3. **Retry / backoff** — `is_retryable()` already exists; the loop must actually
    use it.
 
@@ -122,20 +123,27 @@ Failed / `1` infra). The recovery signal rides in the run record the worker
 already reads. This keeps the disposition→exit-code map (ratified in 0.3.5)
 untouched.
 
-## Budget enforcement
+## Budget enforcement — wall-clock only (as shipped)
+
+> **Scope narrowed during the wave (2026-07-11).** The original plan below was
+> "enforce all four caps." It shipped as **wall-clock only**: `iterations` was
+> already enforced pre-0.4.0, wall-clock landed here, and **`tokens` / `cost` are
+> deferred** — token caps are inscrutable (no human-legible right value per task)
+> and cost caps are blocked on a token→price table that doesn't exist
+> (`consumed.cost_micros` is never incremented). The prod `BudgetLimits` literal
+> still hardcodes `tokens: 0, cost_micros: 0` (unenforced). See the roadmap
+> backlog and the deferred-caps follow-up. This section is kept as the record of
+> the design; the paragraph below describes the wall-clock cap that landed.
 
 The types are already in the schema (`run_record::BudgetLimits { iterations,
-tokens, cost_micros }`, plus `Budgets::wall_clock_start`), and the loop already
-*ticks* `consumed` every iteration via `BudgetTick` events. What's missing is the
-check: today only `iterations` is enforced; `tokens`, `cost_micros`, and
-wall-clock are recorded and ignored.
-
-v0.4.0 enforces all four. When any cap is exceeded the run terminates
-`Failed { mode: BudgetExhausted }`, and the summary names *which* bound blew (an
-agent that fails on cost reads differently from one that fails on wall-clock — the
-routing layer needs to tell them apart). The check runs at the same
-end-of-iteration point where `consumed` is already updated, so the accounting and
-the enforcement read the same numbers.
+tokens, cost_micros }`, plus a new `wall_clock_secs`), and the loop already
+*ticks* `consumed` every iteration via `BudgetTick` events. v0.4.0 adds the
+**wall-clock** check: when `wall_clock_secs != 0 && elapsed >= wall_clock_secs`
+the run terminates `Failed { mode: BudgetExhausted }` with a summary naming the
+bound (`"wall-clock budget exhausted"`). The check runs at the same
+end-of-iteration point where `consumed` is updated. Token and cost enforcement
+would slot in at the same point (reusing `consumed.tokens` / `cost_micros`) if
+and when they're built.
 
 Wall-clock uses `Budgets::wall_clock_start` (already persisted). On resume the
 consumed budgets carry over (0.3.0 already does this for accounting) — so a
@@ -184,7 +192,9 @@ probably not v0.4.0.
   claim-vs-verify is untouched.
 - **No new exit code** — recovery facts ride in the run record; the worker reads
   them and pushes the WIP branch.
-- Budget enforcement covers **all four** caps; `BudgetExhausted` names the bound.
+- Budget enforcement ships **wall-clock only** (`BudgetExhausted` names the
+  bound); `iterations` was already enforced; **token/cost deferred** (inscrutable
+  / no pricing table — see the Budget-enforcement note and the roadmap backlog).
 - Retry is **bounded + deterministic backoff** on `is_retryable()` only.
 
 ## Open questions (to resolve in grooming)
