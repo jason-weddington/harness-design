@@ -32,10 +32,9 @@
 //!   [`crate::run_record::Disposition`] for storage.
 //!
 //! What does **not** live here yet (tracked separately): budget / token /
-//! wall-clock bounds, retry / backoff, loop / no-progress detection,
-//! persistence / checkpointing, and context assembly / compaction. The only
-//! stopping condition beyond the agent finishing is the hard `max_iterations`
-//! cap.
+//! wall-clock bounds, loop / no-progress detection, persistence /
+//! checkpointing, and context assembly / compaction. The only stopping
+//! condition beyond the agent finishing is the hard `max_iterations` cap.
 //!
 //! ## Loop shape
 //!
@@ -53,8 +52,13 @@
 //! 6. If the cap is reached before the model reaches an accepted finish, stop
 //!    ([`LoopOutcome::MaxIterations`]).
 //!
-//! A backend error is surfaced immediately as [`LoopOutcome::BackendError`] —
-//! the loop does **not** retry; retry / backoff lands with the budget work.
+//! A retryable backend error ([`model::BackendError::Transient`]) is retried
+//! up to [`RunConfig::max_retries`] additional times with deterministic
+//! exponential backoff before surfacing [`LoopOutcome::BackendError`]. A
+//! non-retryable error ([`model::BackendError::Terminal`],
+//! [`model::BackendError::Protocol`],
+//! [`model::BackendError::ContextLengthExceeded`]) is surfaced on first
+//! occurrence.
 //!
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
@@ -65,6 +69,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::exec::{CheckReport, ChecksRunner};
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
@@ -116,11 +121,45 @@ pub struct RunConfig {
     /// finish-recovery entirely — no nudge is ever injected and the recovery
     /// terminal is never taken. See [`DEFAULT_MAX_NUDGES`].
     pub max_nudges: u32,
+    /// Number of ADDITIONAL attempts after the first try when a
+    /// [`model::BackendError::Transient`] failure is returned. With the
+    /// default 3, one logical turn calls `backend.turn` at most `1 + 3 = 4`
+    /// times. Set to `0` to disable retries.
+    ///
+    /// **Panic-safety bound:** the exponential schedule
+    /// (`retry_backoff_base * 2^attempt`) is panic-safe only for small values;
+    /// the default (max exponent 2) is safe. A caller configuring a very large
+    /// `max_retries` owns the `Duration`-multiply overflow — saturating math is
+    /// deferred (YAGNI at the pinned default).
+    ///
+    /// See [`DEFAULT_MAX_RETRIES`].
+    pub max_retries: u32,
+    /// Base delay for the deterministic exponential backoff schedule. The
+    /// delay before retry attempt `i` (0-indexed) is `retry_backoff_base *
+    /// 2^i`. Set to [`Duration::ZERO`] in tests to run retries with no sleep.
+    ///
+    /// See [`DEFAULT_RETRY_BACKOFF_BASE`].
+    pub retry_backoff_base: Duration,
 }
 
 /// The default per-turn output cap. Budget-aware sizing lands with the budget
 /// work; this is a fixed value for the thin slice.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Default retry cap: how many ADDITIONAL attempts are made after the first
+/// try on a retryable [`model::BackendError::Transient`] failure. With the
+/// default of 3, one logical turn calls `backend.turn` at most 4 times before
+/// giving up. The exponential backoff schedule (`base * 2^attempt`) is
+/// panic-safe for small values; at the pinned default the max exponent is 2
+/// (0.5 s / 1 s / 2 s). A caller configuring a very large `max_retries` owns
+/// the `Duration`-multiply overflow (saturating math is deferred — YAGNI at
+/// the pinned default).
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Default base delay for the exponential backoff schedule. The delay before
+/// attempt `i` (0-indexed) is `DEFAULT_RETRY_BACKOFF_BASE * 2^i`:
+/// 500 ms, 1 000 ms, 2 000 ms for attempts 0/1/2 (with `max_retries = 3`).
+pub const DEFAULT_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
 /// Default static-tree threshold K — a starting guess, to be tuned against
 /// 0.4.0 run data. After K consecutive non-mutating iterations with a green
@@ -135,7 +174,9 @@ pub const DEFAULT_MAX_NUDGES: u32 = 2;
 
 impl RunConfig {
     /// Build a config with the given `task` and iteration cap. Defaults
-    /// `checks` to `None` and `max_tokens` to [`DEFAULT_MAX_TOKENS`].
+    /// `checks` to `None`, `max_tokens` to [`DEFAULT_MAX_TOKENS`],
+    /// `max_retries` to [`DEFAULT_MAX_RETRIES`], and `retry_backoff_base` to
+    /// [`DEFAULT_RETRY_BACKOFF_BASE`].
     #[must_use]
     pub fn new(task: impl Into<String>, max_iterations: u32) -> Self {
         Self {
@@ -145,6 +186,8 @@ impl RunConfig {
             max_tokens: DEFAULT_MAX_TOKENS,
             static_tree_k: DEFAULT_STATIC_TREE_K,
             max_nudges: DEFAULT_MAX_NUDGES,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         }
     }
 
@@ -176,6 +219,23 @@ impl RunConfig {
     #[must_use]
     pub fn with_max_nudges(mut self, max_nudges: u32) -> Self {
         self.max_nudges = max_nudges;
+        self
+    }
+
+    /// Override the retry cap ([`DEFAULT_MAX_RETRIES`] by default). `0`
+    /// disables retries. See [`RunConfig::max_retries`].
+    #[must_use]
+    pub fn with_max_retries(mut self, n: u32) -> Self {
+        self.max_retries = n;
+        self
+    }
+
+    /// Override the backoff base delay ([`DEFAULT_RETRY_BACKOFF_BASE`] by
+    /// default). Set to [`Duration::ZERO`] in tests to skip the sleep. See
+    /// [`RunConfig::retry_backoff_base`].
+    #[must_use]
+    pub fn with_retry_backoff_base(mut self, base: Duration) -> Self {
+        self.retry_backoff_base = base;
         self
     }
 }
@@ -334,10 +394,15 @@ impl FinishClaim {
 /// Mechanical statistics accumulated by the loop, carried alongside every
 /// [`LoopOutcome`] on the [`RunResult`] a call to [`run`] returns.
 ///
-/// - `iterations`: how many model turns the loop actually drew — a
-///   [`LoopOutcome::BackendError`] on the FIRST turn yields `iterations = 1`
-///   (the erroring draw counts). [`LoopOutcome::MaxIterations`] always yields
-///   `iterations == config.max_iterations`.
+/// - `iterations`: how many **logical** iterations the loop executed — one per
+///   `for`-loop pass. A turn that fails transiently and is retried within the
+///   same pass still counts as **one** logical iteration; retry draws within a
+///   single pass are NOT counted separately. A
+///   [`LoopOutcome::BackendError`] on the FIRST turn yields `iterations = 1`.
+///   [`LoopOutcome::MaxIterations`] always yields
+///   `iterations == config.max_iterations`. Raw `backend.turn` draw count
+///   (including retries within a pass) is observable in tests via
+///   [`crate::test_support::MockBackend::calls`].
 /// - `input_tokens` / `output_tokens`: the sum of
 ///   [`AssistantTurn.usage.input_tokens`](crate::model::Usage::input_tokens) /
 ///   [`output_tokens`](crate::model::Usage::output_tokens) across every
@@ -352,7 +417,9 @@ impl FinishClaim {
 /// in-memory shape the loop hands its caller today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunStats {
-    /// Model turns actually drawn — includes an erroring last turn.
+    /// Logical iterations executed — one per `for`-loop pass. Retry draws
+    /// within one pass count once here; use `MockBackend::calls()` in tests
+    /// to observe the raw `backend.turn` draw count including retries.
     pub iterations: u32,
     /// Sum of `usage.input_tokens` across successful turns.
     pub input_tokens: u64,
@@ -393,8 +460,14 @@ pub enum LoopOutcome {
     /// bottom out here — loop/rejection-counter detection lands with a
     /// separate item.
     MaxIterations,
-    /// The backend returned an error. Surfaced as-is — the loop does not
-    /// retry (retry / backoff lands with the budget work).
+    /// The backend returned an error that exhausted the retry budget. Carries
+    /// the **last** attempt's error. Retryable errors
+    /// ([`model::BackendError::Transient`]) are retried up to
+    /// [`RunConfig::max_retries`] additional times with deterministic
+    /// exponential backoff before reaching this variant. Non-retryable errors
+    /// ([`model::BackendError::Terminal`], [`model::BackendError::Protocol`],
+    /// [`model::BackendError::ContextLengthExceeded`]) reach this variant on
+    /// first occurrence.
     BackendError(model::BackendError),
 }
 
@@ -736,9 +809,11 @@ pub async fn run_persisted(
 /// The engine loop body, shared by [`run`], [`run_persisted`], and [`resume`].
 ///
 /// `stats` is mutated in place as the loop progresses:
-/// - `iterations` is incremented BEFORE each `backend.turn` call — so a
-///   backend error on the first draw yields `iterations = 1`, matching the
-///   "model turns actually drawn" contract in [`RunStats`].
+/// - `iterations` is incremented once per `for`-loop iteration, BEFORE the
+///   first (possibly-retried) `backend.turn` call of that iteration. A turn
+///   that fails transiently and is retried within the same pass still counts
+///   as ONE logical iteration. A backend error on the first iteration yields
+///   `iterations = 1`.
 /// - `input_tokens` / `output_tokens` accumulate the SUCCESSFUL turn's
 ///   [`crate::model::Usage`] only; errored turns contribute nothing.
 ///
@@ -875,15 +950,29 @@ async fn run_loop_impl(
             params: &params,
         };
 
-        // Count the draw BEFORE the call so an error on the first turn still
-        // shows up as `iterations = 1` in `stats`.
+        // Count the logical iteration BEFORE the retry loop so an error on
+        // the first iteration still shows `iterations = 1`. A transient error
+        // retried within the same for-loop pass counts as ONE logical
+        // iteration — `stats.iterations` is NOT re-incremented per retry.
         stats.iterations += 1;
-        let turn = match backend.turn(&req).await {
+        let mut attempt = 0u32;
+        let turn_result = loop {
+            match backend.turn(&req).await {
+                Ok(turn) => break Ok(turn),
+                Err(err) if err.is_retryable() && attempt < config.max_retries => {
+                    sleep(retry_delay(config.retry_backoff_base, attempt)).await;
+                    attempt += 1;
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        let turn = match turn_result {
             Ok(turn) => turn,
             Err(err) => {
-                // Terminal path: BackendError. Persist the disposition before
-                // returning — this path exits early, bypassing the normal
-                // end-of-iteration checkpoint.
+                // Terminal path: BackendError (retries exhausted or
+                // non-retryable). Persist the disposition before returning —
+                // this path exits early, bypassing the normal end-of-iteration
+                // checkpoint. `err` is the LAST attempt's error.
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                     let mode = if err.is_retryable() {
                         FailureMode::TransientInfra
@@ -1529,17 +1618,34 @@ pub async fn resume(
     Ok(RunResult { outcome, stats })
 }
 
+/// Compute the delay before retry attempt `attempt` (0-indexed) using a
+/// deterministic exponential backoff schedule:
+///
+/// ```text
+/// delay = base * 2^attempt
+/// ```
+///
+/// Examples with `base = 500 ms`: attempt 0 → 500 ms, attempt 1 → 1 000 ms,
+/// attempt 2 → 2 000 ms.
+///
+/// **No jitter, no RNG, no wall-clock read** — the delay is a pure function
+/// of the attempt index (determinism invariant 3). Set `base =
+/// Duration::ZERO` in tests to run retries with no sleep.
+fn retry_delay(base: Duration, attempt: u32) -> Duration {
+    base * 2u32.pow(attempt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FINISH_TOOL_NAME, FinishTool, LoopOutcome, Persistence, ResumeError, ResumeMode, RunConfig,
-        RunResult, RunStats, rejection_content, render_tool_result, resume, run, run_id,
-        run_persisted,
+        RunResult, RunStats, rejection_content, render_tool_result, resume, retry_delay, run,
+        run_id, run_persisted,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
-        ToolCallRequest, Usage, UserBlock,
+        ToolCallRequest, TransientKind, Usage, UserBlock,
     };
     use crate::prompt;
     use crate::run_record::{
@@ -5559,5 +5665,179 @@ mod tests {
             "max_nudges=0 must never inject a nudge"
         );
         assert_eq!(rec.recovery_facts, None);
+    }
+
+    // ---- retry / backoff tests ------------------------------------------
+
+    /// Load-bearing unit test: pins the exponential schedule with a NON-zero
+    /// base so the shape is actually tested. The async retry tests all use
+    /// `base = Duration::ZERO` and cannot discriminate between exponential,
+    /// linear, or constant schedules.
+    #[test]
+    fn retry_delay_schedule_is_exponential() {
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), 0),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), 2),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// A single transient error followed by a success completes the run.
+    /// Verifies: `backend.calls() == 2`, `stats.iterations == 1`, and
+    /// `outcome == LoopOutcome::Finished(Disposition::Done{..})`.
+    #[tokio::test]
+    async fn transient_then_success_proceeds() {
+        let transient = BackendError::Transient {
+            kind: TransientKind::RateLimit,
+            retry_after: None,
+        };
+        let done_turn = finish_call(
+            "c1",
+            serde_json::json!({ "disposition": "done", "summary": "all good" }),
+        );
+
+        let backend = MockBackend::new(vec![Err(transient), Ok(done_turn)]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(backend.calls(), 2, "one transient + one success = 2 draws");
+        assert_eq!(stats.iterations, 1, "single logical iteration");
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { verification, .. }) => {
+                assert_eq!(
+                    verification,
+                    Verification::NoChecksConfigured,
+                    "no checks configured"
+                );
+            }
+            other => panic!("expected Finished(Done), got {other:?}"),
+        }
+    }
+
+    /// A retried turn is counted as ONE logical iteration even when
+    /// `backend.turn` was called twice.
+    #[tokio::test]
+    async fn iteration_counted_once_across_retried_turn() {
+        let transient = BackendError::Transient {
+            kind: TransientKind::RateLimit,
+            retry_after: None,
+        };
+        // Plain turn with no tool calls → StoppedWithoutFinish.
+        let no_tools_turn = turn_with(
+            vec![ContentBlock::Text("thinking...".to_string())],
+            StopReason::EndTurn,
+        );
+
+        let backend = MockBackend::new(vec![Err(transient), Ok(no_tools_turn)]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(backend.calls(), 2, "one transient + one success = 2 draws");
+        assert_eq!(
+            stats.iterations, 1,
+            "retry does NOT double-count the iteration"
+        );
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "expected StoppedWithoutFinish, got {outcome:?}"
+        );
+    }
+
+    /// When all retries are exhausted the loop gives up and returns
+    /// `LoopOutcome::BackendError` carrying the last attempt's error, with
+    /// `stats.iterations == 1` (all retries stay inside iteration 1).
+    #[tokio::test]
+    async fn consecutive_transients_exhaust_and_give_up_as_transient_infra() {
+        // max_retries = 3 (default) → 4 total attempts.
+        let script: Vec<Result<AssistantTurn, BackendError>> = (0..4)
+            .map(|_| {
+                Err(BackendError::Transient {
+                    kind: TransientKind::RateLimit,
+                    retry_after: None,
+                })
+            })
+            .collect();
+
+        let backend = MockBackend::new(script);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(backend.calls(), 4, "1 first try + 3 retries = 4 draws");
+        assert_eq!(stats.iterations, 1, "all retries stay inside iteration 1");
+        // The outcome must be BackendError carrying a Transient error.
+        match &outcome {
+            LoopOutcome::BackendError(BackendError::Transient { .. }) => {}
+            other => panic!("expected BackendError(Transient), got {other:?}"),
+        }
+        // into_disposition maps a retryable final error to TransientInfra.
+        match outcome.into_disposition() {
+            Disposition::Failed {
+                mode: FailureMode::TransientInfra,
+                ..
+            } => {}
+            other => panic!("expected Failed(TransientInfra), got {other:?}"),
+        }
+    }
+
+    /// Terminal errors are not retried — `backend.calls() == 1`.
+    #[tokio::test]
+    async fn terminal_fails_on_first_occurrence_no_retry() {
+        let backend = MockBackend::new(vec![Err(BackendError::Terminal {
+            kind: TerminalKind::Other,
+            message: "bad request".to_string(),
+        })]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(backend.calls(), 1, "terminal error: no retries");
+        assert_eq!(stats.iterations, 1);
+        match outcome.into_disposition() {
+            Disposition::Failed {
+                mode: FailureMode::PersistentToolError,
+                ..
+            } => {}
+            other => panic!("expected Failed(PersistentToolError), got {other:?}"),
+        }
+    }
+
+    /// `ContextLengthExceeded` is NOT retried (deferred out of 0.4.0) —
+    /// it maps to `PersistentToolError` on first occurrence.
+    #[tokio::test]
+    async fn context_length_exceeded_not_retried() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContextLengthExceeded)]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(backend.calls(), 1, "ContextLengthExceeded: no retries");
+        assert_eq!(stats.iterations, 1);
+        match outcome.into_disposition() {
+            Disposition::Failed {
+                mode: FailureMode::PersistentToolError,
+                ..
+            } => {}
+            other => panic!("expected Failed(PersistentToolError), got {other:?}"),
+        }
     }
 }
