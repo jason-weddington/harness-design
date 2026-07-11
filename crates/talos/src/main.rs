@@ -52,7 +52,7 @@ use serde::Serialize;
 
 /// Top-level CLI entry point.
 #[derive(clap::Parser)]
-#[command(name = "talos", about = "Talos agent runner", version)]
+#[command(name = "talos", about = "Talos agent runner", version = env!("TALOS_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

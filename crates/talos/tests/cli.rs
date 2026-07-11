@@ -239,8 +239,15 @@ fn help_flag_exits_0_with_plain_help() {
 
 /// `--version` surfaces as `Err` from `try_parse` but must NOT take the
 /// JSON-error exit-1 path — version goes to stdout plainly with exit 0.
+///
+/// It also pins the **dispatch-fleet contract** (see `crates/talos/build.rs` and
+/// `scripts/publish-talos.sh`): the output is `talos <TOKEN>` where `<TOKEN>` is
+/// `<semver>-g<short-sha>`, a single URL/path-safe string. `talos-update.sh`
+/// extracts it via `talos --version | awk '{print $2}'` and uses it verbatim as
+/// a pi-04 path component, so a token free of spaces, slashes, and plus-signs is
+/// load-bearing, not cosmetic.
 #[test]
-fn version_flag_exits_0_with_plain_version() {
+fn version_flag_exits_0_with_fleet_token() {
     let output = Command::new(TALOS_BIN)
         .args(["--version"])
         .stdin(Stdio::null())
@@ -252,12 +259,30 @@ fn version_flag_exits_0_with_plain_version() {
     assert_eq!(output.status.code(), Some(0), "--version must exit 0");
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout_str.contains(env!("CARGO_PKG_VERSION")),
-        "version text must contain CARGO_PKG_VERSION; got: {stdout_str:?}"
-    );
-    assert!(
         !stdout_str.trim_start().starts_with('{'),
         "version must be plain text, not a JSON error object"
+    );
+
+    // `awk '{print $2}'` — the exact extraction talos-update.sh uses.
+    let mut fields = stdout_str.split_whitespace();
+    assert_eq!(
+        fields.next(),
+        Some("talos"),
+        "line 1 field 1 must be `talos`"
+    );
+    let token = fields.next().expect("a version token in field 2");
+
+    assert!(
+        token.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-g")),
+        "token must be `<semver>-g<sha>`; got: {token:?}"
+    );
+    // URL/path-safe: no `+`, no `/`, no whitespace (split_whitespace already
+    // guarantees the last), so it drops into a pi-04 path unescaped.
+    assert!(
+        token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+        "token must be URL/path-safe (alnum, `.`, `-` only); got: {token:?}"
     );
 }
 
