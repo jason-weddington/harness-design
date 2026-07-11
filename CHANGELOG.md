@@ -2,6 +2,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.4.0 - 2026-07-11
+#### Features
+- (**harness**) wall-clock budget — graceful self-termination with recovery facts - (e1cd5b5) - Jason Weddington, *claude-code-sonnet*, *Claude Opus 4.8*
+- (**harness**) bounded deterministic retry with backoff on transient errors - (3ec0aea) - Jason Weddington, *claude-code-sonnet*, *Claude Opus 4.8*
+- (**harness**) finish-recovery protocol — detect done-but-unclaimed spin - (758cf4a) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
+- (**talos**) version-stamp + dual-arch publish to the dispatch fleet - (2d48267) - Jason Weddington, *Claude Opus 4.8*
+#### Bug Fixes
+- (**talos**) raise default --max-iterations 24 → 500 - (d59b1d9) - Jason Weddington, *Claude Opus 4.8*
+#### Documentation
+- (**design**) 0.4.0 bounded-autonomy design — finish-recovery protocol - (2178ce9) - Jason Weddington, *Claude Opus 4.8*
+- (**harness**) reconcile 0.4.0 budget scope to wall-clock-only - (00dfa04) - Jason Weddington, *Claude Opus 4.8*
+- Session 8 continued — 0.4.0 wave shipped, harness-vs-model proven, released - (cdc3456) - Jason Weddington, *Claude Opus 4.8*
+- Session 8 — 0.4.0 bounded-autonomy design/groom + talos-glm harness-gap finding - (3e581d1) - Jason Weddington, *Claude Opus 4.8*
+
+- - -
+
 ## 0.3.7 - 2026-07-11
 #### Features
 - (**tools**) rename run_command to bash with single command-string interface - (e80de7f) - Jason Weddington
