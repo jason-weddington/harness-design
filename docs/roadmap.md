@@ -10,20 +10,15 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.2.0 (2026-07-08)
+## Where we are — v0.4.0 (2026-07-11)
 
-The same loop, unchanged, completes the fixture suite on non-Anthropic models —
-the `ModelBackend` anti-corruption boundary held in anger. v0.1.0 established
-claim-vs-verify (`finish(done)` is a claim the harness verifies itself; a
-verified `Done` carries its evidence by construction); v0.2.0 added the Ollama
-backend (one adapter for localhost + ollama.com) and per-trial metrics. The
-cross-backend matrix (kb-02909 v4): GLM-5.2 12/12; sonnet, haiku, and local
-qwen3.6:35b (think=on) all 11/12; gpt-oss:20b 9/12 — zero false dones in 60
-verified trials. The suite is pass-rate-saturated four models deep; iteration
-counts still discriminate (frontier 5.00 uniform, haiku ~7.9, qwen ~9.75).
-Think config is a first-class routing knob — record it on every eval row.
+Bounded autonomy shipped — the harness is now safe to leave alone. **finish-recovery** detects a done-but-unclaimed spin (green gates + a static tree for K iterations), nudges the model to finish or give a one-sentence status, and on exhaustion terminates `Failed` while writing **recovery facts** so the worker preserves the WIP branch. The harness never fabricates a `Done` — the claim moves up to the lead, so claim-vs-verify stays inviolate while work that couldn't be claimed is still rescued. A **wall-clock budget** lets a run self-terminate gracefully in the margin before the dispatch worker's hard-kill; **bounded retry/backoff** rides transient errors. This built on 0.3.0 (durability — kill the harness mid-run, restart, the run completes) and 0.3.5 (first dogfood — the harness, running as an Agent GTD build engine named **Talos**, shipped merged changes to its own repo).
 
-## 0.3.0 — durability (persist, resume, dispose)
+The session's load-bearing finding: **harness-vs-model, proven empirically.** Hold the model constant (glm) and swap the harness — Talos failed finish-recovery twice, `claude-code-glm` one-shot the exact same 18-AC item. When a strong model fails, suspect the harness first; `claude-code-glm` is now a proven zero-Anthropic lane for complex harness-core work while Talos matures. Talos also gained **fleet-publish**: the i9 builds both arches once and publishes to pi-04, hosts pull, retiring the compile-on-every-host tax — and `release.sh` now ships a fresh fleet artifact as part of every release (a release ships an artifact by definition).
+
+389 tests, ~97% coverage; zero false dones across the whole eval history. **Next: 0.5.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — 0.3.5 front-ran the supervised version.
+
+## 0.3.0 — durability (persist, resume, dispose) — ✅ shipped v0.3.0
 
 **Theme: survive the host.** The run record and `RunStore` shipped in v0.1.0 but
 the loop doesn't use them yet. Wire checkpointing into the loop, unify the
@@ -32,7 +27,7 @@ two resume modes from the design (crash-resume; fresh-context restart). The
 capability claim: *kill the harness mid-run, restart it, and the run completes* —
 the deployment-agnostic promise (Pi, container, spot instance) made real.
 
-## 0.3.5 — first dogfood (the harness builds the harness)
+## 0.3.5 — first dogfood (the harness builds the harness) — ✅ shipped v0.3.5
 
 **Theme: close the loop early.** Deliberately inserted ahead of full bounded
 autonomy: claim-vs-verify + the repo's own quality gates + the blunt
@@ -52,7 +47,7 @@ the data the model-routing decision (#6) has been waiting on. First dogfood
 items must match the engine's strengths: small, crisply specified, mechanically
 checkable (no `search_code` yet — navigation is list+read, fine on this crate).
 
-## 0.4.0 — bounded autonomy (finish-recovery, wall-clock budget, retry)
+## 0.4.0 — bounded autonomy (finish-recovery, wall-clock budget, retry) — ✅ shipped v0.4.0
 
 **Theme: safe to leave alone.** Design of record: [`docs/design/03-bounded-autonomy.md`](./design/03-bounded-autonomy.md).
 Three items (serialized on `engine.rs`): (1) a **finish-recovery protocol** — detect

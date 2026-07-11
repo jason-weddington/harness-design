@@ -59,9 +59,16 @@ working session:
 2. Append a 3-4 sentence summary + the KB entry id to
    [`docs/session-summaries.md`](./docs/session-summaries.md) (chronological,
    newest at the bottom).
+3. Bring [`docs/roadmap.md`](./docs/roadmap.md) current: rewrite its **"Where we
+   are"** header to the newest shipped version, mark any milestone that shipped
+   this session **✅ shipped**, and re-order/rescope what's next if the session
+   changed the plan. The roadmap is the living forward view; a session that ships
+   a capability but leaves the roadmap describing an older state has left the
+   handoff half-done.
 
 **When resuming a session, read the latest `docs/session-summaries.md` entry and
-its linked KB entry first.** Session 1 (`kb-02851`) is the template.
+its linked KB entry first**, then skim `docs/roadmap.md` "Where we are" for the
+current forward view. Session 1 (`kb-02851`) is the template.
 
 ## Status
 
