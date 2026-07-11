@@ -249,3 +249,22 @@ Jason's model-vs-harness frame (glm the stronger model, Claude Code the stronger
 harness), we pivoted to the clean harness-isolating comparison: **claude-code-glm**
 (glm held constant, harness swapped), filed for wiring on the dispatch board. The wave
 is parked pending that. Full handoff: **kb-02996** (perf: kb-02987, kb-02995).
+
+**Session 8, continued — the wave shipped, and the hypothesis proved out.** Once
+claude-code-glm was wired, it **one-shot finish-recovery** (`758cf4a`, ~27 min,
+verified Done) — the exact 18-AC/5-file item talos-glm had failed twice. Same model,
+swap the harness, opposite outcome: **the gap was Talos-the-harness, not glm-the-model**
+— an orchestration failure, not a capability one, the two-failure-mode lens confirmed
+empirically. Ollama credits then ran out, so the last two items ran on claude-code-sonnet
+(Claude Max): retry-backoff (`3ec0aea`) and wall-clock (`e1cd5b5`), both clean one-shots
+that re-grounded correctly onto an `engine.rs` grown ~950 lines by the prior merges
+(symbol-anchored dispatch notes, no re-groom). A side-quest shipped the **talos fleet-
+publish** capability (`2d48267`, GTD 953fd927): version-stamped `talos --version` +
+`scripts/publish-talos.sh` that builds both arches on the i9 and publishes to pi-04 —
+build-once-and-pull, retiring the compile-on-every-host tax. `review-against-intent`
+gated the release at **meets-with-gaps**: every load-bearing seam verified correct in
+code (both recovery terminals build `RecoveryFacts` identically; three `RunConfig`
+knob-sets coexist; retry can't defeat the wall-clock check; clock-only reads; schema v2;
+talos exit codes) — the only gaps were the design doc over-claiming budget scope and a
+stale doc comment, both fixed (`00dfa04`), two minors captured as follow-ups. Released as
+**v0.4.0**. Updated handoff: **kb-02996** (perf: kb-03007 glm proof, kb-03009, kb-03010).
