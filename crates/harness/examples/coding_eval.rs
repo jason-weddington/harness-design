@@ -319,11 +319,12 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
 /// in whole seconds (small runs might round to 0s, which is fine).
 fn stats_one_liner(stats: &RunStats) -> String {
     format!(
-        "{} iters | {} in / {} out | {}s",
+        "{} iters | {} in / {} out | {}s | gate_green_at_exit={}",
         stats.iterations,
         format_tokens_compact(stats.input_tokens),
         format_tokens_compact(stats.output_tokens),
         stats.wall_clock.as_secs(),
+        stats.gates_green_at_exit,
     )
 }
 

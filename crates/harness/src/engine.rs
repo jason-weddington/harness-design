@@ -469,6 +469,16 @@ pub struct RunStats {
     pub output_tokens: u64,
     /// Wall-clock elapsed across the whole [`run`] call.
     pub wall_clock: Duration,
+    /// Whether the harness's last in-loop gate (`run_checks`) was GREEN at the
+    /// terminal — i.e. the value of `last_gate_green` at exit. Lets a caller
+    /// distinguish a [`LoopOutcome::StoppedWithoutFinish`] where the model had
+    /// verified green in-loop then stopped (a finish-discipline miss that
+    /// finish-recovery's precondition *could* target) from one where the gate
+    /// was never green in-loop (correctly out of scope — nudging toward
+    /// `finish` on an unverified state would risk a false claim). Best-effort
+    /// telemetry: an error-propagation (`?`) exit reports the last observed
+    /// value.
+    pub gates_green_at_exit: bool,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -789,6 +799,7 @@ pub async fn run(
         input_tokens: 0,
         output_tokens: 0,
         wall_clock: Duration::ZERO,
+        gates_green_at_exit: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -845,6 +856,7 @@ pub async fn run_persisted(
         input_tokens: 0,
         output_tokens: 0,
         wall_clock: Duration::ZERO,
+        gates_green_at_exit: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1236,6 +1248,15 @@ async fn run_loop_impl(
             }
         }
         messages.push(Message::User { content: results });
+
+        // Mirror the finish-recovery done-oracle into RunStats so EVERY
+        // terminal (StoppedWithoutFinish, MaxIterations, Finished, the recovery
+        // terminals, and `?` error exits) reports whether the last in-loop gate
+        // was green at exit. Placed right after the per-call loop so it reflects
+        // this iteration's final gate state; a no-tool-call StoppedWithoutFinish
+        // (top of the NEXT iteration) correctly reads the prior iteration's
+        // value, since a turn with no calls cannot change the gate.
+        stats.gates_green_at_exit = last_gate_green;
 
         // Nudge-status telemetry: this turn followed a nudge iff
         // `nudge_awaiting_status` was set. If the turn produced an accepted
@@ -1682,6 +1703,7 @@ pub async fn resume(
         input_tokens: 0,
         output_tokens: 0,
         wall_clock: Duration::ZERO,
+        gates_green_at_exit: false,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -2545,6 +2567,53 @@ mod tests {
         assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
         assert_eq!(backend.calls(), 1);
         assert_eq!(stats.iterations, 1);
+        // No run_checks ran, so the gate was never green in-loop: this is the
+        // "stopped before verifying" case, which finish-recovery correctly does
+        // NOT target (nudging toward finish on an unverified state would risk a
+        // false claim).
+        assert!(
+            !stats.gates_green_at_exit,
+            "gate never green in-loop -> gates_green_at_exit must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_without_finish_reports_gate_green_when_verified_then_stopped() {
+        // The counterpart to the never-verified stop above, and the exact
+        // classification `gates_green_at_exit` exists to expose: the model runs
+        // run_checks GREEN in-loop, then stops WITHOUT calling finish. This is a
+        // done-but-unclaimed finish-discipline miss whose green precondition
+        // finish-recovery COULD target. finish-recovery is disabled
+        // (max_nudges = 0) so the stop itself — not a nudge — is the terminal.
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let config = RunConfig::new("do the task", 10)
+            .with_checks(runner)
+            .with_max_nudges(0);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("looks fixed to me".to_string())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "green run_checks then a no-tool-call turn must stop without finish; got {outcome:?}"
+        );
+        assert!(
+            stats.gates_green_at_exit,
+            "the last in-loop gate was green before the stop -> gates_green_at_exit must be true"
+        );
     }
 
     #[tokio::test]
@@ -2818,6 +2887,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 10,
             wall_clock: Duration::from_millis(250),
+            gates_green_at_exit: false,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));

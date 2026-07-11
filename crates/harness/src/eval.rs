@@ -1094,6 +1094,7 @@ mod tests {
                 input_tokens: 111,
                 output_tokens: 22,
                 wall_clock: Duration::from_millis(50),
+                gates_green_at_exit: false,
             },
         };
         let printed = format!("{t:?}");
@@ -1557,6 +1558,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 wall_clock: Duration::ZERO,
+                gates_green_at_exit: false,
             },
         };
         let report = EvalReport {
