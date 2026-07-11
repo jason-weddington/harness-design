@@ -52,13 +52,23 @@ the data the model-routing decision (#6) has been waiting on. First dogfood
 items must match the engine's strengths: small, crisply specified, mechanically
 checkable (no `search_code` yet — navigation is list+read, fine on this crate).
 
-## 0.4.0 — bounded autonomy (budgets, retry, loop detection)
+## 0.4.0 — bounded autonomy (finish-recovery, wall-clock budget, retry)
 
-**Theme: safe to leave alone.** Token/cost/wall-clock budgets enforced in the
-loop; retry/backoff on `Transient` errors (`is_retryable` has been waiting);
-loop/no-progress detection beyond the blunt `max_iterations`. The capability
-claim: *a pathological run terminates itself with a useful `Failed` disposition
-instead of burning budget* — the last prerequisite for unattended operation.
+**Theme: safe to leave alone.** Design of record: [`docs/design/03-bounded-autonomy.md`](./design/03-bounded-autonomy.md).
+Three items (serialized on `engine.rs`): (1) a **finish-recovery protocol** — detect
+a done-but-unclaimed spin (green gates + static tree for K iters), nudge to finish or
+report a one-sentence status, and on exhaustion terminate `Failed` while writing
+**recovery facts** so the worker preserves the WIP branch — the harness never
+fabricates `Done`, the claim moves up to the lead; (2) a **wall-clock budget** so the
+harness self-terminates gracefully in the margin before the dispatch worker's hard-kill
+(needs a new injectable `Clock` seam; per-process semantics); (3) **retry/backoff** on
+`Transient` errors (`is_retryable` has been waiting). The capability claim: *a
+pathological run terminates itself with a useful `Failed` disposition — and doesn't
+throw away work it couldn't claim.*
+
+Budgets were scoped to **wall-clock only**: token caps are inscrutable (no human-legible
+right value) and cost caps have no accumulator yet (see backlog). Being designed against
+real talos run data — including this wave's own finish-discipline failures.
 
 ## 0.5.0 — the GTD build-engine adapter
 
@@ -75,6 +85,11 @@ unsupervised completion — self-git, comment-back, and the full engine contract
 - **Eval levers** (on the GTD board, from the saturation finding): harder task
   *shapes* — withhold-the-failing-test mode, prose-bug-report mode (the realistic
   dispatch shape); haiku floor-run for the model-routing question.
+- **Token + cost budget caps** — deferred from 0.4.0 (which shipped wall-clock only).
+  Token caps are inscrutable (no human-legible right value per task); cost caps are
+  blocked on a token→price table that doesn't exist (`consumed.cost_micros` is never
+  incremented). Revisit token caps only with a concrete reason; cost caps once pricing
+  is wired.
 - **Streaming/SSE + prompt caching** — cost/latency, not capability; when the
   live-run volume justifies it.
 - **Remaining v1-design tools**: `search_code`, `comment` (the design's tools 7–8).

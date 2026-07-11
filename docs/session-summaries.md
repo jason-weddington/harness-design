@@ -211,3 +211,41 @@ engines. Re-dispatched glm → **verified Done, 8 iterations, gate green, zero A
 spend** — the harness can now build the harness on Ollama credits, protecting the
 control-plane session budget. Released as **v0.3.7**. Root-cause KB: kb-02979 (sudoers),
 kb-02980 (glm run), kb-02977 (corrected). Handoff: kb-02972.
+
+---
+
+## Session 8 — 2026-07-11 — 0.4.0 bounded-autonomy: design, groom, and the harness hits the gap it's building
+
+Designed and groomed the **0.4.0 bounded-autonomy** wave, then tried to dogfood it
+on Talos and learned exactly why 0.4.0 exists. The design (`docs/design/03`, commit
+2178ce9) centers on a **finish-recovery protocol**: detect a done-but-unclaimed spin
+(green gates + a static tree for K iters — high precision; red-gate spins fall to the
+budget cap), nudge the model to finish or give a one-sentence status, and on N-nudge
+exhaustion terminate `Failed` while writing **recovery facts** so the worker preserves
+the WIP branch. The load-bearing resolution: the harness *never* fabricates `Done` —
+the claim moves up to the lead, keeping claim-vs-verify inviolate while rescuing work
+that would otherwise be discarded. Budgets were scoped to **wall-clock only** (Jason's
+call: token caps are inscrutable, cost has no accumulator) — its point being graceful
+self-termination in the margin *before* the dispatch worker's hard-kill. Plus bounded
+deterministic retry/backoff on transient errors.
+
+The `groom-to-ready` workflow earned its cost by **overturning two of my design-doc
+leanings** (a new `FailureMode::FinishDiscipline` rather than reusing the
+already-produced `Loop`; recovery facts on `RunRecord`, not the wired-nowhere
+`DispositionReport`) and catching a **CI-invisible trap** — the nudge must be appended
+to the existing user message, not pushed as a new one, or it 400s against Anthropic
+while passing every MockBackend test. Three items landed ready (finish-recovery →
+retry-backoff → wall-clock, serialized on `engine.rs`).
+
+Then dispatch taught the real lesson. Rollouts can't pin a host (FR filed), so we went
+direct on **talos-glm / r7-research** — and finish-recovery **failed twice**: first
+`MaxIterations@24` (talos's default cap, calibrated for small dogfood items, was far
+too low for a 5-file change — bumped 24→500, commit d59b1d9), then
+**`StoppedWithoutFinish@56` with no WIP preserved**. That second failure *is* a live
+demonstration of the two gaps 0.4.0 closes — finish-discipline and work-preservation:
+Talos can't build finish-recovery because Talos doesn't *have* finish-recovery. A
+harness failure, not a glm-capability one (glm is 24/24 on our hardened evals). Per
+Jason's model-vs-harness frame (glm the stronger model, Claude Code the stronger
+harness), we pivoted to the clean harness-isolating comparison: **claude-code-glm**
+(glm held constant, harness swapped), filed for wiring on the dispatch board. The wave
+is parked pending that. Full handoff: **kb-02996** (perf: kb-02987, kb-02995).
