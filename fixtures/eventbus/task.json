@@ -1,0 +1,31 @@
+{
+  "title": "Implement publish and unsubscribe for the multi-file EventBus",
+  "description": "Tier 7 / hard — multi-file dispatch-scale shape.\n\nThe eventbus crate is a small in-memory pub/sub bus split across three source files:\n- `src/model.rs` — `SubId(pub u64)` newtype + `Event { topic: String, payload: i64 }` (both fully implemented).\n- `src/registry.rs` — `Registry` with `subscribe` and `subscribers_for` implemented; `unsubscribe` is a `todo!()` stub.\n- `src/bus.rs` — `EventBus` wrapping a `Registry` plus a `delivery_log: Vec<(SubId, i64)>` with an implemented `delivery_log()` accessor; `publish` is a `todo!()` stub.\n\nThe two stubs sit in TWO different files, so a correct solution is a coherent cross-file edit: the delivery log lives in `bus.rs`, the subscription ids in `registry.rs`, and the `SubId` newtype in `model.rs`.\n\nPUBLISH CONTRACT (the visible, non-revealing surface that grades `publish`):\n- `publish(&mut self, event: &Event) -> usize` delivers `event` to every subscriber of `event.topic` IN SUBSCRIPTION ORDER.\n- For each delivered subscriber, append exactly one `(SubId, event.payload)` entry to `delivery_log` (in delivery order). Return the delivered count.\n- Publishing to a topic with no subscribers returns 0 and appends nothing to `delivery_log`.\n- Distinct topics are isolated: a publish to topic A never delivers to a B-subscriber.\n\nUNSUBSCRIBE CONTRACT:\n- `unsubscribe(&mut self, id: SubId) -> bool` returns `true` and removes exactly that subscriber if `id` is known; returns `false` and changes nothing if `id` is unknown.\n- Removal preserves the relative order of surviving subscribers.\n\nID CONTRACT:\n- `subscribe` allocates monotonic ids starting at 1, never reused (a re-subscribe after an unsubscribe gets a fresh, higher id).\n\nThe `delivery_log()` accessor and the `Vec<(SubId, i64)>` element type are IMPLEMENTED (not stubbed) so the model-under-test knows precisely what to record. Implement only the `publish` and `unsubscribe` bodies; do not paste reference bodies into comments.",
+  "acceptance_criteria": [
+    "`publish` in `src/bus.rs` is implemented (body is not `todo!()`) and delivers to every subscriber of the event's topic in subscription order, appending one `(SubId, payload)` entry per delivery to `delivery_log`, returning the delivered count.",
+    "Publishing to a topic with no subscribers returns 0 and appends nothing; distinct topics are isolated (a publish to topic A never delivers to a B-subscriber).",
+    "`unsubscribe` in `src/registry.rs` is implemented (body is not `todo!()`) and returns `true` for a known id (removing exactly that subscriber) and `false` for an unknown id (changing nothing).",
+    "Unsubscribe preserves the relative order of surviving subscribers (verified by unsubscribing a middle subscriber, then publishing).",
+    "A re-subscribe after an unsubscribe receives a fresh, never-reused id (monotonic; the old id is not recycled).",
+    "`delivery_log()` and the `Vec<(SubId, i64)>` element type remain unchanged; `cargo test` exits 0 with all tests (visible + holdout) passing."
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/bus.rs",
+      "change": "Replace the `todo!()` body of `publish` with a correct implementation: look up the event's topic subscribers via the registry, append one `(SubId, event.payload)` entry to `delivery_log` per subscriber in subscription order, and return the delivered count. Do not modify `delivery_log()`, `subscribe`, `subscribers_for`, `unsubscribe`, or any existing visible test."
+    },
+    {
+      "path": "src/registry.rs",
+      "change": "Replace the `todo!()` body of `unsubscribe` with a correct implementation: find and remove the subscriber with the given id from whichever topic holds it, returning `true` if removed and `false` if unknown; preserve the relative order of surviving subscribers. Do not modify `subscribe`, `subscribers_for`, or any existing visible test."
+    },
+    {
+      "path": "src/model.rs",
+      "change": "Already fully implemented (`SubId`, `Event`); no changes required. Read it to understand the `SubId` newtype and `Event` shape used by `publish` and the delivery log."
+    },
+    {
+      "path": "src/lib.rs",
+      "change": "Module wiring and re-exports are already in place (`pub mod model/registry/bus` + `pub use`); no changes required. Read it to see how the modules connect."
+    }
+  ],
+  "gate_command": "cargo test"
+}

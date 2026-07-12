@@ -1,0 +1,20 @@
+{
+  "title": "Implement try_acquire for the TokenBucket rate limiter",
+  "description": "Tier 6 / hard — withheld-failing-test shape.\n\nThe `TokenBucket` in `src/lib.rs` is a token-bucket rate limiter. `new`, `capacity`, and `available` are fully implemented; `try_acquire` is a `todo!()` stub. There is NO visible failing test in the committed tree — the visible tests exercise only `new` / `capacity` / `available`. The sealed holdout suite (copied into `tests/` only at scoring time) is the sole grader.\n\nREFILL CONTRACT — fully determined, so every `available()` and `try_acquire` outcome is uniquely determined for any monotonic-non-decreasing `now_ms` sequence:\n\n(a) At `new(capacity, refill_per_sec)` the bucket starts FULL: `tokens == capacity`, and the internal refill anchor = 0 logical ms.\n\n(b) `try_acquire` is the ONLY operation that advances refill. On each call, BEFORE the acquire decision, the bucket gains `floor(refill_per_sec * (now_ms - anchor) / 1000)` whole tokens; the result is clamped so `tokens` never exceeds `capacity`. The anchor then advances by the whole-token portion of elapsed time — `gained * 1000 / refill_per_sec` ms — so the sub-token (fractional) portion is CARRIED for the next call (leftover time that did not yield a whole token is retained, not discarded). EXCEPT: when the clamp caps the bucket at `capacity`, the anchor jumps to `now_ms` (idle-past-full time is forfeit).\n\n(c) This refill is COMMITTED to stored state regardless of whether the subsequent acquire succeeds.\n\n(d) `try_acquire` is then atomic all-or-nothing: if refilled `tokens >= n`, deduct `n` and return `true`; else deduct nothing and return `false`. `n > capacity` always returns `false`. `now_ms == anchor` refills nothing (elapsed 0).\n\n(e) `available()` returns the stored token count and performs NO refill of its own — it reflects only the last `try_acquire`'s committed refill.\n\nThe internal sub-token remainder representation (moving anchor, milli-tokens, fixed-point — your choice) is an implementation detail; it is not surfaced in any visible test or in this spec beyond the contract above. Implement only the `try_acquire` body; do not paste a reference body into a comment.",
+  "acceptance_criteria": [
+    "`try_acquire(&mut self, n: u64, now_ms: u64) -> bool` is implemented (body is not `todo!()`) and the sealed holdout suite passes.",
+    "Refill is clamped: a long idle period followed by an acquire never yields more than `capacity` tokens (the bucket cannot overshoot).",
+    "Fractional refill accumulates: multiple sub-`(1000/refill_per_sec)`ms calls eventually yield a whole token via the carried remainder (dropping the remainder stays holdout-red).",
+    "A FAILED `try_acquire` (insufficient tokens, or `n > capacity`) deducts nothing, yet its committed refill is still visible via a subsequent `available()`.",
+    "`n > capacity` always returns `false` regardless of available tokens; `now_ms == anchor` refills nothing.",
+    "`available()` performs no implicit refill; it returns only the stored count from the last committed refill.",
+    "`cargo test` exits 0 with all tests (visible + holdout) passing."
+  ],
+  "files_to_modify": [
+    {
+      "path": "src/lib.rs",
+      "change": "Replace the `todo!()` body of `try_acquire` with a correct implementation of the refill contract stated above. Do not modify `new`, `capacity`, `available`, or any existing visible test; the struct fields may be used as-is or extended with private helper state."
+    }
+  ],
+  "gate_command": "cargo test"
+}
