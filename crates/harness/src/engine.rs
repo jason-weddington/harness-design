@@ -1138,7 +1138,87 @@ async fn run_loop_impl(
         }
 
         if calls.is_empty() {
+            // Finish-recovery at the stop terminal: when the last in-loop gate
+            // was green, nudge the model toward finish before giving up.
+            // Guard: max_nudges > 0 AND last_gate_green.
+            // When false (red/never-green gate OR max_nudges == 0), falls
+            // through to the unchanged StoppedWithoutFinish path below.
+            if config.max_nudges > 0 && last_gate_green {
+                // AC4 — Telemetry capture inside the guard. The normal
+                // telemetry path (lines below the is_empty() return) is
+                // unreachable for a no-tool-call turn, so we capture here.
+                // Must be inside the guard: a mutate-after-nudge-then-stop
+                // case clears last_gate_green, intentionally fails the guard,
+                // and does NOT record the unverified stop text.
+                // AC4: if this stop follows a prior nudge, capture the model's
+                // reply text. The `= false` clear is intentionally OMITTED here:
+                // the nudge branch (AC2) unconditionally sets it to `true`
+                // (avoiding a write-without-read that clippy flags as
+                // `unused_assignments`), and the exhaustion branch (AC3) returns
+                // immediately so the value is never read again.
+                if nudge_awaiting_status {
+                    nudge_statuses.push(turn_text.clone());
+                }
+
+                if nudges_fired < config.max_nudges {
+                    // AC2 — Inject a FRESH user message (NOT last_mut append).
+                    // At this terminal the trailing message is the assistant
+                    // stop turn (no tool calls), so the correct wire shape is
+                    // assistant → fresh-user. Unlike the green-static site,
+                    // where the trailing message is the tool-results
+                    // Message::User and appending avoids a 400-inducing second
+                    // adjacent user turn, here pushing a new Message::User is
+                    // correct: the sequence assistant → user is a valid
+                    // alternating pair and does NOT trigger a 400.
+                    messages.push(Message::User {
+                        content: vec![UserBlock::Text(prompt::render_nudge_prompt())],
+                    });
+                    nudges_fired += 1;
+                    nudge_awaiting_status = true;
+                    continue;
+                }
+                // AC3 — Exhaustion terminal: unified with the green-static
+                // exhaustion terminal (engine.rs:1344–1381). Same summary
+                // literal, same persistence discipline, same return type.
+                let summary = format!(
+                    "gates green but agent did not call finish after {} nudges",
+                    config.max_nudges
+                );
+                let disposition = Disposition::Failed {
+                    mode: FailureMode::FinishDiscipline,
+                    summary,
+                };
+                if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                    ctx.record.messages.clone_from(&messages);
+                    ctx.record.budgets.consumed = BudgetConsumed {
+                        iterations: initial_consumed.iterations + stats.iterations,
+                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                        cost_micros: initial_consumed.cost_micros,
+                    };
+                    ctx.record.recovery_facts = Some(RecoveryFacts {
+                        gates_green_at_exit: last_gate_green,
+                        tree_dirty,
+                        nudge_statuses: nudge_statuses.clone(),
+                    });
+                    ctx.record.disposition = Some(disposition.clone());
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::DispositionSet {
+                                seq: 0,
+                                disposition: disposition.clone(),
+                            },
+                        )
+                        .await?;
+                    p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+                }
+                return Ok(LoopOutcome::Finished(disposition));
+            }
+
             // Terminal path: StoppedWithoutFinish.
+            // Reached when: last_gate_green == false (never verified in-loop,
+            // or gate was invalidated by a later mutation) OR max_nudges == 0
+            // (finish-recovery disabled). All paths below are UNCHANGED.
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 let disposition = Disposition::Failed {
                     mode: FailureMode::StoppedWithoutFinish,
@@ -6240,6 +6320,239 @@ mod tests {
                 }
             ),
             "MaxIterations disposition must be Failed{{BudgetExhausted}}; got {disp:?}"
+        );
+    }
+
+    // =====================================================================
+    // Finish-recovery at the StoppedWithoutFinish terminal (the stop-terminal
+    // trip site added alongside the existing green-static-spin trip site).
+    // =====================================================================
+
+    // AC5 — green→stop→nudge→finish ⇒ Done (harness never constructs Done).
+    // Sequence:
+    //   iter1: run_checks (green) → last_gate_green=true.
+    //   iter2: no-tool-call text stop → guard fires (green+nudges>0) →
+    //          fresh user nudge pushed, nudges_fired=1, continue.
+    //   iter3: finish(done) → handle_finish_call verifies green → Done.
+    // recovery_facts must be None (Done-after-nudge is a clean success).
+    #[tokio::test]
+    async fn green_stop_nudge_finish_done() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 3)
+            .with_checks(runner)
+            .with_max_nudges(1);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("looks fixed".into())],
+                StopReason::EndTurn,
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "..."}),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Done after green-stop nudge + finish; got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        // Done-after-nudge is a clean success: recovery_facts must be None.
+        assert_eq!(
+            rec.recovery_facts, None,
+            "Done-after-nudge must NOT produce recovery_facts"
+        );
+        // Exactly one nudge was injected (as a fresh Message::User after the
+        // assistant stop turn).
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            1,
+            "exactly one nudge must be injected before the finish"
+        );
+        // No adjacent user messages: the nudge is a fresh Message::User pushed
+        // after the assistant stop turn (assistant → user), not a second
+        // adjacent user (which would 400 on the real wire).
+        assert_no_adjacent_user_messages(&rec.messages);
+    }
+
+    // AC6 — green→stop→nudge→stop ⇒ FinishDiscipline + recovery_facts.
+    // Sequence:
+    //   iter1: run_checks (green).
+    //   iter2: text stop → nudge (nudges_fired=1), continue.
+    //   iter3: text stop → guard: nudge_awaiting_status → push "almost done
+    //          here" onto nudge_statuses; nudges_fired==max_nudges →
+    //          exhaustion terminal: Finished(Failed{FinishDiscipline}).
+    // max_iterations MUST be ≥ 3 so iter3's stop reaches exhaustion rather
+    // than the loop cap or an over-draw BackendError.
+    #[tokio::test]
+    async fn green_stop_nudge_exhaustion_finish_discipline() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 3)
+            .with_checks(runner)
+            .with_max_nudges(1);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("still working on it".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("almost done here".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(
+                    *mode,
+                    FailureMode::FinishDiscipline,
+                    "stop-terminal exhaustion must be FinishDiscipline; got {mode:?}"
+                );
+                assert!(
+                    summary.contains("gates green but agent did not call finish"),
+                    "summary must name the recovery; got {summary}"
+                );
+                assert!(
+                    summary.contains("1 nudges"),
+                    "summary must name the nudge count; got {summary}"
+                );
+            }
+            other => panic!("expected Finished(Failed{{FinishDiscipline}}); got {other:?}"),
+        }
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        // AC6 primary: exactly one nudge injected as a fresh Message::User.
+        // This is the LOUD guard against a wrong-shape append silently dropping
+        // the nudge (see AC9).
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            1,
+            "exactly one nudge must be injected (as a fresh Message::User)"
+        );
+        // AC9 wire-shape: no adjacent user messages, and the nudge lives in
+        // its own Message::User immediately preceded by a Message::Assistant.
+        assert_no_adjacent_user_messages(&rec.messages);
+        let nudge_pos = rec.messages.iter().position(|m| {
+            matches!(m, Message::User { content }
+                if content.iter().any(|b| matches!(b, UserBlock::Text(t) if t == NUDGE_TEXT)))
+        });
+        let nudge_idx = nudge_pos.expect("nudge message must exist in rec.messages");
+        assert!(
+            nudge_idx > 0,
+            "nudge message must have a predecessor (the assistant stop turn)"
+        );
+        assert!(
+            matches!(rec.messages[nudge_idx - 1], Message::Assistant { .. }),
+            "the message immediately before the nudge must be Message::Assistant \
+             (stop turn); got {:?}",
+            rec.messages[nudge_idx - 1]
+        );
+        // recovery_facts: gates_green_at_exit, no edit_file/bash (tree_dirty
+        // false), and nudge_statuses contains iter3's text.
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("recovery_facts must be Some on the stop-terminal FinishDiscipline");
+        assert!(
+            facts.gates_green_at_exit,
+            "gates were green at the stop-terminal recovery terminal"
+        );
+        assert!(
+            !facts.tree_dirty,
+            "no edit_file/bash ran, so tree_dirty must be false"
+        );
+        assert!(
+            !facts.nudge_statuses.is_empty(),
+            "nudge_statuses must contain the iter3 stop text"
+        );
+        assert!(
+            facts
+                .nudge_statuses
+                .iter()
+                .any(|s| s.contains("almost done here")),
+            "nudge_statuses must contain the iter3 stop text 'almost done here'; \
+             got {:?}",
+            facts.nudge_statuses
+        );
+    }
+
+    // AC7 — red/never-green stop with recovery ENABLED ⇒ StoppedWithoutFinish
+    // unchanged. The model never calls run_checks so last_gate_green stays
+    // false. The guard `&& last_gate_green` blocks the nudge even though
+    // max_nudges > 0.
+    #[tokio::test]
+    async fn red_never_green_stop_with_recovery_enabled_stops_without_finish() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        // Recovery is ENABLED (max_nudges=1) but the model never calls run_checks.
+        let config = RunConfig::new("do the task", 10)
+            .with_checks(runner)
+            .with_max_nudges(1);
+
+        let backend = MockBackend::from_turns(vec![turn_with(
+            vec![ContentBlock::Text("I am just talking".into())],
+            StopReason::EndTurn,
+        )]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "never-green stop must yield StoppedWithoutFinish even with recovery on; \
+             got {outcome:?}"
+        );
+        assert!(
+            !stats.gates_green_at_exit,
+            "gate was never green in-loop -> gates_green_at_exit must be false"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        // The && last_gate_green guard must block the nudge.
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "no nudge must be injected when last_gate_green is false"
         );
     }
 

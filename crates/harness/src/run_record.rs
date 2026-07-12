@@ -342,8 +342,9 @@ pub struct DispositionReport {
 
 /// Telemetry captured by the harness's recovery terminals — written on EITHER
 /// a [`FailureMode::FinishDiscipline`] terminal (finish-recovery: green gates +
-/// static tree, nudges exhausted) OR the wall-clock
-/// [`FailureMode::BudgetExhausted`]-on-timeout terminal — both build it from the
+/// static-tree spin nudges exhausted, OR green gates + model stopped producing
+/// tool calls nudges exhausted) OR the wall-clock
+/// [`FailureMode::BudgetExhausted`]-on-timeout terminal — all build it from the
 /// same loop-locals. `None` on every other outcome: `Done`, `Blocked`,
 /// `BackendError`. A GREEN-static `MaxIterations` (gates green, tree static,
 /// model never called finish — and finish-recovery disabled via `max_nudges == 0`
@@ -355,6 +356,15 @@ pub struct DispositionReport {
 /// `recovery_facts = None` — a red gate has nothing worth preserving. So
 /// `recovery_facts.is_some()` means "a recovery terminal fired OR a
 /// green-static `MaxIterations` was reached", NOT specifically `FinishDiscipline`.
+///
+/// The [`FailureMode::FinishDiscipline`] terminal has two trip sites: (1) the
+/// green-static-spin site, where the model keeps making non-mutating tool calls
+/// without calling `finish` across K static iterations; and (2) the
+/// stop-terminal site added in 0.4.x, where the model ran `run_checks` green
+/// in-loop and then stopped producing tool calls entirely (`EndTurn` with no calls)
+/// without calling `finish`. Both sites exhaust the nudge budget before
+/// terminating and produce the same `RecoveryFacts` structure with the same
+/// persistence discipline.
 ///
 /// The three fields record what the loop observed at the recovery terminal so
 /// the outer harness (or a reviewer) can recognize a probably-done-but-unclaimed
