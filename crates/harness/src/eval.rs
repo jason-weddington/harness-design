@@ -61,7 +61,10 @@ use crate::workspace::{DiskOffloadSink, Workspace};
 
 /// Generous timeout for the coding-fix eval's `cargo test`: the first compile of
 /// a fresh crate copy is slow on a small host, so allow a wide margin.
-const CODING_CHECK_TIMEOUT: Duration = Duration::from_mins(3);
+///
+/// Exposed as `pub const` so the Claude Code eval runner (`claude_code_eval`)
+/// can reuse the exact same timeout literal — do NOT duplicate it there.
+pub const CODING_CHECK_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Predicate that judges whether a single trial's [`LoopOutcome`] is a pass.
 ///
@@ -340,10 +343,7 @@ pub async fn run_eval(
         // fixture had no holdout/ dir or the env carries no ChecksRunner.
         let holdout_passed =
             if let (Some(holdout_src), Some(checks)) = (&env.holdout_src, &env.checks) {
-                copy_dir_recursive(holdout_src, env.ctx.workspace().root())
-                    .expect("copy holdout/ contents into trial workspace");
-                let report = checks.run(&env.ctx).await;
-                Some(report.passed)
+                Some(score_holdout(holdout_src, checks, &env.ctx).await)
             } else {
                 None
             };
@@ -455,6 +455,29 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Score the holdout re-gate for a single trial: copy the sealed `holdout_src`
+/// directory's contents into the trial workspace (via [`ctx`]'s workspace root)
+/// and run the external oracle gate.
+///
+/// This is the **single shared external oracle** used by both the Talos eval
+/// runner ([`run_eval`]) and the Claude Code eval runner
+/// (`examples/claude_code_eval.rs`) — the same scoring logic ensures that
+/// talos-glm and claude-code-glm rows are directly comparable on the holdout
+/// column (do-not-fork requirement).
+///
+/// Returns `true` when the gate exits green, `false` otherwise.
+///
+/// # Panics
+/// Panics if the holdout directory cannot be copied into the trial workspace.
+/// This indicates a broken host (the workspace or holdout source is
+/// unreadable/unwritable after the agent loop ran), not a recoverable eval
+/// condition.
+pub async fn score_holdout(holdout_src: &Path, checks: &ChecksRunner, ctx: &ToolCtx) -> bool {
+    copy_dir_recursive(holdout_src, ctx.workspace().root())
+        .expect("copy holdout/ contents into trial workspace");
+    checks.run(ctx).await.passed
+}
+
 /// The trivial-smoke-test trial environment: the standard v1 toolset, a stub
 /// context, and NO checks. Used by [`finish_task`] runs, where a `finish(done)`
 /// is accepted on trust ([`Verification::NoChecksConfigured`]).
@@ -483,7 +506,10 @@ pub fn finish_env() -> TrialEnv {
 ///
 /// # Errors
 /// Propagates any `std::fs` error (unreadable source, unwritable destination).
-fn copy_fixture_into_workspace(fixture_src: &Path, workspace_root: &Path) -> std::io::Result<()> {
+pub fn copy_fixture_into_workspace(
+    fixture_src: &Path,
+    workspace_root: &Path,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(workspace_root)?;
     for entry in std::fs::read_dir(fixture_src)? {
         let entry = entry?;
@@ -648,7 +674,7 @@ pub fn finish_task() -> EvalTask {
 mod tests {
     use super::{
         EvalReport, EvalTask, TrialEnv, TrialResult, build_coding_env, coding_fix_task,
-        copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
+        copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -1784,5 +1810,60 @@ mod tests {
                 .any(|m| m.as_str().unwrap_or_default().contains("harness")),
             "the harness crate should be a workspace member"
         );
+    }
+
+    /// `score_holdout` — green gate returns `true` AND the canary file is
+    /// present at `ctx.workspace().root()` afterward; red gate returns `false`.
+    ///
+    /// Uses a REAL `Workspace::new` + `ToolCtx::new` + `DiskOffloadSink::new`
+    /// (NOT `ToolCtx::stub()`, whose root is process-shared/leaked) so the
+    /// function's file-copy side-effect is observable on a real path.
+    #[tokio::test]
+    async fn score_holdout_green_returns_true_and_red_returns_false() {
+        // Build a "holdout source" dir with one canary file.
+        let holdout_holder = tempdir().expect("holdout holder");
+        let holdout_src = holdout_holder.path().join("holdout");
+        std::fs::create_dir(&holdout_src).expect("mkdir holdout");
+        std::fs::write(holdout_src.join("canary.txt"), "canary").expect("write canary");
+
+        // ── Green case ──────────────────────────────────────────────────────
+        let ws_tmp = tempdir().expect("ws tempdir");
+        let off_tmp = tempdir().expect("off tempdir");
+        let workspace =
+            Workspace::new(ws_tmp.path(), Some(off_tmp.path().to_path_buf())).expect("workspace");
+        let ws_root = workspace.root().to_path_buf();
+        let off_canon = off_tmp.path().canonicalize().expect("canon offload");
+        let ctx = ToolCtx::new(
+            Arc::new(workspace),
+            Arc::new(DiskOffloadSink::new(off_canon)),
+        );
+        let result = score_holdout(&holdout_src, &green_checks(ws_root.clone()), &ctx).await;
+        assert!(result, "green gate must return true");
+        assert!(
+            ws_root.join("canary.txt").exists(),
+            "canary must be present at workspace root after score_holdout"
+        );
+
+        // ── Red case ────────────────────────────────────────────────────────
+        let ws_tmp2 = tempdir().expect("ws tempdir 2");
+        let off_tmp2 = tempdir().expect("off tempdir 2");
+        let workspace2 = Workspace::new(ws_tmp2.path(), Some(off_tmp2.path().to_path_buf()))
+            .expect("workspace 2");
+        let ws_root2 = workspace2.root().to_path_buf();
+        let off_canon2 = off_tmp2.path().canonicalize().expect("canon offload 2");
+        let ctx2 = ToolCtx::new(
+            Arc::new(workspace2),
+            Arc::new(DiskOffloadSink::new(off_canon2)),
+        );
+        let red_checks = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 1".to_string()],
+            },
+            ws_root2,
+            Duration::from_secs(10),
+        );
+        let result2 = score_holdout(&holdout_src, &red_checks, &ctx2).await;
+        assert!(!result2, "red gate must return false");
     }
 }
