@@ -2,6 +2,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.5.0 - 2026-07-13
+#### Features
+- (**eval**) two hard fixtures — tokenbucket (withheld-test) + eventbus (multi-file) - (7690dd4) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
+- (**eval**) claude-code-glm eval runner — same fixtures, external holdout scoring - (c2052a1) - Jason Weddington, *claude-code-sonnet*, *Claude Opus 4.8*
+- (**harness**) finish-recovery nudges at the StoppedWithoutFinish terminal too - (e6ef1c0) - Jason Weddington, *claude-code-sonnet*, *Claude Opus 4.8*
+- (**harness**) RunStats.gates_green_at_exit — classify done-but-unclaimed stops - (bafb6ed) - Jason Weddington, *Claude Opus 4.8*
+#### Documentation
+- Session 9 log — finish-discipline completed + harness-vs-model benchmark - (c457798) - Jason Weddington, *Claude Opus 4.8*
+- document the talos fleet-publish flow (release + manual mid-work push) - (ad3136b) - Jason Weddington, *Claude Opus 4.8*
+#### Miscellaneous Chores
+- gitignore .envrc (local direnv with secrets) - (85abcbb) - Jason Weddington, *Claude Opus 4.8*
+
+- - -
+
 ## 0.4.1 - 2026-07-11
 #### Features
 - (**harness**) capture recovery_facts on a green-static MaxIterations - (f02f0e9) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
