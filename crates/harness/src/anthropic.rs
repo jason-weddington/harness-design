@@ -1067,6 +1067,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maps_404_without_type_tag_to_terminal_unknown_model() {
+        // The `not_found_error` type tag short-circuits BEFORE the
+        // status-code match (see maps_404_to_terminal_unknown_model). A 404
+        // that does NOT carry that tag must still land on the `404 =>` arm of
+        // `map_error_status` and classify as UnknownModel — a provider that
+        // returns a bare 404 (or an unparsable body) must not fall through to
+        // the catch-all Terminal{Other}.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such resource"))
+            .mount(&server)
+            .await;
+
+        let backend = AnthropicBackend::new("claude-bogus", "k").with_base_url(server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let err = backend.turn(&req).await.expect_err("must fail");
+        match err {
+            BackendError::Terminal { kind, message } => {
+                assert_eq!(
+                    kind,
+                    TerminalKind::UnknownModel,
+                    "a bare 404 must classify as UnknownModel, not Other",
+                );
+                // The unparsable body falls through as the message verbatim.
+                assert_eq!(message, "no such resource");
+            }
+            other => panic!("expected Terminal{{UnknownModel}} from a bare 404, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn maps_400_with_not_found_type_to_unknown_model() {
         // Some Anthropic responses tag model-not-found as a 400 with
         // `not_found_error`; the type tag must win over the status code.

@@ -669,4 +669,89 @@ mod tests {
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("atomic.rs")]);
     }
+
+    #[test]
+    fn tool_name_is_the_dispatch_key() {
+        // `name()` is what the registry indexes tools by; a drift here would
+        // break dispatch silently. The schema must advertise the same name.
+        assert_eq!(EditFileTool.name(), "edit_file");
+        assert_eq!(EditFileTool.schema()["name"], "edit_file");
+    }
+
+    #[tokio::test]
+    async fn wrong_typed_field_steering_error_names_the_json_type() {
+        // `require_string` builds a human-readable steering message naming the
+        // JSON type the model sent instead of a string. Every type label is a
+        // contract with the model — a wrong/misleading label steers it toward
+        // the wrong retry shape. Pin all of them.
+        let root = TempDir::new().expect("tempdir");
+        let ctx = ctx_for(&root);
+
+        // (value, expected short type name) for each non-string JSON kind.
+        let cases: [(serde_json::Value, &str); 5] = [
+            (json!(null), "null"),
+            (json!(true), "boolean"),
+            (json!(42.0), "number"),
+            (json!(["a"]), "array"),
+            (json!({}), "object"),
+        ];
+        for (value, expected_type) in cases {
+            let out = EditFileTool
+                .run(
+                    json!({
+                        "path": "f.txt",
+                        "old_string": value,
+                        "new_string": "x",
+                    }),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                out.is_error,
+                "non-string `old_string` ({expected_type}) must be a steering error",
+            );
+            assert!(
+                out.summary.contains(&format!("`{expected_type}`")),
+                "message must name the JSON type `{expected_type}` for {value:?}: {}",
+                out.summary,
+            );
+            assert!(
+                out.summary.contains("old_string") && out.summary.contains("string"),
+                "message must name the field and the expected type: {}",
+                out.summary,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_on_a_directory_path_is_steering_error() {
+        // A path whose `exists()` is true but `read()` fails (a directory) must
+        // surface as a steering error, not a panic — the loop relies on every
+        // tool failure being a ToolResult::error.
+        let root = TempDir::new().expect("tempdir");
+        let ctx = ctx_for(&root);
+        std::fs::create_dir(root.path().join("adir")).unwrap();
+
+        let out = EditFileTool
+            .run(
+                json!({
+                    "path": "adir",
+                    "old_string": "x",
+                    "new_string": "y",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            out.is_error,
+            "replacing inside a directory path must be a steering error, not ok",
+        );
+        assert!(
+            out.summary.contains("failed to read"),
+            "should name the read failure: {}",
+            out.summary,
+        );
+        assert!(out.summary.contains("adir"));
+    }
 }

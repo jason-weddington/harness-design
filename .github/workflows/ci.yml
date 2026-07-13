@@ -40,8 +40,8 @@ jobs:
         run: typos
       - name: Cargo.toml sorted
         run: cargo sort --workspace --check
-      - name: Coverage (>=95%)
-        run: cargo llvm-cov nextest --workspace --all-features --fail-under-lines 95
+      - name: Coverage (>=98%)
+        run: cargo llvm-cov nextest --workspace --all-features --fail-under-lines 98
       - name: Doctests
         run: cargo test --doc --workspace
       - name: Unused dependencies

@@ -6729,4 +6729,112 @@ mod tests {
             other => panic!("expected Failed(PersistentToolError), got {other:?}"),
         }
     }
+
+    // ---- ResumeError: Display + Error::source + From<StoreError> --------
+    // These impls are the only surface a caller sees when `resume` fails, so
+    // their wording and error-chaining are observable contracts: a regression
+    // here would silently change how the outer harness logs/routes resume
+    // failures.
+
+    #[test]
+    fn resume_error_display_and_source_chain_are_stable() {
+        let unknown = ResumeError::UnknownRunId("task-9:2".to_string());
+        assert_eq!(
+            unknown.to_string(),
+            "no checkpoint found for run_id \"task-9:2\"",
+            "UnknownRunId Display must quote the run_id",
+        );
+        assert!(
+            std::error::Error::source(&unknown).is_none(),
+            "UnknownRunId must have no underlying source",
+        );
+
+        let store_err = StoreError::LockPoisoned;
+        let wrapped = ResumeError::Store(store_err);
+        assert_eq!(
+            wrapped.to_string(),
+            "store error: internal connection mutex was poisoned",
+            "Store variant must delegate to the StoreError Display via the \
+             `store error: ` prefix",
+        );
+        let src = std::error::Error::source(&wrapped).expect("Store must chain its StoreError");
+        assert!(
+            src.to_string().contains("mutex was poisoned"),
+            "source() must expose the underlying StoreError, got {src}",
+        );
+    }
+
+    #[test]
+    fn resume_error_from_store_error_is_the_store_variant() {
+        // The `?`-driven conversion in `resume` relies on this `From` impl
+        // mapping every StoreError into ResumeError::Store — a regression to
+        // (say) UnknownRunId would mislead the harness into treating a store
+        // fault as a missing checkpoint.
+        let err: ResumeError = StoreError::LockPoisoned.into();
+        assert!(
+            matches!(err, ResumeError::Store(StoreError::LockPoisoned)),
+            "From<StoreError> must produce ResumeError::Store verbatim, got {err:?}",
+        );
+    }
+
+    // ---- Persistence Debug redacts the store pointer ---------------------
+    // `RunStore` has no Debug bound, so the manual Debug impl must substitute
+    // a fixed label — never leak a pointer/addr (which would make run logs
+    // non-deterministic) or panic.
+
+    #[test]
+    fn persistence_debug_redacts_the_store_as_a_fixed_label() {
+        let pers = make_persistence(Arc::new(SnapshotStore::new()));
+        let dbg = format!("{pers:?}");
+        assert!(
+            dbg.contains("task_id") && dbg.contains("\"task-t\""),
+            "Debug must surface task_id, got {dbg}",
+        );
+        assert!(
+            dbg.contains("attempt_n"),
+            "Debug must surface attempt_n, got {dbg}"
+        );
+        assert!(
+            dbg.contains("model_label") && dbg.contains("\"test-model\""),
+            "Debug must surface model_label, got {dbg}",
+        );
+        assert!(
+            dbg.contains("\"<dyn RunStore>\""),
+            "Debug must substitute the fixed `<dyn RunStore>` label, got {dbg}",
+        );
+        // Guard: the Debug output must NOT carry a memory address for the
+        // store (the whole point of the manual impl).
+        assert!(
+            !dbg.contains("0x"),
+            "Debug must not leak a store pointer address, got {dbg}",
+        );
+    }
+
+    // ---- RunConfig builders override the documented defaults ------------
+    // `static_tree_k` and `max_retries` feed finish-recovery detection and
+    // the retry schedule; a no-op builder would silently change both.
+
+    #[test]
+    fn with_static_tree_k_and_with_max_retries_override_their_defaults() {
+        let default = RunConfig::new("t", 5);
+        assert_eq!(default.static_tree_k, super::DEFAULT_STATIC_TREE_K);
+        assert_eq!(default.max_retries, super::DEFAULT_MAX_RETRIES);
+
+        let cfg = RunConfig::new("t", 5)
+            .with_static_tree_k(7)
+            .with_max_retries(0);
+        assert_eq!(
+            cfg.static_tree_k, 7,
+            "with_static_tree_k must set the field"
+        );
+        assert_eq!(cfg.max_retries, 0, "with_max_retries must set the field");
+
+        // `0` is the documented "disable" sentinel for both knobs — make sure
+        // the builders accept it without clamping.
+        let disabled = RunConfig::new("t", 1)
+            .with_static_tree_k(0)
+            .with_max_retries(0);
+        assert_eq!(disabled.static_tree_k, 0);
+        assert_eq!(disabled.max_retries, 0);
+    }
 }

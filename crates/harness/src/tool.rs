@@ -430,4 +430,22 @@ mod tests {
         registry.register("echo", Arc::new(EchoTool));
         assert_eq!(registry.list().len(), 1);
     }
+
+    #[test]
+    fn echo_tool_name_and_schema_are_stable() {
+        // `name()` is the registry/dispatch key: the loop looks up tools by
+        // the name the Tool advertises, so a drift here would silently break
+        // dispatch. The schema must agree on the same name.
+        let echo = EchoTool;
+        assert_eq!(echo.name(), "echo", "EchoTool.name() is the dispatch key");
+        assert_eq!(
+            echo.schema()["name"],
+            "echo",
+            "schema name must match name()"
+        );
+        assert!(
+            echo.schema()["input_schema"]["type"] == "object",
+            "echo schema must advertise an object input",
+        );
+    }
 }

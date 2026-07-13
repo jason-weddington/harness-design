@@ -1043,4 +1043,36 @@ mod tests {
             assert_eq!(new_seq, 7);
         }
     }
+
+    // ---- From<tokio::task::JoinError> preserves the cause string ----------
+    // The `?`-driven conversion inside the store's blocking-task bridge maps
+    // a panicked/cancelled background task into StoreError::Join; the message
+    // must round-trip so run records name the actual failure rather than a
+    // generic placeholder.
+
+    #[tokio::test]
+    async fn join_error_converts_to_store_error_join_preserving_message() {
+        // A panicking spawned task surfaces a JoinError when awaited. The panic
+        // payload must end up in StoreError::Join (stringified) — the only
+        // Clone-friendly representation of the cause.
+        let handle: tokio::task::JoinHandle<()> = tokio::spawn(async {
+            panic!("background boom");
+        });
+        let join_err = handle
+            .await
+            .expect_err("a panicking task must yield a JoinError");
+
+        let store_err: StoreError = join_err.into();
+        match &store_err {
+            StoreError::Join(msg) => assert!(
+                msg.contains("background boom"),
+                "Join message must carry the panic payload, got {msg:?}",
+            ),
+            other => panic!("From<JoinError> must produce StoreError::Join, got {other:?}"),
+        }
+        // And it surfaces through the same Display/source contract as the
+        // directly-constructed variant.
+        assert!(format!("{store_err}").contains("background task error"));
+        assert!(std::error::Error::source(&store_err).is_none());
+    }
 }
