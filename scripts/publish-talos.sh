@@ -8,7 +8,8 @@
 # them to pi-04; the fleet's `talos-update.sh` then just pulls the binary.
 #
 # Fleet contract (talos-update.sh depends on these verbatim):
-#   - Version token: `talos --version` prints `talos <semver>-g<short-sha>`
+#   - Version token: `talos --version` prints `talos <git-describe>` — the
+#     release tag on a tagged commit (e.g. `0.5.0`), else `<tag>-<n>-g<short-sha>`
 #     (URL/path-safe; see crates/talos/build.rs). Consumer: `| awk '{print $2}'`.
 #   - Layout: pi-04:$DIR/<TOKEN>/<arch>/talos  where <arch> ∈ {x86_64, aarch64}
 #     (matching `uname -m` on the hosts).

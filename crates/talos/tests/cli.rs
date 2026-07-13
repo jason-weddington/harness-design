@@ -272,10 +272,12 @@ fn version_flag_exits_0_with_fleet_token() {
     );
     let token = fields.next().expect("a version token in field 2");
 
-    assert!(
-        token.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-g")),
-        "token must be `<semver>-g<sha>`; got: {token:?}"
-    );
+    // The token is `git describe --tags` stamped at build time (build.rs): a
+    // release tag like `0.5.0`, else `<tag>-<n>-g<short-sha>`, else a bare sha
+    // (no-tag fallback) or `unknown` (non-git build). Assert only the durable
+    // fleet contract — a non-empty single token — not a specific version, which
+    // changes every release. Path-safety is asserted below.
+    assert!(!token.is_empty(), "token must be non-empty; got: {token:?}");
     // URL/path-safe: no `+`, no `/`, no whitespace (split_whitespace already
     // guarantees the last), so it drops into a pi-04 path unescaped.
     assert!(
