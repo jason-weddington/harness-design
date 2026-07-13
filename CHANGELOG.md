@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.5.1 - 2026-07-13
+#### Bug Fixes
+- (**talos**) version-stamp from the git tag, not the frozen crate version - (e246511) - Jason Weddington, *Claude Opus 4.8*
+#### Tests
+- ratchet workspace line coverage to ≥98% (95→98 gate) - (e710cba) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+
+- - -
+
 ## 0.5.0 - 2026-07-13
 #### Features
 - (**eval**) two hard fixtures — tokenbucket (withheld-test) + eventbus (multi-file) - (7690dd4) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
