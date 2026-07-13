@@ -10,13 +10,13 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.4.0 (2026-07-11)
+## Where we are — v0.5.0 (2026-07-13)
 
-Bounded autonomy shipped — the harness is now safe to leave alone. **finish-recovery** detects a done-but-unclaimed spin (green gates + a static tree for K iterations), nudges the model to finish or give a one-sentence status, and on exhaustion terminates `Failed` while writing **recovery facts** so the worker preserves the WIP branch. The harness never fabricates a `Done` — the claim moves up to the lead, so claim-vs-verify stays inviolate while work that couldn't be claimed is still rescued. A **wall-clock budget** lets a run self-terminate gracefully in the margin before the dispatch worker's hard-kill; **bounded retry/backoff** rides transient errors. This built on 0.3.0 (durability — kill the harness mid-run, restart, the run completes) and 0.3.5 (first dogfood — the harness, running as an Agent GTD build engine named **Talos**, shipped merged changes to its own repo).
+The finish-discipline safety net is complete, and the harness-vs-model claim has an instrument. 0.4.0's **finish-recovery** rescued a done-but-unclaimed *spin* (model keeps acting, gates green, tree static for K iterations); v0.5.0 closes the other half — the *stop-cold* halt (a no-tool-call turn) where the model verified green then quit without claiming. The eval exposed the gap the honest way: on the 6-model matrix (`kb-03019`) finish-recovery fired **zero** rescues (it only caught the spin), a one-line instrument (`RunStats.gates_green_at_exit`) then classified **~43%** of a weak model's stops as post-green — verified work abandoned (`kb-03033`) — and the **stop-nudge extension** now nudges at the `StoppedWithoutFinish` terminal too. The harness still never fabricates a `Done`; the claim still moves up to the lead.
 
-The session's load-bearing finding: **harness-vs-model, proven empirically.** Hold the model constant (glm) and swap the harness — Talos failed finish-recovery twice, `claude-code-glm` one-shot the exact same 18-AC item. When a strong model fails, suspect the harness first; `claude-code-glm` is now a proven zero-Anthropic lane for complex harness-core work while Talos matures. Talos also gained **fleet-publish**: the i9 builds both arches once and publishes to pi-04, hosts pull, retiring the compile-on-every-host tax — and `release.sh` now ships a fresh fleet artifact as part of every release (a release ships an artifact by definition).
+The session also turned the harness-vs-model anecdote into a **benchmark**: a `claude_code_eval` runner drives claude-code-glm over the same fixtures, scored by the same sealed holdout as Talos, so the two harnesses compare 1:1 on the same model. First result (`kb-03078`) flipped the expected story — both harnesses **saturate** the current fixtures (18/18, holdout 18/18, 0 false-dones), so the pass-rate gap lives only at genuine dispatch scale; but Talos is **~17× more token-efficient** than Claude Code at identical quality. The harness is the variable — on cost here, not pass rate.
 
-389 tests, ~97% coverage; zero false dones across the whole eval history. **Next: 0.5.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — 0.3.5 front-ran the supervised version.
+~394 tests, ~97% coverage; zero false dones across the whole eval history (180+ trials). **Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward.
 
 ## 0.3.0 — durability (persist, resume, dispose) — ✅ shipped v0.3.0
 
@@ -65,7 +65,7 @@ Budgets were scoped to **wall-clock only**: token caps are inscrutable (no human
 right value) and cost caps have no accumulator yet (see backlog). Being designed against
 real talos run data — including this wave's own finish-discipline failures.
 
-## 0.5.0 — the GTD build-engine adapter
+## 0.6.0 — the GTD build-engine adapter
 
 **Theme: the point.** The adapter that picks up a groomed Agent GTD item, clones
 the target repo into the workspace, runs the loop with the project's check
@@ -77,9 +77,8 @@ unsupervised completion — self-git, comment-back, and the full engine contract
 
 ## Backlog (unscheduled, captured)
 
-- **Eval levers** (on the GTD board, from the saturation finding): harder task
-  *shapes* — withhold-the-failing-test mode, prose-bug-report mode (the realistic
-  dispatch shape); haiku floor-run for the model-routing question.
+- **Dispatch-scale fixture tier** — to reproduce the *pass-rate* harness gap in-eval. Session 9 shipped the harness-vs-model benchmark and two "hard" fixtures (tokenbucket withheld-test + eventbus multi-file), but glm saturates them under *both* harnesses (`kb-03078`): the gap lives only at genuine dispatch scale (the 18-AC/5-file item), and a withheld-test spec precise enough to grade unambiguously is also easy to implement (precision-to-grade removes the difficulty). Reproducing the gap needs many-file, high-navigation fixtures — a real authoring effort, and the design challenge is difficulty-without-ambiguity.
+- **The ~17× cost finding** (`kb-03078`) — Talos vs Claude Code token efficiency at equal quality; a strong, cheap-to-tell result worth a blog writeup (post 5, or fold into the benchmark story).
 - **Token + cost budget caps** — deferred from 0.4.0 (which shipped wall-clock only).
   Token caps are inscrutable (no human-legible right value per task); cost caps are
   blocked on a token→price table that doesn't exist (`consumed.cost_micros` is never
