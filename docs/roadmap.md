@@ -92,7 +92,17 @@ and ergonomics, not the core contract.
   incremented). Revisit token caps only with a concrete reason; cost caps once pricing
   is wired.
 - **Streaming/SSE** — cost/latency, not capability; when the live-run volume
-  justifies it. (Prompt caching shipped in v0.5.2 — `98fe789`, `kb-03102`.)
+  justifies it. (Prompt caching shipped in v0.6.0 — `98fe789`, `kb-03102`.)
+- **In-run context compaction** — summarize/evict old turns as a single run
+  approaches its context window, the way Claude Code auto-compacts. Talos does
+  none today: it grows the conversation until the window is hit, then either
+  errors (pre-flight guard, once `num_ctx` is pinned) or — the bug we just
+  fixed — silently truncates. **Explicitly not planned yet.** For dispatch-size
+  work a model's real window is huge (glm 1M, qwen 256k, now pinned), and the
+  right lever *before* compaction is to decompose work into smaller tasks;
+  Ralph's fresh-context-per-iteration is the pattern-level answer for long
+  *objectives*. Revisit only if a single indivisible task genuinely overruns a
+  1M window.
 - **First-class Ralph Loop support** — `--ralph-mode` + a stopping condition
   (e.g. coverage ≥ 95%): on `finish`, the harness checks the condition and, if
   unmet, **restarts the agent loop with fresh context** (state carried by the
