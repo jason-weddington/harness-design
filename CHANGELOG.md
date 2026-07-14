@@ -2,6 +2,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.6.0 - 2026-07-14
+#### Features
+- (**anthropic**) enable prompt caching with static + rolling cache_control breakpoints - (98fe789) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
+- (**eval**) cache-token accounting + claude_code_eval sonnet/real-Anthropic mode - (619ef58) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
+#### Documentation
+- correct roadmap — GTD adapter shipped at 0.3.5, this release is 0.6.0 - (6b64ef8) - Jason Weddington, *Claude Opus 4.8*
+- Session 11 log — checker-only gates decision, prompt caching, benchmark v2 (sonnet ~8x) - (a3e94e1) - Jason Weddington, *Claude Opus 4.8*
+- Session 10 log — benchmark verdict, 0.5.1, talos-glm judgment + workspace, context-failure lesson - (3ec6ed5) - Jason Weddington
+
+- - -
+
 ## 0.5.1 - 2026-07-13
 #### Bug Fixes
 - (**talos**) version-stamp from the git tag, not the frozen crate version - (e246511) - Jason Weddington, *Claude Opus 4.8*
