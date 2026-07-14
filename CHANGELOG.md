@@ -2,6 +2,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.7.0 - 2026-07-14
+#### Features
+- (**ralph**) add the Ralph outer loop (fresh-context restart, stop-command, breakers, per-iteration commit) - (1b4c2bb) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+#### Bug Fixes
+- (**engine**) raise DEFAULT_MAX_TOKENS 4096 → 32768 for reasoning models - (1a7a6ac) - Jason Weddington, *Claude Opus 4.8*
+- (**release**) push tags to github as well as origin - (3d07dcc) - Jason Weddington, *Claude Opus 4.8*
+#### Documentation
+- Ralph core shipped on talos-glm + max_tokens diagnosis (kb-03104) - (7230089) - Jason Weddington, *Claude Opus 4.8*
+- add in-run context compaction to roadmap backlog (not planned yet) - (db1ebaf) - Jason Weddington, *Claude Opus 4.8*
+
+- - -
+
 ## 0.6.0 - 2026-07-14
 #### Features
 - (**anthropic**) enable prompt caching with static + rolling cache_control breakpoints - (98fe789) - Jason Weddington, *claude-code-glm*, *Claude Opus 4.8*
