@@ -10,13 +10,15 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.5.2 (2026-07-14)
+## Where we are — v0.6.0 (2026-07-14)
 
 Talos now caches on the Anthropic API, and the harness-vs-model cost claim has a Sonnet data point. The headline capability this release: **request-side prompt caching** in the Anthropic backend (`98fe789`) — a static `cache_control` breakpoint on the system block (which covers tools via Anthropic's tools→system→messages cache order) plus a rolling breakpoint on the last message, so the stable system+tools prefix is written once and re-read every turn. Confirmed live: talos-sonnet's *fresh* input drops to ≈ 0 (the entire prefix is served from cache after turn 1). This is a standing cost win for every talos-sonnet/opus dispatch and the prerequisite for an honest billed-cost comparison.
 
 The session also ran **benchmark v2** — talos-sonnet vs claude-code-sonnet, k=1 × 6 shared fixtures, live `claude-sonnet-4-6` (`kb-03102`). Two eval-infra pieces landed first (`619ef58`): honest `raw_in = input + cache_read + cache_write` accounting (caching *moves* input into the cache buckets, so summing `input_tokens` alone would misreport), and a `CLAUDE_CODE_ENDPOINT=anthropic` mode so `claude_code_eval` can drive claude-code-sonnet on the real API. Result: **raw-input ≈ 8×** (not the glm 17×; billed ≈ 7.6×), no pass/holdout/false-done gap. Two lessons: caching is **symmetric** (both harnesses cache their prefix, so it did *not* erode Talos's lead — an earlier worry overstated it), and the 17→8 drop is **iteration-driven**, not a shrinking harness edge (the stable property is the ~6–7× per-turn overhead ratio). Also settled a design decision (`kb-03099`): **gates and commit hooks CHECK, agents FIX** — one checker set at both surfaces, no mutation at the commit boundary.
 
-**Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward. Also queued: **first-class Ralph Loop support** (`--ralph-mode` + a stopping condition — the harness restarts the agent loop with *fresh context* on `finish` when the condition isn't met, distinct from finish-recovery's same-context nudge; use case: grind a legacy codebase up to dispatch-readiness overnight). Nearer-term: make talos-glm the default engine; land the field-report worker fixes on agent-gtd-dev (BUG1 first, lead-committed); unify the two runners' fixture discovery (`coding_eval` ran 10 dirs, `claude_code_eval` 6); and a dispatch-scale fixture tier to reproduce the pass-rate gap.
+The **GTD build-engine adapter — the milestone this project was built toward — is shipped and maturing**: the `talos-*` engine family has run as a real headless-dispatch build engine since 0.3.5 (supervised), and every release since has hardened it (unsupervised finish-recovery, workspace/multi-repo dispatch, the bash tool, the sudoers/env plumbing, field-report worker fixes). Talos routinely ships merged changes to its own and adjacent repos on the cheap glm lane.
+
+**Next up: first-class Ralph Loop support** (`--ralph-mode` + a stopping condition — the harness restarts the agent loop with *fresh context* on `finish` when the condition isn't met, distinct from finish-recovery's same-context nudge; use case: grind a legacy codebase up to dispatch-readiness overnight). Nearer-term: make talos-glm the default engine; land the field-report worker fixes on agent-gtd-dev (BUG1 first, lead-committed); unify the two runners' fixture discovery (`coding_eval` ran 10 dirs, `claude_code_eval` 6); and a dispatch-scale fixture tier to reproduce the pass-rate gap.
 
 ## 0.3.0 — durability (persist, resume, dispose) — ✅ shipped v0.3.0
 
@@ -65,15 +67,19 @@ Budgets were scoped to **wall-clock only**: token caps are inscrutable (no human
 right value) and cost caps have no accumulator yet (see backlog). Being designed against
 real talos run data — including this wave's own finish-discipline failures.
 
-## 0.6.0 — the GTD build-engine adapter
+## The GTD build-engine adapter — ✅ shipped (0.3.5 supervised → matured through 0.5.x)
 
 **Theme: the point.** The adapter that picks up a groomed Agent GTD item, clones
-the target repo into the workspace, runs the loop with the project's check
-command, pushes a feature branch, and comments back — the harness as a real
-headless-dispatch build engine alongside Claude Code. Order matters: this lands
-*after* durability and bounds because dispatch hosts restart and nobody reviews a
-runaway. 0.3.5 front-runs the supervised version of this; 0.5.0 is the
-unsupervised completion — self-git, comment-back, and the full engine contract.
+the target repo, runs the loop with the project's `gate_command`, pushes a
+feature branch, and comments back — the harness as a real headless-dispatch build
+engine alongside Claude Code. Delivered incrementally rather than as one milestone
+release: **0.3.5** shipped the supervised version (the `talos-*` engine family, the
+no-MCP TaskSpec contract, the worker owning git + comment-back); subsequent releases
+matured it into the unsupervised engine — finish-recovery and wall-clock bounds
+(0.4.0), the stop-cold nudge (0.5.0), workspace/multi-repo dispatch and the bash tool
+(0.5.1), and the ongoing field-report worker fixes on agent-gtd-dev. Talos now
+routinely lands merged changes on the cheap glm lane; the remaining work is hardening
+and ergonomics, not the core contract.
 
 ## Backlog (unscheduled, captured)
 
