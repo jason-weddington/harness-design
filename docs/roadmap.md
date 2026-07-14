@@ -103,14 +103,10 @@ and ergonomics, not the core contract.
   Ralph's fresh-context-per-iteration is the pattern-level answer for long
   *objectives*. Revisit only if a single indivisible task genuinely overruns a
   1M window.
-- **First-class Ralph Loop support** — `--ralph-mode` + a stopping condition
-  (e.g. coverage ≥ 95%): on `finish`, the harness checks the condition and, if
-  unmet, **restarts the agent loop with fresh context** (state carried by the
-  codebase + a progress/notes file + git history, not the context window).
-  Distinct from finish-recovery, which nudges the *same* context when gates
-  aren't green. Use case: grind a legacy codebase up to dispatch-readiness
-  overnight (one small verified change per iteration). Design discussion started
-  Session 11.
+- **Ralph Loop — ✅ shipped (core `1b4c2bb` / 0.7.0, CLI `talos ralph` / 0.8.0), now growing.** The fresh-context-per-iteration outer loop + `--stop-when` oracle + breakers is real and proven: a talos-qwen run drove the external dng-converter repo 6%→48% coverage across 11 clean iterations (2026-07-14). Forward directions:
+  - **Ralph-ability characterization** (`kb-03109`) — the design heuristic for *which* tasks fit: a **static prompt that re-binds as external state mutates** (coverage %, a checklist, a failing-test list, a grep). Five requirements (monotone external state · pure-function-of-state prompt · cheap unambiguous stop-oracle · progress durable outside the context · units that fit one inner budget). "Write the highest-value missing test" is the canonical small-model case.
+  - **`tasks.md` backlog executor (next experiment)** — the mid-tier (talos-glm) instance of the pattern: prompt = "complete the next unchecked task in `tasks.md`, mark it complete," stop-when = "all boxes checked." Turns Ralph into a generic autonomous project executor over a groomed backlog. Gated on the do-over fix (item `230f9e9b`) — that fix is the *enabling prerequisite*: without it one over-budget task corrupts the run; with it, a too-hard task gets 3 clean do-overs then loudly stops for a human. A `tasks.md`-specific v2: "mark blocked + skip to next" instead of halting the whole loop.
+  - **Ralph dispatch mode** — `talos ralph` is local-only today; the always-planned next step is running a Ralph objective as a headless dispatch on a *remote* host, so the fleet (not a laptop) grinds an overnight objective. This is what keeps GTD relevant alongside `tasks.md`+Ralph: dispatch-to-remote is a must-have, and the task board is for human organization/visibility — Ralph and GTD-dispatch are complementary (GTD dispatches each item as a separate reviewed agent; Ralph grinds a whole objective in one self-restarting loop).
 - **Remaining v1-design tools**: `search_code`, `comment` (the design's tools 7–8).
 - **LLM-judge evidence tier** (`Evidence::Judge`) — deferred from v1 by design.
 - **Model-routing policy** (open decision #6) — blocked on eval data (haiku
