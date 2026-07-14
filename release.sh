@@ -18,7 +18,6 @@ cog bump --auto
 ./scripts/publish-talos.sh
 
 git push origin main --tags
-
-# ./deploy.sh   # uncomment once a deploy target exists (gitignored, local)
+git push github main --tags
 
 # ./deploy.sh   # uncomment once a deploy target exists (gitignored, local)
