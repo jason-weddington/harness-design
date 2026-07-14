@@ -10,13 +10,15 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.5.0 (2026-07-13)
+## Where we are — v0.5.1 (2026-07-14)
 
 The finish-discipline safety net is complete, and the harness-vs-model claim has an instrument. 0.4.0's **finish-recovery** rescued a done-but-unclaimed *spin* (model keeps acting, gates green, tree static for K iterations); v0.5.0 closes the other half — the *stop-cold* halt (a no-tool-call turn) where the model verified green then quit without claiming. The eval exposed the gap the honest way: on the 6-model matrix (`kb-03019`) finish-recovery fired **zero** rescues (it only caught the spin), a one-line instrument (`RunStats.gates_green_at_exit`) then classified **~43%** of a weak model's stops as post-green — verified work abandoned (`kb-03033`) — and the **stop-nudge extension** now nudges at the `StoppedWithoutFinish` terminal too. The harness still never fabricates a `Done`; the claim still moves up to the lead.
 
 The session also turned the harness-vs-model anecdote into a **benchmark**: a `claude_code_eval` runner drives claude-code-glm over the same fixtures, scored by the same sealed holdout as Talos, so the two harnesses compare 1:1 on the same model. First result (`kb-03078`) flipped the expected story — both harnesses **saturate** the current fixtures (18/18, holdout 18/18, 0 false-dones), so the pass-rate gap lives only at genuine dispatch scale; but Talos is **~17× more token-efficient** than Claude Code at identical quality. The harness is the variable — on cost here, not pass rate.
 
-~394 tests, ~97% coverage; zero false dones across the whole eval history (180+ trials). **Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward.
+v0.5.1 ran the benchmark for real and drew the conclusion: talos-glm and claude-code-glm both **saturate** the fixtures (no pass-rate gap at this scale), but Talos is **~17× more token-efficient** at identical quality (`kb-03078`) — verified to be input overhead, not a thinking-mode artifact (a direct ollama.com probe showed GLM defaults to thinking on both paths). So **talos-glm is the cheaper default dispatch lane**, now also **workspace-enabled** (multi-repo; the guard was the only blocker) and **proven on open-ended judgment work** — it restored coverage to **98%** on a decide-the-areas brief without gaming the metric (`kb-03096`). Coverage ratcheted 95→98; the talos binary now self-reports its git tag.
+
+**Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward. Nearer-term: make talos-glm the default engine (a groom-workflow + banner change, not dispatch code); land the field-report worker fixes on agent-gtd-dev (BUG1 first, lead-committed to dodge the bootstrap); and a dispatch-scale fixture tier to reproduce the pass-rate gap the current fixtures are too easy to show.
 
 ## 0.3.0 — durability (persist, resume, dispose) — ✅ shipped v0.3.0
 
