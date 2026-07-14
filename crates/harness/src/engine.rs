@@ -161,9 +161,16 @@ pub struct RunConfig {
     pub clock: Arc<dyn Clock>,
 }
 
-/// The default per-turn output cap. Budget-aware sizing lands with the budget
-/// work; this is a fixed value for the thin slice.
-pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// The default per-turn output cap. Sized for reasoning models: a model whose
+/// thinking counts toward completion tokens (glm-5.2, qwen) can exceed a small
+/// cap mid-turn and get truncated *before* it emits a tool call, which the loop
+/// then sees as a no-tool-call turn and reports as `StoppedWithoutFinish` (a
+/// silent, misdiagnosed stall — see kb-03104). 32768 is safe across every
+/// backend: it is half of Claude Haiku 4.5's 64K output ceiling (Sonnet/Opus
+/// allow 128K) and well within Ollama's `num_predict`; there is no cost
+/// downside since billing is on actual output, not the cap. Override per-run
+/// with [`RunConfig::with_max_tokens`].
+pub const DEFAULT_MAX_TOKENS: u32 = 32768;
 
 /// Default retry cap: how many ADDITIONAL attempts are made after the first
 /// try on a retryable [`model::BackendError::Transient`] failure. With the
