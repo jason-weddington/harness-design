@@ -10,15 +10,13 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.5.1 (2026-07-14)
+## Where we are — v0.5.2 (2026-07-14)
 
-The finish-discipline safety net is complete, and the harness-vs-model claim has an instrument. 0.4.0's **finish-recovery** rescued a done-but-unclaimed *spin* (model keeps acting, gates green, tree static for K iterations); v0.5.0 closes the other half — the *stop-cold* halt (a no-tool-call turn) where the model verified green then quit without claiming. The eval exposed the gap the honest way: on the 6-model matrix (`kb-03019`) finish-recovery fired **zero** rescues (it only caught the spin), a one-line instrument (`RunStats.gates_green_at_exit`) then classified **~43%** of a weak model's stops as post-green — verified work abandoned (`kb-03033`) — and the **stop-nudge extension** now nudges at the `StoppedWithoutFinish` terminal too. The harness still never fabricates a `Done`; the claim still moves up to the lead.
+Talos now caches on the Anthropic API, and the harness-vs-model cost claim has a Sonnet data point. The headline capability this release: **request-side prompt caching** in the Anthropic backend (`98fe789`) — a static `cache_control` breakpoint on the system block (which covers tools via Anthropic's tools→system→messages cache order) plus a rolling breakpoint on the last message, so the stable system+tools prefix is written once and re-read every turn. Confirmed live: talos-sonnet's *fresh* input drops to ≈ 0 (the entire prefix is served from cache after turn 1). This is a standing cost win for every talos-sonnet/opus dispatch and the prerequisite for an honest billed-cost comparison.
 
-The session also turned the harness-vs-model anecdote into a **benchmark**: a `claude_code_eval` runner drives claude-code-glm over the same fixtures, scored by the same sealed holdout as Talos, so the two harnesses compare 1:1 on the same model. First result (`kb-03078`) flipped the expected story — both harnesses **saturate** the current fixtures (18/18, holdout 18/18, 0 false-dones), so the pass-rate gap lives only at genuine dispatch scale; but Talos is **~17× more token-efficient** than Claude Code at identical quality. The harness is the variable — on cost here, not pass rate.
+The session also ran **benchmark v2** — talos-sonnet vs claude-code-sonnet, k=1 × 6 shared fixtures, live `claude-sonnet-4-6` (`kb-03102`). Two eval-infra pieces landed first (`619ef58`): honest `raw_in = input + cache_read + cache_write` accounting (caching *moves* input into the cache buckets, so summing `input_tokens` alone would misreport), and a `CLAUDE_CODE_ENDPOINT=anthropic` mode so `claude_code_eval` can drive claude-code-sonnet on the real API. Result: **raw-input ≈ 8×** (not the glm 17×; billed ≈ 7.6×), no pass/holdout/false-done gap. Two lessons: caching is **symmetric** (both harnesses cache their prefix, so it did *not* erode Talos's lead — an earlier worry overstated it), and the 17→8 drop is **iteration-driven**, not a shrinking harness edge (the stable property is the ~6–7× per-turn overhead ratio). Also settled a design decision (`kb-03099`): **gates and commit hooks CHECK, agents FIX** — one checker set at both surfaces, no mutation at the commit boundary.
 
-v0.5.1 ran the benchmark for real and drew the conclusion: talos-glm and claude-code-glm both **saturate** the fixtures (no pass-rate gap at this scale), but Talos is **~17× more token-efficient** at identical quality (`kb-03078`) — verified to be input overhead, not a thinking-mode artifact (a direct ollama.com probe showed GLM defaults to thinking on both paths). So **talos-glm is the cheaper default dispatch lane**, now also **workspace-enabled** (multi-repo; the guard was the only blocker) and **proven on open-ended judgment work** — it restored coverage to **98%** on a decide-the-areas brief without gaming the metric (`kb-03096`). Coverage ratcheted 95→98; the talos binary now self-reports its git tag.
-
-**Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward. Nearer-term: make talos-glm the default engine (a groom-workflow + banner change, not dispatch code); land the field-report worker fixes on agent-gtd-dev (BUG1 first, lead-committed to dodge the bootstrap); and a dispatch-scale fixture tier to reproduce the pass-rate gap the current fixtures are too easy to show.
+**Next: 0.6.0**, the unsupervised GTD build-engine adapter (self-git, comment-back, the full engine contract) — the milestone this project has been building toward. Also queued: **first-class Ralph Loop support** (`--ralph-mode` + a stopping condition — the harness restarts the agent loop with *fresh context* on `finish` when the condition isn't met, distinct from finish-recovery's same-context nudge; use case: grind a legacy codebase up to dispatch-readiness overnight). Nearer-term: make talos-glm the default engine; land the field-report worker fixes on agent-gtd-dev (BUG1 first, lead-committed); unify the two runners' fixture discovery (`coding_eval` ran 10 dirs, `claude_code_eval` 6); and a dispatch-scale fixture tier to reproduce the pass-rate gap.
 
 ## 0.3.0 — durability (persist, resume, dispose) — ✅ shipped v0.3.0
 
@@ -80,14 +78,23 @@ unsupervised completion — self-git, comment-back, and the full engine contract
 ## Backlog (unscheduled, captured)
 
 - **Dispatch-scale fixture tier** — to reproduce the *pass-rate* harness gap in-eval. Session 9 shipped the harness-vs-model benchmark and two "hard" fixtures (tokenbucket withheld-test + eventbus multi-file), but glm saturates them under *both* harnesses (`kb-03078`): the gap lives only at genuine dispatch scale (the 18-AC/5-file item), and a withheld-test spec precise enough to grade unambiguously is also easy to implement (precision-to-grade removes the difficulty). Reproducing the gap needs many-file, high-navigation fixtures — a real authoring effort, and the design challenge is difficulty-without-ambiguity.
-- **The ~17× cost finding** (`kb-03078`) — Talos vs Claude Code token efficiency at equal quality; a strong, cheap-to-tell result worth a blog writeup (post 5, or fold into the benchmark story).
+- **The cost-gap finding** — Talos vs Claude Code token efficiency at equal quality: **~17× on glm** (`kb-03078`, uncached ollama endpoint) and **~8× raw / ~7.6× billed on sonnet** (`kb-03102`, both harnesses caching the real Anthropic API). A strong, cheap-to-tell result worth a blog writeup — the sharpened story is "harness overhead is real *and survives caching*, but the headline multiple is iteration-sensitive."
+- **Unify runner fixture discovery** — `coding_eval` discovers all 10 fixture dirs (the 4 legacy ones without `task.json` run but without holdout, shown `-`) while `claude_code_eval` runs only the 6 with `task.json`. Either give the 4 legacy fixtures `task.json` + holdout or exclude them from `coding_eval` so the two runners cover the same set.
 - **Token + cost budget caps** — deferred from 0.4.0 (which shipped wall-clock only).
   Token caps are inscrutable (no human-legible right value per task); cost caps are
   blocked on a token→price table that doesn't exist (`consumed.cost_micros` is never
   incremented). Revisit token caps only with a concrete reason; cost caps once pricing
   is wired.
-- **Streaming/SSE + prompt caching** — cost/latency, not capability; when the
-  live-run volume justifies it.
+- **Streaming/SSE** — cost/latency, not capability; when the live-run volume
+  justifies it. (Prompt caching shipped in v0.5.2 — `98fe789`, `kb-03102`.)
+- **First-class Ralph Loop support** — `--ralph-mode` + a stopping condition
+  (e.g. coverage ≥ 95%): on `finish`, the harness checks the condition and, if
+  unmet, **restarts the agent loop with fresh context** (state carried by the
+  codebase + a progress/notes file + git history, not the context window).
+  Distinct from finish-recovery, which nudges the *same* context when gates
+  aren't green. Use case: grind a legacy codebase up to dispatch-readiness
+  overnight (one small verified change per iteration). Design discussion started
+  Session 11.
 - **Remaining v1-design tools**: `search_code`, `comment` (the design's tools 7–8).
 - **LLM-judge evidence tier** (`Evidence::Judge`) — deferred from v1 by design.
 - **Model-routing policy** (open decision #6) — blocked on eval data (haiku
