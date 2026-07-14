@@ -122,6 +122,19 @@ struct TaskSpecPromptTemplate<'a> {
     gate_command: &'a str,
 }
 
+/// The ralph outer-loop per-iteration prompt template. Renders the objective,
+/// the injected progress notes, and the exact notes filename the agent must
+/// append to next. `escape = "none"` is pinned so prompt text with `"`, `<`,
+/// `>`, or `&` passes through untouched — the model sees exactly what a
+/// reviewer sees in the `.md` file.
+#[derive(Template)]
+#[template(path = "ralph_prompt.md", escape = "none")]
+struct RalphPromptTemplate<'a> {
+    objective: &'a str,
+    notes: &'a str,
+    notes_file: &'a str,
+}
+
 /// The synthetic-nudge template — a variable-free string the finish-recovery
 /// protocol appends onto the existing tool-results `Message::User` when it
 /// detects a green-gates + static-tree spin. `escape = "none"` is pinned
@@ -199,6 +212,28 @@ pub fn render_task_prompt_from_spec(spec: &TaskSpec) -> String {
     .expect("task_spec_prompt.md is a static template that renders infallibly for owned inputs")
 }
 
+/// Render the ralph per-iteration prompt: the objective, the injected
+/// progress notes, and the exact notes filename the agent must append to.
+///
+/// The output is the content of the inner [`crate::engine::RunConfig::task`]
+/// slot — the engine wraps it under `# Task` via [`render_task_prompt`], so it
+/// must NOT itself begin with a top-level `# ` heading (all headings are `##`
+/// or lower). The render is a pure function of its inputs and is
+/// byte-deterministic.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_ralph_prompt(objective: &str, notes: &str, notes_file: &str) -> String {
+    RalphPromptTemplate {
+        objective,
+        notes,
+        notes_file,
+    }
+    .render()
+    .expect("ralph_prompt.md is a static template that renders infallibly for owned inputs")
+}
+
 /// Render the synthetic-nudge steering text — the variable-free string the
 /// finish-recovery protocol appends onto the existing tool-results
 /// `Message::User` when it detects a green-gates + static-tree spin. The
@@ -220,8 +255,9 @@ pub fn render_nudge_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NudgePromptTemplate, ToolLine, render_nudge_prompt, render_system_prompt,
-        render_task_prompt, render_task_prompt_from_spec, tool_lines,
+        NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
+        render_ralph_prompt, render_system_prompt, render_task_prompt,
+        render_task_prompt_from_spec, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
     use crate::task_spec::{FileToModify, TaskSpec};
@@ -728,6 +764,90 @@ mod tests {
             .render()
             .expect("variable-free template renders infallibly");
         let via_fn = render_nudge_prompt();
+        assert_eq!(via_struct, via_fn);
+    }
+
+    // --- render_ralph_prompt tests ------------------------------------------
+
+    /// The ralph prompt must contain the load-bearing discipline phrase
+    /// verbatim, an append instruction that names the injected notes file,
+    /// both sentinels (objective + notes), and NO top-level `# ` heading.
+    #[test]
+    fn render_ralph_prompt_pins_phrases_and_injects_fields() {
+        let objective = "SENTINEL_OBJECTIVE do the ralph thing";
+        let notes = "SENTINEL_NOTES prior iteration journal";
+        let notes_file = "SENTINEL_NOTES_FILE.md";
+        let rendered = render_ralph_prompt(objective, notes, notes_file);
+
+        // (a) the literal discipline phrase.
+        assert!(
+            rendered.contains("one thing — not one thing plus a quick refactor"),
+            "ralph prompt must contain the literal discipline phrase; got:\n{rendered}"
+        );
+
+        // (b) an append instruction that includes the word `append` and the
+        // injected notes_file path.
+        assert!(
+            rendered.contains("append"),
+            "ralph prompt must instruct the agent to append; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(notes_file),
+            "ralph prompt must name the injected notes file `{notes_file}`; got:\n{rendered}"
+        );
+
+        // (c) objective and notes sentinels appear verbatim.
+        assert!(
+            rendered.contains(objective),
+            "ralph prompt must inject the objective verbatim; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(notes),
+            "ralph prompt must inject the notes verbatim; got:\n{rendered}"
+        );
+
+        // (d) no top-level `# ` heading — the engine wraps this under `# Task`.
+        for line in rendered.lines() {
+            assert!(
+                !line.starts_with("# "),
+                "ralph prompt must not contain a top-level '# ' heading; \
+                 offending line: {line:?}; full output:\n{rendered}"
+            );
+        }
+    }
+
+    /// The prompt cache is byte-comparison sensitive. Rendering the same
+    /// ralph inputs twice must produce identical bytes.
+    #[test]
+    fn render_ralph_prompt_is_byte_deterministic() {
+        let first = render_ralph_prompt("obj", "notes", "PROGRESS.md");
+        let second = render_ralph_prompt("obj", "notes", "PROGRESS.md");
+        assert_eq!(
+            first.as_bytes(),
+            second.as_bytes(),
+            "same ralph inputs must produce byte-identical output"
+        );
+    }
+
+    /// Empty notes (first iteration) must render without panic.
+    #[test]
+    fn render_ralph_prompt_empty_notes_renders() {
+        let rendered = render_ralph_prompt("objective", "", "PROGRESS.md");
+        assert!(rendered.contains("objective"));
+        assert!(rendered.contains("PROGRESS.md"));
+    }
+
+    /// `RalphPromptTemplate`'s derive-render must agree with the free function.
+    #[test]
+    fn ralph_prompt_template_renders_via_derive() {
+        let via_struct = RalphPromptTemplate {
+            objective: "obj",
+            notes: "notes",
+            notes_file: "PROGRESS.md",
+        }
+        .render()
+        .expect("ralph template renders infallibly");
+        let via_fn = render_ralph_prompt("obj", "notes", "PROGRESS.md");
         assert_eq!(via_struct, via_fn);
     }
 }

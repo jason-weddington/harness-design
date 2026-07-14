@@ -12,6 +12,7 @@ pub mod exec;
 pub mod model;
 pub mod ollama;
 pub mod prompt;
+pub mod ralph;
 pub mod run_record;
 pub mod store;
 pub mod task_spec;
