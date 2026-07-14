@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.8.0 - 2026-07-14
+#### Features
+- (**talos**) add `talos ralph` subcommand — thin CLI over run_ralph - (ce422ff) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+
+- - -
+
 ## 0.7.0 - 2026-07-14
 #### Features
 - (**ralph**) add the Ralph outer loop (fresh-context restart, stop-command, breakers, per-iteration commit) - (1b4c2bb) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
