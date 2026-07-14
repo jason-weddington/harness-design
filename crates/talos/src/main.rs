@@ -15,6 +15,54 @@
 //! `Failed`, which would collapse engine-broke (must be 1) into task-Failed
 //! (20). See [`exit_code`] for the full rationale.
 //!
+//! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
+//! Ralph outer loop toward a plain-objective `--stop-when` command oracle
+//! with a fresh inner context per outer iteration. `ralph` is NOT run-record
+//! persisted this cut — [`harness::ralph::run_ralph`] is invoked directly and
+//! its [`harness::ralph::RalphReport`] is summarized to stdout; no store is
+//! opened and no run id / record path is produced.
+//!
+//! ## `talos ralph` exit code contract
+//!
+//! | Code | Meaning |
+//! |------|---------|
+//! | 0    | `StopConditionMet` — objective met |
+//! | 20   | `Stuck`, `MaxIterationsExhausted`, or `TimeBudgetExhausted` — task-side failure terminals |
+//! | 1    | `Error` or a harness/infra error (clap error, workspace error) |
+//!
+//! There is NO `10`/Blocked analog for ralph — the Ralph outer loop has no
+//! Blocked terminal. See [`ralph_exit_code`] for the rationale.
+//!
+//! ## `talos ralph` flags
+//!
+//! - `--workspace <PathBuf>` (required) — workspace root, MUST already be a
+//!   git work tree ([`harness::ralph::run_ralph`] does NOT run `git init`; the
+//!   harness owns per-iteration git commits and assumes an existing repo).
+//! - `--objective <String>` (required) — the high-level objective.
+//! - `--stop-when <String>` (required) — the outer stop-command oracle, run
+//!   via `/bin/sh -c`; exit `0` = objective met. DISTINCT from `--gate`. A
+//!   whitespace-only value is rejected with a JSON error before any
+//!   filesystem/backend work (an empty oracle exits `0` every call and
+//!   declares the objective met on iteration 1 — a false-done vector).
+//! - `--gate <String>` (optional, default empty) — the inner per-iteration
+//!   gate built via the existing [`build_checks_runner`]; whitespace-only =
+//!   no inner gate.
+//! - `--notes-file <String>` (default `PROGRESS.md`).
+//! - `--max-ralph-iterations <u32>` (default `100`) — outer cap.
+//! - `--inner-max-iterations <u32>` (default `500`) — mirrors `run`'s
+//!   `max_iterations`.
+//! - `--stuck-k <u32>` (default `3`) — matches
+//!   [`harness::ralph::DEFAULT_STUCK_K`].
+//! - `--stop-when-timeout-secs <u64>` (default `300`) — matches
+//!   [`harness::ralph::DEFAULT_STOP_COMMAND_TIMEOUT`] of 5 min.
+//! - `--gate-timeout-secs <u64>` (default `300`).
+//! - `--ralph-wall-clock-secs <u64>` (optional; flag > env
+//!   `TALOS_RALPH_WALL_CLOCK_SECS` > `0` = unbounded, resolved manually like
+//!   the existing `wall_clock_secs` since the clap `env` feature is not
+//!   enabled).
+//! - `--offload-dir <PathBuf>` (optional; default
+//!   `talos_state_dir("talos-ralph").join("offload")`).
+//!
 //! ## Environment variables
 //!
 //! - `TALOS_BACKEND` — `anthropic` (default when unset) | `ollama`
@@ -42,6 +90,7 @@ use harness::exec::{CheckCommand, ChecksRunner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
 use harness::prompt::render_task_prompt_from_spec;
+use harness::ralph::{DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph};
 use harness::run_record::Disposition;
 use harness::store::{RunStore, SqliteRunStore};
 use harness::task_spec::TaskSpec;
@@ -67,6 +116,10 @@ struct Cli {
 enum Command {
     /// Execute a `TaskSpec` JSON and report outcome + exit code.
     Run(RunArgs),
+    /// Run the Ralph outer loop over [`harness::ralph::run_ralph`] — a thin
+    /// CLI that drives the inner engine toward an objective via a
+    /// `--stop-when` command oracle. Not run-record persisted this cut.
+    Ralph(RalphArgs),
 }
 
 /// Arguments for `talos run`.
@@ -128,6 +181,77 @@ struct RunArgs {
     /// is resolved manually in `main()` via the `env_accessor` closure.
     #[arg(long)]
     wall_clock_secs: Option<u64>,
+}
+
+/// Arguments for `talos ralph`.
+///
+/// `ralph` is a thin CLI over [`harness::ralph::run_ralph`]: it selects a
+/// backend, builds a [`Workspace`] + [`ToolCtx`] like `run`, assembles a
+/// [`RalphConfig`] from these flags, calls [`run_ralph`], prints a
+/// [`RalphSummary`], and exits with [`ralph_exit_code`]. It is NOT run-record
+/// persisted this cut.
+#[derive(clap::Args)]
+struct RalphArgs {
+    /// Workspace root (MUST already be a git work tree — `run_ralph` does NOT
+    /// run `git init`; the harness owns per-iteration git commits).
+    #[arg(long)]
+    workspace: PathBuf,
+
+    /// The high-level objective the ralph loop is working toward. Rendered
+    /// verbatim into each per-iteration prompt and commit message.
+    #[arg(long)]
+    objective: String,
+
+    /// The outer stop-command oracle, run via `/bin/sh -c`; exit `0` =
+    /// objective met. DISTINCT from `--gate`. A whitespace-only value is
+    /// rejected with a JSON error before any filesystem/backend work.
+    #[arg(long)]
+    stop_when: String,
+
+    /// The inner per-iteration gate, built via [`build_checks_runner`];
+    /// whitespace-only = no inner gate. DISTINCT from `--stop-when`.
+    #[arg(long, default_value = "")]
+    gate: String,
+
+    /// Workspace-relative path of the notes/progress file the agent
+    /// reads-then-appends each iteration.
+    #[arg(long, default_value = "PROGRESS.md")]
+    notes_file: String,
+
+    /// Hard cap on outer iterations (the ralph outer loop).
+    #[arg(long, default_value_t = 100u32)]
+    max_ralph_iterations: u32,
+
+    /// Inner-run iteration cap handed to each fresh inner [`RunConfig`]
+    /// (mirrors `run`'s `max_iterations`).
+    #[arg(long, default_value_t = 500u32)]
+    inner_max_iterations: u32,
+
+    /// Stuck-detection threshold K: this many consecutive iterations with no
+    /// progress terminate with [`RalphTerminal::Stuck`]. Matches
+    /// [`DEFAULT_STUCK_K`].
+    #[arg(long, default_value_t = DEFAULT_STUCK_K)]
+    stuck_k: u32,
+
+    /// Timeout for the outer stop-command oracle, in seconds.
+    #[arg(long, default_value_t = 300u64)]
+    stop_when_timeout_secs: u64,
+
+    /// Timeout for the inner gate command, in seconds.
+    #[arg(long, default_value_t = 300u64)]
+    gate_timeout_secs: u64,
+
+    /// Wall-clock budget in seconds. `0` or absent = unbounded. Can also be
+    /// set via the environment variable `TALOS_RALPH_WALL_CLOCK_SECS` (flag
+    /// takes precedence over env). Resolved manually in the handler via the
+    /// `env_accessor` closure (the clap `env` feature is NOT enabled).
+    #[arg(long)]
+    ralph_wall_clock_secs: Option<u64>,
+
+    /// Offload directory for oversized tool output. Defaults to
+    /// `talos_state_dir("talos-ralph").join("offload")`.
+    #[arg(long)]
+    offload_dir: Option<PathBuf>,
 }
 
 // ============================================================================
@@ -202,6 +326,46 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
         LoopOutcome::MaxIterations => "MaxIterations",
         LoopOutcome::BudgetExhausted { .. } => "BudgetExhausted",
         LoopOutcome::BackendError(_) => "BackendError",
+    }
+}
+
+/// Map a [`RalphTerminal`] to the ralph exit-code contract.
+///
+/// | Terminal | Code |
+/// |---------|------|
+/// | `StopConditionMet` | 0 |
+/// | `Stuck` | 20 |
+/// | `MaxIterationsExhausted` | 20 |
+/// | `TimeBudgetExhausted` | 20 |
+/// | `Error(_)` | 1 |
+///
+/// Mirrors [`exit_code`]: `0` = objective met, `20` = task-side failure
+/// terminals, `1` = harness/infra error. There is NO `10`/Blocked analog for
+/// ralph — the Ralph outer loop has no Blocked terminal.
+fn ralph_exit_code(terminal: &RalphTerminal) -> i32 {
+    match terminal {
+        RalphTerminal::StopConditionMet => 0,
+        RalphTerminal::Stuck
+        | RalphTerminal::MaxIterationsExhausted
+        | RalphTerminal::TimeBudgetExhausted => 20,
+        RalphTerminal::Error(_) => 1,
+    }
+}
+
+/// Closed [`RalphTerminal`] discriminant string for the stdout
+/// [`RalphSummary`] `terminal` field.
+///
+/// Uses a hand-written match over all variants. `format!("{:?}")` is
+/// explicitly **forbidden** — it would leak the `Error(String)` payload into
+/// the summary and prevent consumers from reliably identifying the terminal
+/// by the `terminal` field alone.
+fn ralph_terminal_str(terminal: &RalphTerminal) -> &'static str {
+    match terminal {
+        RalphTerminal::StopConditionMet => "StopConditionMet",
+        RalphTerminal::Stuck => "Stuck",
+        RalphTerminal::MaxIterationsExhausted => "MaxIterationsExhausted",
+        RalphTerminal::TimeBudgetExhausted => "TimeBudgetExhausted",
+        RalphTerminal::Error(_) => "Error",
     }
 }
 
@@ -284,6 +448,50 @@ fn build_run_summary(
         record_path,
         iterations,
     }
+}
+
+/// Machine-readable JSON summary written to stdout after [`run_ralph`]
+/// returns. `ralph` is NOT run-record persisted this cut — there is no
+/// `run_id` or `record_path` field (unlike [`RunSummary`]).
+#[derive(Serialize)]
+struct RalphSummary {
+    /// The objective the ralph loop worked toward (verbatim copy of
+    /// [`RalphReport::objective`]).
+    objective: String,
+    /// Closed [`RalphTerminal`] discriminant — one of
+    /// `"StopConditionMet"`, `"Stuck"`, `"MaxIterationsExhausted"`,
+    /// `"TimeBudgetExhausted"`, `"Error"`.
+    terminal: &'static str,
+    /// How many outer iterations ran ([`RalphReport::outer_iterations`]).
+    outer_iterations: u32,
+    /// Sum of every iteration's inner iterations
+    /// ([`RalphReport::total_inner_iterations`]).
+    total_inner_iterations: u64,
+}
+
+/// Build the stdout [`RalphSummary`] from a completed ralph run.
+fn build_ralph_summary(
+    objective: String,
+    terminal_s: &'static str,
+    outer_iterations: u32,
+    total_inner_iterations: u64,
+) -> RalphSummary {
+    RalphSummary {
+        objective,
+        terminal: terminal_s,
+        outer_iterations,
+        total_inner_iterations,
+    }
+}
+
+/// Resolve the ralph wall-clock budget: `flag > TALOS_RALPH_WALL_CLOCK_SECS
+/// env > 0` (unbounded). Mirrors the [`resolve_wall_clock_secs`] test-helper
+/// pattern for `run`'s `--wall-clock-secs` — the clap `env` feature is NOT
+/// enabled, so the env fallback is resolved manually. A non-`u64` env value
+/// falls through to `0` (unbounded) without panicking.
+fn resolve_ralph_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
+    flag.or_else(|| env("TALOS_RALPH_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0)
 }
 
 // ============================================================================
@@ -419,7 +627,6 @@ fn read_spec_json(args: &RunArgs) -> Result<String, String> {
 // main
 // ============================================================================
 
-#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // 1. Parse CLI — clap usage errors → exit 1 + JSON error (NOT clap's default exit 2).
@@ -439,8 +646,22 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let Command::Run(args) = cli.command;
 
+    // A 2-variant `Command` enum can no longer use an irrefutable let-else
+    // destructure — `Command::Run` and `Command::Ralph` are two distinct
+    // entry shapes (TaskSpec/disposition vs objective/RalphTerminal), so
+    // dispatch via match.
+    match cli.command {
+        Command::Run(args) => run_cmd(args).await,
+        Command::Ralph(args) => run_ralph_cmd(args).await,
+    }
+}
+
+/// Execute a [`TaskSpec`] JSON and report outcome + exit code (the `run`
+/// subcommand handler). Full persistence: a `SQLite` store record is written
+/// on every terminal path. See the module doc for the exit-code contract.
+#[allow(clippy::too_many_lines)]
+async fn run_cmd(args: RunArgs) {
     // 2. Read and parse spec — must happen BEFORE the store is opened, so a
     //    bad spec never touches the filesystem.
     let spec_json = match read_spec_json(&args) {
@@ -580,6 +801,108 @@ async fn main() {
     std::process::exit(exit_c);
 }
 
+/// Run the Ralph outer loop over [`run_ralph`] (the `ralph` subcommand
+/// handler). A thin CLI: select the backend, build [`Workspace`] +
+/// [`ToolCtx`] like `run`, assemble a [`RalphConfig`] from the flags, call
+/// [`run_ralph`], print a [`RalphSummary`], and exit with
+/// [`ralph_exit_code`]. NOT run-record persisted this cut — no store is
+/// opened.
+async fn run_ralph_cmd(args: RalphArgs) {
+    // 1. Validate `--stop-when` BEFORE any filesystem/backend work: an empty
+    //    oracle exits `0` every call and would declare the objective met on
+    //    iteration 1 — a false-done vector. Whitespace-only is rejected.
+    if args.stop_when.trim().is_empty() {
+        stderr_json_error("--stop-when must be a non-empty command (whitespace-only rejected)");
+        std::process::exit(1);
+    }
+
+    // 2. Select model backend from environment (same contract as `run`).
+    let env_accessor = |k: &str| std::env::var(k).ok();
+    let (backend, _model_label) = match backend_from_env(&env_accessor) {
+        Ok(pair) => pair,
+        Err(e) => {
+            stderr_json_error(&e);
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Resolve + create the offload dir (Workspace::new REQUIRES the
+    //    offload dir to already exist). Defaults to
+    //    `talos_state_dir("talos-ralph").join("offload")`.
+    let offload_dir = args
+        .offload_dir
+        .unwrap_or_else(|| talos_state_dir("talos-ralph").join("offload"));
+    if let Err(e) = std::fs::create_dir_all(&offload_dir) {
+        stderr_json_error(&format!(
+            "failed to create offload dir `{}`: {e}",
+            offload_dir.display()
+        ));
+        std::process::exit(1);
+    }
+
+    // 4. Build Workspace (canonicalizes and validates the roots) + ToolCtx
+    //    with a disk-offload sink, exactly like the run handler.
+    let workspace = match Workspace::new(args.workspace.clone(), Some(offload_dir.clone())) {
+        Ok(w) => w,
+        Err(e) => {
+            stderr_json_error(&format!("workspace error: {e}"));
+            std::process::exit(1);
+        }
+    };
+    let workspace_root = workspace.root().to_path_buf();
+    let sink = DiskOffloadSink::new(offload_dir.clone());
+    let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(sink) as Arc<dyn OffloadSink>);
+
+    // 5. Build the stop-command oracle (outer) via `/bin/sh -c`.
+    let stop_command = CheckCommand {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), args.stop_when.clone()],
+    };
+
+    // 6. Build the optional inner per-iteration ChecksRunner from `--gate`.
+    //    `build_checks_runner` returns `None` for whitespace-only/empty gate.
+    let inner_runner = build_checks_runner(&args.gate, workspace_root, args.gate_timeout_secs);
+
+    // 7. Resolve the ralph wall-clock: flag > TALOS_RALPH_WALL_CLOCK_SECS env
+    //    > 0 (unbounded).
+    let wall_clock_secs = resolve_ralph_wall_clock_secs(args.ralph_wall_clock_secs, &env_accessor);
+
+    // 8. Assemble the RalphConfig.
+    let mut config = RalphConfig::new(
+        &args.objective,
+        stop_command,
+        args.max_ralph_iterations,
+        args.inner_max_iterations,
+    )
+    .with_notes_file(&args.notes_file)
+    .with_stuck_k(args.stuck_k)
+    .with_wall_clock_secs(wall_clock_secs)
+    .with_stop_command_timeout(Duration::from_secs(args.stop_when_timeout_secs));
+    if let Some(runner) = inner_runner {
+        config = config.with_inner_checks(runner);
+    }
+
+    // 9. Run the ralph outer loop. `run_ralph` does NOT run `git init` — the
+    //    workspace must already be a git work tree (validated by the caller).
+    let report: RalphReport = run_ralph(&backend, &ctx, &config).await;
+
+    // 10. Print machine-readable summary and exit with the ralph code.
+    let terminal_s = ralph_terminal_str(&report.terminal);
+    let exit_c = ralph_exit_code(&report.terminal);
+    let summary = build_ralph_summary(
+        report.objective.clone(),
+        terminal_s,
+        report.outer_iterations(),
+        report.total_inner_iterations(),
+    );
+    println!(
+        "{}",
+        serde_json::to_string(&summary)
+            .expect("RalphSummary serializes infallibly — all fields are owned serde types")
+    );
+    std::process::exit(exit_c);
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================
@@ -587,12 +910,14 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, RunSummary, backend_from_env, build_checks_runner, build_run_summary, exit_code,
-        make_run_seed, outcome_str,
+        Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
+        build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
+        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
     use harness::prompt::render_task_prompt_from_spec;
+    use harness::ralph::RalphTerminal;
     use harness::run_record::{Disposition, FailureMode, Verification};
     use harness::task_spec::{FileToModify, TaskSpec};
     use std::path::PathBuf;
@@ -1029,6 +1354,179 @@ mod tests {
         let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "not-a-number")]);
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
+            0,
+            "invalid env value must fall back to 0 (unbounded)"
+        );
+    }
+
+    // ---- ralph_exit_code: all 5 arms -----------------------------------
+
+    #[test]
+    fn ralph_exit_code_stop_condition_met_is_0() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::StopConditionMet),
+            0,
+            "StopConditionMet must be 0 (objective met)"
+        );
+    }
+
+    #[test]
+    fn ralph_exit_code_stuck_is_20() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::Stuck),
+            20,
+            "Stuck is a task-side failure terminal → 20"
+        );
+    }
+
+    #[test]
+    fn ralph_exit_code_max_iterations_exhausted_is_20() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::MaxIterationsExhausted),
+            20,
+            "MaxIterationsExhausted is a task-side failure terminal → 20"
+        );
+    }
+
+    #[test]
+    fn ralph_exit_code_time_budget_exhausted_is_20() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::TimeBudgetExhausted),
+            20,
+            "TimeBudgetExhausted is a task-side failure terminal → 20"
+        );
+    }
+
+    #[test]
+    fn ralph_exit_code_error_is_1() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::Error("git commit failed".into())),
+            1,
+            "Error is a harness/infra failure → 1, never 20"
+        );
+    }
+
+    // ---- ralph_terminal_str: all 5 literals, no payload leak -----------
+
+    #[test]
+    fn ralph_terminal_str_covers_all_five_literals() {
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::StopConditionMet),
+            "StopConditionMet"
+        );
+        assert_eq!(ralph_terminal_str(&RalphTerminal::Stuck), "Stuck");
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::MaxIterationsExhausted),
+            "MaxIterationsExhausted"
+        );
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::TimeBudgetExhausted),
+            "TimeBudgetExhausted"
+        );
+    }
+
+    #[test]
+    fn ralph_terminal_str_error_does_not_leak_payload() {
+        // `format!("{:?}")` is forbidden — it would leak the String payload.
+        // The closed discriminant must be the bare "Error" regardless of the
+        // payload contents.
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::Error("payload with spaces".into())),
+            "Error"
+        );
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::Error(String::new())),
+            "Error"
+        );
+    }
+
+    // ---- RalphSummary: exact field set ---------------------------------
+
+    #[test]
+    fn ralph_summary_exact_field_set() {
+        let summary = build_ralph_summary("build the thing".into(), "Stuck", 7, 42);
+        let json = serde_json::to_value(&summary).expect("RalphSummary must serialize");
+        let obj = json.as_object().expect("must be object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "objective",
+                "outer_iterations",
+                "terminal",
+                "total_inner_iterations"
+            ],
+            "RalphSummary must have exactly the four expected fields (no run_id/record_path)"
+        );
+        assert_eq!(
+            obj.get("objective").and_then(serde_json::Value::as_str),
+            Some("build the thing")
+        );
+        assert_eq!(
+            obj.get("terminal").and_then(serde_json::Value::as_str),
+            Some("Stuck")
+        );
+        assert_eq!(
+            obj.get("outer_iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            obj.get("total_inner_iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn ralph_summary_is_serializable() {
+        let summary: RalphSummary = build_ralph_summary("obj".into(), "StopConditionMet", 1, 0);
+        let json = serde_json::to_string(&summary).expect("must serialize");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+            "round-trips through JSON"
+        );
+    }
+
+    // ---- resolve_ralph_wall_clock_secs: flag > env > 0 -----------------
+
+    #[test]
+    fn ralph_wall_clock_secs_flag_beats_env() {
+        let env = env_with(&[("TALOS_RALPH_WALL_CLOCK_SECS", "999")]);
+        assert_eq!(
+            resolve_ralph_wall_clock_secs(Some(42), &env),
+            42,
+            "explicit flag must take precedence over env"
+        );
+    }
+
+    #[test]
+    fn ralph_wall_clock_secs_env_beats_default() {
+        let env = env_with(&[("TALOS_RALPH_WALL_CLOCK_SECS", "300")]);
+        assert_eq!(
+            resolve_ralph_wall_clock_secs(None, &env),
+            300,
+            "env must beat the default 0"
+        );
+    }
+
+    #[test]
+    fn ralph_wall_clock_secs_both_unset_yields_zero() {
+        let env = env_with(&[]);
+        assert_eq!(
+            resolve_ralph_wall_clock_secs(None, &env),
+            0,
+            "both-unset must yield the sentinel 0 (unbounded)"
+        );
+    }
+
+    #[test]
+    fn ralph_wall_clock_secs_invalid_env_value_falls_back_to_zero() {
+        // A non-u64 env value must not panic — it falls through to default 0.
+        let env = env_with(&[("TALOS_RALPH_WALL_CLOCK_SECS", "not-a-number")]);
+        assert_eq!(
+            resolve_ralph_wall_clock_secs(None, &env),
             0,
             "invalid env value must fall back to 0 (unbounded)"
         );

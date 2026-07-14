@@ -450,3 +450,236 @@ fn nonexistent_file_path_exits_1_with_json_error() {
         "stderr JSON must have an `error` key; got: {parsed}"
     );
 }
+
+// ============================================================================
+// `talos ralph` subcommand integration tests
+//
+// `ralph` is a thin CLI over `harness::ralph::run_ralph`: it is NOT run-record
+// persisted this cut, so these tests assert the ralph exit-code map
+// (0 StopConditionMet / 20 task-side / 1 infra) and the RalphSummary JSON,
+// not store records.
+// ============================================================================
+
+/// `talos ralph --help` exits 0 and prints usage text to stdout (NOT a JSON
+/// error object). Mirrors `help_flag_exits_0_with_plain_help` for `run`.
+#[test]
+fn ralph_help_flag_exits_0_with_usage() {
+    let output = Command::new(TALOS_BIN)
+        .args(["ralph", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(output.status.code(), Some(0), "ralph --help must exit 0");
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout_str.contains("--stop-when") && stdout_str.contains("--objective"),
+        "ralph --help must mention ralph flags; got: {stdout_str:?}"
+    );
+    assert!(
+        !stdout_str.trim_start().starts_with('{'),
+        "help must be plain text, not a JSON error object"
+    );
+}
+
+/// A missing required flag (here `--objective` omitted) is a clap usage
+/// error; the CLI must exit 1 (not clap's default exit 2) with a JSON
+/// `{"error": ...}` on stderr.
+#[test]
+fn ralph_missing_required_flag_exits_1_with_json_error() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "ralph",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--stop-when",
+            "true",
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing --objective must exit 1"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr_str.trim()).unwrap_or_else(|_| {
+        panic!("stderr must be valid JSON; got: {stderr_str:?}");
+    });
+    assert!(
+        parsed.get("error").is_some(),
+        "stderr JSON must have an `error` key; got: {parsed}"
+    );
+}
+
+/// A whitespace-only `--stop-when '   '` is rejected with a JSON error and
+/// exit 1 BEFORE any filesystem/backend work. An empty oracle would exit 0
+/// every call and declare the objective met on iteration 1 — a false-done
+/// vector — so it must be rejected up front.
+#[test]
+fn ralph_whitespace_stop_when_exits_1_with_json_error() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "ralph",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--objective",
+            "do something",
+            "--stop-when",
+            "   ",
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "whitespace-only --stop-when must exit 1"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr_str.trim()).unwrap_or_else(|_| {
+        panic!("stderr must be valid JSON; got: {stderr_str:?}");
+    });
+    assert!(
+        parsed.get("error").is_some(),
+        "stderr JSON must have an `error` key; got: {parsed}"
+    );
+
+    // Rejected BEFORE any filesystem/backend work: the offload dir we passed
+    // exists (we created it), but the default state dir must not have been
+    // touched. The stdout must be empty (no RalphSummary printed).
+    assert!(
+        output.stdout.is_empty(),
+        "no RalphSummary must be printed when --stop-when is rejected; got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Deterministic no-API-key ralph run: `git init` a temp workspace, run with
+/// `TALOS_BACKEND=ollama` + `OLLAMA_MODEL=x` + `OLLAMA_BASE_URL` pointing at a
+/// refused-connection port, `--stop-when 'false'`, `--max-ralph-iterations 1`.
+///
+/// The single inner `engine::run` hits `BackendError` (recorded on the
+/// iteration, the outer loop continues), the stop-command `false` is not met
+/// (exit 1, non-zero), and the single outer pass exhausts `max_outer_iterations`
+/// → `RalphTerminal::MaxIterationsExhausted` → exit 20 and a `RalphSummary`
+/// JSON on stdout. Mirrors `backend_error_via_refused_port_writes_store_record`
+/// for the refused-connection setup.
+#[test]
+fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
+    use std::process::Command as StdCommand;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+
+    // `run_ralph` does NOT run `git init` — the workspace must already be a
+    // git work tree. Initialize it (and a commit-free work tree is fine: the
+    // first iteration's `git status --porcelain` is empty, so no commit is
+    // attempted, and the progress signal is empty so stuck advances — but
+    // with max_outer_iterations=1 the loop exhausts before stuck_k fires).
+    StdCommand::new("git")
+        .arg("init")
+        .current_dir(workspace)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("git init must succeed");
+
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "ralph",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--objective",
+            "build the thing",
+            "--stop-when",
+            "false",
+            "--max-ralph-iterations",
+            "1",
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    // MaxIterationsExhausted → exit code 20 (NOT 1 — the inner BackendError is
+    // recorded on the iteration, the outer loop continues, and the single
+    // outer pass exhausts the outer cap).
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "ralph MaxIterationsExhausted must exit 20; stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // stdout is a machine-readable RalphSummary JSON.
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let summary: serde_json::Value = serde_json::from_str(stdout_str.trim()).unwrap_or_else(|_| {
+        panic!("stdout must be valid RalphSummary JSON; got: {stdout_str:?}");
+    });
+
+    // Exact field set — no run_id / record_path (ralph is not persisted).
+    let obj = summary.as_object().expect("summary must be an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "objective",
+            "outer_iterations",
+            "terminal",
+            "total_inner_iterations"
+        ],
+        "RalphSummary must have exactly the four expected fields; got: {summary}"
+    );
+    assert_eq!(
+        summary.get("terminal").and_then(serde_json::Value::as_str),
+        Some("MaxIterationsExhausted"),
+        "summary terminal must be \"MaxIterationsExhausted\"; got: {summary}"
+    );
+    assert_eq!(
+        summary.get("objective").and_then(serde_json::Value::as_str),
+        Some("build the thing")
+    );
+    assert_eq!(
+        summary
+            .get("outer_iterations")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "exactly one outer pass must have run; got: {summary}"
+    );
+}
