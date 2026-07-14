@@ -33,6 +33,32 @@ cargo nextest run --workspace      # fast test runner
 cargo test --doc --workspace       # doctests (nextest skips these)
 ```
 
+## Ralph mode (`talos ralph`)
+
+The **Ralph loop** drives an agent toward an objective by re-invoking the inner engine with a **fresh context every outer iteration** — durable state lives *outside* the context window (the code on disk, the git history, and a notes file the agent reads-then-appends), so each pass starts cold and still makes forward progress. Each iteration does exactly one unit of work; the **harness owns a git commit per iteration** (a deliberate ralph-only exception to the worker-owns-git rule). Distinct from finish-recovery (which nudges the *same* context when a gate is red) — Ralph *restarts* the context. Core: `crates/harness/src/ralph.rs`.
+
+Two commands, deliberately **never collapsed** — get this wrong and the loop misbehaves:
+
+- **`--gate` (inner, per-iteration):** the `run_checks` command the inner engine uses to verify a `finish(done)` claim. The harness forces the agent to loop until this is green *before* it can finish, so the tree is already green when the per-iteration commit fires.
+- **`--stop-when` (outer objective oracle):** a command run via `/bin/sh -c` whose exit `0` means "objective met, stop the whole loop." This is the goal, not the per-iteration bar.
+
+**The load-bearing gotcha (why gate ≠ stop-when):** the harness's per-iteration `git commit` runs the repo's pre-commit hook and is **not** `--no-verify`'d, and a hook failure is a *fatal* `RalphTerminal::Error` (not a retry). So the pre-commit hook must be **check-only** (never a `--fix`/formatter hook that mutates — see kb-03099) and must match the inner `--gate` set — because the harness guarantees that set is green before committing. Two things must **not** be in the commit hook: (1) the `--stop-when` threshold (e.g. a coverage floor) — it's false until the objective is met, so it would fail every commit; and (2) a **conventional-commit-msg** hook — ralph's commit messages are `ralph: iteration N — <objective>`, which such a hook rejects, killing the loop on the first commit.
+
+Example — grind an unhealthy repo up to 90% test coverage on a local Ollama model:
+
+```bash
+TALOS_BACKEND=ollama OLLAMA_MODEL=qwen3.6:35b OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_THINK=on \
+talos ralph \
+  --workspace /path/to/repo \
+  --objective 'Raise coverage to 90%. Each iteration: run coverage, pick the single highest-value untested function, write ONE test for it, verify it passes, append a note to PROGRESS.md, then finish.' \
+  --stop-when 'uv run --frozen pytest --cov=<pkg> --cov-fail-under=90 -q' \
+  --gate 'uv run --frozen ruff check . && uv run --frozen ruff format --check . && uv run --frozen pytest -q' \
+  --notes-file PROGRESS.md \
+  --max-ralph-iterations 25
+```
+
+The workspace **must already be a git work tree** — `run_ralph` does *not* run `git init`. Backend selection reuses the same `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*` env as `talos run`. Other flags: `--inner-max-iterations` (inner cap per pass, default 500), `--stuck-k` (consecutive no-progress passes before giving up — progress = a git diff *outside* the notes file, default 3), `--ralph-wall-clock-secs` (0 = unbounded; also `TALOS_RALPH_WALL_CLOCK_SECS`), `--stop-when-timeout-secs` / `--gate-timeout-secs` (default 300). Ralph is **not** run-record persisted this cut — it prints a `RalphSummary` JSON (objective / terminal / outer_iterations / total_inner_iterations) to stdout and exits: **0** `StopConditionMet` · **20** `Stuck` / `MaxIterationsExhausted` / `TimeBudgetExhausted` · **1** `Error` (git/spawn failure). Watch progress via the `ralph: iteration N` commits and the notes file, not stdout.
+
 ## Quality gates
 
 Run by lefthook locally and re-run in CI (`.github/workflows/ci.yml`), which is
