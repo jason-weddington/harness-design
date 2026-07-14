@@ -153,10 +153,46 @@ struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Vec<SystemBlock<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     messages: Vec<WireMessage<'a>>,
+}
+
+/// Anthropic prompt-cache breakpoint marker. Serializes to exactly
+/// `{"type":"ephemeral"}` — the only cache ttl Anthropic exposes today. Two
+/// `Some(ephemeral)` instances are constructed per request (one static on the
+/// system block, one rolling on the last content block of the last message),
+/// which is why this derives `Copy`.
+#[derive(Clone, Copy, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl CacheControl {
+    /// The single cache breakpoint marker we send — a 5-minute ephemeral
+    /// cache. Constructed once per breakpoint site, not cached globally,
+    /// because it is cheap and the call sites are few.
+    const fn ephemeral() -> Self {
+        Self { kind: "ephemeral" }
+    }
+}
+
+/// One block of the `system` content-block array. Anthropic accepts `system`
+/// either as a bare string or as an array of typed content blocks; we use the
+/// array form so the single text block can carry a `cache_control` breakpoint.
+///
+/// **Field order is load-bearing within the block.** `cache_control` is
+/// declared LAST (after `text`) so a breakpoint-carrying block has a fixed
+/// byte layout regardless of the skip-serializing-if-none discipline.
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -170,24 +206,71 @@ struct WireMessage<'a> {
 enum WireContentBlock<'a> {
     Text {
         text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: &'a str,
         name: &'a str,
         input: &'a Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: &'a str,
         content: &'a str,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Thinking {
         thinking: &'a str,
         signature: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
+impl WireContentBlock<'_> {
+    /// Attach a prompt-cache breakpoint to this block. Called on the LAST
+    /// content block of the LAST message to roll the cache forward as the
+    /// conversation grows.
+    fn set_cache_breakpoint(&mut self) {
+        let cc = Some(CacheControl::ephemeral());
+        match self {
+            WireContentBlock::Text { cache_control, .. }
+            | WireContentBlock::ToolUse { cache_control, .. }
+            | WireContentBlock::ToolResult { cache_control, .. }
+            | WireContentBlock::Thinking { cache_control, .. } => *cache_control = cc,
+        }
+    }
+}
+
 fn build_request_body<'a>(model: &'a str, req: &'a TurnRequest<'a>) -> RequestBody<'a> {
+    // STATIC breakpoint: a single system text block carrying cache_control.
+    // Anthropic's canonical cache order is tools -> system -> messages, so a
+    // breakpoint on the system block also covers the tools that precede it —
+    // no separate tool-level breakpoint is added.
+    let system = req.system.map(|s| {
+        vec![SystemBlock {
+            kind: "text",
+            text: s,
+            cache_control: Some(CacheControl::ephemeral()),
+        }]
+    });
+
+    let mut messages: Vec<WireMessage<'a>> = req.messages.iter().map(map_message).collect();
+
+    // ROLLING breakpoint: cache the growing conversation prefix by marking
+    // the LAST content block of the LAST message. Guarded so an empty
+    // messages slice or an empty content vec is a no-op (no panic, no
+    // breakpoint attached) — Anthropic rejects empty content anyway.
+    if let Some(last_msg) = messages.last_mut()
+        && let Some(last_block) = last_msg.content.last_mut()
+    {
+        last_block.set_cache_breakpoint();
+    }
+
     RequestBody {
         model,
         max_tokens: req.params.max_tokens,
@@ -197,13 +280,13 @@ fn build_request_body<'a>(model: &'a str, req: &'a TurnRequest<'a>) -> RequestBo
         } else {
             Some(req.params.stop_sequences.as_slice())
         },
-        system: req.system,
+        system,
         tools: if req.tools.is_empty() {
             None
         } else {
             Some(req.tools)
         },
-        messages: req.messages.iter().map(map_message).collect(),
+        messages,
     }
 }
 
@@ -214,7 +297,10 @@ fn map_message(m: &Message) -> WireMessage<'_> {
             content: content
                 .iter()
                 .map(|b| match b {
-                    UserBlock::Text(t) => WireContentBlock::Text { text: t },
+                    UserBlock::Text(t) => WireContentBlock::Text {
+                        text: t,
+                        cache_control: None,
+                    },
                     UserBlock::ToolResult {
                         call_id,
                         content,
@@ -223,6 +309,7 @@ fn map_message(m: &Message) -> WireMessage<'_> {
                         tool_use_id: call_id,
                         content,
                         is_error: *is_error,
+                        cache_control: None,
                     },
                 })
                 .collect(),
@@ -232,11 +319,15 @@ fn map_message(m: &Message) -> WireMessage<'_> {
             content: content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(WireContentBlock::Text { text: t }),
+                    ContentBlock::Text(t) => Some(WireContentBlock::Text {
+                        text: t,
+                        cache_control: None,
+                    }),
                     ContentBlock::ToolCall(c) => Some(WireContentBlock::ToolUse {
                         id: &c.id,
                         name: &c.name,
                         input: &c.input,
+                        cache_control: None,
                     }),
                     // Reasoning blocks are only sent back when the provider
                     // gave us an opaque signature to echo (cache continuity).
@@ -248,6 +339,7 @@ fn map_message(m: &Message) -> WireMessage<'_> {
                     } => Some(WireContentBlock::Thinking {
                         thinking: text,
                         signature: sig,
+                        cache_control: None,
                     }),
                     ContentBlock::Reasoning { opaque: None, .. } => None,
                 })
@@ -830,7 +922,11 @@ mod tests {
         assert_eq!(parsed["max_tokens"], 512);
         assert_eq!(parsed["temperature"], 0.3);
         assert_eq!(parsed["stop_sequences"], json!(["END"]));
-        assert_eq!(parsed["system"], "you are a harness");
+        // system is now a one-element content-block array carrying the STATIC
+        // cache breakpoint.
+        assert_eq!(parsed["system"][0]["type"], "text");
+        assert_eq!(parsed["system"][0]["text"], "you are a harness");
+        assert_eq!(parsed["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(parsed["tools"][0]["name"], "echo");
 
         // Messages mapping.
@@ -862,6 +958,22 @@ mod tests {
         assert_eq!(a_content[2]["type"], "thinking");
         assert_eq!(a_content[2]["thinking"], "trace");
         assert_eq!(a_content[2]["signature"], "sig-1");
+
+        // ROLLING breakpoint: only the LAST content block of the LAST message
+        // carries cache_control. In this test the last message is the
+        // assistant message, so the rolling breakpoint lands on a_content[2]
+        // (the surviving thinking block) — that is deliberate for this
+        // serialization unit test and MUST NOT be "fixed"; production's last
+        // pre-model message is always a user text/tool_result block.
+        assert_eq!(a_content[2]["cache_control"]["type"], "ephemeral");
+        // No other block carries a breakpoint.
+        assert_eq!(u_content[0]["cache_control"], Value::Null);
+        assert_eq!(u_content[1]["cache_control"], Value::Null);
+        assert_eq!(a_content[0]["cache_control"], Value::Null);
+        assert_eq!(a_content[1]["cache_control"], Value::Null);
+        // Budget: static system + rolling last-block = exactly 2.
+        let cc_count = body_text.matches("\"cache_control\"").count();
+        assert_eq!(cc_count, 2, "expected exactly 2 cache_control breakpoints");
     }
 
     // ---- request-shape: optional fields are omitted when absent -----------
@@ -907,6 +1019,157 @@ mod tests {
         assert!(body_text.contains("\"model\""));
         assert!(body_text.contains("\"max_tokens\""));
         assert!(body_text.contains("\"messages\""));
+    }
+
+    // ---- rolling-breakpoint guards: empty content and empty messages -------
+
+    // A last message whose blocks all filter out (here: a single unsigned
+    // Reasoning block) maps to an EMPTY content vec. The rolling-breakpoint
+    // guard must skip attaching and not panic, and the body must contain ZERO
+    // cache_control occurrences (no system, no rolling).
+    #[tokio::test]
+    async fn rolling_breakpoint_skipped_when_last_message_content_is_empty() {
+        let server = MockServer::start().await;
+        mount_success(
+            &server,
+            &json!({
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let messages = vec![Message::Assistant {
+            content: vec![ContentBlock::Reasoning {
+                text: "x".to_string(),
+                opaque: None,
+            }],
+        }];
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+        backend.turn(&req).await.expect("turn ok");
+
+        let received = server.received_requests().await.unwrap();
+        let body_text = std::str::from_utf8(&received[0].body).unwrap();
+        assert!(
+            !body_text.contains("\"cache_control\""),
+            "no breakpoint expected when last content is empty, got: {body_text}"
+        );
+    }
+
+    // An empty messages slice must not panic and must not attach a rolling
+    // breakpoint. (Anthropic rejects this request server-side; we only assert
+    // our own serialization does not crash or invent a breakpoint.)
+    #[tokio::test]
+    async fn rolling_breakpoint_skipped_when_messages_slice_is_empty() {
+        let server = MockServer::start().await;
+        mount_success(
+            &server,
+            &json!({
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let messages: Vec<Message> = vec![];
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+        backend.turn(&req).await.expect("turn ok");
+
+        let received = server.received_requests().await.unwrap();
+        let body_text = std::str::from_utf8(&received[0].body).unwrap();
+        assert!(
+            !body_text.contains("\"cache_control\""),
+            "no breakpoint expected with empty messages, got: {body_text}"
+        );
+    }
+
+    // ---- two-breakpoint production-realistic last message ------------------
+
+    // Production's last pre-model message is always a user text/tool_result
+    // block (the loop alternates user -> assistant -> user). This test pins
+    // the production shape: a last-message user text block carries the rolling
+    // breakpoint, and the whole body contains EXACTLY two cache_control
+    // occurrences (static system + rolling last-block).
+    #[tokio::test]
+    async fn two_breakpoints_attach_for_production_realistic_last_message() {
+        let server = MockServer::start().await;
+        mount_success(
+            &server,
+            &json!({
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let messages = vec![
+            Message::User {
+                content: vec![UserBlock::Text("first turn".to_string())],
+            },
+            Message::Assistant {
+                content: vec![ContentBlock::Text("reply".to_string())],
+            },
+            Message::User {
+                content: vec![UserBlock::Text("second turn".to_string())],
+            },
+        ];
+        let tools: Vec<Value> = vec![json!({
+            "name": "echo",
+            "description": "echoes input back",
+            "input_schema": {"type": "object"}
+        })];
+        let p = params();
+        let req = TurnRequest {
+            system: Some("you are a harness"),
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+        backend.turn(&req).await.expect("turn ok");
+
+        let received = server.received_requests().await.unwrap();
+        let body_text = std::str::from_utf8(&received[0].body).unwrap();
+        let parsed: Value = serde_json::from_str(body_text).expect("json");
+
+        // STATIC breakpoint on the system block.
+        assert_eq!(parsed["system"][0]["cache_control"]["type"], "ephemeral");
+
+        // ROLLING breakpoint on the last message's last (only) content block.
+        let msgs = parsed["messages"].as_array().expect("messages array");
+        let last = msgs.last().expect("last message present");
+        let last_content = last["content"].as_array().expect("last content array");
+        let last_block = last_content.last().expect("last block present");
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+
+        // Budget: exactly two breakpoints total.
+        let cc_count = body_text.matches("\"cache_control\"").count();
+        assert_eq!(cc_count, 2, "expected exactly 2 cache_control breakpoints");
     }
 
     // ---- status-code arm coverage ----------------------------------------
