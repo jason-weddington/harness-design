@@ -27,7 +27,7 @@
 //! | Code | Meaning |
 //! |------|---------|
 //! | 0    | `StopConditionMet` — objective met |
-//! | 20   | `Stuck`, `MaxIterationsExhausted`, or `TimeBudgetExhausted` — task-side failure terminals |
+//! | 20   | `Stuck`, `MaxIterationsExhausted`, `TimeBudgetExhausted`, or `DoOversExhausted` — task-side failure terminals |
 //! | 1    | `Error` or a harness/infra error (clap error, workspace error) |
 //!
 //! There is NO `10`/Blocked analog for ralph — the Ralph outer loop has no
@@ -53,6 +53,14 @@
 //!   `max_iterations`.
 //! - `--stuck-k <u32>` (default `3`) — matches
 //!   [`harness::ralph::DEFAULT_STUCK_K`].
+//! - `--max-do-overs <u32>` (default `3`) — consecutive do-over cap; matches
+//!   [`harness::ralph::DEFAULT_MAX_DO_OVERS`]. A non-green inner outcome that
+//!   left the tree dirty, or a green `Finished(Done)` whose per-iteration
+//!   `git commit` exited non-zero (e.g. a rejecting pre-commit hook), is
+//!   reverted to the last green commit and retried as a do-over; after this
+//!   many CONSECUTIVE do-overs (a green commit resets the count) the loop
+//!   terminates with [`harness::ralph::RalphTerminal::DoOversExhausted`]
+//!   (exit 20).
 //! - `--stop-when-timeout-secs <u64>` (default `300`) — matches
 //!   [`harness::ralph::DEFAULT_STOP_COMMAND_TIMEOUT`] of 5 min.
 //! - `--gate-timeout-secs <u64>` (default `300`).
@@ -90,7 +98,9 @@ use harness::exec::{CheckCommand, ChecksRunner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
 use harness::prompt::render_task_prompt_from_spec;
-use harness::ralph::{DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph};
+use harness::ralph::{
+    DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph,
+};
 use harness::run_record::Disposition;
 use harness::store::{RunStore, SqliteRunStore};
 use harness::task_spec::TaskSpec;
@@ -233,6 +243,16 @@ struct RalphArgs {
     #[arg(long, default_value_t = DEFAULT_STUCK_K)]
     stuck_k: u32,
 
+    /// Consecutive-do-over cap: this many consecutive do-overs (a non-green
+    /// inner outcome that left the tree dirty, or a green `Finished(Done)`
+    /// whose per-iteration `git commit` exited non-zero — both reverted to
+    /// the last green commit) terminate with
+    /// [`RalphTerminal::DoOversExhausted`] (exit 20). A green commit resets
+    /// the count; an inner `BackendError` is exempt. Matches
+    /// [`DEFAULT_MAX_DO_OVERS`].
+    #[arg(long, default_value_t = DEFAULT_MAX_DO_OVERS)]
+    max_do_overs: u32,
+
     /// Timeout for the outer stop-command oracle, in seconds.
     #[arg(long, default_value_t = 300u64)]
     stop_when_timeout_secs: u64,
@@ -337,6 +357,7 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
 /// | `Stuck` | 20 |
 /// | `MaxIterationsExhausted` | 20 |
 /// | `TimeBudgetExhausted` | 20 |
+/// | `DoOversExhausted` | 20 |
 /// | `Error(_)` | 1 |
 ///
 /// Mirrors [`exit_code`]: `0` = objective met, `20` = task-side failure
@@ -347,7 +368,8 @@ fn ralph_exit_code(terminal: &RalphTerminal) -> i32 {
         RalphTerminal::StopConditionMet => 0,
         RalphTerminal::Stuck
         | RalphTerminal::MaxIterationsExhausted
-        | RalphTerminal::TimeBudgetExhausted => 20,
+        | RalphTerminal::TimeBudgetExhausted
+        | RalphTerminal::DoOversExhausted => 20,
         RalphTerminal::Error(_) => 1,
     }
 }
@@ -365,6 +387,7 @@ fn ralph_terminal_str(terminal: &RalphTerminal) -> &'static str {
         RalphTerminal::Stuck => "Stuck",
         RalphTerminal::MaxIterationsExhausted => "MaxIterationsExhausted",
         RalphTerminal::TimeBudgetExhausted => "TimeBudgetExhausted",
+        RalphTerminal::DoOversExhausted => "DoOversExhausted",
         RalphTerminal::Error(_) => "Error",
     }
 }
@@ -876,6 +899,7 @@ async fn run_ralph_cmd(args: RalphArgs) {
     )
     .with_notes_file(&args.notes_file)
     .with_stuck_k(args.stuck_k)
+    .with_max_do_overs(args.max_do_overs)
     .with_wall_clock_secs(wall_clock_secs)
     .with_stop_command_timeout(Duration::from_secs(args.stop_when_timeout_secs));
     if let Some(runner) = inner_runner {
@@ -1359,7 +1383,7 @@ mod tests {
         );
     }
 
-    // ---- ralph_exit_code: all 5 arms -----------------------------------
+    // ---- ralph_exit_code: all 6 arms -----------------------------------
 
     #[test]
     fn ralph_exit_code_stop_condition_met_is_0() {
@@ -1398,6 +1422,15 @@ mod tests {
     }
 
     #[test]
+    fn ralph_exit_code_do_overs_exhausted_is_20() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::DoOversExhausted),
+            20,
+            "DoOversExhausted is a task-side failure terminal → 20"
+        );
+    }
+
+    #[test]
     fn ralph_exit_code_error_is_1() {
         assert_eq!(
             ralph_exit_code(&RalphTerminal::Error("git commit failed".into())),
@@ -1406,10 +1439,10 @@ mod tests {
         );
     }
 
-    // ---- ralph_terminal_str: all 5 literals, no payload leak -----------
+    // ---- ralph_terminal_str: all 6 literals, no payload leak -----------
 
     #[test]
-    fn ralph_terminal_str_covers_all_five_literals() {
+    fn ralph_terminal_str_covers_all_six_literals() {
         assert_eq!(
             ralph_terminal_str(&RalphTerminal::StopConditionMet),
             "StopConditionMet"
@@ -1422,6 +1455,10 @@ mod tests {
         assert_eq!(
             ralph_terminal_str(&RalphTerminal::TimeBudgetExhausted),
             "TimeBudgetExhausted"
+        );
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::DoOversExhausted),
+            "DoOversExhausted"
         );
     }
 
