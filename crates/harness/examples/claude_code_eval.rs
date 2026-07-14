@@ -1,7 +1,17 @@
-//! Claude Code GLM eval runner: drives `claude --model glm-5.2:cloud` (Claude
-//! Code using GLM-5.2 via Ollama Cloud) over the **same fixture substrate** the
-//! Talos `coding_eval` uses, scored by the **same sealed-holdout gate**, so
-//! talos-glm and claude-code-glm rows are directly comparable.
+//! Claude Code eval runner: drives `claude` (Claude Code) over the **same
+//! fixture substrate** the Talos `coding_eval` uses, scored by the **same
+//! sealed-holdout gate**, so talos and claude-code rows are directly
+//! comparable. Two endpoint modes:
+//!
+//! - `CLAUDE_CODE_ENDPOINT=ollama` (default): `claude` talks to GLM-5.2 via
+//!   **Ollama Cloud** (`ANTHROPIC_BASE_URL=https://ollama.com`,
+//!   `ANTHROPIC_AUTH_TOKEN=<OLLAMA_CLOUD_API_KEY>`). This is the original
+//!   talos-glm vs claude-code-glm comparison path — byte-identical to the
+//!   pre-endpoint-mode behavior.
+//! - `CLAUDE_CODE_ENDPOINT=anthropic`: `claude` talks to the **real Anthropic
+//!   API** via the ambient `ANTHROPIC_API_KEY` (no `base_url` override, no auth
+//!   token injected). `CLAUDE_CODE_MODEL=claude-sonnet-4-6` produces the
+//!   talos-sonnet vs claude-code-sonnet comparison.
 //!
 //! ## Product-comparison constraints (2026-07-12)
 //!
@@ -33,18 +43,32 @@
 //! ## Usage
 //!
 //! ```text
+//! # Ollama Cloud / GLM-5.2 (default endpoint mode)
 //! OLLAMA_CLOUD_API_KEY=... cargo run --example claude_code_eval
 //! OLLAMA_CLOUD_API_KEY=... CODING_EVAL_K=5 CLAUDE_CODE_MAX_TURNS=32 \
 //!   cargo run --example claude_code_eval
 //! OLLAMA_CLOUD_API_KEY=... CODING_EVAL_FIXTURE=calc \
 //!   cargo run --example claude_code_eval
+//!
+//! # Real Anthropic / Sonnet
+//! ANTHROPIC_API_KEY=sk-... CLAUDE_CODE_ENDPOINT=anthropic \
+//!   CLAUDE_CODE_MODEL=claude-sonnet-4-6 cargo run --example claude_code_eval
 //! ```
 //!
 //! ## Environment variables
 //!
-//! - `OLLAMA_CLOUD_API_KEY`  **(required at runtime)** — Ollama Cloud API key.
+//! - `CLAUDE_CODE_ENDPOINT`  (optional) — `ollama` (default) or `anthropic`.
+//!   Selects which backend `claude` talks to. Panics on any other value.
+//! - `CLAUDE_CODE_MODEL`     (optional) — the `--model` arg passed to the
+//!   `claude` binary in BOTH modes. Defaults to `glm-5.2:cloud` (the ollama
+//!   default); set to e.g. `claude-sonnet-4-6` in anthropic mode.
+//! - `OLLAMA_CLOUD_API_KEY`  (required in `ollama` mode) — Ollama Cloud API key.
 //!   **Distinct** from `OLLAMA_API_KEY` (local key). Passed to the child
-//!   process as `ANTHROPIC_AUTH_TOKEN`.
+//!   process as `ANTHROPIC_AUTH_TOKEN`. NOT required in `anthropic` mode.
+//! - `ANTHROPIC_API_KEY`    (required in `anthropic` mode) — the ambient
+//!   Anthropic API key `claude` authenticates with. NOT required in `ollama`
+//!   mode (the child's `ANTHROPIC_API_KEY` is `env_remove`d there so the auth
+//!   token takes effect).
 //! - `CLAUDE_CODE_MAX_TURNS` (optional) — `--max-turns` cap per CC run; default
 //!   **24** (matches the Talos dispatch default for parity — a smaller budget
 //!   would misattribute a budget gap as a capability gap; operators may
@@ -58,7 +82,10 @@
 //!
 //! **Note:** `num_turns` (CC) and Talos `iterations` are not identical
 //! semantics but are the closest comparable column; wall-clock and token cost
-//! are apples-to-apples.
+//! are apples-to-apples. The `raw_in` summary column (`input_tokens` +
+//! `cache_read_tokens` + `cache_write_tokens`) is the headline
+//! harness-overhead number — identical computation on both runners so a
+//! talos-sonnet row and a claude-code-sonnet row are directly comparable.
 
 use std::env;
 use std::path::PathBuf;
@@ -114,10 +141,28 @@ struct CcResult {
 }
 
 /// Token counts from the CC JSON envelope.
-#[derive(serde::Deserialize)]
+///
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` mirror the
+/// Anthropic API usage shape: with prompt caching on, Anthropic MOVES cached
+/// input out of `input_tokens` into these two buckets. Both are `Option` /
+/// `#[serde(default)]` so ollama-mode runs (which report 0 / omit them)
+/// degrade cleanly to 0 — the CC-side `RunStats.cache_*_tokens` then stays 0
+/// and the `raw_in` summary column computes identically to the Talos side.
+///
+/// The field names mirror the Anthropic JSON keys verbatim (no `#[serde(rename)]`
+/// needed) — the shared `_tokens` postfix is intentional, hence the allow.
+#[allow(clippy::struct_field_names)]
+#[derive(serde::Deserialize, Default)]
 struct CcUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Anthropic `cache_read_input_tokens` — cache hits. Absent in ollama mode.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    /// Anthropic `cache_creation_input_tokens` — cache writes. Absent in
+    /// ollama mode.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 // ── Constants / helpers ──────────────────────────────────────────────────────
@@ -131,6 +176,38 @@ const DEFAULT_K: u32 = 3;
 /// against Talos with `--max-iterations 24`. A smaller CC budget would
 /// misattribute a budget gap as a capability gap.
 const DEFAULT_MAX_TURNS: u32 = 24;
+
+/// Default `--model` arg passed to the `claude` binary in BOTH endpoint modes
+/// when `CLAUDE_CODE_MODEL` is unset. Pinned to the ollama-cloud GLM model so
+/// the default-endpoint run is byte-identical to the pre-endpoint-mode
+/// behavior. Set `CLAUDE_CODE_MODEL=claude-sonnet-4-6` for an anthropic-mode
+/// Sonnet run.
+const DEFAULT_CLAUDE_MODEL: &str = "glm-5.2:cloud";
+
+/// Endpoint mode: which backend `claude` talks to.
+///
+/// `Ollama` is the default and is byte-identical to the pre-endpoint-mode
+/// behavior (`ANTHROPIC_BASE_URL=https://ollama.com`, auth via
+/// `OLLAMA_CLOUD_API_KEY`). `Anthropic` talks to the real Anthropic API via
+/// the ambient `ANTHROPIC_API_KEY` — no `base_url` override, no auth token.
+enum EndpointMode {
+    Ollama,
+    Anthropic,
+}
+
+impl EndpointMode {
+    /// Read `CLAUDE_CODE_ENDPOINT` from the environment, defaulting to
+    /// `Ollama`. Panics with a clear message on any other value.
+    fn from_env() -> Self {
+        match env::var("CLAUDE_CODE_ENDPOINT").as_deref() {
+            Ok("ollama") | Err(_) => Self::Ollama,
+            Ok("anthropic") => Self::Anthropic,
+            Ok(other) => {
+                panic!("CLAUDE_CODE_ENDPOINT must be `ollama` or `anthropic`, got `{other}`")
+            }
+        }
+    }
+}
 
 /// Read a `u32` from the environment, falling back to `default` when the
 /// variable is unset or unparsable. Same pattern as `coding_eval.rs`.
@@ -146,11 +223,35 @@ fn env_u32(name: &str, default: u32) -> u32 {
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Gate: OLLAMA_CLOUD_API_KEY must be set at runtime.  The gate is here so
-    // `cargo nextest run` (which never executes examples) passes without the
-    // key, while a live run fails fast with a clear message.
-    let ollama_cloud_key =
-        env::var("OLLAMA_CLOUD_API_KEY").expect("OLLAMA_CLOUD_API_KEY must be set");
+    // Endpoint mode selects which backend `claude` talks to. Ollama mode
+    // (default) is byte-identical to the pre-endpoint-mode behavior; anthropic
+    // mode talks to the real Anthropic API via the ambient ANTHROPIC_API_KEY.
+    let endpoint = EndpointMode::from_env();
+
+    // OLLAMA_CLOUD_API_KEY is required ONLY in ollama mode (it is the auth
+    // token passed to ollama.com). Anthropic-mode runs authenticate via the
+    // ambient ANTHROPIC_API_KEY and do not touch ollama.com at all.
+    //
+    // The gate is here (not at the spawn site) so `cargo nextest run` — which
+    // never executes examples — passes without the key, while a live
+    // ollama-mode run fails fast with a clear message.
+    let ollama_cloud_key = match endpoint {
+        EndpointMode::Ollama => Some(
+            env::var("OLLAMA_CLOUD_API_KEY")
+                .expect("OLLAMA_CLOUD_API_KEY must be set in CLAUDE_CODE_ENDPOINT=ollama mode"),
+        ),
+        EndpointMode::Anthropic => {
+            // Sanity: anthropic mode REQUIRES the ambient ANTHROPIC_API_KEY.
+            // Fail fast here rather than letting claude fail opaquely later.
+            env::var("ANTHROPIC_API_KEY")
+                .expect("ANTHROPIC_API_KEY must be set in CLAUDE_CODE_ENDPOINT=anthropic mode");
+            None
+        }
+    };
+
+    // The `--model` arg passed to `claude` in BOTH modes.
+    let claude_model =
+        env::var("CLAUDE_CODE_MODEL").unwrap_or_else(|_| DEFAULT_CLAUDE_MODEL.to_string());
 
     let k = env_u32("CODING_EVAL_K", DEFAULT_K);
     let max_turns = env_u32("CLAUDE_CODE_MAX_TURNS", DEFAULT_MAX_TURNS);
@@ -216,8 +317,13 @@ async fn main() {
     );
 
     println!(
-        "claude_code_eval: {} fixture(s) (k={k}, max_turns={max_turns}, bin={claude_bin})",
+        "claude_code_eval: {} fixture(s) (k={k}, max_turns={max_turns}, bin={claude_bin}, \
+         endpoint={}, model={claude_model})",
         fixtures.len(),
+        match endpoint {
+            EndpointMode::Ollama => "ollama",
+            EndpointMode::Anthropic => "anthropic",
+        },
     );
 
     let mut summary: Vec<(String, EvalReport)> = Vec::with_capacity(fixtures.len());
@@ -282,29 +388,49 @@ async fn main() {
                 CODING_CHECK_TIMEOUT,
             );
 
-            // Spawn CC with glm-5.2:cloud. Env: Ollama Cloud endpoint + auth.
-            // No --system-prompt: CC runs with its own default agentic system
+            // Spawn CC. Env wiring depends on endpoint mode:
+            //   ollama     → ANTHROPIC_BASE_URL=https://ollama.com,
+            //               ANTHROPIC_AUTH_TOKEN=<OLLAMA_CLOUD_API_KEY>,
+            //               ANTHROPIC_API_KEY env_removed (so the auth token
+            //               takes effect). Byte-identical to the pre-endpoint-
+            //               mode behavior.
+            //   anthropic  → no base_url override, no auth token, no env_remove:
+            //               claude authenticates against the real Anthropic API
+            //               via the ambient ANTHROPIC_API_KEY.
+            // `--model` comes from CLAUDE_CODE_MODEL in BOTH modes. No
+            // --system-prompt: CC runs with its own default agentic system
             // prompt (product-comparison DoR — each harness keeps its real
             // advantages).
-            let child_output = Command::new(&claude_bin)
-                .current_dir(&ws_root)
-                .env("ANTHROPIC_BASE_URL", "https://ollama.com")
-                .env("ANTHROPIC_AUTH_TOKEN", &ollama_cloud_key)
-                .env_remove("ANTHROPIC_API_KEY")
-                .args([
-                    "--model",
-                    "glm-5.2:cloud",
-                    "--dangerously-skip-permissions",
-                    "--max-turns",
-                    &max_turns.to_string(),
-                    "--output-format",
-                    "json",
-                    "--print",
-                    &task_prompt,
-                ])
-                .output()
-                .await
-                .expect("spawn claude binary");
+            let mut cmd = Command::new(&claude_bin);
+            cmd.current_dir(&ws_root).args([
+                "--model",
+                &claude_model,
+                "--dangerously-skip-permissions",
+                "--max-turns",
+                &max_turns.to_string(),
+                "--output-format",
+                "json",
+                "--print",
+                &task_prompt,
+            ]);
+            match endpoint {
+                EndpointMode::Ollama => {
+                    cmd.env("ANTHROPIC_BASE_URL", "https://ollama.com")
+                        .env(
+                            "ANTHROPIC_AUTH_TOKEN",
+                            ollama_cloud_key
+                                .as_ref()
+                                .expect("ollama mode requires OLLAMA_CLOUD_API_KEY"),
+                        )
+                        .env_remove("ANTHROPIC_API_KEY");
+                }
+                EndpointMode::Anthropic => {
+                    // No base_url override; no auth token; no env_remove. The
+                    // ambient ANTHROPIC_API_KEY (validated at startup) is what
+                    // claude authenticates with.
+                }
+            }
+            let child_output = cmd.output().await.expect("spawn claude binary");
 
             // Parse CC's JSON envelope.  On parse failure (e.g. empty stdout,
             // binary crash) fall back to a zero-filled default — the subtype
@@ -342,6 +468,21 @@ async fn main() {
 
             let input_tokens = cc.usage.as_ref().and_then(|u| u.input_tokens).unwrap_or(0);
             let output_tokens = cc.usage.as_ref().and_then(|u| u.output_tokens).unwrap_or(0);
+            // Cache tokens from claude's JSON usage — absent in ollama mode
+            // (default 0), populated by the real Anthropic API when caching is
+            // on. Aggregated into the CC-side RunStats so the summary's
+            // cache_rd / cache_wr / raw_in columns compute identically to the
+            // Talos side.
+            let cache_read_tokens = cc
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_read_input_tokens)
+                .unwrap_or(0);
+            let cache_write_tokens = cc
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_creation_input_tokens)
+                .unwrap_or(0);
 
             let stats = RunStats {
                 iterations: cc.num_turns.unwrap_or(0),
@@ -351,6 +492,8 @@ async fn main() {
                 // CC has no observable in-loop gate; the external oracle lives
                 // solely in the holdout column.
                 gates_green_at_exit: false,
+                cache_read_tokens,
+                cache_write_tokens,
             };
 
             let trial = TrialResult {
@@ -408,7 +551,7 @@ async fn main() {
 fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
     println!("\n=== SUMMARY ===");
     println!(
-        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}",
+        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
         "fixture",
         "passes/k",
         "pass_rate",
@@ -417,6 +560,9 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
         "mean_wall",
         "holdout",
         "false_dn",
+        "cache_rd",
+        "cache_wr",
+        "raw_in",
     );
     for (name, r) in summary {
         let total_tokens = r.total_input_tokens() + r.total_output_tokens();
@@ -442,7 +588,7 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
             format!("{}/{}", r.holdout_passes(), holdout_n)
         };
         println!(
-            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>8.1}s  {:>11}  {:>8}",
+            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>8.1}s  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
             format!("{}/{}", r.passes, r.trials),
             r.pass_rate,
             r.mean_iterations(),
@@ -450,6 +596,9 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
             mean_wall,
             holdout_col,
             r.false_dones(),
+            format_tokens_compact(r.total_cache_read_tokens()),
+            format_tokens_compact(r.total_cache_write_tokens()),
+            format_tokens_compact(r.total_raw_input_tokens()),
         );
     }
 }

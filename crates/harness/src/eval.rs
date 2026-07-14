@@ -128,8 +128,10 @@ pub struct TrialResult {
 /// stats are exposed as accessor methods
 /// ([`Self::mean_iterations`], [`Self::min_iterations`],
 /// [`Self::max_iterations`], [`Self::total_input_tokens`],
-/// [`Self::total_output_tokens`], [`Self::total_wall_clock`]) rather than
-/// baked-in fields, so the source of truth is one place (`trial_results`).
+/// [`Self::total_output_tokens`], [`Self::total_cache_read_tokens`],
+/// [`Self::total_cache_write_tokens`], [`Self::total_raw_input_tokens`],
+/// [`Self::total_wall_clock`]) rather than baked-in fields, so the source of
+/// truth is one place (`trial_results`).
 ///
 /// Not `PartialEq` — inherited from [`TrialResult`] and [`LoopOutcome`], whose
 /// [`crate::model::BackendError`] variant doesn't compare.
@@ -199,6 +201,38 @@ impl EvalReport {
         self.trial_results
             .iter()
             .map(|t| t.stats.output_tokens)
+            .sum()
+    }
+
+    /// Sum of every trial's `cache_read_tokens` (Anthropic cache hits).
+    #[must_use]
+    pub fn total_cache_read_tokens(&self) -> u64 {
+        self.trial_results
+            .iter()
+            .map(|t| t.stats.cache_read_tokens)
+            .sum()
+    }
+
+    /// Sum of every trial's `cache_write_tokens` (Anthropic cache writes).
+    #[must_use]
+    pub fn total_cache_write_tokens(&self) -> u64 {
+        self.trial_results
+            .iter()
+            .map(|t| t.stats.cache_write_tokens)
+            .sum()
+    }
+
+    /// Sum of every trial's RAW input: `input_tokens + cache_read_tokens +
+    /// cache_write_tokens`. With prompt caching on, Anthropic MOVES cached
+    /// input out of `input_tokens` into the cache buckets — so this is the
+    /// harness-overhead number comparable to an UNCACHED run (the GLM 17x
+    /// figure was measured UNCACHED on ollama.com), NOT `total_input_tokens`
+    /// alone (which would report an artificially tiny input for a cached run).
+    #[must_use]
+    pub fn total_raw_input_tokens(&self) -> u64 {
+        self.trial_results
+            .iter()
+            .map(|t| t.stats.input_tokens + t.stats.cache_read_tokens + t.stats.cache_write_tokens)
             .sum()
     }
 
@@ -928,8 +962,16 @@ mod tests {
     }
 
     /// A finish(done) turn with an explicit non-zero `Usage` — for tests that
-    /// pin per-trial `RunStats` values through the eval harness.
-    fn finish_done_turn_with_usage(input_tokens: u32, output_tokens: u32) -> AssistantTurn {
+    /// pin per-trial `RunStats` values through the eval harness. The cache
+    /// fields default to `None` (provider-didn't-report); pass `Some` to model a
+    /// cached turn (Anthropic moves cached input out of `input_tokens` into
+    /// `cache_read_input_tokens` / `cache_creation_input_tokens`).
+    fn finish_done_turn_with_usage(
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read: Option<u32>,
+        cache_write: Option<u32>,
+    ) -> AssistantTurn {
         AssistantTurn {
             content: vec![ContentBlock::ToolCall(ToolCallRequest {
                 id: "c-finish".to_string(),
@@ -940,31 +982,39 @@ mod tests {
             usage: Usage {
                 input_tokens,
                 output_tokens,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
                 reasoning_tokens: None,
             },
         }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn eval_report_aggregates_pin_mean_min_max_iterations_and_token_totals() {
         // Three trials, each drawing a KNOWN, distinct number of turns and
         // token counts. After the eval finishes we assert every aggregate
         // accessor on the report matches the hand-computed values exactly.
         //
-        // Trial layout (each trial is one script prefix):
+        // Trial layout (each trial is one script prefix; usage per turn is
+        // (input, output, cache_read, cache_write)):
         //   trial 0: echo, echo, finish   → 3 iterations
-        //     usage per turn:  (10, 1), (20, 2), (30, 3)
+        //     usage per turn:  (10, 1, 5, 3), (20, 2, 7, 4), (30, 3, 10, 5)
+        //     → input=60, output=6, cache_read=22, cache_write=12, raw_in=94
         //   trial 1: echo, finish         → 2 iterations
-        //     usage per turn:  (40, 4), (50, 5)
+        //     usage per turn:  (40, 4, 8, 6), (50, 5, 12, 9)
+        //     → input=90, output=9, cache_read=20, cache_write=15, raw_in=125
         //   trial 2: finish               → 1 iteration
-        //     usage per turn:  (60, 6)
+        //     usage per turn:  (60, 6, None, None)   [uncached — like Ollama]
+        //     → input=60, output=6, cache_read=0, cache_write=0, raw_in=60
         //
         // Totals:
         //   iterations: [3, 2, 1] → mean 2.0, min 1, max 3
         //   input_tokens per trial: [60, 90, 60] → total 210
         //   output_tokens per trial: [6, 9, 6]   → total 21
+        //   cache_read_tokens per trial: [22, 20, 0] → total 42
+        //   cache_write_tokens per trial: [12, 15, 0] → total 27
+        //   raw_input per trial: [94, 125, 60] → total 279
         let script = vec![
             // trial 0
             AssistantTurn {
@@ -977,8 +1027,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 1,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
+                    cache_read_tokens: Some(5),
+                    cache_write_tokens: Some(3),
                     reasoning_tokens: None,
                 },
             },
@@ -992,12 +1042,12 @@ mod tests {
                 usage: Usage {
                     input_tokens: 20,
                     output_tokens: 2,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
+                    cache_read_tokens: Some(7),
+                    cache_write_tokens: Some(4),
                     reasoning_tokens: None,
                 },
             },
-            finish_done_turn_with_usage(30, 3),
+            finish_done_turn_with_usage(30, 3, Some(10), Some(5)),
             // trial 1
             AssistantTurn {
                 content: vec![ContentBlock::ToolCall(ToolCallRequest {
@@ -1009,14 +1059,14 @@ mod tests {
                 usage: Usage {
                     input_tokens: 40,
                     output_tokens: 4,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
+                    cache_read_tokens: Some(8),
+                    cache_write_tokens: Some(6),
                     reasoning_tokens: None,
                 },
             },
-            finish_done_turn_with_usage(50, 5),
-            // trial 2
-            finish_done_turn_with_usage(60, 6),
+            finish_done_turn_with_usage(50, 5, Some(12), Some(9)),
+            // trial 2 — uncached (cache fields None, like an Ollama turn).
+            finish_done_turn_with_usage(60, 6, None, None),
         ];
         let backend = MockBackend::from_turns(script);
         let task = finish_task();
@@ -1055,12 +1105,19 @@ mod tests {
         assert_eq!(report.trial_results[0].stats.iterations, 3);
         assert_eq!(report.trial_results[0].stats.input_tokens, 60);
         assert_eq!(report.trial_results[0].stats.output_tokens, 6);
+        assert_eq!(report.trial_results[0].stats.cache_read_tokens, 22);
+        assert_eq!(report.trial_results[0].stats.cache_write_tokens, 12);
         assert_eq!(report.trial_results[1].stats.iterations, 2);
         assert_eq!(report.trial_results[1].stats.input_tokens, 90);
         assert_eq!(report.trial_results[1].stats.output_tokens, 9);
+        assert_eq!(report.trial_results[1].stats.cache_read_tokens, 20);
+        assert_eq!(report.trial_results[1].stats.cache_write_tokens, 15);
         assert_eq!(report.trial_results[2].stats.iterations, 1);
         assert_eq!(report.trial_results[2].stats.input_tokens, 60);
         assert_eq!(report.trial_results[2].stats.output_tokens, 6);
+        // Trial 2 was uncached (cache fields None) → cache stats stay 0.
+        assert_eq!(report.trial_results[2].stats.cache_read_tokens, 0);
+        assert_eq!(report.trial_results[2].stats.cache_write_tokens, 0);
 
         // Aggregate accessors match the hand-computed values EXACTLY.
         assert!((report.mean_iterations() - 2.0).abs() < f64::EPSILON);
@@ -1068,6 +1125,24 @@ mod tests {
         assert_eq!(report.max_iterations(), Some(3));
         assert_eq!(report.total_input_tokens(), 60 + 90 + 60);
         assert_eq!(report.total_output_tokens(), 6 + 9 + 6);
+        // Cache-token aggregation: two trials carry nonzero cache_read/cache_write,
+        // trial 2 is uncached. Totals: cache_read = 22 + 20 = 42 (trial 2
+        // contributes 0), cache_write = 12 + 15 = 27 (trial 2 contributes 0).
+        assert_eq!(report.total_cache_read_tokens(), 22 + 20);
+        assert_eq!(report.total_cache_write_tokens(), 12 + 15);
+        // Raw input = input + cache_read + cache_write, summed across trials.
+        //   trial 0: 60 + 22 + 12 = 94
+        //   trial 1: 90 + 20 + 15 = 125
+        //   trial 2: 60 + 0 + 0   = 60
+        //   total = 279
+        assert_eq!(report.total_raw_input_tokens(), 94 + 125 + 60);
+        // Cross-check: raw must equal input + cache_read + cache_write totals.
+        assert_eq!(
+            report.total_raw_input_tokens(),
+            report.total_input_tokens()
+                + report.total_cache_read_tokens()
+                + report.total_cache_write_tokens(),
+        );
         // total_wall_clock sums the three per-trial durations. We can't pin an
         // exact value, but it must equal `sum(trial.stats.wall_clock)` — the
         // accessor's contract.
@@ -1103,6 +1178,9 @@ mod tests {
         assert_eq!(empty.max_iterations(), None);
         assert_eq!(empty.total_input_tokens(), 0);
         assert_eq!(empty.total_output_tokens(), 0);
+        assert_eq!(empty.total_cache_read_tokens(), 0);
+        assert_eq!(empty.total_cache_write_tokens(), 0);
+        assert_eq!(empty.total_raw_input_tokens(), 0);
         assert_eq!(empty.total_wall_clock(), Duration::ZERO);
     }
 
@@ -1121,6 +1199,8 @@ mod tests {
                 output_tokens: 22,
                 wall_clock: Duration::from_millis(50),
                 gates_green_at_exit: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             },
         };
         let printed = format!("{t:?}");
@@ -1585,6 +1665,8 @@ mod tests {
                 output_tokens: 0,
                 wall_clock: Duration::ZERO,
                 gates_green_at_exit: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             },
         };
         let report = EvalReport {

@@ -451,6 +451,15 @@ impl FinishClaim {
 ///   SUCCESSFUL turn. Turns that returned a
 ///   [`BackendError`](crate::model::BackendError) contribute nothing. Per-turn
 ///   `u32` values sum into `u64` so a long run can't overflow.
+/// - `cache_read_tokens` / `cache_write_tokens`: the sum of
+///   [`Usage::cache_read_tokens`](crate::model::Usage::cache_read_tokens) /
+///   [`Usage::cache_write_tokens`](crate::model::Usage::cache_write_tokens)
+///   across every SUCCESSFUL turn, treating `None` as 0 (a provider that
+///   doesn't report cache tokens contributes nothing). With prompt caching
+///   on, Anthropic MOVES cached input out of `input_tokens` into these two
+///   buckets — so the harness-overhead number comparable to an UNCACHED run
+///   is `input_tokens + cache_read_tokens + cache_write_tokens` (the
+///   "raw input"), NOT `input_tokens` alone.
 /// - `wall_clock`: measured across the whole [`run`] call — from just before
 ///   the loop starts to just after it returns.
 ///
@@ -467,6 +476,16 @@ pub struct RunStats {
     pub input_tokens: u64,
     /// Sum of `usage.output_tokens` across successful turns.
     pub output_tokens: u64,
+    /// Sum of `usage.cache_read_tokens` across successful turns (`None` → 0).
+    /// With prompt caching on, Anthropic moves cached input out of
+    /// `input_tokens` into this bucket — so the harness-overhead number
+    /// comparable to an UNCACHED run is `input_tokens + cache_read_tokens +
+    /// cache_write_tokens` (raw input), NOT `input_tokens` alone.
+    pub cache_read_tokens: u64,
+    /// Sum of `usage.cache_write_tokens` across successful turns (`None` → 0).
+    /// See [`Self::cache_read_tokens`] — populated by Anthropic when a turn
+    /// writes a fresh cache entry.
+    pub cache_write_tokens: u64,
     /// Wall-clock elapsed across the whole [`run`] call.
     pub wall_clock: Duration,
     /// Whether the harness's last in-loop gate (`run_checks`) was GREEN at the
@@ -800,6 +819,8 @@ pub async fn run(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
         gates_green_at_exit: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -857,6 +878,8 @@ pub async fn run_persisted(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
         gates_green_at_exit: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1089,11 +1112,18 @@ async fn run_loop_impl(
         // into history (Message::from consumes it).
         let per_turn_input = u64::from(turn.usage.input_tokens);
         let per_turn_output = u64::from(turn.usage.output_tokens);
+        // Cache tokens are `Option<u32>`: `None` means "this provider didn't
+        // report it", treated as 0 for accumulation (a provider that never
+        // reports cache tokens — Ollama today — simply contributes 0).
+        let per_turn_cache_read = u64::from(turn.usage.cache_read_tokens.unwrap_or(0));
+        let per_turn_cache_write = u64::from(turn.usage.cache_write_tokens.unwrap_or(0));
 
         // Accumulate into run totals. Per-turn u32 values sum into u64 so a
         // long run can't overflow.
         stats.input_tokens += per_turn_input;
         stats.output_tokens += per_turn_output;
+        stats.cache_read_tokens += per_turn_cache_read;
+        stats.cache_write_tokens += per_turn_cache_write;
 
         // Snapshot the calls before moving the turn into history (the `From`
         // impl consumes `turn.content`).
@@ -1784,6 +1814,8 @@ pub async fn resume(
         output_tokens: 0,
         wall_clock: Duration::ZERO,
         gates_green_at_exit: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -2968,6 +3000,8 @@ mod tests {
             output_tokens: 10,
             wall_clock: Duration::from_millis(250),
             gates_green_at_exit: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));

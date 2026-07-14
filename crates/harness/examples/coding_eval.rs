@@ -264,7 +264,7 @@ async fn main() {
 fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
     println!("\n=== SUMMARY ===");
     println!(
-        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}",
+        "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
         "fixture",
         "passes/k",
         "pass_rate",
@@ -273,6 +273,9 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
         "mean_wall",
         "holdout",
         "false_dn",
+        "cache_rd",
+        "cache_wr",
+        "raw_in",
     );
     for (name, r) in summary {
         let total_tokens = r.total_input_tokens() + r.total_output_tokens();
@@ -302,7 +305,7 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
             format!("{}/{}", r.holdout_passes(), holdout_n)
         };
         println!(
-            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>8.1}s  {:>11}  {:>8}",
+            "{name:<name_col$}  {:>9}  {:>10.3}  {:>10.2}  {:>12}  {:>8.1}s  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
             format!("{}/{}", r.passes, r.trials),
             r.pass_rate,
             r.mean_iterations(),
@@ -310,6 +313,9 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
             mean_wall,
             holdout_col,
             r.false_dones(),
+            format_tokens_compact(r.total_cache_read_tokens()),
+            format_tokens_compact(r.total_cache_write_tokens()),
+            format_tokens_compact(r.total_raw_input_tokens()),
         );
     }
 }
