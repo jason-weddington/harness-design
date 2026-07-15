@@ -2,6 +2,16 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.8.1 - 2026-07-15
+#### Bug Fixes
+- (**ralph**) commit only green finishes; revert-to-green + N consecutive do-overs - (242a57f) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+#### Documentation
+- Session 12 log — ralph CLI (0.8.0), do-over fix, qwen dogfood + 3 gaps (kb-03112) - (1dc5b25) - Jason Weddington
+- roadmap — Ralph shipped + forward view (ralph-ability, tasks.md, dispatch mode) - (0322c43) - Jason Weddington
+- document talos ralph mode in README - (6190f0c) - Jason Weddington
+
+- - -
+
 ## 0.8.0 - 2026-07-14
 #### Features
 - (**talos**) add `talos ralph` subcommand — thin CLI over run_ralph - (ce422ff) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
