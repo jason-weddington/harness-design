@@ -10,7 +10,7 @@
 //!   pre-endpoint-mode behavior.
 //! - `CLAUDE_CODE_ENDPOINT=anthropic`: `claude` talks to the **real Anthropic
 //!   API** via the ambient `ANTHROPIC_API_KEY` (no `base_url` override, no auth
-//!   token injected). `CLAUDE_CODE_MODEL=claude-sonnet-4-6` produces the
+//!   token injected). `CLAUDE_CODE_MODEL=claude-sonnet-5` produces the
 //!   talos-sonnet vs claude-code-sonnet comparison.
 //!
 //! ## Product-comparison constraints (2026-07-12)
@@ -52,7 +52,7 @@
 //!
 //! # Real Anthropic / Sonnet
 //! ANTHROPIC_API_KEY=sk-... CLAUDE_CODE_ENDPOINT=anthropic \
-//!   CLAUDE_CODE_MODEL=claude-sonnet-4-6 cargo run --example claude_code_eval
+//!   CLAUDE_CODE_MODEL=claude-sonnet-5 cargo run --example claude_code_eval
 //! ```
 //!
 //! ## Environment variables
@@ -61,7 +61,7 @@
 //!   Selects which backend `claude` talks to. Panics on any other value.
 //! - `CLAUDE_CODE_MODEL`     (optional) — the `--model` arg passed to the
 //!   `claude` binary in BOTH modes. Defaults to `glm-5.2:cloud` (the ollama
-//!   default); set to e.g. `claude-sonnet-4-6` in anthropic mode.
+//!   default); set to e.g. `claude-sonnet-5` in anthropic mode.
 //! - `OLLAMA_CLOUD_API_KEY`  (required in `ollama` mode) — Ollama Cloud API key.
 //!   **Distinct** from `OLLAMA_API_KEY` (local key). Passed to the child
 //!   process as `ANTHROPIC_AUTH_TOKEN`. NOT required in `anthropic` mode.
@@ -180,7 +180,7 @@ const DEFAULT_MAX_TURNS: u32 = 24;
 /// Default `--model` arg passed to the `claude` binary in BOTH endpoint modes
 /// when `CLAUDE_CODE_MODEL` is unset. Pinned to the ollama-cloud GLM model so
 /// the default-endpoint run is byte-identical to the pre-endpoint-mode
-/// behavior. Set `CLAUDE_CODE_MODEL=claude-sonnet-4-6` for an anthropic-mode
+/// behavior. Set `CLAUDE_CODE_MODEL=claude-sonnet-5` for an anthropic-mode
 /// Sonnet run.
 const DEFAULT_CLAUDE_MODEL: &str = "glm-5.2:cloud";
 

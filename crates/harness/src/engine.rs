@@ -302,7 +302,7 @@ pub struct Persistence {
     pub task_id: String,
     /// Which attempt number this is for the task (used in the run id).
     pub attempt_n: u32,
-    /// Human-readable label for the model backend (e.g. `"claude-sonnet-4-6"`).
+    /// Human-readable label for the model backend (e.g. `"claude-sonnet-5"`).
     /// Carried on every [`Event::ModelCall`]; the model backend deliberately
     /// does not expose its own id at the trait level.
     pub model_label: String,

@@ -16,7 +16,7 @@ an off-the-shelf harness wouldn't work.
   serve as another headless-dispatch build engine — the thing that picks up a groomed
   GTD task and executes it autonomously, alongside the existing Claude Code engine.
 - **Model support, in order:**
-  - Anthropic API — Haiku, Sonnet, Opus (claude-haiku-4-5, claude-sonnet-4-6,
+  - Anthropic API — Haiku, Sonnet, Opus (claude-haiku-4-5, claude-sonnet-5,
     claude-opus-4-8).
   - Local **Ollama** models, for cheap/offline iteration and to learn how a harness
     abstracts over heterogeneous model backends.

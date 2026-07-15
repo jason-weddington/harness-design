@@ -626,7 +626,7 @@ mod tests {
         mount_success(&server, &body).await;
 
         let backend =
-            AnthropicBackend::new("claude-sonnet-4-6", "sk-test").with_base_url(server.uri());
+            AnthropicBackend::new("claude-sonnet-5", "sk-test").with_base_url(server.uri());
         let messages = user_hi();
         let tools: Vec<Value> = vec![];
         let p = params();
@@ -870,7 +870,7 @@ mod tests {
         };
 
         let backend =
-            AnthropicBackend::new("claude-sonnet-4-6", "sk-test").with_base_url(server.uri());
+            AnthropicBackend::new("claude-sonnet-5", "sk-test").with_base_url(server.uri());
         backend.turn(&req).await.expect("turn ok");
 
         let received = server.received_requests().await.expect("requests captured");
@@ -918,7 +918,7 @@ mod tests {
 
         // Parsed-value spot checks.
         let parsed: Value = serde_json::from_str(body_text).expect("json");
-        assert_eq!(parsed["model"], "claude-sonnet-4-6");
+        assert_eq!(parsed["model"], "claude-sonnet-5");
         assert_eq!(parsed["max_tokens"], 512);
         assert_eq!(parsed["temperature"], 0.3);
         assert_eq!(parsed["stop_sequences"], json!(["END"]));

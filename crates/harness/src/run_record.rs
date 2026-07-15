@@ -724,7 +724,7 @@ mod tests {
         let events = vec![
             Event::ModelCall {
                 seq: 1,
-                model: "claude-sonnet-4-6".to_string(),
+                model: "claude-sonnet-5".to_string(),
                 prompt_tokens: 1024,
                 completion_tokens: 256,
             },

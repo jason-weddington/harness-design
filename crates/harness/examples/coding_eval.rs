@@ -16,7 +16,7 @@
 //! ```text
 //! # Anthropic (default backend)
 //! ANTHROPIC_API_KEY=sk-... cargo run --example coding_eval
-//! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-4-6 CODING_EVAL_K=5 \
+//! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-5 CODING_EVAL_K=5 \
 //!   cargo run --example coding_eval
 //! # Ollama cloud (GLM-5.2)
 //! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_MODEL=glm-5.2:cloud \

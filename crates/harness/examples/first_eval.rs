@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! ANTHROPIC_API_KEY=sk-... cargo run --example first_eval
-//! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-4-6 cargo run --example first_eval
+//! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-5 cargo run --example first_eval
 //! ```
 //!
 //! Environment:

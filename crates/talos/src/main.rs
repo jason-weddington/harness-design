@@ -1100,12 +1100,12 @@ mod tests {
         let env = env_with(&[
             ("TALOS_BACKEND", "anthropic"),
             ("ANTHROPIC_API_KEY", "sk-xyz"),
-            ("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            ("ANTHROPIC_MODEL", "claude-sonnet-5"),
         ]);
         let (backend, label) = backend_from_env(&env).expect("must succeed");
         assert!(matches!(backend, Backend::Anthropic(_)));
         assert_eq!(
-            label, "claude-sonnet-4-6",
+            label, "claude-sonnet-5",
             "model_label must be the model id verbatim"
         );
     }
