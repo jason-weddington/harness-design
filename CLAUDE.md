@@ -24,6 +24,18 @@ an off-the-shelf harness wouldn't work.
   and pre-push quality gates so headless agents can "run wild" without a human
   reviewing every line. (The gate stack is in place — see Quality gates below.)
 
+## Model capability reference — SWE-bench Pro
+
+For engine-routing decisions. Always compare within a SINGLE leaderboard — cross-harness/scaffold numbers vary widely (the same model was reported anywhere from 63% to 80% across sources), so mixed-source comparisons are meaningless.
+
+| Model | SWE-bench Pro |
+|---|---|
+| Claude Opus 4.8 | 69.2% |
+| Claude Sonnet 5 | 63.2% |
+| GLM-5.2 | 62.1% (top open-weights) |
+
+Source: [llm-stats.com/benchmarks/swe-bench-pro](https://llm-stats.com/benchmarks/swe-bench-pro), as of 2026-07-15. Takeaway: GLM-5.2 sits within ~1 pt of Sonnet 5 and ~7 pts of Opus 4.8 — so **model capability is not what separates the talos-glm and talos-sonnet lanes; the harness is** (talos vs. Claude Code). This is why a talos-glm miss falls back to claude-code-glm (same model, stronger harness), not to a bigger model. Refresh when the model lineup changes.
+
 ## Why Rust
 
 Part of the learning goal. Rust's compiler and type system give us a layer of
