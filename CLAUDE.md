@@ -22,7 +22,7 @@ an off-the-shelf harness wouldn't work.
     abstracts over heterogeneous model backends.
 - **Be the kind of codebase autonomous agents can build safely.** Strong commit-time
   and pre-push quality gates so headless agents can "run wild" without a human
-  reviewing every line. (Gate stack is being researched — see below.)
+  reviewing every line. (The gate stack is in place — see Quality gates below.)
 
 ## Why Rust
 
@@ -70,19 +70,16 @@ working session:
 its linked KB entry first**, then skim `docs/roadmap.md` "Where we are" for the
 current forward view. Session 1 (`kb-02851`) is the template.
 
-## Status
-
-Early/greenfield. The quality-gate harness is in place (commit-time + pre-push via
-lefthook, mirrored in CI); `crates/harness` is a placeholder lib with one tested
-function so the gates have something to enforce. **Next:** the real harness loop
-(model I/O → tool dispatch → state), starting with an Anthropic provider, then Ollama.
-
 ## Layout
 
-Cargo virtual workspace. `crates/harness` is the core library; new crates (model
-providers, a CLI, the GTD build-engine adapter) get added to `members` in the root
-`Cargo.toml`. Lint strictness + shared deps are centralized in `[workspace.lints]` /
-`[workspace.dependencies]`.
+Cargo virtual workspace. `crates/harness` is the core library (model backends,
+engine loop, tools, the Ralph outer loop); `crates/talos` is the CLI / GTD
+build-engine binary (`talos run`, `talos ralph`). New crates get added to `members`
+in the root `Cargo.toml`. Lint strictness + shared deps are centralized in
+`[workspace.lints]` / `[workspace.dependencies]`.
+
+Current status and the forward view live in [`docs/roadmap.md`](./docs/roadmap.md)
+(its "Where we are" header), not here.
 
 ## Build / Test
 
@@ -104,7 +101,7 @@ releases. The gate config is the source of truth: `lefthook.yml`, `deny.toml`,
 |---|---|
 | commit-msg | conventional commits (`cog verify`) |
 | pre-commit | `cargo fmt --check`, `clippy -D warnings`, `typos`, `cargo sort --check`, `gitleaks`, `cargo nextest run` |
-| pre-push | coverage `--fail-under-lines 95`, `cargo test --doc`, `cargo machete`, `cargo deny check` |
+| pre-push | coverage `--fail-under-lines 98`, `cargo test --doc`, `cargo machete`, `cargo deny check` |
 | CI | re-runs all of the above + a daily scheduled `cargo audit` |
 
 **rustc is a gate too** — type checking, null-safety, the borrow checker, match
@@ -112,13 +109,14 @@ exhaustiveness, and unused-import/variable detection are free, so there's no
 mypy-equivalent gate. `unsafe` is `forbid`-den project-wide. The extra gates only
 cover what the compiler can't see.
 
-**Coverage ratchet:** the `95` lives in `lefthook.yml` AND `.github/workflows/ci.yml`.
-Bump both upward as coverage improves; never regress it. Licenses are restricted to
+**Coverage ratchet:** the `--fail-under-lines` value lives in `lefthook.yml` AND
+`.github/workflows/ci.yml` (currently `98`). Bump both upward as coverage improves;
+never regress it. Licenses are restricted to
 `MIT`/`Apache-2.0` in `deny.toml` — a dep under any other license is a deliberate add.
 
 ## Release
 
-Decoupled from deploy (matches the Python projects). At a meaningful boundary run `./release.sh`: it cuts the version (`cog bump --auto` — trust it; type commits honestly, `fix:` vs `feat:`, and don't hand-pin the version), tags, **publishes a fresh talos fleet binary** (`scripts/publish-talos.sh`, run between the bump and the push, so a release ships an artifact by definition), then `git push origin main --tags`. No crates.io publish.
+Decoupled from deploy (matches the Python projects). At a meaningful boundary run `./release.sh`: it cuts the version (`cog bump --auto` — trust it; type commits honestly, `fix:` vs `feat:`, and don't hand-pin the version), tags, **publishes a fresh talos fleet binary** (`scripts/publish-talos.sh`, run between the bump and the push, so a release ships an artifact by definition), then pushes main + tags to **both** `origin` and `github`. No crates.io publish.
 
 ## Talos fleet binary (build + push without a release)
 
@@ -135,4 +133,4 @@ Talos is self-hosting — the binary changes every wave — so the dispatch host
 cd ~/git/agent-gtd-dispatch && ./talos-update.sh
 ```
 
-`publish-talos.sh` advances `pi-04:/srv/talos/latest` to the new token only after both arches upload (artifacts are immutable per token); `talos-update.sh` reads that `latest` via pi-04's Caddy and installs on each host in `DISPATCH_HOSTS` (default `pironman01 r7-research`), skipping any host already current. The version token is `0.1.0-g<short-sha>`; to verify, both hosts' installed token should carry the same `<short-sha>` as `git rev-parse --short HEAD`.
+`publish-talos.sh` advances `pi-04:/srv/talos/latest` to the new token only after both arches upload (artifacts are immutable per token); `talos-update.sh` reads that `latest` via pi-04's Caddy and installs on each host in `DISPATCH_HOSTS` (default `pironman01 r7-research`), skipping any host already current. The version token is `<semver>-g<short-sha>` (from `git describe --tags`, stamped by `crates/talos/build.rs`); to verify, both hosts' installed token should carry the same `<short-sha>` as `git rev-parse --short HEAD`.
