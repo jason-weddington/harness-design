@@ -2,6 +2,19 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.9.0 - 2026-07-15
+#### Features
+- (**bedrock**) add AWS Bedrock model backend (Converse API, TALOS_BEDROCK-gated) - (886aa2f) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
+#### Documentation
+- Session 13 log — Sonnet 5 + AWS Bedrock backend, harness-is-the-variable proven (kb-03115) - (87b8b76) - Jason Weddington
+- add AWS Bedrock to the CLAUDE.md model-support list - (4ca45f4) - Jason Weddington
+- add SWE-bench Pro model-capability reference for engine routing - (10bc595) - Jason Weddington
+- scrub obsolete CLAUDE.md — drop Status section, fix stale gate/version facts - (9560a83) - Jason Weddington
+#### Miscellaneous Chores
+- move canonical Sonnet reference to Sonnet 5 (claude-sonnet-5) - (ddba2d3) - Jason Weddington
+
+- - -
+
 ## 0.8.1 - 2026-07-15
 #### Bug Fixes
 - (**ralph**) commit only green finishes; revert-to-green + N consecutive do-overs - (242a57f) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
