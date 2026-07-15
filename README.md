@@ -2,7 +2,7 @@
 
 A learning project to understand agent harness design by building one in Rust —
 intended to serve as a headless-dispatch build engine for Agent GTD, supporting
-Anthropic API models (Haiku/Sonnet/Opus) and local Ollama models. See
+Anthropic API models (Haiku/Sonnet/Opus), AWS Bedrock (Converse API), and local Ollama models. See
 [`CLAUDE.md`](./CLAUDE.md) for goals.
 
 ## Dev setup
@@ -33,6 +33,20 @@ cargo nextest run --workspace      # fast test runner
 cargo test --doc --workspace       # doctests (nextest skips these)
 ```
 
+## Backends
+
+`talos run` selects a model backend from the environment (see `backend_from_env` in `crates/talos/src/main.rs`). Precedence: a `TALOS_BEDROCK` value that is non-empty after trimming selects the AWS Bedrock backend (Converse API) ahead of everything else; otherwise `TALOS_BACKEND` picks `anthropic` (default) or `ollama`.
+
+- `TALOS_BEDROCK` — set to any non-empty (after `.trim()`) value to run on AWS Bedrock (Converse API) instead of the Anthropic API or Ollama. This is for work machines that cannot call the Anthropic API directly. Credentials AND region resolve via the standard AWS chain (env/profile/SSO/IMDS — no keys in source). It wins over `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*`; an unset, empty, or whitespace-only value falls through to the `TALOS_BACKEND` match. Only `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-4-8` (via `ANTHROPIC_MODEL`) are mapped to Bedrock inference-profile ids; anything else is rejected at construction.
+- `TALOS_BACKEND` — `anthropic` (default when unset) | `ollama`.
+- `ANTHROPIC_API_KEY` — required for the anthropic backend.
+- `ANTHROPIC_MODEL` — optional; default `claude-haiku-4-5`. Used by both the anthropic and bedrock backends.
+- `OLLAMA_MODEL` — required for ollama.
+- `OLLAMA_BASE_URL` — optional; default `http://localhost:11434`.
+- `OLLAMA_API_KEY` — optional bearer token.
+- `OLLAMA_NUM_CTX` — optional `u32`; defaults to 32 768 for localhost.
+- `OLLAMA_THINK` — `off|on|low|medium|high|max`.
+
 ## Ralph mode (`talos ralph`)
 
 The **Ralph loop** drives an agent toward an objective by re-invoking the inner engine with a **fresh context every outer iteration** — durable state lives *outside* the context window (the code on disk, the git history, and a notes file the agent reads-then-appends), so each pass starts cold and still makes forward progress. Each iteration does exactly one unit of work; the **harness owns a git commit per iteration** (a deliberate ralph-only exception to the worker-owns-git rule). Distinct from finish-recovery (which nudges the *same* context when a gate is red) — Ralph *restarts* the context. Core: `crates/harness/src/ralph.rs`.
@@ -57,7 +71,7 @@ talos ralph \
   --max-ralph-iterations 25
 ```
 
-The workspace **must already be a git work tree** — `run_ralph` does *not* run `git init`. Backend selection reuses the same `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*` env as `talos run`. Other flags: `--inner-max-iterations` (inner cap per pass, default 500), `--stuck-k` (consecutive no-progress passes before giving up — progress = a git diff *outside* the notes file, default 3), `--max-do-overs` (consecutive non-green / rejected-green-commit do-overs before `DoOversExhausted` — each reverted to the last green commit — default 3), `--ralph-wall-clock-secs` (0 = unbounded; also `TALOS_RALPH_WALL_CLOCK_SECS`), `--stop-when-timeout-secs` / `--gate-timeout-secs` (default 300). Ralph is **not** run-record persisted this cut — it prints a `RalphSummary` JSON (objective / terminal / outer_iterations / total_inner_iterations) to stdout and exits: **0** `StopConditionMet` · **20** `Stuck` / `MaxIterationsExhausted` / `TimeBudgetExhausted` / `DoOversExhausted` · **1** `Error` (git/spawn/revert failure). Watch progress via the `ralph: iteration N` commits and the notes file, not stdout.
+The workspace **must already be a git work tree** — `run_ralph` does *not* run `git init`. Backend selection reuses the same `TALOS_BEDROCK` / `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*` env as `talos run`. Other flags: `--inner-max-iterations` (inner cap per pass, default 500), `--stuck-k` (consecutive no-progress passes before giving up — progress = a git diff *outside* the notes file, default 3), `--max-do-overs` (consecutive non-green / rejected-green-commit do-overs before `DoOversExhausted` — each reverted to the last green commit — default 3), `--ralph-wall-clock-secs` (0 = unbounded; also `TALOS_RALPH_WALL_CLOCK_SECS`), `--stop-when-timeout-secs` / `--gate-timeout-secs` (default 300). Ralph is **not** run-record persisted this cut — it prints a `RalphSummary` JSON (objective / terminal / outer_iterations / total_inner_iterations) to stdout and exits: **0** `StopConditionMet` · **20** `Stuck` / `MaxIterationsExhausted` / `TimeBudgetExhausted` / `DoOversExhausted` · **1** `Error` (git/spawn/revert failure). Watch progress via the `ralph: iteration N` commits and the notes file, not stdout.
 
 ## Quality gates
 

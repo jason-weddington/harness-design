@@ -6,6 +6,7 @@
 //! the real harness loop lands next. See the project `CLAUDE.md` for goals.
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod engine;
 pub mod eval;
 pub mod exec;

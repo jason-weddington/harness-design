@@ -73,6 +73,12 @@
 //!
 //! ## Environment variables
 //!
+//! - `TALOS_BEDROCK` — when set to a non-empty (after `.trim()`) value,
+//!   selects the AWS Bedrock backend (Converse API) AHEAD of `TALOS_BACKEND`
+//!   / `ANTHROPIC_*` / `OLLAMA_*`; unset/empty/whitespace-only falls through.
+//!   Credentials AND region resolve via the standard AWS chain (env/profile
+//!   /SSO/IMDS — no keys in source). Only `claude-haiku-4-5` /
+//!   `claude-sonnet-5` / `claude-opus-4-8` (via `ANTHROPIC_MODEL`) are mapped.
 //! - `TALOS_BACKEND` — `anthropic` (default when unset) | `ollama`
 //! - `ANTHROPIC_API_KEY` — required for anthropic
 //! - `ANTHROPIC_MODEL` — optional; default `claude-haiku-4-5`
@@ -93,6 +99,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
+use harness::bedrock::BedrockBackend;
 use harness::engine::{LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
 use harness::exec::{CheckCommand, ChecksRunner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
@@ -283,6 +290,7 @@ struct RalphArgs {
 /// No `Debug` derive — the api key must not appear in formatter chains.
 enum Backend {
     Anthropic(AnthropicBackend),
+    Bedrock(BedrockBackend),
     Ollama(OllamaBackend),
 }
 
@@ -291,6 +299,7 @@ impl ModelBackend for Backend {
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         match self {
             Self::Anthropic(b) => b.turn(req).await,
+            Self::Bedrock(b) => b.turn(req).await,
             Self::Ollama(b) => b.turn(req).await,
         }
     }
@@ -596,16 +605,49 @@ fn build_ollama_backend(
     Ok((Backend::Ollama(ollama), model_label))
 }
 
+/// Build a [`BedrockBackend`] from the injected environment accessor.
+///
+/// Reads `ANTHROPIC_MODEL` (default `claude-haiku-4-5`, mirroring
+/// [`build_anthropic_backend`]), maps it to the Bedrock inference-profile id
+/// (returning `Err` on an unmapped model), constructs the backend, and
+/// returns `model_label` `bedrock:{canonical}` (e.g. `bedrock:claude-haiku-4-5`)
+/// — by analogy to ollama's `ollama:{model}` label. Credentials AND region
+/// resolve via the standard AWS chain lazily on the first turn (no static
+/// keys in source).
+fn build_bedrock_backend(
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<(Backend, String), String> {
+    let canonical = env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-haiku-4-5".to_string());
+    let backend = BedrockBackend::new(&canonical)?;
+    let model_label = format!("bedrock:{canonical}");
+    Ok((Backend::Bedrock(backend), model_label))
+}
+
 /// Select and construct the model backend from the injected environment.
 ///
-/// `TALOS_BACKEND`: `"anthropic"` (default when unset) | `"ollama"`.
+/// Precedence: a `TALOS_BEDROCK` env var that is non-empty after `.trim()`
+/// selects [`BedrockBackend`] FIRST — ahead of `TALOS_BACKEND` /
+/// `ANTHROPIC_API_KEY` / `OLLAMA_*`. This lets talos run on a work machine
+/// that cannot call the Anthropic API directly (AWS Bedrock Converse API,
+/// standard AWS credential chain, no keys in source). An unset, empty, or
+/// whitespace-only `TALOS_BEDROCK` falls through to the existing match.
+///
+/// Otherwise `TALOS_BACKEND`: `"anthropic"` (default when unset) |
+/// `"ollama"`.
 ///
 /// Returns `Err(message)` — never panics — for:
 /// - `TALOS_BACKEND` set to anything other than `"anthropic"` / `"ollama"`
 /// - Missing required provider vars (`ANTHROPIC_API_KEY`, `OLLAMA_MODEL`)
+/// - `ANTHROPIC_MODEL` set to a model `TALOS_BEDROCK` cannot map (only
+///   `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-4-8`)
 /// - `OLLAMA_THINK` outside the accepted set
 /// - `OLLAMA_NUM_CTX` present but unparsable as `u32`
 fn backend_from_env(env: &impl Fn(&str) -> Option<String>) -> Result<(Backend, String), String> {
+    if let Some(v) = env("TALOS_BEDROCK").as_deref()
+        && !v.trim().is_empty()
+    {
+        return build_bedrock_backend(env);
+    }
     match env("TALOS_BACKEND").as_deref() {
         Some("anthropic") | None => build_anthropic_backend(env),
         Some("ollama") => build_ollama_backend(env),
@@ -1093,6 +1135,65 @@ mod tests {
         assert!(matches!(backend, Backend::Anthropic(_)));
         // model_label is the model id verbatim (default)
         assert_eq!(label, "claude-haiku-4-5");
+    }
+
+    // ---- TALOS_BEDROCK precedence ----------------------------------------
+
+    #[test]
+    fn talos_bedrock_selects_bedrock_with_no_other_vars() {
+        let env = env_with(&[("TALOS_BEDROCK", "1")]);
+        let (backend, label) = backend_from_env(&env).expect("must succeed");
+        assert!(matches!(backend, Backend::Bedrock(_)));
+        assert_eq!(label, "bedrock:claude-haiku-4-5");
+    }
+
+    #[test]
+    fn talos_bedrock_wins_over_ollama_when_both_set() {
+        let env = env_with(&[
+            ("TALOS_BEDROCK", "1"),
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "qwen3:32b"),
+        ]);
+        let (backend, label) = backend_from_env(&env).expect("must succeed");
+        assert!(matches!(backend, Backend::Bedrock(_)));
+        assert_eq!(label, "bedrock:claude-haiku-4-5");
+    }
+
+    #[test]
+    fn talos_bedrock_empty_falls_through_to_anthropic() {
+        let env = env_with(&[("TALOS_BEDROCK", ""), ("ANTHROPIC_API_KEY", "sk-test")]);
+        let (backend, _label) = backend_from_env(&env).expect("must succeed");
+        assert!(matches!(backend, Backend::Anthropic(_)));
+    }
+
+    #[test]
+    fn talos_bedrock_whitespace_only_falls_through_to_anthropic() {
+        let env = env_with(&[("TALOS_BEDROCK", "   "), ("ANTHROPIC_API_KEY", "sk-test")]);
+        let (backend, _label) = backend_from_env(&env).expect("must succeed");
+        assert!(
+            matches!(backend, Backend::Anthropic(_)),
+            "whitespace-only TALOS_BEDROCK must NOT select Bedrock"
+        );
+    }
+
+    #[test]
+    fn talos_bedrock_unmapped_model_is_err() {
+        let env = env_with(&[("TALOS_BEDROCK", "1"), ("ANTHROPIC_MODEL", "claude-3-opus")]);
+        assert!(
+            backend_from_env(&env).is_err(),
+            "unmapped ANTHROPIC_MODEL under TALOS_BEDROCK must be Err"
+        );
+    }
+
+    #[test]
+    fn talos_bedrock_explicit_model_label() {
+        let env = env_with(&[
+            ("TALOS_BEDROCK", "1"),
+            ("ANTHROPIC_MODEL", "claude-sonnet-5"),
+        ]);
+        let (backend, label) = backend_from_env(&env).expect("must succeed");
+        assert!(matches!(backend, Backend::Bedrock(_)));
+        assert_eq!(label, "bedrock:claude-sonnet-5");
     }
 
     #[test]

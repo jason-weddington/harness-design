@@ -9,6 +9,11 @@ description = "Core agent-harness library."
 [dependencies]
 askama.workspace = true
 async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-bedrockruntime.workspace = true
+aws-smithy-http-client.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
 reqwest = { workspace = true }
 rusqlite.workspace = true
 serde = { workspace = true }
