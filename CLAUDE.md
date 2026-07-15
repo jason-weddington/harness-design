@@ -20,6 +20,9 @@ an off-the-shelf harness wouldn't work.
     claude-opus-4-8).
   - Local **Ollama** models, for cheap/offline iteration and to learn how a harness
     abstracts over heterogeneous model backends.
+  - **AWS Bedrock** (Converse API) — for environments where the Anthropic API isn't
+    reachable (e.g. a work machine); gated by `TALOS_BEDROCK` (wins over any
+    Anthropic/Ollama env), standard AWS credential chain, haiku-4-5/sonnet-5/opus-4-8 only.
 - **Be the kind of codebase autonomous agents can build safely.** Strong commit-time
   and pre-push quality gates so headless agents can "run wild" without a human
   reviewing every line. (The gate stack is in place — see Quality gates below.)
