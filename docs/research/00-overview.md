@@ -418,3 +418,7 @@ Framed as decisions we must make next.
    self-verification, error recovery, containment, pass^k evals, observability.
 7. [Model-Layer Features](07-model-layer-features.md) — Anthropic API + Ollama,
    capability detection, graceful degradation, the Rust transport layer.
+8. [Discriminating Evals](08-discriminating-evals.md) — *(added 2026-08-13)* how
+   marquee coding benchmarks are structured (SWE-bench Verified/Pro, Terminal-Bench,
+   METR time horizon), saturation-resistant metrics, harness-vs-model evaluation
+   (Harness-Bench), and the design axes for un-saturating our own suite.
