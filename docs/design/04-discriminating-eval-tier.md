@@ -1,6 +1,6 @@
 # Design 04 — The discriminating eval tier (tier-2: mined-from-history tasks)
 
-*Drafted 2026-08-13. Status: **proposal — open decisions at the end.** Inputs: research track [08-discriminating-evals](../research/08-discriminating-evals.md) and the six-repo feasibility probe (kb-03197). Sessions: kb-03196.*
+*Drafted 2026-08-13; decisions ratified 2026-08-14. Status: **design of record — pilot next.** Inputs: research track [08-discriminating-evals](../research/08-discriminating-evals.md) and the six-repo feasibility probe (kb-03197). Sessions: kb-03196.*
 
 ## Problem
 
@@ -29,13 +29,24 @@ Pilot shortlist (hard rungs): grit-mile `323485d` (modality-aware ramp check), `
 
 **Task-statement synthesis — the craft step, run as a pipeline.** Draft from commit message + diff + (for agent_gtd) the original groomed GTD spec recovered via the item-id in the commit subject; sanitize so the statement describes behavior without naming the fix; critic pass screening for SWE-bench Verified's two dominant defects (underspecified statement, unfair/overly-specific tests — Verified discarded 68% of naively-mined tasks for these). Agent-driven with human spot-check on the pilot; difficulty lives in the work, never in the grading.
 
+**Spec-level ladder — the resolution of the known-solvable problem (decided 2026-08-14).** Jason's objection: nearly every mined commit was *built by headless dispatch with a detailed groomed spec* — so we already know Opus/Sonnet + CC + full spec solves them, and reproducing that setup cannot discriminate. Resolution: **a mined commit is a task family parameterized by how much of the grooming the statement reveals.** The known-solvable tuple is (task + full spec); the discrimination axis is withholding the grooming. Three spec levels per task:
+
+- **S3 — full groomed spec** (AC + files_to_modify + scope + pinned constants). Known-solvable by construction; kept only as the *calibration floor* — an engine failing S3 is below the dispatch bar.
+- **S2 — AC only.** Behavioral acceptance criteria, zero localization (no file paths, no component names, no constants). Strips exactly what the groom workflow's code-grounding critic contributes. The standard tier-2 statement.
+- **S1 — intent only.** The pre-groom artifact: the inbox-capture seed, or for bugs the *symptom* with no cause stated. The agent grooms AND builds — disambiguate, scope, localize, root-cause, implement. Never been done headless; unknown even for Opus. (This mirrors SWE-bench, whose statements are the raw *issue text* — the pre-groom artifact — with the 68% discard as the warning that raw intent needs an underspecification screen to stay fairly gradable.)
+
+Above S1 sits the **wave composite**: a multi-item rollout (groomed, DAG-ordered, manager-merged) collapsed into one task at wave-intent level, graded by the union of the wave's mined tests. Single items are known-solvable; whole features by one agent in one context are not — this is the long-horizon top rung, where frontier-vs-frontier discrimination most plausibly lives.
+
+Two side benefits: **the eval measures the value of grooming itself** — score-vs-spec-level per engine yields the routing rubric's missing axis ("how much spec does this engine need?") as data; and **the dispatch record supplies per-task baselines free** (original engine, wall-clock, iterations, lead interventions from the perf log — tasks that needed redispatch/inline fixes are pre-labeled as empirically harder).
+
 **Environments — pre-provisioned per-repo, snapshot per-task.** One cached base environment per repo (venv/node_modules/target with deps installed — this amortizes cleanr's torch pull and grit-mile's pnpm install); per-task setup is `git worktree` at the parent commit + copy-in of the cached deps. Runs on this box (the 5090 host) initially; dispatch-host portability is out of scope for the pilot.
 
 **Contamination hygiene.** Private repos are contamination-proof by construction (SWE-bench Pro pays for this with GPL sourcing and legal agreements; we get it free). Two exceptions enforced at mining time: harness-design engine-loop and eval-fixture commits are excluded (or scored only via `claude_code_eval`, the non-talos harness); grit-mile's embedded eval harness and `it.fails` property tests are excluded from every given-test set and baseline.
 
-## Open decisions (for the design conversation)
+## Decisions of record (ratified 2026-08-14)
 
-1. **Hidden vs visible FAIL_TO_PASS.** Proposal says hidden (SWE-bench shape; prevents test-gaming; reuses our sealed-holdout discipline). The alternative — visible failing tests like tier-1 — makes tasks easier and more like real dispatch (where AC are visible). Could split: statement carries the *behavioral* AC, tests stay hidden.
-2. **Pilot scope.** Proposal: hand-mine ~8 tasks (2 easy, 3 mid, 3 hard from the shortlist), run the 5-engine matrix (opus / sonnet / glm / haiku / qwen, k=3), and check the one thing that matters: **does the ladder separate Opus from Sonnet from GLM?** Only after discrimination is proven do we automate the mining pipeline.
-3. **Harness-vs-harness runs.** The same mined tasks serve talos-vs-claude-code comparisons (Harness-Bench frame: fix prompts/sandbox/budget/evaluator, vary harness). Include in the pilot matrix or defer?
-4. **Where task artifacts live.** A new `evals/` repo (keeps benchmark content out of the harness repo and away from dispatch agents' eyes) vs `fixtures-v2/` here. The self-reference probe argues for a separate repo.
+1. **Hidden FAIL_TO_PASS** — mined tests are the sealed grader; the statement carries behavioral AC (at the spec level the rung dictates). Prevents test-gaming; reuses the holdout discipline that caught nemotron's false-dones.
+2. **Pilot before automation.** Hand-mine ~8 tasks (2 easy / 3 mid / 3 hard from the kb-03197 shortlist) and sample the *spec grid*, not just the tasks: the 8 at S2, 2-3 of them re-run at S1, plus one wave composite. Run the 5-engine matrix (opus / sonnet / glm / haiku / qwen, k=3). The pilot answers: does spec-withholding discriminate, is S1 fair or just noisy, and are composites completable at all? Only after discrimination is proven do we automate mining.
+3. **Harness-vs-harness deferred.** Once the ladder discriminates models on talos, the same tasks serve the talos-vs-claude-code comparison (Harness-Bench frame: fix prompts/sandbox/budget/evaluator, vary harness) as a follow-up matrix.
+4. **Separate `evals` repo** for task artifacts (snapshots, statements, sealed tests). Keeps benchmark content out of dispatch agents' reach (the csv-ledger answer-key incident), keeps five other repos' code out of this repo's history, and absorbs continuous rung growth. The harness repo keeps the runner.
+5. **grit-mile code may be used in eval tasks** (Jason, 2026-08-14) — same private trust boundary.
