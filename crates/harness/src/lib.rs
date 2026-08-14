@@ -10,6 +10,7 @@ pub mod bedrock;
 pub mod engine;
 pub mod eval;
 pub mod exec;
+pub mod mined_eval;
 pub mod model;
 pub mod ollama;
 pub mod prompt;
