@@ -370,7 +370,14 @@ fn parse_pytest_summary_totals(line: &str) -> Option<usize> {
     let inner = line
         .strip_prefix("===")
         .and_then(|s| s.rsplit_once("==="))?;
-    let body = inner.0.trim();
+    // Strip the REST of the banner's `=` padding, not just the first three:
+    // pytest pads to terminal width (`====== 1 failed, 6 passed ======`), so
+    // leaving it attached glues `======` onto the FIRST bucket's count, whose
+    // `parse::<usize>()` then fails and silently drops that bucket. That
+    // under-counts multi-bucket summaries (false `parse-mismatch`) and, for a
+    // single-bucket summary, zeroes `any` so the check returns `None` and
+    // disables itself entirely.
+    let body = inner.0.trim_matches('=').trim();
     // Split on `,` and pick the leading integer + label pairs; ignore the
     // trailing `in T.TTs`.
     let mut total: usize = 0;
@@ -1103,7 +1110,11 @@ pub fn claimed_disposition_label(outcome: &LoopOutcome) -> String {
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish".to_string(),
         LoopOutcome::MaxIterations => "MaxIterations".to_string(),
         LoopOutcome::BudgetExhausted { .. } => "BudgetExhausted".to_string(),
-        LoopOutcome::BackendError(_) => "BackendError".to_string(),
+        // Carry the error payload: a bare `BackendError` label is undiagnosable
+        // after the fact (the runner persists no run record), and the variants
+        // it collapses — context-guard trip, protocol/parse failure, retries
+        // exhausted — demand completely different responses from the operator.
+        LoopOutcome::BackendError(e) => format!("BackendError({e})"),
     }
 }
 
@@ -1759,6 +1770,28 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         );
         // Not a summary line.
         assert_eq!(parse_pytest_summary_totals("=== FAILURES ==="), None);
+    }
+
+    /// Regression: pytest pads its banner to terminal width, not to three `=`.
+    /// Both lines below are verbatim from real gate output; the width-padded
+    /// form previously dropped the FIRST bucket (`1 failed`), yielding 7 and a
+    /// spurious `parse-mismatch: 8 ids vs summary 7` that voided whole tasks.
+    #[test]
+    fn parse_pytest_summary_totals_strips_full_width_banner_padding() {
+        assert_eq!(
+            parse_pytest_summary_totals(
+                "============== 1 failed, 6 passed, 1 skipped, 8 warnings in 1.85s ==============",
+            ),
+            Some(8),
+        );
+        // Single-bucket: the same bug returned `None`, silently DISABLING the
+        // truncation cross-check rather than merely miscounting it.
+        assert_eq!(
+            parse_pytest_summary_totals(
+                "============================== 68 passed in 0.30s ==============================",
+            ),
+            Some(68),
+        );
     }
 
     // ---- Invalid{parse-empty} on -q output --------------------------------
@@ -2760,12 +2793,22 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             }),
             "BudgetExhausted",
         );
-        assert_eq!(
+        // The payload is carried, not just the variant name: a bare
+        // "BackendError" is undiagnosable after the fact (no run record is
+        // persisted), and it collapses causes needing opposite operator
+        // responses — a context-guard trip vs auth vs a parse failure.
+        let labelled =
             claimed_disposition_label(&LoopOutcome::BackendError(BackendError::Terminal {
                 kind: TerminalKind::Auth,
                 message: "no creds".to_string(),
-            })),
-            "BackendError",
+            }));
+        assert!(
+            labelled.starts_with("BackendError("),
+            "expected a payload-carrying label, got {labelled}",
+        );
+        assert!(
+            labelled.contains("no creds"),
+            "expected the underlying cause in the label, got {labelled}",
         );
     }
 
