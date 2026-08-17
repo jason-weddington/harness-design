@@ -21,7 +21,7 @@
 //! # Ollama cloud (GLM-5.2)
 //! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_MODEL=glm-5.2:cloud \
 //!   cargo run --example coding_eval
-//! # Ollama localhost (small local models; num_ctx defaults to 32768 locally)
+//! # Ollama localhost (small local models; num_ctx resolved from /api/show)
 //! EVAL_BACKEND=ollama OLLAMA_MODEL=qwen3.6:35b cargo run --example coding_eval
 //! # narrow to a single fixture directory name
 //! ANTHROPIC_API_KEY=sk-... CODING_EVAL_FIXTURE=lru-cache cargo run --example coding_eval
@@ -37,10 +37,21 @@
 //!   set `https://ollama.com` for Ollama cloud.
 //! - `OLLAMA_API_KEY`        (optional) — attached as a Bearer token when set
 //!   (required in practice for Ollama cloud).
-//! - `OLLAMA_NUM_CTX`        (optional) — context window. When unset it
-//!   defaults to `32768` for localhost (local defaults are VRAM-tiered and
-//!   overflow truncates SILENTLY — never rely on them) and stays unset for
-//!   remote hosts (cloud models default to their max context).
+//! - `OLLAMA_NUM_CTX`        (optional) — context window override. When unset
+//!   for a localhost URL, the runner probes `POST /api/show` and pins the
+//!   model's own advertised `{arch}.context_length`; if the probe fails the
+//!   runner panics with the full error (fail-loud — never falls back to a
+//!   constant). When set, the value is used verbatim and no probe is made; an
+//!   unparsable value panics naming `OLLAMA_NUM_CTX` and the raw string.
+//!   Use this as an escape hatch in BOTH directions: to pin a smaller window
+//!   when the advertised value exceeds available VRAM, or to set a window for
+//!   non-localhost daemons (e.g. `http://jason-desktop:11434`, a LAN address)
+//!   that are neither matched by `is_local` nor probed — they inherit Ollama's
+//!   own low default (~2048, with silent oldest-message dropping). An empty
+//!   value (`OLLAMA_NUM_CTX= cmd`) is treated as unset.
+//!   Note: `crates/talos/src/main.rs` still pins 32 768 for localhost (no
+//!   probe, sync path). Eval `num_ctx` rows are NOT comparable to talos
+//!   dispatch rows until that follow-up lands.
 //! - `OLLAMA_THINK`          (optional) — `off|on|low|medium|high|max`
 //!   (gpt-oss ignores plain booleans; GLM-5.2 supports high/max).
 //! - `CODING_EVAL_K`         (optional) — number of trials; defaults to 3.
@@ -59,17 +70,18 @@ use harness::anthropic::AnthropicBackend;
 use harness::engine::{LoopOutcome, RunStats};
 use harness::eval::{EvalReport, TrialResult, coding_fix_task, discover_fixtures, run_eval};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
-use harness::ollama::{OllamaBackend, ThinkLevel};
+use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
 use harness::run_record::{Disposition, Verification};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5";
 
-/// Default `num_ctx` for LOCALHOST Ollama runs when `OLLAMA_NUM_CTX` is unset.
-/// Local defaults are VRAM-tiered (4k on small GPUs) and overflow truncates
-/// silently, so an explicit value is mandatory hygiene; remote/cloud hosts get
-/// no default (cloud models run at their max context).
-const DEFAULT_LOCAL_NUM_CTX: u32 = 32_768;
+/// Audit floor for the resolved `num_ctx`. This is NOT a default or fallback —
+/// it is never assigned to `num_ctx`. When the resolved value is below this
+/// threshold the runner emits a warning to stderr and the provenance token in
+/// `desc` uses the BELOW-FLOOR variant; the run still proceeds with the
+/// verbatim advertised value.
+const MIN_EXPECTED_NUM_CTX: u32 = 32_768;
 
 /// Example-local backend selection: one enum over the concrete backends so the
 /// generic `run_eval(&impl ModelBackend, ...)` call site stays monomorphic.
@@ -91,7 +103,7 @@ impl ModelBackend for Backend {
 /// Build the backend from the environment (see the module docs for the
 /// variables). Returns the backend plus a human-readable description line for
 /// the run header — model, endpoint, and the knobs that affect comparability.
-fn backend_from_env() -> (Backend, String) {
+async fn backend_from_env() -> (Backend, String) {
     match env::var("EVAL_BACKEND").as_deref() {
         Ok("ollama") => {
             let model = env::var("OLLAMA_MODEL")
@@ -99,10 +111,54 @@ fn backend_from_env() -> (Backend, String) {
             let base_url =
                 env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
             let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
-            let num_ctx = env::var("OLLAMA_NUM_CTX")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .or(is_local.then_some(DEFAULT_LOCAL_NUM_CTX));
+
+            // OLLAMA_API_KEY is hoisted ABOVE num_ctx resolution so its value
+            // can be forwarded to the /api/show probe.
+            let api_key: Option<String> = env::var("OLLAMA_API_KEY").ok().filter(|s| !s.is_empty());
+
+            // Five-branch OLLAMA_NUM_CTX resolution:
+            // (0) set but empty/whitespace after trim → treated as unset (falls through to (3)/(4)).
+            //     Matches the file-local convention for CODING_EVAL_FIXTURE
+            //     ("Empty string is treated as 'unset' — the shell's `VAR= cmd` idiom").
+            // (1) set, non-empty, parses as u32 → use it, no HTTP call.
+            // (2) set, non-empty, does NOT parse as u32 → panic! naming the var and raw value.
+            // (3) unset/empty AND is_local → probe /api/show; panic! on error (never fall back).
+            // (4) unset/empty AND NOT is_local → None (no probe; unchanged behavior).
+            let raw_num_ctx = env::var("OLLAMA_NUM_CTX").ok();
+            let (num_ctx, num_ctx_desc) = match raw_num_ctx.as_deref().map(str::trim) {
+                Some(trimmed) if !trimmed.is_empty() => {
+                    let n = trimmed.parse::<u32>().unwrap_or_else(|_| {
+                        panic!(
+                            "OLLAMA_NUM_CTX must be a valid u32, got `{}`",
+                            raw_num_ctx.as_deref().unwrap_or("")
+                        )
+                    });
+                    (Some(n), format!("num_ctx={n} (explicit OLLAMA_NUM_CTX)"))
+                }
+                _ if is_local => {
+                    let resolved = resolve_context_length(&base_url, &model, api_key.as_deref())
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    let v = resolved.value;
+                    let a = resolved.architecture;
+                    let k = resolved.key;
+                    if v < MIN_EXPECTED_NUM_CTX {
+                        eprintln!(
+                            "WARNING: resolved num_ctx={v} for `{model}` (arch={a}, key={k}) \
+                             is BELOW the {MIN_EXPECTED_NUM_CTX} sanity floor; trials may be \
+                             truncation-invalid — set OLLAMA_NUM_CTX to override"
+                        );
+                        (
+                            Some(v),
+                            format!("num_ctx={v} (resolved, BELOW-FLOOR: arch={a} key={k})"),
+                        )
+                    } else {
+                        (Some(v), format!("num_ctx={v} (resolved: arch={a} key={k})"))
+                    }
+                }
+                _ => (None, "num_ctx=default".to_string()),
+            };
+
             let think = env::var("OLLAMA_THINK").ok().map(|v| match v.as_str() {
                 "off" => ThinkLevel::Off,
                 "on" => ThinkLevel::On,
@@ -114,7 +170,7 @@ fn backend_from_env() -> (Backend, String) {
             });
 
             let mut backend = OllamaBackend::new(&model, &base_url);
-            if let Ok(key) = env::var("OLLAMA_API_KEY") {
+            if let Some(key) = api_key {
                 backend = backend.with_api_key(key);
             }
             if let Some(n) = num_ctx {
@@ -124,8 +180,7 @@ fn backend_from_env() -> (Backend, String) {
                 backend = backend.with_think(level);
             }
             let desc = format!(
-                "ollama `{model}` @ {base_url} (num_ctx={}, think={})",
-                num_ctx.map_or("default".into(), |n| n.to_string()),
+                "ollama `{model}` @ {base_url} ({num_ctx_desc}, think={})",
                 env::var("OLLAMA_THINK").unwrap_or_else(|_| "unset".into()),
             );
             (Backend::Ollama(backend), desc)
@@ -164,7 +219,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let (backend, backend_desc) = backend_from_env();
+    let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("CODING_EVAL_K", DEFAULT_K);
     let max_iterations = env_u32("CODING_EVAL_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS);
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears

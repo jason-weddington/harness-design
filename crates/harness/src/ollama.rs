@@ -9,8 +9,18 @@
 //! `{base_url}/api/chat` with `"stream": false`, awaits the full JSON
 //! response, and translates Ollama's native chat shape into the normalized
 //! types in [`crate::model`]. Streaming/SSE, structured outputs (`format`),
-//! the OpenAI-compat `/v1` path, and capability discovery
-//! (`/api/show|tags|ps`) are all out of scope here.
+//! the OpenAI-compat `/v1` path, and capability discovery via `/api/tags` and
+//! `/api/ps` are out of scope here. Context-length resolution via
+//! `POST /api/show` (`resolve_context_length`) IS in scope: it lets eval
+//! runners probe a model's advertised context window before constructing a
+//! backend, so the window is set from the model's own metadata rather than a
+//! hardcoded fallback.
+//!
+//! Note: a non-localhost, non-cloud Ollama daemon (e.g. `http://jason-desktop:11434`,
+//! a LAN address) is neither matched by `is_local` nor probed by the eval
+//! runners — it receives no `num_ctx` and therefore inherits Ollama's own low
+//! default (documented as 2048 with silent oldest-message dropping). Setting
+//! `OLLAMA_NUM_CTX` is the operator's remedy for that topology.
 //!
 //! ## One adapter, local + cloud
 //!
@@ -206,6 +216,208 @@ impl ModelBackend for OllamaBackend {
 
         Ok(map_response(parsed))
     }
+}
+
+// ============================================================================
+// Context-length resolution via /api/show
+// ============================================================================
+
+/// Timeout for the `POST /api/show` probe.
+///
+/// A hung daemon must not wedge eval startup; `reqwest` 0.12 has NO default
+/// request timeout. `OllamaBackend::new` uses a bare `Client::new()` — that is
+/// deliberately not copied here.
+const SHOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The result of a successful [`resolve_context_length`] call.
+///
+/// Carries provenance (not a bare `u32`) so a wrong-key resolution is
+/// detectable after the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedContextLength {
+    /// The advertised context length.
+    pub value: u32,
+    /// The literal string read from `model_info["general.architecture"]`.
+    pub architecture: String,
+    /// The literal key that was looked up: `"{architecture}.context_length"`.
+    pub key: String,
+}
+
+/// Error returned by [`resolve_context_length`] when the probe fails.
+#[derive(Debug, thiserror::Error)]
+#[error("could not resolve context length for model `{model}` from {url}: {kind}")]
+pub struct ContextLengthError {
+    pub model: String,
+    pub url: String,
+    pub kind: ContextLengthErrorKind,
+}
+
+/// The specific failure reason within a [`ContextLengthError`].
+#[derive(Debug, thiserror::Error)]
+pub enum ContextLengthErrorKind {
+    /// The HTTP request itself failed (connect refused, DNS, timeout, etc.).
+    /// Carries `reqwest::Error::to_string()` — never a hand-written string.
+    #[error("transport failure: {0}")]
+    Transport(String),
+    /// The daemon replied with a non-2xx status.
+    /// `body` is the verbatim response body text, un-parsed.
+    #[error("HTTP {status}: {body}")]
+    Status { status: u16, body: String },
+    /// The response was 200 but its payload did not have the expected shape.
+    /// The message names the failing JSON path.
+    #[error("malformed /api/show payload: {0}")]
+    Malformed(String),
+}
+
+/// Resolve the advertised context length for `model` from the Ollama daemon at
+/// `base_url` by querying `POST /api/show`.
+///
+/// Resolution path:
+/// 1. Parse the 200 body as JSON.
+/// 2. Take the object at `model_info`.
+/// 3. Read `model_info["general.architecture"]` as string `arch`.
+/// 4. Read `model_info["{arch}.context_length"]` and convert to `u32`.
+///
+/// There is NO fallback scan over `model_info` for any key ending in
+/// `.context_length` — real payloads contain decoy keys
+/// (e.g. `gptoss.rope.scaling.original_context_length`) that would produce
+/// wrong values.
+///
+/// The returned value also arms the pre-flight guard via `with_num_ctx`
+/// (see `OllamaBackend::with_num_ctx`), so a small advertised window converts
+/// silent truncation into a hard `BackendError::ContextLengthExceeded` — loud
+/// by design.
+///
+/// # Errors
+///
+/// Returns [`ContextLengthError`] on any of:
+/// - transport failure (connect refused, DNS, timeout)
+/// - non-2xx HTTP status
+/// - malformed payload (missing/wrong-typed fields)
+/// - zero context length
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let r = harness::ollama::resolve_context_length(
+///     "http://localhost:11434",
+///     "qwen3.6:35b",
+///     None,
+/// ).await?;
+/// println!("num_ctx={} (arch={} key={})", r.value, r.architecture, r.key);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn resolve_context_length(
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<ResolvedContextLength, ContextLengthError> {
+    let url = format!("{}/api/show", base_url.trim_end_matches('/'));
+
+    // Convenience closure — builds an error with the same model/url context.
+    let mk_err = |kind| ContextLengthError {
+        model: model.to_string(),
+        url: url.clone(),
+        kind,
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(SHOW_TIMEOUT)
+        .build()
+        .map_err(|e| mk_err(ContextLengthErrorKind::Transport(e.to_string())))?;
+
+    let mut builder = client.post(&url).json(&serde_json::json!({"model": model}));
+    if let Some(key) = api_key {
+        builder = builder.header("authorization", format!("Bearer {key}"));
+    }
+
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| mk_err(ContextLengthErrorKind::Transport(e.to_string())))?;
+
+    let status = response.status();
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| mk_err(ContextLengthErrorKind::Transport(e.to_string())))?;
+
+    if !status.is_success() {
+        return Err(mk_err(ContextLengthErrorKind::Status {
+            status: status.as_u16(),
+            body: body_text,
+        }));
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&body_text).map_err(|_| {
+        mk_err(ContextLengthErrorKind::Malformed(
+            "body not JSON".to_string(),
+        ))
+    })?;
+
+    let model_info = payload.get("model_info").ok_or_else(|| {
+        mk_err(ContextLengthErrorKind::Malformed(
+            "model_info missing".to_string(),
+        ))
+    })?;
+
+    let model_info = model_info.as_object().ok_or_else(|| {
+        mk_err(ContextLengthErrorKind::Malformed(
+            "model_info not an object".to_string(),
+        ))
+    })?;
+
+    let arch_val = model_info.get("general.architecture").ok_or_else(|| {
+        mk_err(ContextLengthErrorKind::Malformed(
+            "model_info.general.architecture missing".to_string(),
+        ))
+    })?;
+
+    let arch = arch_val.as_str().ok_or_else(|| {
+        mk_err(ContextLengthErrorKind::Malformed(
+            "model_info.general.architecture not a string".to_string(),
+        ))
+    })?;
+
+    let ctx_key = format!("{arch}.context_length");
+
+    let ctx_val = model_info.get(&ctx_key).ok_or_else(|| {
+        mk_err(ContextLengthErrorKind::Malformed(format!(
+            "model_info.{ctx_key} missing"
+        )))
+    })?;
+
+    let value = match ctx_val {
+        serde_json::Value::Number(n) => {
+            let u = n.as_u64().ok_or_else(|| {
+                mk_err(ContextLengthErrorKind::Malformed(format!(
+                    "model_info.{ctx_key} not a u32"
+                )))
+            })?;
+            u32::try_from(u).map_err(|_| {
+                mk_err(ContextLengthErrorKind::Malformed(format!(
+                    "model_info.{ctx_key} not a u32"
+                )))
+            })?
+        }
+        _ => {
+            return Err(mk_err(ContextLengthErrorKind::Malformed(format!(
+                "model_info.{ctx_key} not a u32"
+            ))));
+        }
+    };
+
+    if value == 0 {
+        return Err(mk_err(ContextLengthErrorKind::Malformed(format!(
+            "model_info.{ctx_key} is zero"
+        ))));
+    }
+
+    Ok(ResolvedContextLength {
+        value,
+        architecture: arch.to_string(),
+        key: ctx_key,
+    })
 }
 
 // ============================================================================
@@ -1513,5 +1725,431 @@ mod tests {
         let req = simple_req(&messages, &tools, &p);
         let turn = backend.turn(&req).await.expect("turn ok");
         assert_eq!(turn.text(), "ok");
+    }
+
+    // ---- (h) context-length resolution ------------------------------------
+
+    use super::{ContextLengthErrorKind, resolve_context_length};
+
+    /// Mount a successful `/api/show` response with the given `model_info` payload.
+    async fn mount_show(server: &MockServer, model_info: Value) {
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(json!({"model_info": model_info}).to_string()),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a `/api/show` response that returns the given status and body.
+    async fn mount_show_error(server: &MockServer, status: u16, body: &str) {
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a `/api/show` response with a raw body (for testing non-JSON bodies).
+    async fn mount_show_raw(server: &MockServer, body: &str) {
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    // Request path is /api/show, method is POST, body equals {"model":"qwen3.6:35b"}.
+    #[tokio::test]
+    async fn show_request_shape_is_correct() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({"general.architecture": "qwen35moe", "qwen35moe.context_length": 262_144_u32}),
+        )
+        .await;
+
+        resolve_context_length(&server.uri(), "qwen3.6:35b", None)
+            .await
+            .expect("resolve ok");
+
+        let received = server.received_requests().await.expect("requests captured");
+        assert_eq!(received.len(), 1);
+        let r: &Request = &received[0];
+        assert_eq!(r.method.as_str(), "POST");
+        assert_eq!(r.url.path(), "/api/show");
+        let parsed: Value = serde_json::from_slice(&r.body).expect("json body");
+        assert_eq!(parsed, json!({"model": "qwen3.6:35b"}));
+    }
+
+    // Bearer header present when api_key is Some.
+    #[tokio::test]
+    async fn show_bearer_present_when_api_key_set() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({"general.architecture": "qwen35moe", "qwen35moe.context_length": 262_144_u32}),
+        )
+        .await;
+
+        resolve_context_length(&server.uri(), "qwen3.6:35b", Some("sk-test"))
+            .await
+            .expect("resolve ok");
+
+        let received = server.received_requests().await.expect("requests captured");
+        assert_eq!(received.len(), 1);
+        let r: &Request = &received[0];
+        assert_eq!(
+            r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+    }
+
+    // No authorization header when api_key is None.
+    #[tokio::test]
+    async fn show_no_bearer_when_no_api_key() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({"general.architecture": "qwen35moe", "qwen35moe.context_length": 262_144_u32}),
+        )
+        .await;
+
+        resolve_context_length(&server.uri(), "qwen3.6:35b", None)
+            .await
+            .expect("resolve ok");
+
+        let received = server.received_requests().await.expect("requests captured");
+        let r: &Request = &received[0];
+        assert!(
+            r.headers.get("authorization").is_none(),
+            "no api key => no Authorization header"
+        );
+    }
+
+    // Pinned decoy regression: gpt-oss shape. The decoy key
+    // gptoss.rope.scaling.original_context_length must NOT be returned.
+    #[tokio::test]
+    async fn show_gptoss_decoy_regression() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({
+                "general.architecture": "gptoss",
+                "gptoss.context_length": 131_072_u32,
+                "gptoss.rope.scaling.original_context_length": 4096_u32
+            }),
+        )
+        .await;
+
+        let r = resolve_context_length(&server.uri(), "gpt-oss:20b", None)
+            .await
+            .expect("resolve ok");
+        assert_eq!(r.value, 131_072);
+        assert_eq!(r.architecture, "gptoss");
+        assert_eq!(r.key, "gptoss.context_length");
+    }
+
+    // Pinned qwen35moe shape.
+    #[tokio::test]
+    async fn show_qwen35moe_pinned() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({
+                "general.architecture": "qwen35moe",
+                "qwen35moe.context_length": 262_144_u32
+            }),
+        )
+        .await;
+
+        let r = resolve_context_length(&server.uri(), "qwen3.6:35b", None)
+            .await
+            .expect("resolve ok");
+        assert_eq!(r.value, 262_144);
+        assert_eq!(r.architecture, "qwen35moe");
+        assert_eq!(r.key, "qwen35moe.context_length");
+    }
+
+    // 404 from /api/show yields Status { status: 404 }, and Display contains
+    // the model id, url, and "404".
+    #[tokio::test]
+    async fn show_404_yields_status_error() {
+        let server = MockServer::start().await;
+        mount_show_error(&server, 404, r#"{"error":"model 'x' not found"}"#).await;
+
+        let err = resolve_context_length(&server.uri(), "x", None)
+            .await
+            .expect_err("must fail");
+        assert!(matches!(
+            err.kind,
+            ContextLengthErrorKind::Status { status: 404, .. }
+        ));
+        let display = err.to_string();
+        assert!(display.contains('x'), "should contain model id");
+        assert!(display.contains("404"), "should contain status code");
+        // url is in the error struct; to_string() goes through the #[error] format
+        assert!(display.contains(&server.uri()) || display.contains("api/show"));
+    }
+
+    // Unreachable endpoint yields Transport, never a panic.
+    #[tokio::test]
+    async fn show_unreachable_yields_transport_error() {
+        // Port 1 on localhost requires root and will always be refused —
+        // the canonical closed-port trick (mirrors existing
+        // `connect_refused_maps_to_transient_network`).
+        let err = resolve_context_length("http://127.0.0.1:1", "model", None)
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(err.kind, ContextLengthErrorKind::Transport(_)),
+            "expected Transport, got {:?}",
+            err.kind
+        );
+    }
+
+    // (a) 200 body that is not JSON.
+    #[tokio::test]
+    async fn show_malformed_not_json() {
+        let server = MockServer::start().await;
+        mount_show_raw(&server, "not json at all").await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(msg.contains("body not JSON"), "got: {msg}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (b) JSON with no model_info key.
+    #[tokio::test]
+    async fn show_malformed_no_model_info() {
+        let server = MockServer::start().await;
+        mount_show_raw(&server, r#"{"other_field": 1}"#).await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(msg.contains("model_info missing"), "got: {msg}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (c) model_info present but not an object.
+    #[tokio::test]
+    async fn show_malformed_model_info_not_object() {
+        let server = MockServer::start().await;
+        mount_show_raw(&server, r#"{"model_info": []}"#).await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(msg.contains("model_info not an object"), "got: {msg}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (d) model_info object but no general.architecture.
+    #[tokio::test]
+    async fn show_malformed_no_general_architecture() {
+        let server = MockServer::start().await;
+        mount_show_raw(&server, r#"{"model_info": {"other.key": 1}}"#).await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.general.architecture missing"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (e) general.architecture present but not a string.
+    #[tokio::test]
+    async fn show_malformed_architecture_not_string() {
+        let server = MockServer::start().await;
+        mount_show_raw(&server, r#"{"model_info": {"general.architecture": 42}}"#).await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.general.architecture not a string"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (f) context_length key absent.
+    #[tokio::test]
+    async fn show_malformed_context_length_missing() {
+        let server = MockServer::start().await;
+        mount_show_raw(
+            &server,
+            r#"{"model_info": {"general.architecture": "myarch"}}"#,
+        )
+        .await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.myarch.context_length missing"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (g) context_length is -1 (not representable as u32).
+    #[tokio::test]
+    async fn show_malformed_context_length_negative() {
+        let server = MockServer::start().await;
+        mount_show_raw(
+            &server,
+            r#"{"model_info": {"general.architecture": "myarch", "myarch.context_length": -1}}"#,
+        )
+        .await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.myarch.context_length not a u32"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (h) context_length is a string "262144" (not a number).
+    #[tokio::test]
+    async fn show_malformed_context_length_string() {
+        let server = MockServer::start().await;
+        mount_show_raw(
+            &server,
+            r#"{"model_info": {"general.architecture": "myarch", "myarch.context_length": "262144"}}"#,
+        )
+        .await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.myarch.context_length not a u32"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (i) context_length is 4294967296 (exceeds u32::MAX).
+    #[tokio::test]
+    async fn show_malformed_context_length_too_large() {
+        let server = MockServer::start().await;
+        mount_show_raw(
+            &server,
+            r#"{"model_info": {"general.architecture": "myarch", "myarch.context_length": 4294967296}}"#,
+        )
+        .await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.myarch.context_length not a u32"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // (j) context_length is 0 — Malformed, not Ok(0).
+    #[tokio::test]
+    async fn show_malformed_context_length_zero() {
+        let server = MockServer::start().await;
+        mount_show_raw(
+            &server,
+            r#"{"model_info": {"general.architecture": "myarch", "myarch.context_length": 0}}"#,
+        )
+        .await;
+        let err = resolve_context_length(&server.uri(), "m", None)
+            .await
+            .expect_err("must fail");
+        match &err.kind {
+            ContextLengthErrorKind::Malformed(msg) => {
+                assert!(
+                    msg.contains("model_info.myarch.context_length is zero"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // Trailing slash on base_url is tolerated — resolves against /api/show
+    // with a single slash.
+    #[tokio::test]
+    async fn show_trailing_slash_base_url_is_tolerated() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({
+                "general.architecture": "qwen35moe",
+                "qwen35moe.context_length": 262_144_u32
+            }),
+        )
+        .await;
+
+        let base_with_slash = format!("{}/", server.uri());
+        let r = resolve_context_length(&base_with_slash, "qwen3.6:35b", None)
+            .await
+            .expect("resolve ok");
+        assert_eq!(r.value, 262_144);
+    }
+
+    // Below-floor value (8192) is returned verbatim — no clamp.
+    #[tokio::test]
+    async fn show_below_floor_value_returned_verbatim() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({
+                "general.architecture": "qwen3",
+                "qwen3.context_length": 8192_u32
+            }),
+        )
+        .await;
+
+        let r = resolve_context_length(&server.uri(), "qwen3:1b", None)
+            .await
+            .expect("resolve ok");
+        assert_eq!(r.value, 8192);
+        assert_eq!(r.architecture, "qwen3");
+        assert_eq!(r.key, "qwen3.context_length");
     }
 }

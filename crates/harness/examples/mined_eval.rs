@@ -75,15 +75,16 @@ use harness::mined_eval::{
     TrialScore, load_statement, load_task,
 };
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
-use harness::ollama::{OllamaBackend, ThinkLevel};
+use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5";
 
-/// Default `num_ctx` for LOCALHOST Ollama runs when `OLLAMA_NUM_CTX` is unset.
-/// Same rationale as `coding_eval.rs` — local defaults are VRAM-tiered and
-/// overflow truncates silently, so an explicit value is mandatory hygiene.
-const DEFAULT_LOCAL_NUM_CTX: u32 = 32_768;
+/// Audit floor for the resolved `num_ctx`. This is NOT a default or fallback —
+/// it is never assigned to `num_ctx`. When the resolved value is below this
+/// threshold the runner emits a warning to stderr; the run proceeds with the
+/// verbatim advertised value.
+const MIN_EXPECTED_NUM_CTX: u32 = 32_768;
 
 /// Default trial count (`k`) when `MINED_EVAL_K` is not set.
 const DEFAULT_K: u32 = 3;
@@ -117,7 +118,9 @@ impl ModelBackend for Backend {
 /// `backend_from_env`. Extracting it to the lib would couple the harness
 /// library to eval-runner env names (which are pilot-scoped and may churn);
 /// leaving it duplicated in the two example runners keeps churn localised.
-fn backend_from_env() -> (Backend, String) {
+/// `num_ctx` resolution itself now lives in `harness::ollama` and is
+/// deliberately not duplicated — both runners call `resolve_context_length`.
+async fn backend_from_env() -> (Backend, String) {
     match env::var("EVAL_BACKEND").as_deref() {
         Ok("ollama") => {
             let model = env::var("OLLAMA_MODEL")
@@ -125,10 +128,54 @@ fn backend_from_env() -> (Backend, String) {
             let base_url =
                 env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
             let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
-            let num_ctx = env::var("OLLAMA_NUM_CTX")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .or(is_local.then_some(DEFAULT_LOCAL_NUM_CTX));
+
+            // OLLAMA_API_KEY is hoisted ABOVE num_ctx resolution so its value
+            // can be forwarded to the /api/show probe.
+            let api_key: Option<String> = env::var("OLLAMA_API_KEY").ok().filter(|s| !s.is_empty());
+
+            // Five-branch OLLAMA_NUM_CTX resolution:
+            // (0) set but empty/whitespace after trim → treated as unset (falls through to (3)/(4)).
+            //     Matches the file-local convention for MINED_EVAL_SPEC_LEVEL
+            //     (empty string treated as 'unset' — the shell's `VAR= cmd` idiom).
+            // (1) set, non-empty, parses as u32 → use it, no HTTP call.
+            // (2) set, non-empty, does NOT parse as u32 → panic! naming the var and raw value.
+            // (3) unset/empty AND is_local → probe /api/show; panic! on error (never fall back).
+            // (4) unset/empty AND NOT is_local → None (no probe; unchanged behavior).
+            let raw_num_ctx = env::var("OLLAMA_NUM_CTX").ok();
+            let (num_ctx, num_ctx_desc) = match raw_num_ctx.as_deref().map(str::trim) {
+                Some(trimmed) if !trimmed.is_empty() => {
+                    let n = trimmed.parse::<u32>().unwrap_or_else(|_| {
+                        panic!(
+                            "OLLAMA_NUM_CTX must be a valid u32, got `{}`",
+                            raw_num_ctx.as_deref().unwrap_or("")
+                        )
+                    });
+                    (Some(n), format!("num_ctx={n} (explicit OLLAMA_NUM_CTX)"))
+                }
+                _ if is_local => {
+                    let resolved = resolve_context_length(&base_url, &model, api_key.as_deref())
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    let v = resolved.value;
+                    let a = resolved.architecture;
+                    let k = resolved.key;
+                    if v < MIN_EXPECTED_NUM_CTX {
+                        eprintln!(
+                            "WARNING: resolved num_ctx={v} for `{model}` (arch={a}, key={k}) \
+                             is BELOW the {MIN_EXPECTED_NUM_CTX} sanity floor; trials may be \
+                             truncation-invalid — set OLLAMA_NUM_CTX to override"
+                        );
+                        (
+                            Some(v),
+                            format!("num_ctx={v} (resolved, BELOW-FLOOR: arch={a} key={k})"),
+                        )
+                    } else {
+                        (Some(v), format!("num_ctx={v} (resolved: arch={a} key={k})"))
+                    }
+                }
+                _ => (None, "num_ctx=default".to_string()),
+            };
+
             let think = env::var("OLLAMA_THINK").ok().map(|v| match v.as_str() {
                 "off" => ThinkLevel::Off,
                 "on" => ThinkLevel::On,
@@ -140,7 +187,7 @@ fn backend_from_env() -> (Backend, String) {
             });
 
             let mut backend = OllamaBackend::new(&model, &base_url);
-            if let Ok(key) = env::var("OLLAMA_API_KEY") {
+            if let Some(key) = api_key {
                 backend = backend.with_api_key(key);
             }
             if let Some(n) = num_ctx {
@@ -150,8 +197,7 @@ fn backend_from_env() -> (Backend, String) {
                 backend = backend.with_think(level);
             }
             let desc = format!(
-                "ollama `{model}` @ {base_url} (num_ctx={}, think={})",
-                num_ctx.map_or("default".into(), |n| n.to_string()),
+                "ollama `{model}` @ {base_url} ({num_ctx_desc}, think={})",
                 env::var("OLLAMA_THINK").unwrap_or_else(|_| "unset".into()),
             );
             (Backend::Ollama(backend), desc)
@@ -195,7 +241,7 @@ fn expand_home(raw: &str) -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let (backend, backend_desc) = backend_from_env();
+    let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("MINED_EVAL_K", DEFAULT_K);
     let max_iterations = env_u32("MINED_EVAL_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS);
     let spec_level = env::var("MINED_EVAL_SPEC_LEVEL")
