@@ -1032,6 +1032,60 @@ pub struct MinedTrialResult {
     /// Absolute path to the persisted raw re-gate stdout+stderr under
     /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
+    /// Whether finish-recovery was structurally armed for this trial: true iff
+    /// `run_checks` is in the registry AND `run_config.max_nudges > 0`. On the
+    /// tier-2 path today `single_trial` calls `standard_registry(None)`, which
+    /// omits `run_checks` when `checks.is_none()`, so this is always `false`
+    /// for tier-2 — meaning NOT-ARMED, not tried-and-failed. Computed at
+    /// runtime from `tools` and `run_config`; never hard-coded. Read this
+    /// field alongside `gates_green_at_exit` and `nudges_fired`.
+    pub finish_recovery_armed: bool,
+    /// Whether the last in-loop gate (`run_checks`) was GREEN at the terminal.
+    /// Constant on the tier-2 path today: `single_trial` builds the registry
+    /// as `standard_registry(None)` (`mined_eval.rs:1313`), and
+    /// `standard_registry` registers `run_checks` only when `checks.is_some()`
+    /// (`crates/harness/src/tools/mod.rs:45-47`, pinned by the test
+    /// `registers_all_v1_tools_without_checks` at `tools/mod.rs:82-98`).
+    /// Because `last_gate_green` is set true ONLY by a `run_checks` result
+    /// (`crates/harness/src/engine.rs:1358-1359`), both finish-recovery guards
+    /// (engine.rs:1183, engine.rs:1430) are structurally unreachable in tier-2
+    /// — so `false` here means NOT-ARMED, not tried-and-failed. Read
+    /// `finish_recovery_armed` alongside this value. `mutating_iters`,
+    /// `bash_calls_ok`, `edit_file_calls_ok`, `iters_since_tree_change_at_exit`
+    /// and `peak_iters_since_tree_change` are the columns that actually vary.
+    pub gates_green_at_exit: bool,
+    /// Finish-recovery nudges injected this trial. Constant on the tier-2
+    /// path today: `single_trial` builds the registry as
+    /// `standard_registry(None)` (`mined_eval.rs:1313`), and
+    /// `standard_registry` registers `run_checks` only when `checks.is_some()`
+    /// (`crates/harness/src/tools/mod.rs:45-47`, pinned by the test
+    /// `registers_all_v1_tools_without_checks` at `tools/mod.rs:82-98`).
+    /// Because `last_gate_green` is set true ONLY by a `run_checks` result
+    /// (`crates/harness/src/engine.rs:1358-1359`), both finish-recovery guards
+    /// (engine.rs:1183, engine.rs:1430) are structurally unreachable in tier-2
+    /// — so `0` here means NOT-ARMED, not tried-and-failed. Read
+    /// `finish_recovery_armed` alongside this value. `mutating_iters`,
+    /// `bash_calls_ok`, `edit_file_calls_ok`, `iters_since_tree_change_at_exit`
+    /// and `peak_iters_since_tree_change` are the columns that actually vary.
+    pub nudges_fired: u32,
+    /// Whether any successful `edit_file` or `bash` call ran this trial
+    /// (latched, never cleared). From [`crate::engine::RunStats::tree_dirty`].
+    pub tree_dirty: bool,
+    /// Consecutive-non-mutating-iteration counter value at the terminal.
+    /// From [`crate::engine::RunStats::iters_since_tree_change_at_exit`].
+    pub iters_since_tree_change_at_exit: u32,
+    /// Peak value the consecutive-non-mutating-iteration counter reached.
+    /// From [`crate::engine::RunStats::peak_iters_since_tree_change`].
+    pub peak_iters_since_tree_change: u32,
+    /// Count of loop iterations classified as mutating.
+    /// From [`crate::engine::RunStats::mutating_iters`].
+    pub mutating_iters: u32,
+    /// Count of successful (`!is_error`) `bash` tool calls this trial.
+    /// From [`crate::engine::RunStats::bash_calls_ok`].
+    pub bash_calls_ok: u32,
+    /// Count of successful (`!is_error`) `edit_file` tool calls this trial.
+    /// From [`crate::engine::RunStats::edit_file_calls_ok`].
+    pub edit_file_calls_ok: u32,
 }
 
 /// The full run report over `k` trials of one task.
@@ -1089,6 +1143,36 @@ impl MinedReport {
             return 0.0;
         }
         f64::from(self.resolved_count) / f64::from(denom)
+    }
+
+    /// Trials where the last in-loop gate was GREEN at exit and the agent did
+    /// NOT claim Done. EVERY non-Done label counts — `Blocked`, `Failed`,
+    /// `MaxIterations`, `StoppedWithoutFinish`, `BudgetExhausted`,
+    /// `BackendError`, `NotRun` (see `claimed_disposition_label`,
+    /// `mined_eval.rs:1105`). Expected to read 0 for every tier-2 report until
+    /// the tier-2 path registers a `run_checks` tool — see
+    /// `MinedTrialResult::gates_green_at_exit`.
+    #[must_use]
+    pub fn post_green_stops(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| t.gates_green_at_exit && t.claimed_disposition != CLAIMED_DONE)
+            .map(|_| 1u32)
+            .sum()
+    }
+
+    /// Trials the sealed re-gate scored `Resolved` where the agent did NOT
+    /// claim Done — the finish-discipline gap. `Invalid` and `Unresolved`
+    /// trials are never `Resolved`, so they never count.
+    #[must_use]
+    pub fn resolved_unclaimed(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| {
+                matches!(t.score, TrialScore::Resolved) && t.claimed_disposition != CLAIMED_DONE
+            })
+            .map(|_| 1u32)
+            .sum()
     }
 }
 
@@ -1331,6 +1415,7 @@ async fn single_trial<B: ModelBackend>(
     // Worktrees drop here (after re-gate has read the workspace).
     drop(worktrees);
 
+    let finish_recovery_armed = tools.get("run_checks").is_some() && run_config.max_nudges > 0;
     MinedTrialResult {
         trial,
         score,
@@ -1341,6 +1426,15 @@ async fn single_trial<B: ModelBackend>(
         claimed_disposition: claimed,
         statuses,
         gate_output_path,
+        finish_recovery_armed,
+        gates_green_at_exit: stats.gates_green_at_exit,
+        nudges_fired: stats.nudges_fired,
+        tree_dirty: stats.tree_dirty,
+        iters_since_tree_change_at_exit: stats.iters_since_tree_change_at_exit,
+        peak_iters_since_tree_change: stats.peak_iters_since_tree_change,
+        mutating_iters: stats.mutating_iters,
+        bash_calls_ok: stats.bash_calls_ok,
+        edit_file_calls_ok: stats.edit_file_calls_ok,
     }
 }
 
@@ -1364,6 +1458,15 @@ fn invalid_trial(
         claimed_disposition: "NotRun".to_string(),
         statuses: BTreeMap::new(),
         gate_output_path,
+        finish_recovery_armed: false,
+        gates_green_at_exit: false,
+        nudges_fired: 0,
+        tree_dirty: false,
+        iters_since_tree_change_at_exit: 0,
+        peak_iters_since_tree_change: 0,
+        mutating_iters: 0,
+        bash_calls_ok: 0,
+        edit_file_calls_ok: 0,
     }
 }
 
@@ -1402,9 +1505,9 @@ impl Drop for ScratchDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLAIMED_DONE, MinedReport, MinedTask, MinedTrialResult, PytestParser, ResolveDetail,
-        ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus, TrialScore,
-        claimed_disposition_label, copy_sealed, expand_home, load_statement, load_task,
+        CLAIMED_BLOCKED, CLAIMED_DONE, MinedReport, MinedTask, MinedTrialResult, PytestParser,
+        ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
+        TrialScore, claimed_disposition_label, copy_sealed, expand_home, load_statement, load_task,
         match_task_id, matches_exclusion, normalize, parse_pytest_summary_totals,
         parse_short_summary_line, prepare_worktrees, resolve, run_env_setup, sanitize_for_filename,
         strip_param_suffix,
@@ -2309,7 +2412,13 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         );
     }
 
-    fn trial(idx: u32, score: TrialScore, claimed: &str) -> MinedTrialResult {
+    fn trial_tel(
+        idx: u32,
+        score: TrialScore,
+        claimed: &str,
+        green: bool,
+        nudges: u32,
+    ) -> MinedTrialResult {
         MinedTrialResult {
             trial: idx,
             score,
@@ -2320,7 +2429,111 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             claimed_disposition: claimed.to_string(),
             statuses: BTreeMap::new(),
             gate_output_path: PathBuf::from("/dev/null"),
+            finish_recovery_armed: false,
+            gates_green_at_exit: green,
+            nudges_fired: nudges,
+            tree_dirty: false,
+            iters_since_tree_change_at_exit: 0,
+            peak_iters_since_tree_change: 0,
+            mutating_iters: 0,
+            bash_calls_ok: 0,
+            edit_file_calls_ok: 0,
         }
+    }
+
+    fn trial(idx: u32, score: TrialScore, claimed: &str) -> MinedTrialResult {
+        trial_tel(idx, score, claimed, false, 0)
+    }
+
+    #[test]
+    fn post_green_stops_counts_green_exit_non_done() {
+        let unresolved = || TrialScore::Unresolved {
+            reason: ResolveDetail {
+                fail_to_pass_status: Vec::new(),
+                unexcluded_red: Vec::new(),
+                missing_fail_to_pass: vec!["x".to_string()],
+            },
+        };
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 4,
+            resolved_count: 1,
+            invalid_count: 0,
+            trials: vec![
+                trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, true, 0),
+                trial_tel(1, TrialScore::Resolved, "MaxIterations", true, 0),
+                trial_tel(2, unresolved(), CLAIMED_BLOCKED, true, 0),
+                trial_tel(3, TrialScore::Resolved, "MaxIterations", false, 0),
+            ],
+        };
+        assert_eq!(report.post_green_stops(), 2);
+
+        let report2 = MinedReport {
+            task_id: "t2".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 2,
+            resolved_count: 0,
+            invalid_count: 0,
+            trials: vec![
+                trial_tel(0, TrialScore::Resolved, "MaxIterations", false, 0),
+                trial_tel(1, unresolved(), CLAIMED_DONE, false, 0),
+            ],
+        };
+        assert_eq!(report2.post_green_stops(), 0);
+    }
+
+    #[test]
+    fn resolved_unclaimed_counts_resolved_non_done() {
+        let unresolved = || TrialScore::Unresolved {
+            reason: ResolveDetail {
+                fail_to_pass_status: Vec::new(),
+                unexcluded_red: Vec::new(),
+                missing_fail_to_pass: vec!["x".to_string()],
+            },
+        };
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 5,
+            resolved_count: 3,
+            invalid_count: 1,
+            trials: vec![
+                trial(0, TrialScore::Resolved, CLAIMED_DONE),
+                trial(1, TrialScore::Resolved, "MaxIterations"),
+                trial(2, TrialScore::Resolved, CLAIMED_BLOCKED),
+                trial(3, unresolved(), "MaxIterations"),
+                trial(
+                    4,
+                    TrialScore::Invalid {
+                        reason: "setup-failed".to_string(),
+                    },
+                    "NotRun",
+                ),
+            ],
+        };
+        assert_eq!(report.resolved_unclaimed(), 2);
+
+        let report2 = MinedReport {
+            task_id: "t2".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 2,
+            resolved_count: 2,
+            invalid_count: 0,
+            trials: vec![
+                trial(0, TrialScore::Resolved, CLAIMED_DONE),
+                trial(1, TrialScore::Resolved, CLAIMED_DONE),
+            ],
+        };
+        assert_eq!(report2.resolved_unclaimed(), 0);
     }
 
     #[test]
@@ -2696,6 +2909,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         // Header aggregates:
         assert_eq!(report.valid_denominator(), k);
         assert!((report.resolved_rate() - 1.0).abs() < f64::EPSILON);
+        assert!(
+            !report.trials[0].finish_recovery_armed,
+            "tier-2 registers no run_checks — see standard_registry(None) at single_trial"
+        );
     }
 
     #[tokio::test]

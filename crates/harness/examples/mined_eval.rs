@@ -313,13 +313,27 @@ async fn main() {
             max_iterations,
         };
         let mut on_trial = |trial: &MinedTrialResult| {
+            // On a tier-2 run today fr_armed is expected false, green_at_exit
+            // false, and nudges 0 on EVERY trial (correct behaviour, not a
+            // wiring bug — see the doc-comments on MinedTrialResult::gates_green_at_exit
+            // and MinedTrialResult::nudges_fired). The discriminating columns
+            // are mut_iters, bash_ok, edits_ok, static_iters, and peak_static.
             println!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
                 trial.iterations,
                 trial.wall.as_secs(),
+                trial.finish_recovery_armed,
+                trial.gates_green_at_exit,
+                trial.nudges_fired,
+                trial.tree_dirty,
+                trial.iters_since_tree_change_at_exit,
+                trial.peak_iters_since_tree_change,
+                trial.mutating_iters,
+                trial.bash_calls_ok,
+                trial.edit_file_calls_ok,
                 trial.gate_output_path.display(),
             );
         };
@@ -384,11 +398,23 @@ fn print_summary(
         .max("task".len());
 
     println!(
-        "\n=== SUMMARY (backend={backend_desc}, spec_level={spec_level:?}, max_iterations={max_iterations}, k={k}) ==="
+        "\n=== SUMMARY (backend={backend_desc}, spec_level={spec_level:?}, max_iterations={max_iterations}, k={k}, static_tree_k={}, max_nudges={}) ===",
+        harness::engine::DEFAULT_STATIC_TREE_K,
+        harness::engine::DEFAULT_MAX_NUDGES,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}",
-        "task", "resolved/val", "res_rate", "invalid", "false_dn", "claimed_D", "mean_iter",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "task",
+        "resolved/val",
+        "res_rate",
+        "invalid",
+        "false_dn",
+        "grn_stop",
+        "res_unclm",
+        "mut_rate",
+        "peak_stat",
+        "claimed_D",
+        "mean_iter",
     );
     for r in summary {
         let claimed_done: u32 = r
@@ -406,13 +432,33 @@ fn print_summary(
             let sum: u64 = r.trials.iter().map(|t| u64::from(t.iterations)).sum();
             sum as f64 / r.trials.len() as f64
         };
+        #[allow(clippy::cast_precision_loss)]
+        let mut_rate = {
+            let iter_sum: u64 = r.trials.iter().map(|t| u64::from(t.iterations)).sum();
+            let mut_sum: u64 = r.trials.iter().map(|t| u64::from(t.mutating_iters)).sum();
+            if iter_sum == 0 {
+                0.0_f64
+            } else {
+                mut_sum as f64 / iter_sum as f64
+            }
+        };
+        let peak_stat: u32 = r
+            .trials
+            .iter()
+            .map(|t| t.peak_iters_since_tree_change)
+            .max()
+            .unwrap_or(0);
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9.2}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9.2}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
             r.invalid_count,
             r.false_dones(),
+            r.post_green_stops(),
+            r.resolved_unclaimed(),
+            mut_rate,
+            peak_stat,
             claimed_done,
             mean_iter,
         );

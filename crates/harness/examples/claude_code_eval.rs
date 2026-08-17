@@ -494,6 +494,15 @@ async fn main() {
                 gates_green_at_exit: false,
                 cache_read_tokens,
                 cache_write_tokens,
+                // CC exposes no in-loop nudge, tree-mutation, or
+                // tool-classification state — all counters default to zero.
+                nudges_fired: 0,
+                tree_dirty: false,
+                iters_since_tree_change_at_exit: 0,
+                peak_iters_since_tree_change: 0,
+                mutating_iters: 0,
+                bash_calls_ok: 0,
+                edit_file_calls_ok: 0,
             };
 
             let trial = TrialResult {

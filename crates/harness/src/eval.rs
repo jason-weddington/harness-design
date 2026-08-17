@@ -1201,6 +1201,13 @@ mod tests {
                 gates_green_at_exit: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                nudges_fired: 0,
+                tree_dirty: false,
+                iters_since_tree_change_at_exit: 0,
+                peak_iters_since_tree_change: 0,
+                mutating_iters: 0,
+                bash_calls_ok: 0,
+                edit_file_calls_ok: 0,
             },
         };
         let printed = format!("{t:?}");
@@ -1667,6 +1674,13 @@ mod tests {
                 gates_green_at_exit: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                nudges_fired: 0,
+                tree_dirty: false,
+                iters_since_tree_change_at_exit: 0,
+                peak_iters_since_tree_change: 0,
+                mutating_iters: 0,
+                bash_calls_ok: 0,
+                edit_file_calls_ok: 0,
             },
         };
         let report = EvalReport {

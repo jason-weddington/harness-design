@@ -469,6 +469,36 @@ impl FinishClaim {
 ///   "raw input"), NOT `input_tokens` alone.
 /// - `wall_clock`: measured across the whole [`run`] call — from just before
 ///   the loop starts to just after it returns.
+/// - `nudges_fired`: finish-recovery nudges injected this loop invocation.
+///   Counted since THIS loop invocation — a resumed run starts from zero;
+///   pre-crash values live in `RunRecord::recovery_facts`.
+/// - `tree_dirty`: a LATCH set by the first successful `edit_file`/`bash`
+///   and NEVER cleared for the rest of the run. Counted since THIS loop
+///   invocation — a resumed run starts from zero; pre-crash values live in
+///   `RunRecord::recovery_facts`.
+/// - `iters_since_tree_change_at_exit`: the consecutive-non-mutating-iteration
+///   counter's value at the terminal. On the `Finished` terminal
+///   (engine.rs:1414) reflects state as of the END of the PREVIOUS iteration,
+///   because that return precedes the counter-update block at
+///   engine.rs:1420-1424. Counted since THIS loop invocation — a resumed run
+///   starts from zero; pre-crash values live in `RunRecord::recovery_facts`.
+/// - `peak_iters_since_tree_change`: the maximum that the
+///   consecutive-non-mutating-iteration counter EVER reached during the run.
+///   On the `Finished` terminal (engine.rs:1414) reflects state as of the END
+///   of the PREVIOUS iteration, because that return precedes the
+///   counter-update block at engine.rs:1420-1424. Counted since THIS loop
+///   invocation — a resumed run starts from zero; pre-crash values live in
+///   `RunRecord::recovery_facts`.
+/// - `mutating_iters`: count of loop iterations whose end-of-iteration
+///   classification was mutating. On the `Finished` terminal (engine.rs:1414)
+///   reflects state as of the END of the PREVIOUS iteration, because that
+///   return precedes the counter-update block at engine.rs:1420-1424. Counted
+///   since THIS loop invocation — a resumed run starts from zero; pre-crash
+///   values live in `RunRecord::recovery_facts`.
+/// - `bash_calls_ok` / `edit_file_calls_ok`: count of individual SUCCESSFUL
+///   (`!is_error`) `bash` / `edit_file` tool calls. Counted since THIS loop
+///   invocation — a resumed run starts from zero; pre-crash values live in
+///   `RunRecord::recovery_facts`.
 ///
 /// Deliberately NOT `serde`: persistence wiring
 /// (into [`crate::run_record`]) is a later milestone; this type is the
@@ -505,6 +535,51 @@ pub struct RunStats {
     /// telemetry: an error-propagation (`?`) exit reports the last observed
     /// value.
     pub gates_green_at_exit: bool,
+    /// Finish-recovery nudges injected this loop invocation. Counted since
+    /// THIS loop invocation — a resumed run (`resume`, engine.rs:1808) starts
+    /// from zero; pre-crash values live in `RunRecord::recovery_facts`
+    /// (`crates/harness/src/run_record.rs`).
+    pub nudges_fired: u32,
+    /// A LATCH set by the first successful `edit_file`/`bash`
+    /// (engine.rs:1362) and NEVER cleared for the rest of the run. Counted
+    /// since THIS loop invocation — a resumed run (`resume`, engine.rs:1808)
+    /// starts from zero; pre-crash values live in `RunRecord::recovery_facts`
+    /// (`crates/harness/src/run_record.rs`).
+    pub tree_dirty: bool,
+    /// The consecutive-non-mutating-iteration counter's value at the
+    /// terminal. On the `Finished` terminal (engine.rs:1414) this value
+    /// reflects state as of the END of the PREVIOUS iteration, because that
+    /// return precedes the counter-update block at engine.rs:1420-1424.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero; pre-crash values live in
+    /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
+    pub iters_since_tree_change_at_exit: u32,
+    /// The maximum that the consecutive-non-mutating-iteration counter EVER
+    /// reached during the run. On the `Finished` terminal (engine.rs:1414)
+    /// this value reflects state as of the END of the PREVIOUS iteration,
+    /// because that return precedes the counter-update block at
+    /// engine.rs:1420-1424. Counted since THIS loop invocation — a resumed
+    /// run (`resume`, engine.rs:1808) starts from zero; pre-crash values live
+    /// in `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
+    pub peak_iters_since_tree_change: u32,
+    /// Count of loop iterations whose end-of-iteration classification was
+    /// mutating. On the `Finished` terminal (engine.rs:1414) this value
+    /// reflects state as of the END of the PREVIOUS iteration, because that
+    /// return precedes the counter-update block at engine.rs:1420-1424.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero; pre-crash values live in
+    /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
+    pub mutating_iters: u32,
+    /// Count of individual SUCCESSFUL (`!is_error`) `bash` tool calls.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero; pre-crash values live in
+    /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
+    pub bash_calls_ok: u32,
+    /// Count of individual SUCCESSFUL (`!is_error`) `edit_file` tool calls.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero; pre-crash values live in
+    /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
+    pub edit_file_calls_ok: u32,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -828,6 +903,13 @@ pub async fn run(
         gates_green_at_exit: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        nudges_fired: 0,
+        tree_dirty: false,
+        iters_since_tree_change_at_exit: 0,
+        peak_iters_since_tree_change: 0,
+        mutating_iters: 0,
+        bash_calls_ok: 0,
+        edit_file_calls_ok: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -887,6 +969,13 @@ pub async fn run_persisted(
         gates_green_at_exit: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        nudges_fired: 0,
+        tree_dirty: false,
+        iters_since_tree_change_at_exit: 0,
+        peak_iters_since_tree_change: 0,
+        mutating_iters: 0,
+        bash_calls_ok: 0,
+        edit_file_calls_ok: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1211,6 +1300,7 @@ async fn run_loop_impl(
                         content: vec![UserBlock::Text(prompt::render_nudge_prompt())],
                     });
                     nudges_fired += 1;
+                    stats.nudges_fired += 1;
                     nudge_awaiting_status = true;
                     continue;
                 }
@@ -1361,6 +1451,11 @@ async fn run_loop_impl(
                     mutated_this_iter = true;
                     tree_dirty = true;
                     last_gate_green = false;
+                    if call.name == "bash" {
+                        stats.bash_calls_ok += 1;
+                    } else {
+                        stats.edit_file_calls_ok += 1;
+                    }
                 }
             }
         }
@@ -1374,6 +1469,7 @@ async fn run_loop_impl(
         // (top of the NEXT iteration) correctly reads the prior iteration's
         // value, since a turn with no calls cannot change the gate.
         stats.gates_green_at_exit = last_gate_green;
+        stats.tree_dirty = tree_dirty;
 
         // Nudge-status telemetry: this turn followed a nudge iff
         // `nudge_awaiting_status` was set. If the turn produced an accepted
@@ -1419,9 +1515,17 @@ async fn run_loop_impl(
         // per-iteration tick collide.
         if mutated_this_iter {
             iters_since_tree_change = 0;
+            stats.mutating_iters += 1;
         } else {
             iters_since_tree_change += 1;
         }
+        stats.iters_since_tree_change_at_exit = iters_since_tree_change;
+        // Peak update BEFORE the trip check: the green-static trip resets the
+        // counter to 0 at engine.rs:1451, so a peak update placed after the
+        // trip would silently under-report.
+        stats.peak_iters_since_tree_change = stats
+            .peak_iters_since_tree_change
+            .max(iters_since_tree_change);
 
         // Detection / high-precision trip — evaluated after the counter
         // update, only when finish-recovery is enabled (`max_nudges > 0`).
@@ -1445,6 +1549,7 @@ async fn run_loop_impl(
                     content.push(UserBlock::Text(nudge_text));
                 }
                 nudges_fired += 1;
+                stats.nudges_fired += 1;
                 nudge_awaiting_status = true;
                 // Reset so K static iterations must re-accumulate before the
                 // next trip.
@@ -1823,6 +1928,13 @@ pub async fn resume(
         gates_green_at_exit: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        nudges_fired: 0,
+        tree_dirty: false,
+        iters_since_tree_change_at_exit: 0,
+        peak_iters_since_tree_change: 0,
+        mutating_iters: 0,
+        bash_calls_ok: 0,
+        edit_file_calls_ok: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -3009,13 +3121,28 @@ mod tests {
             gates_green_at_exit: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            nudges_fired: 0,
+            tree_dirty: false,
+            iters_since_tree_change_at_exit: 0,
+            peak_iters_since_tree_change: 0,
+            mutating_iters: 0,
+            bash_calls_ok: 0,
+            edit_file_calls_ok: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
         let b = a.clone();
         assert_eq!(a, b);
-        let c = RunStats { iterations: 4, ..b };
+        let c = RunStats {
+            iterations: 4,
+            ..b.clone()
+        };
         assert_ne!(a, c);
+        let d = RunStats {
+            nudges_fired: 1,
+            ..b.clone()
+        };
+        assert_ne!(a, d);
     }
 
     #[tokio::test]
@@ -5935,7 +6062,7 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
@@ -5944,6 +6071,18 @@ mod tests {
         assert!(
             matches!(outcome, LoopOutcome::MaxIterations),
             "one-nudge spin should hit MaxIterations, not the recovery terminal; got {outcome:?}"
+        );
+        assert_eq!(stats.nudges_fired, 1, "exactly one nudge fired");
+        assert!(
+            !stats.tree_dirty,
+            "no edit_file/bash ran — tree_dirty must be false"
+        );
+        assert_eq!(stats.mutating_iters, 0, "no mutating iterations");
+        assert_eq!(stats.bash_calls_ok, 0, "no bash calls");
+        assert_eq!(stats.edit_file_calls_ok, 0, "no edit_file calls");
+        assert_eq!(
+            stats.peak_iters_since_tree_change, 3,
+            "trip fires at iters==3 then resets — peak must be 3"
         );
 
         let rec = snap_store
@@ -6074,7 +6213,7 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
@@ -6127,6 +6266,10 @@ mod tests {
         );
         assert_eq!(count_nudge_injections(&rec.messages), 2);
         assert_no_adjacent_user_messages(&rec.messages);
+        assert_eq!(
+            stats.nudges_fired, 2,
+            "nudges_fired must equal DEFAULT_MAX_NUDGES=2"
+        );
     }
 
     // AC-4 detection test: a successful edit_file between green-static iters
@@ -6177,7 +6320,7 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
@@ -6220,6 +6363,16 @@ mod tests {
         assert!(
             root_path.join("flag").exists(),
             "edit_file must have created the flag file"
+        );
+        assert_eq!(stats.edit_file_calls_ok, 1, "one successful edit_file call");
+        assert_eq!(stats.bash_calls_ok, 0, "no bash calls");
+        assert_eq!(
+            stats.tree_dirty, facts.tree_dirty,
+            "RunStats.tree_dirty and RecoveryFacts.tree_dirty must agree"
+        );
+        assert_eq!(
+            stats.gates_green_at_exit, facts.gates_green_at_exit,
+            "RunStats.gates_green_at_exit and RecoveryFacts.gates_green_at_exit must agree"
         );
     }
 
@@ -6314,7 +6467,7 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
@@ -6362,6 +6515,23 @@ mod tests {
             ),
             "MaxIterations disposition must be Failed{{BudgetExhausted}}; got {disp:?}"
         );
+        assert_eq!(
+            stats.nudges_fired, 0,
+            "max_nudges=0 must never fire a nudge"
+        );
+        assert_eq!(
+            stats.iters_since_tree_change_at_exit, 4,
+            "counter must be 4 at exit (all 4 iters non-mutating)"
+        );
+        assert_eq!(
+            stats.peak_iters_since_tree_change, 4,
+            "peak must be 4 (monotone non-mutating run)"
+        );
+        assert_eq!(stats.mutating_iters, 0, "no mutating iterations");
+        assert!(
+            !stats.tree_dirty,
+            "no edit_file/bash ran — tree_dirty must be false"
+        );
     }
 
     // =====================================================================
@@ -6399,13 +6569,17 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
         assert!(
             matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
             "expected Done after green-stop nudge + finish; got {outcome:?}"
+        );
+        assert_eq!(
+            stats.nudges_fired, 1,
+            "exactly one nudge fired at the stop terminal"
         );
 
         let rec = snap_store
@@ -6464,7 +6638,7 @@ mod tests {
 
         let snap_store = Arc::new(SnapshotStore::new());
         let pers = make_persistence(snap_store.clone());
-        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
             .await
             .expect("no error");
 
@@ -6545,6 +6719,68 @@ mod tests {
             "nudge_statuses must contain the iter3 stop text 'almost done here'; \
              got {:?}",
             facts.nudge_statuses
+        );
+        assert_eq!(
+            stats.nudges_fired, 1,
+            "exactly one nudge fired at the stop terminal"
+        );
+        assert!(
+            stats.gates_green_at_exit,
+            "gates_green_at_exit must be true on the stop-terminal FinishDiscipline terminal"
+        );
+    }
+
+    // AC5 — successful bash latches tree_dirty, increments bash_calls_ok,
+    // clears last_gate_green, and marks the iteration as mutating.
+    // NOTE: no engine test exercises the `call.name == "bash"` half of the
+    // tool-classification arm today — this test is additive, not a duplicate
+    // of `edit_file_resets_counter_and_clears_green_until_fresh_run_checks`
+    // (which covers only the edit_file half).
+    #[tokio::test]
+    async fn successful_bash_latches_tree_dirty_and_clears_green() {
+        // Sequence:
+        //   iter 1: run_checks (green) — last_gate_green=true, iters 0->1.
+        //   iter 2: bash "true" (success, mutating) — tree_dirty=true,
+        //           last_gate_green=false, iters 1->0 (mutated). bash_calls_ok=1.
+        //   max_iterations=2 -> MaxIterations.
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        // Leave max_nudges at DEFAULT_MAX_NUDGES=2 (do not call with_max_nudges).
+        let config = RunConfig::new("do the task", 2).with_checks(runner);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![tool_call(
+                    "c2",
+                    "bash",
+                    serde_json::json!({"command": "true"}),
+                )],
+                StopReason::ToolUse,
+            ),
+        ]);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "expected MaxIterations; got {outcome:?}"
+        );
+        assert_eq!(stats.bash_calls_ok, 1, "one successful bash call");
+        assert_eq!(stats.edit_file_calls_ok, 0, "no edit_file calls");
+        assert!(stats.tree_dirty, "bash must latch tree_dirty");
+        assert_eq!(stats.mutating_iters, 1, "bash iter is mutating");
+        assert_eq!(
+            stats.iters_since_tree_change_at_exit, 0,
+            "counter reset by bash on iter 2"
+        );
+        assert_eq!(
+            stats.peak_iters_since_tree_change, 1,
+            "run_checks iter accumulated 1 before bash reset the counter"
+        );
+        assert!(
+            !stats.gates_green_at_exit,
+            "bash must clear gates_green_at_exit (last_gate_green)"
         );
     }
 
