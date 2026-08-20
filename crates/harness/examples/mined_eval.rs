@@ -319,7 +319,7 @@ async fn main() {
             // and MinedTrialResult::nudges_fired). The discriminating columns
             // are mut_iters, bash_ok, edits_ok, static_iters, and peak_static.
             println!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | sections={} | dropped_outside={} | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -334,6 +334,8 @@ async fn main() {
                 trial.mutating_iters,
                 trial.bash_calls_ok,
                 trial.edit_file_calls_ok,
+                trial.agent_tests_added.len(),
+                trial.agent_tests_modified.len(),
                 trial.sections_seen,
                 trial.dropped_outside_section,
                 trial.gate_output_path.display(),
@@ -406,7 +408,7 @@ fn print_summary(
         harness::engine::DEFAULT_MAX_NUDGES,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
         "task",
         "resolved/val",
         "res_rate",
@@ -416,6 +418,7 @@ fn print_summary(
         "res_unclm",
         "mut_rate",
         "peak_stat",
+        "tdd_wrote",
         "claimed_D",
         "mean_iter",
     );
@@ -451,8 +454,16 @@ fn print_summary(
             .map(|t| t.peak_iters_since_tree_change)
             .max()
             .unwrap_or(0);
+        // Test-first compliance: trials in which the agent authored at least
+        // one test file of its own. Authorship only — these files do not reach
+        // the sealed re-gate under today's file-scoped gate_commands.
+        let tdd_wrote: usize = r
+            .trials
+            .iter()
+            .filter(|t| !t.agent_tests_added.is_empty())
+            .count();
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9.2}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
@@ -462,6 +473,7 @@ fn print_summary(
             r.resolved_unclaimed(),
             mut_rate,
             peak_stat,
+            format!("{}/{}", tdd_wrote, r.trials.len()),
             claimed_done,
             mean_iter,
         );

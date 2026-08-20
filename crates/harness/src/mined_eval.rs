@@ -1062,6 +1062,98 @@ pub async fn run_env_setup(
     }
 }
 
+// ===== agent test authorship ==============================================
+
+/// Timeout for the `git status` scan that measures agent test authorship.
+const AUTHORSHIP_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether `path` looks like a pytest test file.
+///
+/// Deliberately a path-shape heuristic, not a collection attempt: the scan runs
+/// BEFORE [`copy_sealed`] and must not execute anything the agent wrote. Matches
+/// pytest's own default discovery conventions — a `tests` directory component,
+/// a `test_`-prefixed basename, or a `_test.py` suffix. All eight tier-2 tasks
+/// keep their tests under `tests/`, so the directory clause carries the signal
+/// today; the basename clauses cover an agent that invents a new location.
+fn is_test_path(path: &str) -> bool {
+    let p = Path::new(path);
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("py"))
+        && let Some(name) = p.file_name().and_then(|n| n.to_str())
+        && (name.starts_with("test_") || name.ends_with("_test.py"))
+    {
+        return true;
+    }
+    p.components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("tests"))
+}
+
+/// Split `git status --porcelain -uall` output into (added, modified) test paths.
+///
+/// Pure so the porcelain vocabulary is pinned by unit tests rather than by
+/// standing up a git repo per case. Status codes are the two-character XY pair
+/// in columns 0-1; the path starts at column 3. `??` (untracked) and any `A` in
+/// either column count as ADDED; anything else that names a test path counts as
+/// MODIFIED, which deliberately includes `D` (deleting a test is authorship too,
+/// and lumping it with modified keeps the added-count honest). A rename record
+/// (`R  old -> new`) is attributed to its destination.
+///
+/// `-uall` is REQUIRED at the call site: without it git collapses an untracked
+/// directory to a single `?? somedir/` entry and every test file inside it is
+/// invisible to this parser.
+fn parse_authored_tests(porcelain: &str) -> (Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    for line in porcelain.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let (code, rest) = line.split_at(2);
+        let path = rest.trim_start();
+        let path = path.rsplit(" -> ").next().unwrap_or(path);
+        let path = path.trim_matches('"');
+        if !is_test_path(path) {
+            continue;
+        }
+        if code == "??" || code.contains('A') {
+            added.push(path.to_string());
+        } else {
+            modified.push(path.to_string());
+        }
+    }
+    (added, modified)
+}
+
+/// Record which test files the AGENT created or changed in `workspace_root`.
+///
+/// MUST be called before [`copy_sealed`] overwrites the sealed paths, otherwise
+/// every sealed file reads as agent-modified. Returns `(added, modified)`;
+/// a git failure yields two empty vectors rather than failing the trial —
+/// this is observational telemetry and must never change a score.
+///
+/// This is the tier-2-native way to measure test-first compliance. The engine
+/// cannot supply it: `single_trial` registers no `run_checks` tool, so the loop
+/// never observes gate state, and the file-scoped `gate_command` of every tier-2
+/// task collects only sealed paths — an agent-authored test at a new path is
+/// invisible to the re-gate entirely.
+async fn scan_authored_tests(workspace_root: &Path) -> (Vec<String>, Vec<String>) {
+    let outcome = run(&ExecSpec {
+        program: "git".to_string(),
+        args: vec![
+            "status".to_string(),
+            "--porcelain".to_string(),
+            "-uall".to_string(),
+        ],
+        cwd: workspace_root.to_path_buf(),
+        timeout: AUTHORSHIP_SCAN_TIMEOUT,
+        extra_env: Vec::new(),
+    })
+    .await;
+    if outcome.exit_code != Some(0) {
+        return (Vec::new(), Vec::new());
+    }
+    parse_authored_tests(&outcome.stdout)
+}
+
 // ===== sealed re-gate =====================================================
 
 /// Copy the sealed files from `<task_dir>/sealed/<entry.path>` over
@@ -1258,6 +1350,18 @@ pub struct MinedTrialResult {
     /// Number of `short test summary info` section headers seen in the
     /// sealed re-gate output for this trial. See [`ParseReport::sections_seen`].
     pub sections_seen: usize,
+    /// Test files the AGENT created during the run, captured by
+    /// [`scan_authored_tests`] BEFORE `copy_sealed` overwrites the sealed
+    /// paths. This is the test-first-compliance measurement: a non-empty
+    /// value means the agent wrote a test of its own. Note these files do NOT
+    /// reach the sealed re-gate under today's file-scoped `gate_command`s, so
+    /// this measures authorship only, never whether the agent's test passed.
+    pub agent_tests_added: Vec<String>,
+    /// Existing test files the agent modified, same capture point. Under
+    /// today's task authoring every such path is also a sealed path, so a
+    /// non-empty value means the agent edited a file `copy_sealed` then
+    /// reverted — worth seeing, and never scored.
+    pub agent_tests_modified: Vec<String>,
     /// Absolute path to the persisted raw re-gate stdout+stderr under
     /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
@@ -1632,7 +1736,12 @@ async fn single_trial<B: ModelBackend>(
     let RunResult { outcome, stats } = engine::run(backend, &tools, &ctx, &run_config).await;
     let claimed = claimed_disposition_label(&outcome);
 
-    // 4. Sealed re-gate + scoring.
+    // 4. Test-authorship telemetry — MUST run before the re-gate, because
+    //    `copy_sealed` overwrites the sealed paths and would make every one of
+    //    them read as agent-modified.
+    let (agent_tests_added, agent_tests_modified) = scan_authored_tests(&workspace_root).await;
+
+    // 5. Sealed re-gate + scoring.
     let (score, raw) =
         sealed_regate_score(config.task, config.task_dir, &workspace_root, parser).await;
     let gate_output_path = persist_gate_output(&config.task.id, trial, &raw);
@@ -1665,6 +1774,8 @@ async fn single_trial<B: ModelBackend>(
         statuses: reparse.statuses,
         dropped_outside_section: reparse.dropped_outside_section,
         sections_seen: reparse.sections_seen,
+        agent_tests_added,
+        agent_tests_modified,
         gate_output_path,
         finish_recovery_armed,
         gates_green_at_exit: stats.gates_green_at_exit,
@@ -1699,6 +1810,8 @@ fn invalid_trial(
         statuses: BTreeMap::new(),
         dropped_outside_section: 0,
         sections_seen: 0,
+        agent_tests_added: Vec::new(),
+        agent_tests_modified: Vec::new(),
         gate_output_path,
         finish_recovery_armed: false,
         gates_green_at_exit: false,
@@ -1750,9 +1863,10 @@ mod tests {
         CLAIMED_BLOCKED, CLAIMED_DONE, MinedReport, MinedTask, MinedTrialResult, PytestParser,
         ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
         TrialScore, build_collection_errors, claimed_disposition_label, copy_sealed, expand_home,
-        gate_fault_reason, load_statement, load_task, match_task_id, matches_exclusion, normalize,
-        parse_pytest_summary_totals, parse_short_summary_line, prepare_worktrees, resolve,
-        run_env_setup, sanitize_for_filename, strip_param_suffix,
+        gate_fault_reason, is_test_path, load_statement, load_task, match_task_id,
+        matches_exclusion, normalize, parse_authored_tests, parse_pytest_summary_totals,
+        parse_short_summary_line, prepare_worktrees, resolve, run_env_setup, sanitize_for_filename,
+        scan_authored_tests, strip_param_suffix,
     };
     use crate::run_record::{Disposition, FailureMode, Verification};
     use std::collections::BTreeMap;
@@ -2104,6 +2218,106 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert!(parse_short_summary_line("tests/x.py .").is_none());
         // Case-sensitive: `passed` (lowercase) is not a STATUS token.
         assert!(parse_short_summary_line("passed tests/x.py::t").is_none());
+    }
+
+    // ---- agent test authorship --------------------------------------------
+
+    #[test]
+    fn is_test_path_matches_pytest_discovery_conventions() {
+        // Directory component.
+        assert!(is_test_path("tests/test_cli.py"));
+        assert!(is_test_path("src/pkg/tests/helpers.py"));
+        // Basename conventions, outside a tests/ dir.
+        assert!(is_test_path("src/test_thing.py"));
+        assert!(is_test_path("src/thing_test.py"));
+        // Non-tests.
+        assert!(!is_test_path("src/agent_gtd/cli.py"));
+        assert!(!is_test_path("README.md"));
+        // `test_`-prefixed but not Python — a fixture datafile, not a test.
+        assert!(!is_test_path("data/test_input.json"));
+        // Substring, not a path component: must NOT match.
+        assert!(!is_test_path("src/latest/thing.py"));
+    }
+
+    #[test]
+    fn parse_authored_tests_splits_added_from_modified() {
+        // Verbatim `git status --porcelain -uall` vocabulary.
+        let porcelain = concat!(
+            "?? tests/test_agent_authored.py\n",
+            "A  tests/test_staged_new.py\n",
+            " M tests/test_existing.py\n",
+            "M  tests/test_staged_edit.py\n",
+            " D tests/test_deleted.py\n",
+            "R  tests/test_old.py -> tests/test_renamed.py\n",
+            "?? src/agent_gtd/cli.py\n",
+            " M src/agent_gtd/service.py\n",
+        );
+        let (added, modified) = parse_authored_tests(porcelain);
+        assert_eq!(
+            added,
+            vec![
+                "tests/test_agent_authored.py".to_string(),
+                "tests/test_staged_new.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            modified,
+            vec![
+                "tests/test_existing.py".to_string(),
+                "tests/test_staged_edit.py".to_string(),
+                "tests/test_deleted.py".to_string(),
+                "tests/test_renamed.py".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_authored_tests_ignores_short_and_empty_lines() {
+        assert_eq!(parse_authored_tests(""), (Vec::new(), Vec::new()));
+        assert_eq!(parse_authored_tests("??\n M\n\n"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn parse_authored_tests_unquotes_paths_with_spaces() {
+        let (added, _) = parse_authored_tests("?? \"tests/test a b.py\"\n");
+        assert_eq!(added, vec!["tests/test a b.py".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_authored_tests_sees_untracked_files_in_new_directories() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let st = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .expect("git");
+            assert!(st.success(), "git {args:?}");
+        }
+        // A test in a directory git would otherwise collapse to `?? deep/`.
+        std::fs::create_dir_all(root.join("deep/tests")).expect("mkdir");
+        std::fs::write(root.join("deep/tests/test_new.py"), "def test_x(): pass\n").expect("write");
+        std::fs::write(root.join("notes.md"), "hi\n").expect("write");
+
+        let (added, modified) = scan_authored_tests(root).await;
+        assert_eq!(added, vec!["deep/tests/test_new.py".to_string()]);
+        assert!(modified.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_authored_tests_returns_empty_when_git_fails() {
+        // Not a git repo → non-zero exit → telemetry degrades to empty rather
+        // than failing the trial.
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(
+            scan_authored_tests(dir.path()).await,
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]
@@ -2755,6 +2969,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             statuses: BTreeMap::new(),
             dropped_outside_section: 0,
             sections_seen: 0,
+            agent_tests_added: Vec::new(),
+            agent_tests_modified: Vec::new(),
             gate_output_path: PathBuf::from("/dev/null"),
             finish_recovery_armed: false,
             gates_green_at_exit: green,
