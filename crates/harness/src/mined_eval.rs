@@ -136,6 +136,12 @@ pub struct MinedTask {
     pub test_scope: String,
     /// Shell command run in the primary workspace for the sealed re-gate.
     /// Passed to `bash -c`.
+    ///
+    /// Authoring invariant (verified across all eight tier-2 task.json files):
+    /// every `.py` path named in `gate_command` also appears in `sealed[]`,
+    /// and `copy_sealed` overwrites those files before the re-gate — which is
+    /// WHY agent-authored tests cannot currently reach the scorer (open
+    /// question 3).
     pub gate_command: String,
     /// Test ids that must all be Passed for a trial to resolve.
     pub fail_to_pass: Vec<String>,
@@ -284,19 +290,40 @@ pub enum TestStatus {
     XPass,
 }
 
+/// Result of parsing a test-runner's output via [`TestReportParser::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseReport {
+    /// Parsed nodeid → status map.
+    pub statuses: BTreeMap<String, TestStatus>,
+    /// Second-source count from the runner's trailing summary line; `None`
+    /// when absent.
+    pub summary_count: Option<usize>,
+    /// Status lines that matched a recognised status tag but fell OUTSIDE
+    /// a `short test summary info` section. A nonzero value on a future run
+    /// is the tripwire that pytest renamed its banner: section scoping makes
+    /// the parser under-inclusive, whose failure mode is silent (everything
+    /// becomes `Invalid{parse-empty}` at exactly zero ids).
+    pub dropped_outside_section: usize,
+    /// Number of `short test summary info` section headers seen in the
+    /// output. Zero means the gate produced no parseable section (e.g. an
+    /// early timeout, a collection error that aborts before pytest reaches
+    /// that section, or a bare `-q` run without `-rA`).
+    pub sections_seen: usize,
+}
+
 /// Parser of a runner's test-report output into a `nodeid -> status` map.
 ///
 /// Only [`PytestParser`] ships in the pilot; the trait exists so a vitest or
 /// cargo-test parser can plug in later without touching the scorer.
 pub trait TestReportParser: Send + Sync {
     /// Parse `output` (typically `stdout + stderr` from the gate command) into
-    /// `(map, summary_count)`.
+    /// a [`ParseReport`].
     ///
     /// `summary_count` is the parser's second-source count of individual test
     /// outcomes, cross-checked against `map.len()` in [`resolve`] to detect
     /// truncation / broken output (`parse-mismatch`). `None` means the parser
     /// has no second-source count.
-    fn parse(&self, output: &str) -> (BTreeMap<String, TestStatus>, Option<usize>);
+    fn parse(&self, output: &str) -> ParseReport;
 }
 
 /// Parser for pytest's `-rA` short-summary lines.
@@ -315,26 +342,49 @@ pub trait TestReportParser: Send + Sync {
 pub struct PytestParser;
 
 impl TestReportParser for PytestParser {
-    fn parse(&self, output: &str) -> (BTreeMap<String, TestStatus>, Option<usize>) {
-        let mut map: BTreeMap<String, TestStatus> = BTreeMap::new();
+    fn parse(&self, output: &str) -> ParseReport {
+        let mut statuses: BTreeMap<String, TestStatus> = BTreeMap::new();
         let mut summary_count: Option<usize> = None;
+        let mut in_section = false;
+        let mut sections_seen: usize = 0;
+        let mut dropped_outside_section: usize = 0;
         for line in output.lines() {
-            let trimmed = line.trim_start();
-            if let Some((status, rest)) = parse_short_summary_line(trimmed) {
-                // pytest short-summary lines are `STATUS nodeid [reason]`.
-                // Take the first whitespace-delimited token after STATUS as
-                // the nodeid — the (optional) reason is ignored.
-                let nodeid = rest.split_whitespace().next().unwrap_or_default();
+            let t = line.trim_start();
+            let tag = parse_short_summary_line(t);
+            // (1) section-start detection.
+            if t.starts_with('=') && t.contains("short test summary info") {
+                in_section = true;
+                sections_seen += 1;
+            } else if in_section && (t.trim().is_empty() || tag.is_none()) {
+                // (2) section-end: blank or non-status line while in-section.
+                in_section = false;
+            }
+            // (3) nodeid recording.
+            if let Some((status, rest)) = tag {
+                let nodeid = derive_nodeid(status, rest);
                 if !nodeid.is_empty() {
-                    // Last-write-wins on duplicates (a re-run would be rare
-                    // and harmless — a stable status is what matters).
-                    map.insert(nodeid.to_string(), status);
+                    if in_section {
+                        // Last-write-wins on duplicates (a re-run is rare
+                        // and harmless — a stable status is what matters).
+                        statuses.insert(nodeid, status);
+                    } else {
+                        dropped_outside_section += 1;
+                    }
                 }
-            } else if let Some(n) = parse_pytest_summary_totals(trimmed) {
+            }
+            // (4) summary count — unconditional: a status line can never
+            // also be a `===`-prefixed summary line, so this is always a
+            // no-op on status lines.
+            if let Some(n) = parse_pytest_summary_totals(t) {
                 summary_count = Some(n);
             }
         }
-        (map, summary_count)
+        ParseReport {
+            statuses,
+            summary_count,
+            dropped_outside_section,
+            sections_seen,
+        }
     }
 }
 
@@ -355,6 +405,30 @@ fn parse_short_summary_line(line: &str) -> Option<(TestStatus, &str)> {
         }
     }
     None
+}
+
+/// Derive the map key from a parsed short-summary `rest` fragment.
+///
+/// For `SKIPPED [N] <location>: <reason>` (the bracketed form emitted when
+/// multiple tests share a skip condition), the key is the location token with
+/// at most one trailing `:` stripped. For all other statuses the key is the
+/// first whitespace-delimited token.
+fn derive_nodeid(status: TestStatus, rest: &str) -> String {
+    if status == TestStatus::Skipped {
+        let first = rest.split_whitespace().next().unwrap_or_default();
+        if first.starts_with('[') && first.ends_with(']') {
+            // Bracketed: key is the NEXT token, trailing `:` stripped.
+            return rest
+                .split_whitespace()
+                .nth(1)
+                .map(|s| s.trim_end_matches(':').to_string())
+                .unwrap_or_default();
+        }
+    }
+    rest.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Parse pytest's trailing summary line into a total-outcome count.
@@ -494,6 +568,28 @@ fn matches_exclusion(raw_nodeid: &str, normalized_nodeid: &str, excl: &str) -> b
 ///
 /// Three-member so **infra failures never masquerade as agent failures**:
 /// [`Self::Invalid`] is excluded from the `resolved / k` denominator.
+///
+/// `Invalid` reason prefixes and where each is produced:
+/// - `worktree-setup-failed` — `single_trial`, worktree add step
+/// - `setup-failed` — `run_env_setup`, timeout / non-zero exit / no exit code
+/// - `offload-scratch-failed` — `single_trial`, scratch dir creation
+/// - `workspace-init-failed` — `single_trial`, `Workspace::new`
+/// - `offload-canon-failed` — `single_trial`, offload path canonicalize
+/// - `sealed-copy-failed` — `copy_sealed`, file/dir copy failure
+/// - `gate-timeout` — `sealed_regate_score`, gate exceeded timeout
+/// - `gate-no-exit-code` — `sealed_regate_score`, gate killed by signal with no output
+/// - `parse-empty` — `resolve`, parser emitted empty map
+/// - `parse-mismatch` — `resolve`, parsed count != summary count
+/// - `positive-control-uncollected` — `resolve`, a positive control id is absent
+///
+/// Invalid means the MEASUREMENT failed and the trial leaves the denominator.
+/// Anything traceable to the code under test is `Unresolved`.
+///
+/// `Unresolved` arms:
+/// - Red positive control (agent broke a must-stay-green test)
+/// - Missing or red `fail_to_pass` id
+/// - Unexcluded red id
+/// - File-level collection error (module unimportable — real agent failure)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrialScore {
     /// Every `fail_to_pass` + `positive_controls` id was Passed AND every
@@ -501,9 +597,8 @@ pub enum TrialScore {
     Resolved,
     /// The gate ran and parsed, but at least one clause did not hold.
     Unresolved { reason: ResolveDetail },
-    /// An infra failure — `env.setup` timed out, sealed copy failed, parser
-    /// emitted an empty map, count-mismatch, or a `positive_controls` id was
-    /// uncollected. Excluded from the resolved/k rate.
+    /// An infra failure — excluded from the resolved/k rate. See the enum
+    /// doc for the complete list of reason prefixes.
     Invalid { reason: String },
 }
 
@@ -520,6 +615,13 @@ pub struct ResolveDetail {
     /// `fail_to_pass` ids that were missing or non-Passed (`Skipped` /
     /// `XFail` / `Failed` / `Error`).
     pub missing_fail_to_pass: Vec<String>,
+    /// File-level pytest collection errors: `Error` statuses with no `::`
+    /// separator and a `.py` extension. When non-empty the agent left a
+    /// module unimportable — a real agent failure. Scored `Unresolved`
+    /// (step 3 of [`resolve`]). The `.py`-extension guard in
+    /// [`build_collection_errors`] is load-bearing independently of the
+    /// section-scoping fix; do NOT drop it.
+    pub collection_errors: Vec<String>,
 }
 
 /// Score a parsed nodeid→status map against `task`'s clauses.
@@ -528,17 +630,26 @@ pub struct ResolveDetail {
 /// [`TrialScore::Invalid`] up front for structural problems (empty parse,
 /// count-mismatch, missing `positive_control`) so the caller sees a distinct
 /// signal from a genuine unresolved verdict.
+///
+/// Step 3 (collection errors) precedes step 4 (positive-control loop): a
+/// file-level `ERROR <path>` means pytest never ran — the positive controls
+/// are absent because the agent broke an import, not because the controls
+/// regressed. The `.py`-extension guard in `build_collection_errors` ensures
+/// the arm is correct even if a future parser regression reintroduces
+/// caplog-style phantom ids.
 #[must_use]
 pub fn resolve(
     parsed: &BTreeMap<String, TestStatus>,
     summary_count: Option<usize>,
     task: &MinedTask,
 ) -> TrialScore {
+    // (1) Empty parse: gate produced no parseable ids.
     if parsed.is_empty() {
         return TrialScore::Invalid {
             reason: "parse-empty".to_string(),
         };
     }
+    // (2) Count mismatch: parsed count disagrees with pytest's own total.
     if let Some(n) = summary_count
         && n != parsed.len()
     {
@@ -555,7 +666,21 @@ pub fn resolve(
         .map(|(id, status)| (id.clone(), normalize(id), *status))
         .collect();
 
-    // (a) positive_controls: every id present + Passed. Absent ⇒ Invalid.
+    // (3) Collection errors: file-level ERROR records mean the agent left a
+    // module unimportable — a real agent failure, not an infra fault.
+    let collection_errors = build_collection_errors(&normalized);
+    if !collection_errors.is_empty() {
+        return TrialScore::Unresolved {
+            reason: ResolveDetail {
+                fail_to_pass_status: build_fail_to_pass_status(&normalized, task),
+                unexcluded_red: build_unexcluded_red(&normalized, task),
+                missing_fail_to_pass: build_missing_fail_to_pass(&normalized, task),
+                collection_errors,
+            },
+        };
+    }
+
+    // (4) positive_controls: every id present + Passed. Absent ⇒ Invalid.
     for pc in &task.positive_controls {
         match find_status_for_task_id(&normalized, pc) {
             None => {
@@ -572,13 +697,14 @@ pub fn resolve(
                         fail_to_pass_status: build_fail_to_pass_status(&normalized, task),
                         unexcluded_red: build_unexcluded_red(&normalized, task),
                         missing_fail_to_pass: build_missing_fail_to_pass(&normalized, task),
+                        collection_errors: Vec::new(),
                     },
                 };
             }
         }
     }
 
-    // (b) fail_to_pass: every id present + Passed.
+    // (5) fail_to_pass: every id present + Passed.
     let missing_ftp = build_missing_fail_to_pass(&normalized, task);
     if !missing_ftp.is_empty() {
         return TrialScore::Unresolved {
@@ -586,11 +712,12 @@ pub fn resolve(
                 fail_to_pass_status: build_fail_to_pass_status(&normalized, task),
                 unexcluded_red: build_unexcluded_red(&normalized, task),
                 missing_fail_to_pass: missing_ftp,
+                collection_errors: Vec::new(),
             },
         };
     }
 
-    // (c) any other red id must be covered by an exclusion.
+    // (6) any other red id must be covered by an exclusion.
     let unexcluded = build_unexcluded_red(&normalized, task);
     if !unexcluded.is_empty() {
         return TrialScore::Unresolved {
@@ -598,6 +725,7 @@ pub fn resolve(
                 fail_to_pass_status: build_fail_to_pass_status(&normalized, task),
                 unexcluded_red: unexcluded,
                 missing_fail_to_pass: Vec::new(),
+                collection_errors: Vec::new(),
             },
         };
     }
@@ -693,6 +821,35 @@ fn build_unexcluded_red(
         }
     }
     out
+}
+
+/// File-level pytest collection errors: parsed ids whose status is
+/// [`TestStatus::Error`] AND which lack a `::` separator (they are file
+/// paths, not test nodeids) AND whose extension is `.py`.
+///
+/// `normalized` is produced by iterating a [`BTreeMap`] (call site in
+/// [`resolve`]), so the result is already in ascending order and free of
+/// duplicates; no explicit `.sort()` / `.dedup()` is needed.
+///
+/// The `.py`-extension clause is load-bearing independently of the
+/// section-scoping fix: without it, a future parser regression that lets a
+/// caplog phantom like `agent_gtd.event_bus:event_bus.py:130` through would
+/// silently convert a loud `Invalid{parse-empty}` into a quiet `Unresolved`.
+/// Its `Path::extension()` returns `Some("py:130")` — which does NOT equal
+/// `"py"` — so the phantom is excluded correctly even without section
+/// scoping.
+pub(crate) fn build_collection_errors(normalized: &[(String, String, TestStatus)]) -> Vec<String> {
+    normalized
+        .iter()
+        .filter(|(raw, _, status)| {
+            *status == TestStatus::Error
+                && !raw.contains("::")
+                && Path::new(raw)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("py"))
+        })
+        .map(|(raw, _, _)| raw.clone())
+        .collect()
 }
 
 // ===== per-trial workspace: worktrees + env.setup =========================
@@ -963,25 +1120,76 @@ pub fn copy_sealed(
     Ok(())
 }
 
+/// Map a gate-execution outcome to an [`Invalid`](TrialScore::Invalid) reason,
+/// or `None` when the outcome is scoreable.
+///
+/// Returns `Some` for two cases that make the output unscoreable:
+/// - **Timeout**: all output was dropped by the executor (see `exec.rs:183-193`).
+/// - **Signal-kill with no stdout**: `exit_code` is `None` (the OS delivered
+///   no numeric exit status) AND `stdout` is empty. The `stdout.trim().is_empty()`
+///   guard is REQUIRED: `exec.rs:174` maps `exit_code = status.ok().and_then(|s| s.code())`,
+///   which is `None` for a child killed by a signal (OOM-kill, SIGSEGV) — and
+///   in that branch stdout/stderr ARE fully captured. Without the guard, a
+///   pytest run that emitted its whole `-rA` section and was then `SIGKILLed`
+///   would flip from a scoreable `Unresolved` to `Invalid`, shrinking the
+///   denominator on real agent evidence — the exact direction Defect 2 exists
+///   to eliminate.
+///
+/// A non-zero exit code returns `None`: a red gate is NOT an infra fault.
+pub fn gate_fault_reason(
+    timed_out: bool,
+    exit_code: Option<i32>,
+    duration: std::time::Duration,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    if timed_out {
+        return Some(format!("gate-timeout: after {}s", duration.as_secs()));
+    }
+    if exit_code.is_none() && stdout.trim().is_empty() {
+        return Some(format!(
+            "gate-no-exit-code: no exit status (stderr: {})",
+            stderr.trim()
+        ));
+    }
+    None
+}
+
 /// Run the sealed re-gate and score the result.
 ///
-/// Steps (mirrors the tier-1 holdout ordering):
-/// 1. `copy_sealed` — overwrite the agent's copies of the sealed files.
-/// 2. Run `task.gate_command` under `bash -c` in `workspace_root` with
-///    `PYTEST_ADDOPTS="-rA"` injected, [`CODING_CHECK_TIMEOUT`] timeout.
-///    We use [`crate::exec::run`] directly (not [`crate::exec::ChecksRunner`])
-///    because `ChecksRunner` truncates output to a 4 KB tail, which would
-///    lose the `-rA` PASSED lines the scorer needs.
-/// 3. Parse `stdout + stderr` with `parser`.
-/// 4. Call [`resolve`].
-///
-/// Returns `(TrialScore, raw_output)` — the caller persists `raw_output`
-/// to disk for provenance.
+/// Delegates to [`sealed_regate_score_with_timeout`] at [`CODING_CHECK_TIMEOUT`].
 pub async fn sealed_regate_score<P: TestReportParser + ?Sized>(
     task: &MinedTask,
     task_dir: &Path,
     workspace_root: &Path,
     parser: &P,
+) -> (TrialScore, String) {
+    sealed_regate_score_with_timeout(task, task_dir, workspace_root, parser, CODING_CHECK_TIMEOUT)
+        .await
+}
+
+/// Run the sealed re-gate with a caller-supplied timeout and score the result.
+///
+/// Steps (mirrors the tier-1 holdout ordering):
+/// 1. `copy_sealed` — overwrite the agent's copies of the sealed files.
+/// 2. Run `task.gate_command` under `bash -c` in `workspace_root` with
+///    `PYTEST_ADDOPTS="-rA"` injected.
+///    We use [`crate::exec::run`] directly (not [`crate::exec::ChecksRunner`])
+///    because `ChecksRunner` truncates output to a 4 KB tail, which would
+///    lose the `-rA` PASSED lines the scorer needs.
+/// 3. Check for gate execution faults (timeout, signal-kill) via
+///    [`gate_fault_reason`]; return `Invalid` immediately on fault.
+/// 4. Parse `stdout + stderr` with `parser`.
+/// 5. Call [`resolve`].
+///
+/// Returns `(TrialScore, raw_output)` — the caller persists `raw_output`
+/// to disk for provenance.
+pub async fn sealed_regate_score_with_timeout<P: TestReportParser + ?Sized>(
+    task: &MinedTask,
+    task_dir: &Path,
+    workspace_root: &Path,
+    parser: &P,
+    timeout: std::time::Duration,
 ) -> (TrialScore, String) {
     if let Err(reason) = copy_sealed(task_dir, workspace_root, &task.sealed) {
         return (TrialScore::Invalid { reason }, String::new());
@@ -990,13 +1198,22 @@ pub async fn sealed_regate_score<P: TestReportParser + ?Sized>(
         program: "bash".to_string(),
         args: vec!["-c".to_string(), task.gate_command.clone()],
         cwd: workspace_root.to_path_buf(),
-        timeout: CODING_CHECK_TIMEOUT,
+        timeout,
         extra_env: vec![("PYTEST_ADDOPTS".to_string(), "-rA".to_string())],
     })
     .await;
     let raw = format!("{}{}", outcome.stdout, outcome.stderr);
-    let (parsed, count) = parser.parse(&raw);
-    let score = resolve(&parsed, count, task);
+    if let Some(reason) = gate_fault_reason(
+        outcome.timed_out,
+        outcome.exit_code,
+        outcome.duration,
+        &outcome.stdout,
+        &outcome.stderr,
+    ) {
+        return (TrialScore::Invalid { reason }, raw);
+    }
+    let report = parser.parse(&raw);
+    let score = resolve(&report.statuses, report.summary_count, task);
     (score, raw)
 }
 
@@ -1026,9 +1243,21 @@ pub struct MinedTrialResult {
     /// `BackendError`). Used for the claimed-Done × Unresolved false-done
     /// cross-tab.
     pub claimed_disposition: String,
-    /// Raw nodeid → status map from the sealed re-gate parser (empty when
-    /// the trial is [`TrialScore::Invalid`] before the parser ran).
+    /// Raw nodeid → status map from the sealed re-gate parser.
+    /// Empty for every pre-agent `Invalid` trial (worktree/setup/offload
+    /// failures) and for a gate timeout (raw is `""`; `exec.rs:183-193`
+    /// drops output on timeout). Possibly non-empty for a `gate-no-exit-code`
+    /// `Invalid` trial where output WAS captured before the signal. The
+    /// re-parse site is at `mined_eval.rs:single_trial` (after
+    /// `sealed_regate_score`).
     pub statuses: BTreeMap<String, TestStatus>,
+    /// Lines that matched a status tag but fell outside any
+    /// `short test summary info` section. Non-zero means the parser was
+    /// under-inclusive on this trial; see [`ParseReport::dropped_outside_section`].
+    pub dropped_outside_section: usize,
+    /// Number of `short test summary info` section headers seen in the
+    /// sealed re-gate output for this trial. See [`ParseReport::sections_seen`].
+    pub sections_seen: usize,
     /// Absolute path to the persisted raw re-gate stdout+stderr under
     /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
@@ -1115,6 +1344,10 @@ impl MinedReport {
     /// — the mined analogue of [`crate::eval::EvalReport::false_dones`].
     ///
     /// `Invalid` trials do NOT contribute here; only Unresolved does.
+    ///
+    /// A file-level collection error now scores `Unresolved`, so an agent
+    /// that claims Done while leaving a module unimportable IS a false-done
+    /// and DOES contribute here — intended semantics, not a regression.
     #[must_use]
     pub fn false_dones(&self) -> u32 {
         self.trials
@@ -1406,8 +1639,13 @@ async fn single_trial<B: ModelBackend>(
 
     // Re-parse to capture the raw status map on the trial record (empty on
     // Invalid trials that never ran the parser).
-    let (statuses, _) = if raw.is_empty() {
-        (BTreeMap::new(), None)
+    let reparse = if raw.is_empty() {
+        ParseReport {
+            statuses: BTreeMap::new(),
+            summary_count: None,
+            dropped_outside_section: 0,
+            sections_seen: 0,
+        }
     } else {
         parser.parse(&raw)
     };
@@ -1424,7 +1662,9 @@ async fn single_trial<B: ModelBackend>(
         output_tokens: stats.output_tokens,
         wall: start.elapsed(),
         claimed_disposition: claimed,
-        statuses,
+        statuses: reparse.statuses,
+        dropped_outside_section: reparse.dropped_outside_section,
+        sections_seen: reparse.sections_seen,
         gate_output_path,
         finish_recovery_armed,
         gates_green_at_exit: stats.gates_green_at_exit,
@@ -1457,6 +1697,8 @@ fn invalid_trial(
         wall: start.elapsed(),
         claimed_disposition: "NotRun".to_string(),
         statuses: BTreeMap::new(),
+        dropped_outside_section: 0,
+        sections_seen: 0,
         gate_output_path,
         finish_recovery_armed: false,
         gates_green_at_exit: false,
@@ -1507,10 +1749,10 @@ mod tests {
     use super::{
         CLAIMED_BLOCKED, CLAIMED_DONE, MinedReport, MinedTask, MinedTrialResult, PytestParser,
         ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
-        TrialScore, claimed_disposition_label, copy_sealed, expand_home, load_statement, load_task,
-        match_task_id, matches_exclusion, normalize, parse_pytest_summary_totals,
-        parse_short_summary_line, prepare_worktrees, resolve, run_env_setup, sanitize_for_filename,
-        strip_param_suffix,
+        TrialScore, build_collection_errors, claimed_disposition_label, copy_sealed, expand_home,
+        gate_fault_reason, load_statement, load_task, match_task_id, matches_exclusion, normalize,
+        parse_pytest_summary_totals, parse_short_summary_line, prepare_worktrees, resolve,
+        run_env_setup, sanitize_for_filename, strip_param_suffix,
     };
     use crate::run_record::{Disposition, FailureMode, Verification};
     use std::collections::BTreeMap;
@@ -1782,7 +2024,7 @@ mod tests {
 
     // ---- pytest parser ---------------------------------------------------
 
-    /// Synthetic `-rA` short-summary output. NEVER real talos-evals capture.
+    /// Synthetic pytest output for unit tests. Task CONTENT (statements, sealed test sources, answer keys) never enters this repo, but verbatim gate-output CAPTURES are required test input and live in `crates/harness/testdata/mined_eval/`.
     fn synthetic_pytest_output() -> String {
         // Includes noise: a dot-progress line, a header, a traceback, and a
         // trailing summary. The parser must find only the STATUS lines.
@@ -1815,7 +2057,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
     #[test]
     fn pytest_parser_reads_short_summary_lines_only() {
-        let (map, count) = PytestParser.parse(&synthetic_pytest_output());
+        let report = PytestParser.parse(&synthetic_pytest_output());
+        let map = &report.statuses;
+        let count = report.summary_count;
         assert_eq!(count, Some(5));
         assert_eq!(map.len(), 5);
         assert_eq!(
@@ -1838,15 +2082,17 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
     #[test]
     fn pytest_parser_handles_error_and_xpass() {
-        let out = "ERROR tests/test_x.py::TestX::test_broken\nXPASS tests/test_x.py::TestX::test_unex_pass\n=== 0 passed, 1 error, 1 xpassed in 0.01s ===";
-        let (map, count) = PytestParser.parse(out);
-        assert_eq!(count, Some(2));
+        let out = "=========================== short test summary info ============================\nERROR tests/test_x.py::TestX::test_broken\nXPASS tests/test_x.py::TestX::test_unex_pass\n=== 0 passed, 1 error, 1 xpassed in 0.01s ===";
+        let report = PytestParser.parse(out);
+        assert_eq!(report.summary_count, Some(2));
         assert_eq!(
-            map.get("tests/test_x.py::TestX::test_broken"),
+            report.statuses.get("tests/test_x.py::TestX::test_broken"),
             Some(&TestStatus::Error)
         );
         assert_eq!(
-            map.get("tests/test_x.py::TestX::test_unex_pass"),
+            report
+                .statuses
+                .get("tests/test_x.py::TestX::test_unex_pass"),
             Some(&TestStatus::XPass)
         );
     }
@@ -1903,12 +2149,14 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     fn dots_only_output_yields_parse_empty_invalid() {
         // A `-q` run without -rA: dots, no STATUS lines.
         let dots_only = "tests/x.py ...F.                                     [100%]\n";
-        let (map, count) = PytestParser.parse(dots_only);
+        let report = PytestParser.parse(dots_only);
+        let map = &report.statuses;
+        let count = report.summary_count;
         assert!(map.is_empty(), "dots-only output produces no ids");
         assert_eq!(count, None, "no summary line in this fragment");
         // Scoring: parse-empty is Invalid, never silently unresolved.
         let task = sample_task_for_scoring();
-        let score = resolve(&map, count, &task);
+        let score = resolve(map, count, &task);
         assert!(matches!(score, TrialScore::Invalid { .. }));
         if let TrialScore::Invalid { reason } = score {
             assert_eq!(reason, "parse-empty");
@@ -1926,6 +2174,83 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     fn status_map(pairs: &[(&str, TestStatus)]) -> BTreeMap<String, TestStatus> {
         pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
     }
+
+    fn task_from_json(json: &str) -> MinedTask {
+        let dir = tempdir().expect("tempdir");
+        write_task(dir.path(), json);
+        load_task(dir.path()).expect("parse task json")
+    }
+
+    const DEADLOCK_TASK_JSON: &str = r#"{
+        "id": "agent-gtd-rollout-deadlock",
+        "repo": "agent-gtd",
+        "repo_path": "~/git/agent-gtd",
+        "parent_sha": "aaaa111",
+        "fix_sha": "bbbb222",
+        "rung_guess": "mid",
+        "language": "python",
+        "provenance": {},
+        "env": {
+            "setup": "uv sync --frozen",
+            "sibling_repos": []
+        },
+        "test_scope": "tests/test_dispatch_service.py tests/test_rollout_service.py tests/test_rollout_executor.py",
+        "gate_command": "uv run --frozen pytest tests/test_dispatch_service.py tests/test_rollout_service.py tests/test_rollout_executor.py -q",
+        "fail_to_pass": [
+            "tests/test_dispatch_service.py::test_create_run_manage_mode_rejected",
+            "tests/test_rollout_service.py::test_complete_item_in_rollout_from_ready",
+            "tests/test_rollout_service.py::test_complete_item_in_rollout_from_ready_unblocks_downstream",
+            "tests/test_rollout_executor.py::test_manage_dispatch_does_not_flip_item_status"
+        ],
+        "positive_controls": [
+            "tests/test_rollout_service.py::test_complete_item_in_rollout_rejects_pending_status",
+            "tests/test_rollout_service.py::test_managed_rollout_happy_path",
+            "tests/test_rollout_executor.py::test_manage_dispatch_flips_wave_to_running",
+            "tests/test_rollout_executor.py::test_manage_dispatch_emits_wave_started_event",
+            "tests/test_rollout_executor.py::test_happy_path_plan_rollout_to_complete_item_in_rollout"
+        ],
+        "pass_to_pass_exclusions": [],
+        "sealed": [
+            {"path": "tests/test_dispatch_service.py"},
+            {"path": "tests/test_rollout_service.py"},
+            {"path": "tests/test_rollout_executor.py"}
+        ],
+        "notes": []
+    }"#;
+
+    const FROM_JSON_TASK_JSON: &str = r#"{
+        "id": "agent-gtd-from-json-contract",
+        "repo": "agent-gtd",
+        "repo_path": "~/git/agent-gtd",
+        "parent_sha": "aaaa111",
+        "fix_sha": "bbbb222",
+        "rung_guess": "mid",
+        "language": "python",
+        "provenance": {},
+        "env": {
+            "setup": "uv sync --frozen",
+            "sibling_repos": []
+        },
+        "test_scope": "tests/test_cli.py",
+        "gate_command": "uv run --frozen pytest tests/test_cli.py -q",
+        "fail_to_pass": [
+            "test_do_add_item_honors_project_id_and_status_from_payload",
+            "test_do_add_item_persists_priority_due_date_assigned_to",
+            "test_do_add_item_unknown_key_raises_and_creates_nothing",
+            "test_cmd_add_item_unknown_key_exits_nonzero",
+            "test_do_add_item_http_mode_threads_priority_due_date_assigned_to",
+            "test_http_post_create_item_includes_priority_due_date_assigned_to"
+        ],
+        "positive_controls": [
+            "test_do_add_item_flags_override_payload",
+            "test_http_post_create_item_omits_priority_due_date_assigned_to_when_none"
+        ],
+        "pass_to_pass_exclusions": [],
+        "sealed": [
+            {"path": "tests/test_cli.py"}
+        ],
+        "notes": []
+    }"#;
 
     #[test]
     fn resolve_returns_resolved_on_all_green() {
@@ -2428,6 +2753,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall: Duration::ZERO,
             claimed_disposition: claimed.to_string(),
             statuses: BTreeMap::new(),
+            dropped_outside_section: 0,
+            sections_seen: 0,
             gate_output_path: PathBuf::from("/dev/null"),
             finish_recovery_armed: false,
             gates_green_at_exit: green,
@@ -2452,6 +2779,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
                 fail_to_pass_status: Vec::new(),
                 unexcluded_red: Vec::new(),
                 missing_fail_to_pass: vec!["x".to_string()],
+                collection_errors: Vec::new(),
             },
         };
         let report = MinedReport {
@@ -2494,6 +2822,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
                 fail_to_pass_status: Vec::new(),
                 unexcluded_red: Vec::new(),
                 missing_fail_to_pass: vec!["x".to_string()],
+                collection_errors: Vec::new(),
             },
         };
         let report = MinedReport {
@@ -2555,6 +2884,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
                             fail_to_pass_status: Vec::new(),
                             unexcluded_red: Vec::new(),
                             missing_fail_to_pass: vec!["x".to_string()],
+                            collection_errors: Vec::new(),
                         },
                     },
                     CLAIMED_DONE,
@@ -2567,6 +2897,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
                             fail_to_pass_status: Vec::new(),
                             unexcluded_red: Vec::new(),
                             missing_fail_to_pass: vec!["x".to_string()],
+                            collection_errors: Vec::new(),
                         },
                     },
                     "Blocked",
@@ -2703,7 +3034,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             // A shell script emulating pytest -rA short-summary output.
-            gate_command: r"printf 'PASSED tests/test_x.py::T::a\nPASSED tests/test_x.py::T::b\n=== 2 passed in 0.0s ===\n'".to_string(),
+            gate_command: r"printf '=== short test summary info ===\nPASSED tests/test_x.py::T::a\nPASSED tests/test_x.py::T::b\n=== 2 passed in 0.0s ===\n'".to_string(),
             fail_to_pass: vec!["T::a".to_string()],
             positive_controls: vec!["T::b".to_string()],
             pass_to_pass_exclusions: Vec::new(),
@@ -2847,7 +3178,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         //    pytest -rA output that resolves the trial.
         let mut task = task_pointing_at(&primary_src, None, &parent);
         task.gate_command =
-            r"printf 'PASSED tests/test_synth.py::T::pass_it\n=== 1 passed in 0.0s ===\n'"
+            r"printf '=== short test summary info ===\nPASSED tests/test_synth.py::T::pass_it\n=== 1 passed in 0.0s ===\n'"
                 .to_string();
         task.fail_to_pass = vec!["T::pass_it".to_string()];
         task.sealed = vec![SealedEntry {
@@ -3325,11 +3656,15 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         // "PASSED " with nothing following the space — the whole line is
         // caught by parse_short_summary_line, but nodeid comes out empty and
         // the parser skips the insertion.
-        let out = "PASSED \nPASSED tests/x.py::T::real\n=== 1 passed in 0.0s ===";
-        let (map, count) = PytestParser.parse(out);
-        assert_eq!(map.len(), 1, "empty nodeid line must not insert");
-        assert!(map.contains_key("tests/x.py::T::real"));
-        assert_eq!(count, Some(1));
+        let out = "=========================== short test summary info ============================\nPASSED \nPASSED tests/x.py::T::real\n=== 1 passed in 0.0s ===";
+        let report = PytestParser.parse(out);
+        assert_eq!(
+            report.statuses.len(),
+            1,
+            "empty nodeid line must not insert"
+        );
+        assert!(report.statuses.contains_key("tests/x.py::T::real"));
+        assert_eq!(report.summary_count, Some(1));
     }
 
     // ---- normalize fallthrough: non-.py first segment ---------------------
@@ -3364,7 +3699,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let mut task = task_pointing_at(&primary_src, None, &parent);
         // Gate emits ONE red fail_to_pass id, no positive_controls.
         task.gate_command =
-            r"printf 'FAILED tests/x.py::T::red\n=== 0 passed, 1 failed in 0.0s ===\n'".to_string();
+            r"printf '=== short test summary info ===\nFAILED tests/x.py::T::red\n=== 0 passed, 1 failed in 0.0s ===\n'".to_string();
         task.fail_to_pass = vec!["T::red".to_string()];
         task.sealed = vec![SealedEntry {
             path: "dest.py".to_string(),
@@ -3515,5 +3850,409 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         // Either create_dir_all or the copy itself will fail; both surface
         // as `sealed-copy-failed: ...`.
         assert!(bad.starts_with("sealed-copy-failed"), "reason: {bad}");
+    }
+
+    // ---- new section-scoping + collection-error tests -------------------
+
+    #[test]
+    fn pytest_parser_ignores_caplog_error_lines_outside_summary_section() {
+        let fixture = include_str!("../testdata/mined_eval/deadlock-trial-0.txt");
+        let report = PytestParser.parse(fixture);
+        assert_eq!(report.statuses.len(), 121);
+        assert_eq!(report.summary_count, Some(121));
+        assert_eq!(report.dropped_outside_section, 6);
+        assert_eq!(report.sections_seen, 1);
+        assert!(
+            !report
+                .statuses
+                .contains_key("agent_gtd.event_bus:event_bus.py:130")
+        );
+        for key in report.statuses.keys() {
+            assert!(key.contains("::"), "key without '::': {key}");
+        }
+    }
+
+    #[test]
+    fn pytest_parser_uses_location_for_bracketed_skipped_lines() {
+        let fixture = include_str!("../testdata/mined_eval/attribution-trial-0.txt");
+        let report = PytestParser.parse(fixture);
+        assert_eq!(
+            report
+                .statuses
+                .get("tests/test_dispatch_attribution.py:191"),
+            Some(&TestStatus::Skipped)
+        );
+        assert!(!report.statuses.contains_key("[1]"));
+        assert_eq!(report.statuses.len(), 8);
+        assert_eq!(report.summary_count, Some(8));
+        assert_eq!(report.dropped_outside_section, 0);
+        assert_eq!(report.sections_seen, 1);
+    }
+
+    #[test]
+    fn status_lines_without_a_summary_header_parse_empty() {
+        let input = "PASSED tests/test_x.py::test_a\nFAILED tests/test_x.py::test_b\n=== 1 passed, 1 failed in 0.01s ===";
+        let report = PytestParser.parse(input);
+        assert!(report.statuses.is_empty());
+        assert_eq!(report.summary_count, Some(2));
+        assert_eq!(report.dropped_outside_section, 2);
+        assert_eq!(report.sections_seen, 0);
+        let task = sample_task_for_scoring();
+        let score = resolve(&report.statuses, report.summary_count, &task);
+        match score {
+            TrialScore::Invalid { reason } => {
+                assert_eq!(reason, "parse-empty");
+            }
+            other => panic!("expected Invalid{{parse-empty}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_line_terminates_the_summary_section() {
+        let input = "=== short test summary info ===\nPASSED tests/test_x.py::test_a\n\nPASSED tests/test_y.py::test_b\n=== 1 passed in 0.01s ===";
+        let report = PytestParser.parse(input);
+        assert_eq!(report.statuses.len(), 1);
+        assert!(!report.statuses.contains_key("tests/test_y.py::test_b"));
+        assert_eq!(report.dropped_outside_section, 1);
+    }
+
+    #[test]
+    fn build_collection_errors_discriminates_file_level_errors() {
+        // Real collection-error shape: file path, no `::`, `.py` extension.
+        assert_eq!(
+            build_collection_errors(&[(
+                "tests/test_cli.py".to_string(),
+                "tests/test_cli.py".to_string(),
+                TestStatus::Error,
+            )]),
+            vec!["tests/test_cli.py".to_string()],
+        );
+        // An Error WITH `::` is a normal red test, not a collection error.
+        assert!(
+            build_collection_errors(&[(
+                "tests/test_x.py::TestX::test_broken".to_string(),
+                "TestX::test_broken".to_string(),
+                TestStatus::Error,
+            )])
+            .is_empty()
+        );
+        // Verbatim Defect-1 phantom: no `::`, but extension is `py:130` not `py`.
+        assert!(
+            build_collection_errors(&[(
+                "agent_gtd.event_bus:event_bus.py:130".to_string(),
+                "agent_gtd.event_bus:event_bus.py:130".to_string(),
+                TestStatus::Error,
+            )])
+            .is_empty()
+        );
+        // A Passed status is not an error.
+        assert!(
+            build_collection_errors(&[(
+                "tests/test_cleanr.py::TestCommentFilters::test_owner_comments_skipped".to_string(),
+                "TestCommentFilters::test_owner_comments_skipped".to_string(),
+                TestStatus::Passed,
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn deadlock_capture_no_longer_scores_parse_mismatch() {
+        let fixture = include_str!("../testdata/mined_eval/deadlock-trial-0.txt");
+        let report = PytestParser.parse(fixture);
+        let task = task_from_json(DEADLOCK_TASK_JSON);
+        let score = resolve(&report.statuses, report.summary_count, &task);
+        match score {
+            TrialScore::Unresolved { reason } => {
+                assert_eq!(
+                    reason.missing_fail_to_pass,
+                    vec![
+                        "tests/test_dispatch_service.py::test_create_run_manage_mode_rejected"
+                            .to_string(),
+                        "tests/test_rollout_executor.py::test_manage_dispatch_does_not_flip_item_status"
+                            .to_string(),
+                    ]
+                );
+                assert!(reason.unexcluded_red.is_empty());
+                assert!(reason.collection_errors.is_empty());
+                assert_eq!(reason.fail_to_pass_status.len(), 4);
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_error_scores_unresolved_not_invalid() {
+        let fixture = include_str!("../testdata/mined_eval/from-json-trial-1.txt");
+        let report = PytestParser.parse(fixture);
+        assert_eq!(report.statuses.len(), 1);
+        assert_eq!(report.summary_count, Some(1));
+        let task = task_from_json(FROM_JSON_TASK_JSON);
+        let score = resolve(&report.statuses, report.summary_count, &task);
+        assert!(
+            !matches!(score, TrialScore::Invalid { .. }),
+            "must not be Invalid"
+        );
+        match score {
+            TrialScore::Unresolved { reason } => {
+                assert_eq!(
+                    reason.collection_errors,
+                    vec!["tests/test_cli.py".to_string()]
+                );
+                assert_eq!(reason.missing_fail_to_pass.len(), 6);
+                assert_eq!(reason.fail_to_pass_status.len(), 6);
+                assert_eq!(reason.unexcluded_red, vec!["tests/test_cli.py".to_string()]);
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_error_arm_precedes_positive_control_arm() {
+        // `sample_task_for_scoring()` has a positive_control that would be
+        // uncollected if we only have a file-level Error. The collection-error
+        // arm (step 3) must fire BEFORE the positive-control loop (step 4).
+        let task = sample_task_for_scoring();
+        let parsed = status_map(&[("tests/test_cleanr.py", TestStatus::Error)]);
+        let score = resolve(&parsed, Some(1), &task);
+        match score {
+            TrialScore::Unresolved { reason } => {
+                assert_eq!(
+                    reason.collection_errors,
+                    vec!["tests/test_cleanr.py".to_string()]
+                );
+            }
+            other => panic!("expected Unresolved (collection-error arm), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_capture_still_scores_parse_mismatch() {
+        let fixture_lines: Vec<&str> = include_str!("../testdata/mined_eval/deadlock-trial-0.txt")
+            .lines()
+            .collect();
+        let hdr = fixture_lines
+            .iter()
+            .position(|l| l.contains("short test summary info"))
+            .expect("fixture must have a short test summary info header");
+        let truncated: String = fixture_lines[hdr..=hdr + 60]
+            .iter()
+            .chain(std::iter::once(
+                fixture_lines.last().expect("fixture non-empty"),
+            ))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = PytestParser.parse(&truncated);
+        assert_eq!(report.statuses.len(), 60);
+        assert_eq!(report.summary_count, Some(121));
+        assert_eq!(report.dropped_outside_section, 0);
+        let task = task_from_json(DEADLOCK_TASK_JSON);
+        let score = resolve(&report.statuses, report.summary_count, &task);
+        match score {
+            TrialScore::Invalid { reason } => {
+                assert_eq!(reason, "parse-mismatch: 60 ids vs summary 121");
+            }
+            other => panic!("expected Invalid{{parse-mismatch}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_agent_authored_tests_do_not_change_the_verdict() {
+        // This test models a FUTURE gate_command that collects a whole
+        // directory: under today's eight tier-2 gate_commands an agent-authored
+        // test cannot reach the re-gate at all (each gate_command names
+        // specific test files that are overwritten by copy_sealed — so the
+        // agent's additions are invisible). This is defense-in-depth for a
+        // shape not yet observed in real tier-2 runs.
+        let fixture = include_str!("../testdata/mined_eval/deadlock-trial-0.txt");
+        let fixture_lines: Vec<&str> = fixture.lines().collect();
+        let hdr = fixture_lines
+            .iter()
+            .position(|l| l.contains("short test summary info"))
+            .expect("fixture must have a short test summary info header");
+        let new_line = "PASSED tests/test_agent_authored.py::test_added";
+        let mut mutated_lines = fixture_lines.clone();
+        mutated_lines.insert(hdr + 1, new_line);
+        let mutated: String = mutated_lines.join("\n");
+        let mutated = mutated.replacen("2 failed, 119 passed", "2 failed, 120 passed", 1);
+        let report = PytestParser.parse(&mutated);
+        assert_eq!(report.statuses.len(), 122);
+        assert_eq!(report.summary_count, Some(122));
+        let task = task_from_json(DEADLOCK_TASK_JSON);
+        let score_original = resolve(
+            &PytestParser.parse(fixture).statuses,
+            PytestParser.parse(fixture).summary_count,
+            &task,
+        );
+        let score_mutated = resolve(&report.statuses, report.summary_count, &task);
+        // Same variant.
+        assert!(matches!(score_mutated, TrialScore::Unresolved { .. }));
+        // Same missing_fail_to_pass.
+        if let (TrialScore::Unresolved { reason: r1 }, TrialScore::Unresolved { reason: r2 }) =
+            (score_original, score_mutated)
+        {
+            assert_eq!(r1.missing_fail_to_pass, r2.missing_fail_to_pass);
+        }
+    }
+
+    #[test]
+    fn gate_fault_reason_maps_every_arm() {
+        use std::time::Duration;
+        // Timeout arm.
+        assert_eq!(
+            gate_fault_reason(true, None, Duration::from_mins(3), "", ""),
+            Some("gate-timeout: after 180s".to_string()),
+        );
+        // Signal-killed with stderr, no stdout -> Invalid.
+        assert_eq!(
+            gate_fault_reason(false, None, Duration::ZERO, "", "boom\n"),
+            Some("gate-no-exit-code: no exit status (stderr: boom)".to_string()),
+        );
+        // Signal-killed WITH stdout -> scoreable (stay as None).
+        assert_eq!(
+            gate_fault_reason(false, None, Duration::ZERO, "PASSED tests/x.py::t\n", ""),
+            None,
+        );
+        // Non-zero exit code -> scoreable.
+        assert_eq!(
+            gate_fault_reason(false, Some(1), Duration::ZERO, "", ""),
+            None
+        );
+        // Zero exit code -> scoreable.
+        assert_eq!(
+            gate_fault_reason(false, Some(0), Duration::ZERO, "", ""),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_regate_score_invalid_on_gate_timeout() {
+        use super::sealed_regate_score_with_timeout;
+        let task_dir = tempdir().expect("task tempdir");
+        std::fs::create_dir_all(task_dir.path().join("sealed/tests")).expect("mkdir sealed");
+        std::fs::write(task_dir.path().join("sealed/tests/test_x.py"), "# sealed\n")
+            .expect("write sealed");
+        let ws = tempdir().expect("ws tempdir");
+        std::fs::create_dir_all(ws.path().join("tests")).expect("mkdir tests");
+        std::fs::write(ws.path().join("tests/test_x.py"), "# agent\n").expect("write agent");
+        let task = MinedTask {
+            id: "synth-timeout".to_string(),
+            repo: "r".to_string(),
+            repo_path: "/tmp/x".to_string(),
+            parent_sha: "aaa".to_string(),
+            fix_sha: "bbb".to_string(),
+            rung_guess: "easy".to_string(),
+            language: "python".to_string(),
+            provenance: serde_json::Value::Null,
+            env: super::MinedEnv {
+                setup: "true".to_string(),
+                sibling_repos: Vec::new(),
+            },
+            test_scope: String::new(),
+            gate_command: "sleep 5".to_string(),
+            fail_to_pass: Vec::new(),
+            positive_controls: Vec::new(),
+            pass_to_pass_exclusions: Vec::new(),
+            sealed: vec![SealedEntry {
+                path: "tests/test_x.py".to_string(),
+            }],
+            notes: Vec::new(),
+        };
+        let (score, raw) = sealed_regate_score_with_timeout(
+            &task,
+            task_dir.path(),
+            ws.path(),
+            &PytestParser,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        match score {
+            TrialScore::Invalid { reason } => {
+                assert!(
+                    reason.starts_with("gate-timeout: after "),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Invalid{{gate-timeout}}, got {other:?}"),
+        }
+        assert_eq!(raw, "", "timeout raw must be empty");
+    }
+
+    #[tokio::test]
+    async fn sealed_regate_score_invalid_when_gate_dies_without_output() {
+        use super::sealed_regate_score_with_timeout;
+        let task_dir = tempdir().expect("task tempdir");
+        std::fs::create_dir_all(task_dir.path().join("sealed/tests")).expect("mkdir sealed");
+        std::fs::write(task_dir.path().join("sealed/tests/test_x.py"), "# sealed\n")
+            .expect("write sealed");
+        let ws = tempdir().expect("ws tempdir");
+        std::fs::create_dir_all(ws.path().join("tests")).expect("mkdir tests");
+        std::fs::write(ws.path().join("tests/test_x.py"), "# agent\n").expect("write agent");
+        let task = MinedTask {
+            id: "synth-sigkill".to_string(),
+            repo: "r".to_string(),
+            repo_path: "/tmp/x".to_string(),
+            parent_sha: "aaa".to_string(),
+            fix_sha: "bbb".to_string(),
+            rung_guess: "easy".to_string(),
+            language: "python".to_string(),
+            provenance: serde_json::Value::Null,
+            env: super::MinedEnv {
+                setup: "true".to_string(),
+                sibling_repos: Vec::new(),
+            },
+            test_scope: String::new(),
+            gate_command: "kill -KILL $$".to_string(),
+            fail_to_pass: Vec::new(),
+            positive_controls: Vec::new(),
+            pass_to_pass_exclusions: Vec::new(),
+            sealed: vec![SealedEntry {
+                path: "tests/test_x.py".to_string(),
+            }],
+            notes: Vec::new(),
+        };
+        let (score, _raw) = sealed_regate_score_with_timeout(
+            &task,
+            task_dir.path(),
+            ws.path(),
+            &PytestParser,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        match score {
+            TrialScore::Invalid { reason } => {
+                assert!(reason.starts_with("gate-no-exit-code"), "reason: {reason}");
+            }
+            other => panic!("expected Invalid{{gate-no-exit-code}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_error_unresolved_counts_as_false_done() {
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 1,
+            resolved_count: 0,
+            invalid_count: 0,
+            trials: vec![trial(
+                0,
+                TrialScore::Unresolved {
+                    reason: ResolveDetail {
+                        fail_to_pass_status: Vec::new(),
+                        unexcluded_red: vec!["tests/test_cli.py".to_string()],
+                        missing_fail_to_pass: Vec::new(),
+                        collection_errors: vec!["tests/test_cli.py".into()],
+                    },
+                },
+                CLAIMED_DONE,
+            )],
+        };
+        assert_eq!(report.false_dones(), 1);
+        assert_eq!(report.valid_denominator(), 1);
+        assert!((report.resolved_rate() - 0.0).abs() < f64::EPSILON);
     }
 }

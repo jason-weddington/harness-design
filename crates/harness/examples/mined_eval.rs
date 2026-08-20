@@ -319,7 +319,7 @@ async fn main() {
             // and MinedTrialResult::nudges_fired). The discriminating columns
             // are mut_iters, bash_ok, edits_ok, static_iters, and peak_static.
             println!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | sections={} | dropped_outside={} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -334,6 +334,8 @@ async fn main() {
                 trial.mutating_iters,
                 trial.bash_calls_ok,
                 trial.edit_file_calls_ok,
+                trial.sections_seen,
+                trial.dropped_outside_section,
                 trial.gate_output_path.display(),
             );
         };
@@ -369,9 +371,10 @@ fn trial_score_one_liner(score: &TrialScore) -> String {
         TrialScore::Resolved => "Resolved".to_string(),
         TrialScore::Unresolved { reason } => {
             format!(
-                "Unresolved (missing_ftp={}, unexcluded_red={})",
+                "Unresolved (missing_ftp={}, unexcluded_red={}, collection_errors={})",
                 reason.missing_fail_to_pass.len(),
                 reason.unexcluded_red.len(),
+                reason.collection_errors.len(),
             )
         }
         TrialScore::Invalid { reason } => format!("Invalid ({reason})"),

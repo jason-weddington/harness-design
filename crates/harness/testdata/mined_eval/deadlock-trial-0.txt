@@ -1,0 +1,411 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.12, pytest-9.0.2, pluggy-1.6.0
+rootdir: /tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd
+configfile: pyproject.toml
+plugins: hypothesis-6.151.9, asyncio-1.3.0, anyio-4.12.1, cov-7.0.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 121 items
+
+tests/test_dispatch_service.py ....F                                     [  4%]
+tests/test_rollout_service.py .......................................... [ 38%]
+...............................                                          [ 64%]
+tests/test_rollout_executor.py ..................................F...... [ 98%]
+..                                                                       [100%]
+
+=================================== FAILURES ===================================
+_____________________ test_create_run_manage_mode_rejected _____________________
+
+    @pytest.mark.asyncio
+    async def test_create_run_manage_mode_rejected() -> None:
+        """AC-5: create_run raises ValidationError when mode='manage'.
+    
+        This blocks the old path that allowed a manage run to be keyed to a rollout
+        item's ID, which caused RunActiveError deadlock when the manage agent later
+        tried to dispatch a child build for that same item.
+    
+        Callers must use dispatch_rollout (which calls dispatch_rollout_run) instead.
+        """
+        from agent_gtd.exceptions import ValidationError as GTDValidationError
+        from agent_gtd.services.dispatch_service import create_run
+    
+        # DB is never reached because the guard fires first — use a mock.
+        db = MagicMock()
+    
+        with pytest.raises(GTDValidationError) as exc_info:
+>           await create_run(
+                db,
+                user_id="any-user-id",
+                item_id="any-item-id",
+                mode="manage",
+                rollout_id="any-rollout-id",
+            )
+
+tests/test_dispatch_service.py:177: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/agent_gtd/services/dispatch_service.py:66: in create_run
+    item = await get_item(db, user_id, item_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+db = <MagicMock id='134154069754944'>, user_id = 'any-user-id'
+item_id = 'any-item-id'
+
+    async def get_item(db: DbPool, user_id: str, item_id: str) -> dict[str, Any]:
+        """Get a single item by ID.
+    
+        Accessible if the item is in a project the user can access (owned or
+        shared), or is a project-less (inbox) item owned by the user.
+    
+        Raises:
+            NotFoundError: If the item doesn't exist or isn't accessible.
+        """
+>       row = await db.fetchrow(
+            "SELECT * FROM items WHERE id = $1 AND "
+            "((user_id = $2 AND project_id IS NULL) OR project_id IN "
+            "(SELECT id FROM projects WHERE user_id = $3 "
+            "UNION SELECT project_id FROM project_members WHERE user_id = $4))",
+            item_id,
+            user_id,
+            user_id,
+            user_id,
+        )
+E       TypeError: object MagicMock can't be used in 'await' expression
+
+src/agent_gtd/services/item_service.py:183: TypeError
+________________ test_manage_dispatch_does_not_flip_item_status ________________
+
+client = <httpx.AsyncClient object at 0x7a032d6ff650>
+_mock_dispatch_preflight = None
+
+    async def test_manage_dispatch_does_not_flip_item_status(
+        client: AsyncClient, _mock_dispatch_preflight
+    ):
+        """dispatch_rollout does not change any item's status (regression: kb-01515, Bug 1).
+    
+        After the fix, dispatch_item(mode='manage') is blocked entirely. The correct
+        path is dispatch_rollout which creates a manage run with item_id=NULL and
+        therefore never touches any item's status. This test verifies that the old
+        path (dispatch_item mode=manage) returns 409, and that dispatch_rollout
+        leaves a 'ready' item untouched.
+        """
+        from agent_gtd.auth import create_token, register_user
+        from agent_gtd.database import get_db
+        from agent_gtd.services.settings_service import set_user_setting
+    
+        db = await get_db()
+        user = await register_user("wave-manage-status@test.com", "pw")
+        user_id = user.id
+        project_id = await _make_project(db, user_id)
+    
+        now = _now()
+        await db.execute(
+            "UPDATE projects SET git_origin = $1, updated_at = $2 WHERE id = $3",
+            "git@github.com:test/manage-status.git",
+            now,
+            project_id,
+        )
+        await set_user_setting(db, user_id, "dispatch.service_url", "http://fake:8100")
+        await set_user_setting(db, user_id, "dispatch.service_api_key", "test-key")
+    
+        # Create a rollout-bound item in 'ready' status
+        item_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO items"
+            " (id, project_id, user_id, title, status, created_at, updated_at)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            item_id,
+            project_id,
+            user_id,
+            "Wave item A",
+            "ready",
+            now,
+            now,
+        )
+    
+        rollout_id = await _make_wave_run(db, user_id, project_id, status="pending")
+    
+        token = create_token(user_id)
+    
+        # Old path (dispatch_item mode=manage) must be rejected — confirms Bug 1 fix
+        res_old = await client.post(
+            f"/api/items/{item_id}/dispatch",
+            json={"mode": "manage", "rollout_id": rollout_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+>       assert res_old.status_code == 409, (
+            f"Expected 409 for dispatch_item(mode=manage), got {res_old.status_code}"
+        )
+E       AssertionError: Expected 409 for dispatch_item(mode=manage), got 201
+E       assert 201 == 409
+E        +  where 201 = <Response [201 Created]>.status_code
+
+tests/test_rollout_executor.py:1374: AssertionError
+=============================== warnings summary ===============================
+tests/test_rollout_executor.py: 43 warnings
+  /tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/jwt/api_jwt.py:153: InsecureKeyLengthWarning: The HMAC key is 20 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+    return self._jws.encode(
+
+tests/test_rollout_executor.py: 41 warnings
+  /tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/jwt/api_jwt.py:371: InsecureKeyLengthWarning: The HMAC key is 20 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+    decoded = self.decode_complete(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+==================================== PASSES ====================================
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event 07ece0a5-5844-4b06-9d4f-eec4ac7fb595 to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 78, in fetch
+    rows = await cursor.fetchall()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 68, in fetchall
+    return await self._execute(self._cursor.fetchall)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 32, in _execute
+    return await self._conn._execute(fn, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event 862464fd-45cf-42da-89f3-33ce0d882f12 to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 78, in fetch
+    rows = await cursor.fetchall()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 68, in fetchall
+    return await self._execute(self._cursor.fetchall)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 32, in _execute
+    return await self._conn._execute(fn, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event 5eeca3e3-b273-4364-8c98-c6d227f34698 to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 77, in fetch
+    cursor = await conn.execute(_pg_to_sqlite(sql), args if args else None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 223, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event feae7c7c-21e7-4932-b0f4-9dddd08d845d to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 77, in fetch
+    cursor = await conn.execute(_pg_to_sqlite(sql), args if args else None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 223, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event 332311c0-0d2d-457c-ab32-a0b423e1e197 to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 77, in fetch
+    cursor = await conn.execute(_pg_to_sqlite(sql), args if args else None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 223, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+---------------------------- Captured log teardown -----------------------------
+ERROR    agent_gtd.event_bus:event_bus.py:130 Failed to fan out event 943d61e2-c70a-4d13-ac13-15a1fabffbbc to project members
+Traceback (most recent call last):
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/event_bus.py", line 109, in publish
+    member_rows = await db.fetch(
+                  ^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/src/agent_gtd/sqlite_pool.py", line 78, in fetch
+    rows = await cursor.fetchall()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 68, in fetchall
+    return await self._execute(self._cursor.fetchall)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/cursor.py", line 32, in _execute
+    return await self._conn._execute(fn, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 160, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/tmp/harness-mined-mined-agent-gtd-rollout-deadlock-3050470-12/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 63, in _connection_worker_thread
+    result = function()
+sqlite3.ProgrammingError: Cannot operate on a closed database.
+=========================== short test summary info ============================
+PASSED tests/test_dispatch_service.py::test_reconcile_orphans_publishes_one_event_per_row
+PASSED tests/test_dispatch_service.py::test_reconcile_orphans_payload_contains_run_id_and_error_msg
+PASSED tests/test_dispatch_service.py::test_reconcile_orphans_returns_zero_when_no_active_runs
+PASSED tests/test_dispatch_service.py::test_reconcile_orphans_logs_each_run_id
+PASSED tests/test_rollout_service.py::test_parse_declared_files_extracts_lines
+PASSED tests/test_rollout_service.py::test_parse_declared_files_stops_at_next_heading
+PASSED tests/test_rollout_service.py::test_parse_declared_files_empty_section
+PASSED tests/test_rollout_service.py::test_parse_declared_files_no_section
+PASSED tests/test_rollout_service.py::test_parse_declared_files_blank_lines_ignored
+PASSED tests/test_rollout_service.py::test_parse_declared_files_plain_paths
+PASSED tests/test_rollout_service.py::test_has_ac_true
+PASSED tests/test_rollout_service.py::test_has_ac_true_multiple_lines
+PASSED tests/test_rollout_service.py::test_has_ac_false_empty_section
+PASSED tests/test_rollout_service.py::test_has_ac_false_no_section
+PASSED tests/test_rollout_service.py::test_has_ac_false_only_blanks
+PASSED tests/test_rollout_service.py::test_validate_passes_for_valid_items
+PASSED tests/test_rollout_service.py::test_validate_multiple_valid_items_same_project
+PASSED tests/test_rollout_service.py::test_validate_empty_list_not_raised_here
+PASSED tests/test_rollout_service.py::test_validate_item_not_found
+PASSED tests/test_rollout_service.py::test_validate_item_not_accessible_by_user
+PASSED tests/test_rollout_service.py::test_validate_wrong_status_new
+PASSED tests/test_rollout_service.py::test_validate_wrong_status_active
+PASSED tests/test_rollout_service.py::test_validate_wrong_status_done
+PASSED tests/test_rollout_service.py::test_validate_missing_acceptance_criteria
+PASSED tests/test_rollout_service.py::test_validate_empty_acceptance_criteria
+PASSED tests/test_rollout_service.py::test_validate_missing_files_to_modify
+PASSED tests/test_rollout_service.py::test_validate_empty_files_to_modify
+PASSED tests/test_rollout_service.py::test_validate_missing_build_engine
+PASSED tests/test_rollout_service.py::test_validate_external_blocker_blocks_item
+PASSED tests/test_rollout_service.py::test_validate_internal_blocker_allowed
+PASSED tests/test_rollout_service.py::test_validate_resolved_external_blocker_allowed
+PASSED tests/test_rollout_service.py::test_validate_mixed_projects_rejected
+PASSED tests/test_rollout_service.py::test_validate_collects_all_failures
+PASSED tests/test_rollout_service.py::test_validate_multiple_failures_same_item
+PASSED tests/test_rollout_service.py::test_plan_rollout_empty_item_ids_raises
+PASSED tests/test_rollout_service.py::test_plan_rollout_no_dispatch_config_raises
+PASSED tests/test_rollout_service.py::test_plan_rollout_no_rollout_inserted_on_legality_failure
+PASSED tests/test_rollout_service.py::test_plan_rollout_no_rollout_inserted_on_empty_list
+PASSED tests/test_rollout_service.py::test_cancel_rollout_halted_to_cancelled
+PASSED tests/test_rollout_service.py::test_cancel_rollout_running_to_cancelled
+PASSED tests/test_rollout_service.py::test_cancel_rollout_idempotent
+PASSED tests/test_rollout_service.py::test_cancel_rollout_marks_in_progress_items_skipped
+PASSED tests/test_rollout_service.py::test_cancel_rollout_completed_items_untouched
+PASSED tests/test_rollout_service.py::test_start_rollout_pending_to_running
+PASSED tests/test_rollout_service.py::test_start_rollout_rejects_running
+PASSED tests/test_rollout_service.py::test_start_rollout_rejects_halted
+PASSED tests/test_rollout_service.py::test_start_rollout_rejects_cancelled
+PASSED tests/test_rollout_service.py::test_start_rollout_rejects_done
+PASSED tests/test_rollout_service.py::test_start_rollout_wrong_user
+PASSED tests/test_rollout_service.py::test_start_rollout_emits_wave_started_event
+PASSED tests/test_rollout_service.py::test_validate_mixed_projects_item_with_existing_failures
+PASSED tests/test_rollout_service.py::test_call_planner_http_status_error
+PASSED tests/test_rollout_service.py::test_call_planner_timeout_error
+PASSED tests/test_rollout_service.py::test_call_planner_network_error
+PASSED tests/test_rollout_service.py::test_call_planner_success
+PASSED tests/test_rollout_service.py::test_plan_rollout_project_not_found
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_completed_cascades_item_done
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_halted_does_not_cascade
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_skipped_does_not_cascade
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_graph_complete_true_when_last_item
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_graph_complete_false_when_items_remain
+PASSED tests/test_rollout_service.py::test_get_rollout_returns_dict
+PASSED tests/test_rollout_service.py::test_get_rollout_not_found_raises
+PASSED tests/test_rollout_service.py::test_get_rollout_wrong_user_raises
+PASSED tests/test_rollout_service.py::test_relaunch_manage_increments_count
+PASSED tests/test_rollout_service.py::test_relaunch_manage_emits_correct_event
+PASSED tests/test_rollout_service.py::test_relaunch_manage_not_found_raises
+PASSED tests/test_rollout_service.py::test_relaunch_manage_wrong_user_raises
+PASSED tests/test_rollout_service.py::test_relaunch_manage_returns_updated_dict
+PASSED tests/test_rollout_service.py::test_halt_rollout_accepts_running_status
+PASSED tests/test_rollout_service.py::test_halt_rollout_accepts_pending_status
+PASSED tests/test_rollout_service.py::test_halt_rollout_rejects_completed_status
+PASSED tests/test_rollout_service.py::test_halt_rollout_rejects_halted_status
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_from_ready
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_from_ready_unblocks_downstream
+PASSED tests/test_rollout_service.py::test_complete_item_in_rollout_rejects_pending_status
+PASSED tests/test_rollout_service.py::test_managed_rollout_happy_path
+PASSED tests/test_rollout_executor.py::test_advance_rollout_fresh
+PASSED tests/test_rollout_executor.py::test_advance_rollout_after_dispatch
+PASSED tests/test_rollout_executor.py::test_advance_rollout_after_complete
+PASSED tests/test_rollout_executor.py::test_advance_rollout_graph_complete
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_unblocks
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_closes_wave
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_bad_status
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_persists_merge_actor
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_decision_rule_in_event_payload
+PASSED tests/test_rollout_executor.py::test_halt_rollout
+PASSED tests/test_rollout_executor.py::test_halt_rollout_already_halted
+PASSED tests/test_rollout_executor.py::test_halt_rollout_with_item_id_in_payload
+PASSED tests/test_rollout_executor.py::test_halt_rollout_emits_comment_id_in_payload
+PASSED tests/test_rollout_executor.py::test_replan_rollout_no_remaining
+PASSED tests/test_rollout_executor.py::test_replan_rollout_creates_new_version
+PASSED tests/test_rollout_executor.py::test_advance_rollout_not_found
+PASSED tests/test_rollout_executor.py::test_advance_rollout_not_running
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_invalid_outcome
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_item_not_found
+PASSED tests/test_rollout_executor.py::test_complete_item_in_rollout_downstream_not_pending
+PASSED tests/test_rollout_executor.py::test_replan_rollout_not_running
+PASSED tests/test_rollout_executor.py::test_replan_rollout_with_from_item
+PASSED tests/test_rollout_executor.py::test_replan_rollout_from_item_no_descendants
+PASSED tests/test_rollout_executor.py::test_call_planner_no_config
+PASSED tests/test_rollout_executor.py::test_call_planner_http_error
+PASSED tests/test_rollout_executor.py::test_replan_rollout_readiness_regression
+PASSED tests/test_rollout_executor.py::test_plan_rollout_route_legality_failure_returns_422
+PASSED tests/test_rollout_executor.py::test_plan_rollout_route_happy_path_returns_dag
+PASSED tests/test_rollout_executor.py::test_manage_dispatch_flips_wave_to_running
+PASSED tests/test_rollout_executor.py::test_manage_dispatch_emits_wave_started_event
+PASSED tests/test_rollout_executor.py::test_manage_dispatch_rejected_if_wave_not_pending
+PASSED tests/test_rollout_executor.py::test_build_dispatch_transitions_wave_plan_item_to_dispatched
+PASSED tests/test_rollout_executor.py::test_build_dispatch_sets_claude_run_id_on_wave_plan_item
+PASSED tests/test_rollout_executor.py::test_build_dispatch_with_non_running_wave_raises_validation_error
+PASSED tests/test_rollout_executor.py::test_manage_dispatch_without_rollout_id_rejected
+PASSED tests/test_rollout_executor.py::test_happy_path_plan_rollout_to_complete_item_in_rollout
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_valid_phase
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_all_phases
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_invalid_phase
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_non_running_wave
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_unauthorized
+PASSED tests/test_rollout_executor.py::test_update_rollout_state_null_item
+FAILED tests/test_dispatch_service.py::test_create_run_manage_mode_rejected
+FAILED tests/test_rollout_executor.py::test_manage_dispatch_does_not_flip_item_status
+================= 2 failed, 119 passed, 84 warnings in 14.79s ==================

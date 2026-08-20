@@ -8,4 +8,4 @@ aci = "aci"   # agent-computer interface (Anthropic's term), not a typo of ACPI
 # them from cargo, and typos skips them here for the same reason: a fixture
 # may deliberately contain non-standard identifiers or partial-word test
 # vectors (e.g. `"caf"` — the truncated "café" — in the text-preview fixture).
-extend-exclude = ["CHANGELOG.md", "*.lock", "fixtures/**"]
+extend-exclude = ["CHANGELOG.md", "*.lock", "fixtures/**", "crates/harness/testdata/**/*.txt"]
