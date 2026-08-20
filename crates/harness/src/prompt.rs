@@ -678,6 +678,40 @@ mod tests {
         );
     }
 
+    /// The task prompt must carry test-first framing AND must not tell the
+    /// model that a bare passing gate means done. Both are load-bearing: on a
+    /// healthy repo the gate command is GREEN before the agent touches
+    /// anything, so an unconditional "as soon as this passes, finish" reads as
+    /// an instruction to finish at iteration 1. Red-first is what makes a green
+    /// gate mean something — it turns the signal from a state into a
+    /// transition. A wording pass must not silently drop either half.
+    #[test]
+    fn render_task_prompt_from_spec_carries_test_first_framing() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+        assert!(
+            rendered.contains("FIRST"),
+            "approach section must instruct the model to write a failing test \
+             first; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Confirm it fails"),
+            "test-first framing must require observing the RED state, not just \
+             writing a test; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("As soon as this command passes"),
+            "the unconditional passing-gate phrasing is a trap on a repo whose \
+             gate is already green; got:\n{rendered}"
+        );
+    }
+
     /// The verification section must carry finish-discipline framing containing
     /// the literal substring `finish(done) immediately` — added after the first
     /// dogfood run, where the model completed and verified the task by
