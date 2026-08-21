@@ -1062,6 +1062,31 @@ pub async fn run_env_setup(
     }
 }
 
+// ===== tier-2 agent prompt ================================================
+
+/// Assemble the tier-2 agent prompt: the mined statement, then the shared
+/// test-first approach guidance.
+///
+/// Tier-2's prompt is the mined statement VERBATIM — it never passes through
+/// `task_spec_prompt.md`, so harness-owned guidance that lives only in that
+/// template reaches talos dispatch and the tier-1 eval but NOT this path. That
+/// asymmetry silently voided a test-first experiment (three matrix runs that
+/// measured nothing), which is why the guidance is appended here from the same
+/// template rather than restated.
+///
+/// The guidance is deliberately harness-owned rather than written into the
+/// talos-evals statement files: it is a property of the harness under test, not
+/// task content, and putting it in task data would contaminate every spec level
+/// of every task and make a harness behavior look like part of the mined
+/// commit.
+fn tier2_task_prompt(statement: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        statement.trim_end(),
+        crate::prompt::render_test_first_approach()
+    )
+}
+
 // ===== agent test authorship ==============================================
 
 /// Timeout for the `git status` scan that measures agent test authorship.
@@ -1732,7 +1757,7 @@ async fn single_trial<B: ModelBackend>(
         Arc::new(DiskOffloadSink::new(offload_canon)),
     );
     let tools = standard_registry(None);
-    let run_config = RunConfig::new(config.statement.to_string(), config.max_iterations);
+    let run_config = RunConfig::new(tier2_task_prompt(config.statement), config.max_iterations);
     let RunResult { outcome, stats } = engine::run(backend, &tools, &ctx, &run_config).await;
     let claimed = claimed_disposition_label(&outcome);
 
@@ -1866,7 +1891,7 @@ mod tests {
         gate_fault_reason, is_test_path, load_statement, load_task, match_task_id,
         matches_exclusion, normalize, parse_authored_tests, parse_pytest_summary_totals,
         parse_short_summary_line, prepare_worktrees, resolve, run_env_setup, sanitize_for_filename,
-        scan_authored_tests, strip_param_suffix,
+        scan_authored_tests, strip_param_suffix, tier2_task_prompt,
     };
     use crate::run_record::{Disposition, FailureMode, Verification};
     use std::collections::BTreeMap;
@@ -2218,6 +2243,36 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert!(parse_short_summary_line("tests/x.py .").is_none());
         // Case-sensitive: `passed` (lowercase) is not a STATUS token.
         assert!(parse_short_summary_line("passed tests/x.py::t").is_none());
+    }
+
+    // ---- tier-2 agent prompt ----------------------------------------------
+
+    /// The consume-side pin: it is not enough that the guidance RENDERS, it has
+    /// to reach the tier-2 agent. A prior experiment changed
+    /// `task_spec_prompt.md` and re-ran the matrix three times without noticing
+    /// that tier-2 passes the mined statement straight into `RunConfig::new`,
+    /// so the change could not possibly apply. This test fails if that wiring
+    /// is ever removed.
+    #[test]
+    fn tier2_task_prompt_appends_the_shared_test_first_guidance() {
+        let out = tier2_task_prompt("Fix the deadlock in the rollout executor.\n");
+        assert!(
+            out.starts_with("Fix the deadlock in the rollout executor."),
+            "statement must lead the prompt; got:\n{out}"
+        );
+        // Byte-identical to what the task-spec template includes — not a
+        // paraphrase that can drift.
+        assert!(
+            out.ends_with(&crate::prompt::render_test_first_approach()),
+            "tier-2 prompt must end with the SHARED approach template; got:\n{out}"
+        );
+        assert!(out.contains("Confirm it fails"), "got:\n{out}");
+        // Exactly one blank line between the two parts, regardless of how the
+        // statement file happens to end.
+        assert!(
+            out.contains(".\n\n## Approach"),
+            "expected one blank line between statement and guidance; got:\n{out}"
+        );
     }
 
     // ---- agent test authorship --------------------------------------------

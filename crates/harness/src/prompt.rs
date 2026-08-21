@@ -122,6 +122,16 @@ struct TaskSpecPromptTemplate<'a> {
     gate_command: &'a str,
 }
 
+/// The test-first ("red, green") approach guidance, factored into its own
+/// template so the two surfaces that need it cannot drift apart:
+/// [`TaskSpecPromptTemplate`] `{% include %}`s it for the groomed-item path
+/// (talos dispatch, tier-1 coding eval), and [`render_test_first_approach`]
+/// renders it standalone for the tier-2 mined-task path, whose agent prompt is
+/// the raw mined statement and never passes through the task-spec template.
+#[derive(Template)]
+#[template(path = "test_first_approach.md", escape = "none")]
+struct TestFirstApproachTemplate;
+
 /// The ralph outer-loop per-iteration prompt template. Renders the objective,
 /// the injected progress notes, and the exact notes filename the agent must
 /// append to next. `escape = "none"` is pinned so prompt text with `"`, `<`,
@@ -252,12 +262,33 @@ pub fn render_nudge_prompt() -> String {
         .expect("nudge_prompt.md is a static variable-free template that renders infallibly")
 }
 
+/// Render the test-first approach guidance on its own.
+///
+/// For callers that assemble an agent prompt WITHOUT the task-spec template —
+/// today that is the tier-2 mined-task eval, whose prompt is the mined
+/// statement verbatim. Sharing one template with
+/// [`render_task_prompt_from_spec`] is the point: an experiment that changes
+/// the guidance must change it for both surfaces at once, or the eval stops
+/// measuring what dispatch actually ships.
+///
+/// The render is a pure function of its (empty) inputs and is
+/// byte-deterministic — re-rendering produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_test_first_approach() -> String {
+    TestFirstApproachTemplate
+        .render()
+        .expect("test_first_approach.md is a static variable-free template that renders infallibly")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
         render_ralph_prompt, render_system_prompt, render_task_prompt,
-        render_task_prompt_from_spec, tool_lines,
+        render_task_prompt_from_spec, render_test_first_approach, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
     use crate::task_spec::{FileToModify, TaskSpec};
@@ -710,6 +741,32 @@ mod tests {
             "the unconditional passing-gate phrasing is a trap on a repo whose \
              gate is already green; got:\n{rendered}"
         );
+    }
+
+    /// The two surfaces that carry test-first guidance must carry the SAME
+    /// bytes. `task_spec_prompt.md` `{% include %}`s the shared template for
+    /// the groomed-item path; tier-2's mined-eval appends
+    /// [`render_test_first_approach`] to the raw statement. If someone edits
+    /// one and paraphrases the other, the eval stops measuring what dispatch
+    /// ships — and that failure is invisible at runtime.
+    #[test]
+    fn task_spec_prompt_embeds_the_shared_test_first_template_verbatim() {
+        let shared = render_test_first_approach();
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let rendered = render_task_prompt_from_spec(&spec);
+        assert!(
+            rendered.contains(shared.trim_end()),
+            "task-spec prompt must embed the shared approach template verbatim;\n\
+             shared:\n{shared}\nrendered:\n{rendered}"
+        );
+        // Byte-deterministic, like every other template render here.
+        assert_eq!(shared, render_test_first_approach());
     }
 
     /// The verification section must carry finish-discipline framing containing
