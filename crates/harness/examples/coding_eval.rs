@@ -68,7 +68,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::engine::{LoopOutcome, RunStats};
-use harness::eval::{EvalReport, TrialResult, coding_fix_task, discover_fixtures, run_eval};
+use harness::eval::{EvalReport, TrialResult, coding_fix_task_with, discover_fixtures, run_eval};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
 use harness::run_record::{Disposition, Verification};
@@ -222,6 +222,12 @@ async fn main() {
     let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("CODING_EVAL_K", DEFAULT_K);
     let max_iterations = env_u32("CODING_EVAL_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS);
+    // Test-first guidance is ON by default, matching what talos dispatch ships.
+    // `CODING_EVAL_TEST_FIRST=0` strips it so the same fixtures can be run A/B.
+    // Record this on every eval row — like `think`, it is a prompt-surface knob
+    // and results must never be compared across it.
+    let include_test_first = env::var("CODING_EVAL_TEST_FIRST")
+        .map_or(true, |v| !matches!(v.as_str(), "0" | "off" | "false"));
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears
     // the narrow-to-one-fixture override.
     let fixture_filter = env::var("CODING_EVAL_FIXTURE")
@@ -255,7 +261,7 @@ async fn main() {
 
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
-         (max_iterations={max_iterations})",
+         (max_iterations={max_iterations}, test_first={include_test_first})",
         fixtures.len(),
     );
 
@@ -269,7 +275,7 @@ async fn main() {
             .and_then(|s| s.to_str())
             .unwrap_or("<unnamed>")
             .to_string();
-        let (mut task, env_factory) = coding_fix_task(fixture);
+        let (mut task, env_factory) = coding_fix_task_with(fixture, include_test_first);
         // Stamp the fixture name onto the task so the report says which
         // fixture ran — otherwise every report would just read `coding_fix`.
         task.name = fixture_name.clone();

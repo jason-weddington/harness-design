@@ -8,3 +8,4 @@ nothing. Then implement until it passes.
 If the task genuinely has no test-shaped outcome (a pure refactor, a dependency
 bump, a docs or config change), state that in one line and go straight to the
 change.
+

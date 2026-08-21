@@ -120,6 +120,7 @@ struct TaskSpecPromptTemplate<'a> {
     acceptance_criteria: &'a [String],
     files_to_modify: &'a [FileToModify],
     gate_command: &'a str,
+    include_test_first: bool,
 }
 
 /// The test-first ("red, green") approach guidance, factored into its own
@@ -211,12 +212,31 @@ pub fn render_task_prompt(task: &str) -> String {
 /// Never in practice — see [`render_system_prompt`].
 #[must_use]
 pub fn render_task_prompt_from_spec(spec: &TaskSpec) -> String {
+    render_task_prompt_from_spec_with(spec, true)
+}
+
+/// [`render_task_prompt_from_spec`] with the test-first approach section
+/// toggleable.
+///
+/// Exists so an eval can measure the guidance's effect by running the SAME
+/// harness with and without it. Production (talos dispatch) always renders it —
+/// `render_task_prompt_from_spec` hard-codes `true` — so a toggle can never
+/// silently disable it on the shipping path; only a caller that explicitly asks
+/// for `false` gets the stripped prompt.
+///
+/// The render is a pure function of its inputs and is byte-deterministic.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_task_prompt_from_spec_with(spec: &TaskSpec, include_test_first: bool) -> String {
     TaskSpecPromptTemplate {
         title: &spec.title,
         description: &spec.description,
         acceptance_criteria: &spec.acceptance_criteria,
         files_to_modify: &spec.files_to_modify,
         gate_command: &spec.gate_command,
+        include_test_first,
     }
     .render()
     .expect("task_spec_prompt.md is a static template that renders infallibly for owned inputs")
@@ -288,7 +308,8 @@ mod tests {
     use super::{
         NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
         render_ralph_prompt, render_system_prompt, render_task_prompt,
-        render_task_prompt_from_spec, render_test_first_approach, tool_lines,
+        render_task_prompt_from_spec, render_task_prompt_from_spec_with,
+        render_test_first_approach, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
     use crate::task_spec::{FileToModify, TaskSpec};
@@ -741,6 +762,36 @@ mod tests {
             "the unconditional passing-gate phrasing is a trap on a repo whose \
              gate is already green; got:\n{rendered}"
         );
+    }
+
+    /// The toggle must actually strip the section, and the production entry
+    /// point must never be able to reach the stripped form: an eval knob that
+    /// silently disabled guidance on the shipping path would be worse than no
+    /// knob at all.
+    #[test]
+    fn test_first_toggle_strips_the_section_but_never_on_the_production_path() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        let with = render_task_prompt_from_spec_with(&spec, true);
+        let without = render_task_prompt_from_spec_with(&spec, false);
+
+        assert!(with.contains("## Approach"), "got:\n{with}");
+        assert!(!without.contains("## Approach"), "got:\n{without}");
+        assert!(!without.contains("Confirm it fails"), "got:\n{without}");
+        // Everything else is identical — the toggle changes ONE section, so an
+        // A/B run differs only in the variable under test.
+        assert_eq!(with.replace(&render_test_first_approach(), ""), without);
+        // The default entry point is the `true` arm, byte for byte.
+        assert_eq!(render_task_prompt_from_spec(&spec), with);
+        // Verification framing survives in both arms.
+        for r in [&with, &without] {
+            assert!(r.contains("finish(done) immediately"), "got:\n{r}");
+        }
     }
 
     /// The two surfaces that carry test-first guidance must carry the SAME

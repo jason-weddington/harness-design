@@ -17,8 +17,7 @@ prefer edit_file for mutations (its unique-match contract is safer than sed -i).
 {% for f in files_to_modify -%}
 - `{{ f.path }}`: {{ f.change }}
 {% endfor %}
-{% include "test_first_approach.md" %}
-## Verification
+{% if include_test_first %}{% include "test_first_approach.md" %}{% endif %}## Verification
 
 Run the following command to verify the task is complete:
 

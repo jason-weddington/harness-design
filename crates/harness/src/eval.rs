@@ -651,13 +651,35 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
 /// Panics if `fixture_src/task.json` exists but cannot be read or is not valid
 /// [`crate::task_spec::TaskSpec`] JSON — a broken fixture is a broken host.
 pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) {
+    coding_fix_task_with(fixture_src, true)
+}
+
+/// [`coding_fix_task`] with the test-first approach guidance toggleable.
+///
+/// Exists so the tier-1 eval can measure the guidance's effect A/B on the same
+/// fixtures. Tier-1 is the surface where the measurement is meaningful: it
+/// registers a real `run_checks` runner AND keeps a sealed holdout re-gate, so
+/// a test the agent writes counts during the run while the holdout stays an
+/// independent oracle. (Tier-2 cannot measure the benefit — its file-scoped
+/// gate never collects agent-authored tests and `copy_sealed` overwrites the
+/// ones written at sealed paths.)
+///
+/// Only affects the prompt when the fixture carries a `task.json`; the legacy
+/// bare-string prompt has no sections to toggle.
+///
+/// # Panics
+/// Same as [`coding_fix_task`].
+pub fn coding_fix_task_with(
+    fixture_src: &Path,
+    include_test_first: bool,
+) -> (EvalTask, impl Fn() -> TrialEnv) {
     let task_json_path = fixture_src.join("task.json");
     let task_prompt = if task_json_path.exists() {
         let json_str = std::fs::read_to_string(&task_json_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", task_json_path.display()));
         let spec: crate::task_spec::TaskSpec = serde_json::from_str(&json_str)
             .unwrap_or_else(|e| panic!("parse {} as TaskSpec: {e}", task_json_path.display()));
-        crate::prompt::render_task_prompt_from_spec(&spec)
+        crate::prompt::render_task_prompt_from_spec_with(&spec, include_test_first)
     } else {
         "The test suite in this Rust crate fails. Find the bug, fix it, \
                and make the tests pass."
