@@ -3,7 +3,7 @@
 //! sealed-holdout gate**, so talos and claude-code rows are directly
 //! comparable. Two endpoint modes:
 //!
-//! - `CLAUDE_CODE_ENDPOINT=ollama` (default): `claude` talks to GLM-5.2 via
+//! - `CLAUDE_CODE_ENDPOINT=ollama` (default): `claude` talks to GLM-5.3 via
 //!   **Ollama Cloud** (`ANTHROPIC_BASE_URL=https://ollama.com`,
 //!   `ANTHROPIC_AUTH_TOKEN=<OLLAMA_CLOUD_API_KEY>`). This is the original
 //!   talos-glm vs claude-code-glm comparison path — byte-identical to the
@@ -43,7 +43,7 @@
 //! ## Usage
 //!
 //! ```text
-//! # Ollama Cloud / GLM-5.2 (default endpoint mode)
+//! # Ollama Cloud / GLM-5.3 (default endpoint mode)
 //! OLLAMA_CLOUD_API_KEY=... cargo run --example claude_code_eval
 //! OLLAMA_CLOUD_API_KEY=... CODING_EVAL_K=5 CLAUDE_CODE_MAX_TURNS=32 \
 //!   cargo run --example claude_code_eval
@@ -60,7 +60,7 @@
 //! - `CLAUDE_CODE_ENDPOINT`  (optional) — `ollama` (default) or `anthropic`.
 //!   Selects which backend `claude` talks to. Panics on any other value.
 //! - `CLAUDE_CODE_MODEL`     (optional) — the `--model` arg passed to the
-//!   `claude` binary in BOTH modes. Defaults to `glm-5.2:cloud` (the ollama
+//!   `claude` binary in BOTH modes. Defaults to `glm-5.3:cloud` (the ollama
 //!   default); set to e.g. `claude-sonnet-5` in anthropic mode.
 //! - `OLLAMA_CLOUD_API_KEY`  (required in `ollama` mode) — Ollama Cloud API key.
 //!   **Distinct** from `OLLAMA_API_KEY` (local key). Passed to the child
@@ -178,11 +178,11 @@ const DEFAULT_K: u32 = 3;
 const DEFAULT_MAX_TURNS: u32 = 24;
 
 /// Default `--model` arg passed to the `claude` binary in BOTH endpoint modes
-/// when `CLAUDE_CODE_MODEL` is unset. Pinned to the ollama-cloud GLM model so
-/// the default-endpoint run is byte-identical to the pre-endpoint-mode
-/// behavior. Set `CLAUDE_CODE_MODEL=claude-sonnet-5` for an anthropic-mode
+/// when `CLAUDE_CODE_MODEL` is unset. Pinned to the ollama-cloud GLM model the
+/// dispatch `claude-code-glm` and `talos-glm` engines run, so talos-vs-Claude
+/// Code rows stay same-model. Set `CLAUDE_CODE_MODEL=claude-sonnet-5` for an anthropic-mode
 /// Sonnet run.
-const DEFAULT_CLAUDE_MODEL: &str = "glm-5.2:cloud";
+const DEFAULT_CLAUDE_MODEL: &str = "glm-5.3:cloud";
 
 /// Endpoint mode: which backend `claude` talks to.
 ///

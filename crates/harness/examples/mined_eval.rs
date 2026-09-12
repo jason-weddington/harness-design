@@ -35,9 +35,9 @@
 //!   MINED_EVAL_SPEC_LEVEL=s1 MINED_EVAL_K=5 \
 //!   cargo run --example mined_eval
 //!
-//! # Ollama cloud (GLM-5.2)
+//! # Ollama cloud (GLM-5.3)
 //! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com \
-//!   OLLAMA_MODEL=glm-5.2:cloud OLLAMA_API_KEY=... \
+//!   OLLAMA_MODEL=glm-5.3:cloud OLLAMA_API_KEY=... \
 //!   MINED_EVAL_TASKS_DIR=~/git/talos-evals/tasks \
 //!   cargo run --example mined_eval
 //! ```

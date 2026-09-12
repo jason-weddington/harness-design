@@ -39,7 +39,7 @@
 //!   *streaming*; a missing `stream` field would hand us an NDJSON stream this
 //!   slice can't parse. The field is emitted on every request.
 //! - **Model id is constructor config, never hardcoded.** [`OllamaBackend::new`]
-//!   takes the model id (e.g. `glm-5.2:cloud` on cloud, a `qwen3.6`-family tag
+//!   takes the model id (e.g. `glm-5.3:cloud` on cloud, a `qwen3.6`-family tag
 //!   locally); the wire never carries a literal.
 //! - **No api-key leakage in `Debug`.** [`OllamaBackend`] deliberately does
 //!   **not** derive `Debug`; the api key only travels into the

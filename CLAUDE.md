@@ -39,6 +39,8 @@ For engine-routing decisions. Always compare within a SINGLE leaderboard — cro
 
 Source: [llm-stats.com/benchmarks/swe-bench-pro](https://llm-stats.com/benchmarks/swe-bench-pro), as of 2026-07-15. Takeaway: GLM-5.2 sits within ~1 pt of Sonnet 5 and ~7 pts of Opus 4.8 — so **model capability is not what separates the talos-glm and talos-sonnet lanes; the harness is** (talos vs. Claude Code). This is why a talos-glm miss falls back to claude-code-glm (same model, stronger harness), not to a bigger model. Refresh when the model lineup changes.
 
+GLM-5.3 and GLM-5.3-Flash — the models behind `talos-glm` and `talos-glm-flash` since 2026-09-12 — are **not on this leaderboard yet** (re-checked 2026-09-12; the three rows above were unchanged). Until they are, don't put them in the table from another source; our own talos eval rows against the 5.2 baseline are in `kb-03220` (tier-2: both 13/24 vs 5.2's 9/24, flash with far better finish discipline).
+
 ## Why Rust
 
 Part of the learning goal. Rust's compiler and type system give us a layer of

@@ -18,8 +18,8 @@
 //! ANTHROPIC_API_KEY=sk-... cargo run --example coding_eval
 //! ANTHROPIC_API_KEY=sk-... ANTHROPIC_MODEL=claude-sonnet-5 CODING_EVAL_K=5 \
 //!   cargo run --example coding_eval
-//! # Ollama cloud (GLM-5.2)
-//! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_MODEL=glm-5.2:cloud \
+//! # Ollama cloud (GLM-5.3)
+//! EVAL_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_MODEL=glm-5.3:cloud \
 //!   cargo run --example coding_eval
 //! # Ollama localhost (small local models; num_ctx resolved from /api/show)
 //! EVAL_BACKEND=ollama OLLAMA_MODEL=qwen3.6:35b cargo run --example coding_eval
@@ -31,7 +31,7 @@
 //! - `EVAL_BACKEND`          (optional) — `anthropic` (default) or `ollama`.
 //! - `ANTHROPIC_API_KEY`     (required for anthropic) — passed to the backend.
 //! - `ANTHROPIC_MODEL`       (optional) — defaults to `claude-haiku-4-5`.
-//! - `OLLAMA_MODEL`          (required for ollama) — e.g. `glm-5.2:cloud`,
+//! - `OLLAMA_MODEL`          (required for ollama) — e.g. `glm-5.3:cloud`,
 //!   `qwen3.6:35b`, `gpt-oss:20b`. Never hardcoded.
 //! - `OLLAMA_BASE_URL`       (optional) — defaults to `http://localhost:11434`;
 //!   set `https://ollama.com` for Ollama cloud.
@@ -53,7 +53,7 @@
 //!   probe, sync path). Eval `num_ctx` rows are NOT comparable to talos
 //!   dispatch rows until that follow-up lands.
 //! - `OLLAMA_THINK`          (optional) — `off|on|low|medium|high|max`
-//!   (gpt-oss ignores plain booleans; GLM-5.2 supports high/max).
+//!   (gpt-oss ignores plain booleans; GLM-5.3 supports low/high/max and defaults to max).
 //! - `CODING_EVAL_K`         (optional) — number of trials; defaults to 3.
 //! - `CODING_EVAL_FIXTURE`   (optional) — narrows the run to the single named
 //!   fixture directory under `fixtures/` (e.g. `lru-cache`). When unset, every
