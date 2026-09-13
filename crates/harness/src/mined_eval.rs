@@ -79,6 +79,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -86,7 +87,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{self, LoopOutcome, RunConfig, RunResult};
 use crate::eval::{CODING_CHECK_TIMEOUT, copy_dir_recursive};
-use crate::exec::{ExecSpec, run, shell_checks_runner};
+use crate::exec::{CheckReport, ExecSpec, run, shell_checks_runner};
 use crate::model::ModelBackend;
 use crate::run_record::Disposition;
 use crate::tool::ToolCtx;
@@ -1625,7 +1626,7 @@ pub struct MinedTrialResult {
     /// reverted — worth seeing, and never scored.
     pub agent_tests_modified: Vec<String>,
     /// Absolute path to the persisted raw re-gate stdout+stderr under
-    /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt`.
+    /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
     /// Whether finish-recovery was structurally armed for this trial: true iff
     /// `run_checks` is in the registry AND `run_config.max_nudges > 0`.
@@ -1675,6 +1676,26 @@ pub struct MinedTrialResult {
     /// Count of successful (`!is_error`) `edit_file` tool calls this trial.
     /// From [`crate::engine::RunStats::edit_file_calls_ok`].
     pub edit_file_calls_ok: u32,
+    /// The post-run agent-gate verdict — THE production-shippability signal.
+    /// A real dispatch pushes only when this gate is green at a
+    /// claim-verified `Done`, so this is what separates a sealed-`Resolved`
+    /// trial that is actually shippable from one that merely happens to pass
+    /// the hidden tests while the agent's own project gate (lint/typecheck/
+    /// whole suite) is red or was never re-run at the end.
+    ///
+    /// `Some(report.passed)` in [`AgentGateMode::On`], computed by running
+    /// the resolved `agent_gate_command` once immediately after `engine::run`
+    /// returns (before `scan_authored_tests`/`sealed_regate_score`, so it
+    /// sees the agent's own tree rather than the sealed-path overwrite from
+    /// `copy_sealed`). `None` in [`AgentGateMode::Off`] and on every
+    /// pre-agent `Invalid` path (see [`invalid_trial`]) — meaning
+    /// NOT-RUN, not "ran and failed".
+    pub agent_gate_post: Option<bool>,
+    /// Absolute path to the persisted post-run agent-gate output, written
+    /// next to [`Self::gate_output_path`] as `agent-gate-output.txt`.
+    /// `Some` iff [`Self::agent_gate_post`] is `Some` (the gate ran);
+    /// `None` otherwise.
+    pub agent_gate_output_path: Option<PathBuf>,
 }
 
 /// The full run report over `k` trials of one task.
@@ -1799,6 +1820,40 @@ impl MinedReport {
             .map(|_| 1u32)
             .sum()
     }
+
+    /// Trials that are actually production-shippable: the sealed re-gate
+    /// scored [`TrialScore::Resolved`] AND the agent's claimed terminal was
+    /// `Done`. Deliberately stricter than `resolved_count` alone — a real
+    /// dispatch pushes only on a claim-verified `Done`, so a `Resolved`
+    /// trial that ended `MaxIterations` (or any other non-`Done` claim) is
+    /// correct-but-NOT-shippable and must not count here.
+    #[must_use]
+    pub fn shippable(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| {
+                matches!(t.score, TrialScore::Resolved) && t.claimed_disposition == CLAIMED_DONE
+            })
+            .map(|_| 1u32)
+            .sum()
+    }
+
+    /// Trials the sealed re-gate scored [`TrialScore::Resolved`] where the
+    /// post-run agent gate came back red ([`MinedTrialResult::agent_gate_post`]
+    /// `== Some(false)`) — resolved-but-NOT-shippable for a different reason
+    /// than [`Self::resolved_unclaimed`]: the sealed tests happen to pass,
+    /// but the agent's own project gate was red (or never re-run) at the
+    /// end. A trial where the post-run gate never ran
+    /// (`agent_gate_post == None`, e.g. [`AgentGateMode::Off`]) never counts
+    /// here — that is NOT-ARMED, not tried-and-failed.
+    #[must_use]
+    pub fn resolved_gate_red(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| matches!(t.score, TrialScore::Resolved) && t.agent_gate_post == Some(false))
+            .map(|_| 1u32)
+            .sum()
+    }
 }
 
 /// Label used for a Done disposition on [`MinedTrialResult::claimed_disposition`].
@@ -1866,27 +1921,75 @@ fn resolve_state_root(
     std::env::temp_dir()
 }
 
-/// Persist raw re-gate output under
-/// `<xdg-state>/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt` and
+/// Per-process run id used to namespace the mined-eval state directory, so
+/// concurrent runner processes (e.g. parallel matrix configs evaluating the
+/// SAME task) never overwrite each other's persisted gate captures.
+/// Computed ONCE per process — `<unix-secs>-<pid>` — and cached; every trial
+/// in this process shares the same run id.
+fn run_id() -> &'static str {
+    static RUN_ID: OnceLock<String> = OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        format!("{secs}-{}", std::process::id())
+    })
+}
+
+/// Persist `raw` under
+/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/<filename>` and
 /// return its absolute path. A write error falls back to a temp path so a
-/// trial never fails just because the state dir is unwritable.
-fn persist_gate_output(task_id: &str, trial: u32, raw: &str) -> PathBuf {
+/// trial never fails just because the state dir is unwritable. Shared by
+/// [`persist_gate_output`] (`gate-output.txt`) and
+/// [`persist_agent_gate_output`] (`agent-gate-output.txt`) so both captures
+/// land in the same per-trial directory.
+fn persist_named_output(task_id: &str, trial: u32, filename: &str, raw: &str) -> PathBuf {
     let dir = xdg_state_root()
         .join("talos/mined-eval")
+        .join(run_id())
         .join(task_id)
         .join(format!("trial-{trial}"));
-    let path = dir.join("gate-output.txt");
+    let path = dir.join(filename);
     if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, raw).is_ok() {
         return path;
     }
     // Best-effort fallback so a trial never dies over an offload write.
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let fallback = std::env::temp_dir().join(format!(
-        "talos-mined-eval-{}-{trial}-{n}.txt",
+        "talos-mined-eval-{}-{trial}-{n}-{filename}",
         sanitize_for_filename(task_id)
     ));
     let _ = std::fs::write(&fallback, raw);
     fallback
+}
+
+/// Persist raw re-gate output under
+/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`
+/// and return its absolute path. A write error falls back to a temp path so a
+/// trial never fails just because the state dir is unwritable.
+fn persist_gate_output(task_id: &str, trial: u32, raw: &str) -> PathBuf {
+    persist_named_output(task_id, trial, "gate-output.txt", raw)
+}
+
+/// Persist the post-run agent-gate's captured output under
+/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/agent-gate-output.txt`,
+/// next to [`persist_gate_output`]'s capture, and return its absolute path.
+/// Same best-effort fallback behavior — a write failure never fails the
+/// trial.
+fn persist_agent_gate_output(task_id: &str, trial: u32, raw: &str) -> PathBuf {
+    persist_named_output(task_id, trial, "agent-gate-output.txt", raw)
+}
+
+/// Best-effort full text of a post-run [`CheckReport`] for persistence:
+/// prefers the offloaded full combined stdout+stderr, falling back to the
+/// bounded `excerpt` when the offload path is absent or unreadable (e.g. the
+/// `OFFLOAD_UNAVAILABLE` placeholder).
+fn agent_gate_output_raw(report: &CheckReport) -> String {
+    report
+        .offload_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| report.excerpt.clone())
 }
 
 /// Serialise a task id for use in a filename fragment (drop path-y chars).
@@ -2080,6 +2183,20 @@ async fn single_trial<B: ModelBackend>(
     let RunResult { outcome, stats } = engine::run(backend, &tools, &ctx, &run_config).await;
     let claimed = claimed_disposition_label(&outcome);
 
+    // 3b. Post-run agent gate (On mode only) — THE production-shippability
+    //     signal: a real dispatch pushes only when this gate is green at a
+    //     verified Done. Must run BEFORE `scan_authored_tests` /
+    //     `sealed_regate_score` so it sees the agent's own tree, not the
+    //     sealed-path overwrite `copy_sealed` performs during scoring.
+    let (agent_gate_post, agent_gate_output_path) = if let Some(runner) = checks.as_ref() {
+        let report = runner.run(&ctx).await;
+        let raw = agent_gate_output_raw(&report);
+        let path = persist_agent_gate_output(&config.task.id, trial, &raw);
+        (Some(report.passed), Some(path))
+    } else {
+        (None, None)
+    };
+
     // 4. Test-authorship telemetry — MUST run before the re-gate, because
     //    `copy_sealed` overwrites the sealed paths and would make every one of
     //    them read as agent-modified.
@@ -2130,6 +2247,8 @@ async fn single_trial<B: ModelBackend>(
         mutating_iters: stats.mutating_iters,
         bash_calls_ok: stats.bash_calls_ok,
         edit_file_calls_ok: stats.edit_file_calls_ok,
+        agent_gate_post,
+        agent_gate_output_path,
     }
 }
 
@@ -2166,6 +2285,8 @@ fn invalid_trial(
         mutating_iters: 0,
         bash_calls_ok: 0,
         edit_file_calls_ok: 0,
+        agent_gate_post: None,
+        agent_gate_output_path: None,
     }
 }
 
@@ -3650,6 +3771,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             mutating_iters: 0,
             bash_calls_ok: 0,
             edit_file_calls_ok: 0,
+            agent_gate_post: None,
+            agent_gate_output_path: None,
         }
     }
 
@@ -3774,6 +3897,63 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         };
         assert_eq!(report.clean_tree_nudges(), 1);
         assert_eq!(report.clean_tree_dones(), 1);
+    }
+
+    #[test]
+    fn shippable_requires_resolved_and_claimed_done() {
+        // Resolved + Done: shippable.
+        let resolved_done = trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, false, 0);
+        // Resolved + MaxIterations: correct but NOT shippable — the mined
+        // analogue of a dispatch that would never have pushed this trial.
+        let resolved_max_iterations = trial_tel(1, TrialScore::Resolved, "MaxIterations", false, 0);
+
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 2,
+            resolved_count: 2,
+            invalid_count: 0,
+            trials: vec![resolved_done, resolved_max_iterations],
+        };
+        assert_eq!(report.shippable(), 1);
+    }
+
+    #[test]
+    fn resolved_gate_red_requires_resolved_and_post_gate_some_false() {
+        // Resolved + post Some(false): counts.
+        let resolved_gate_red = MinedTrialResult {
+            agent_gate_post: Some(false),
+            ..trial_tel(0, TrialScore::Resolved, "MaxIterations", false, 0)
+        };
+        // Resolved + post None (gate never ran, e.g. AgentGateMode::Off):
+        // does NOT count — that is NOT-ARMED, not tried-and-failed.
+        let resolved_gate_not_run = MinedTrialResult {
+            agent_gate_post: None,
+            ..trial_tel(1, TrialScore::Resolved, "MaxIterations", false, 0)
+        };
+        // Resolved + post Some(true): does not count.
+        let resolved_gate_green = MinedTrialResult {
+            agent_gate_post: Some(true),
+            ..trial_tel(2, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 3,
+            resolved_count: 3,
+            invalid_count: 0,
+            trials: vec![
+                resolved_gate_red,
+                resolved_gate_not_run,
+                resolved_gate_green,
+            ],
+        };
+        assert_eq!(report.resolved_gate_red(), 1);
     }
 
     #[test]
@@ -4468,6 +4648,78 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert!(trial.finish_recovery_armed);
         assert!(trial.tree_dirty);
         assert_eq!(backend.calls(), 3);
+
+        // The post-run agent gate (run once after `engine::run` returns,
+        // BEFORE the sealed re-gate) sees the SAME tree the last rejected
+        // `finish(done)` saw: `.agent_marker` is still present, so the gate
+        // is red. This is the "correct-but-NOT-shippable" case the item
+        // exists to surface — Resolved (sealed tests pass) but the agent's
+        // own project gate never went green at the end.
+        assert_eq!(trial.agent_gate_post, Some(false));
+        assert_eq!(report.resolved_gate_red(), 1);
+        assert_eq!(report.shippable(), 0);
+        let agent_gate_output_path = trial
+            .agent_gate_output_path
+            .as_ref()
+            .expect("agent gate output path must be Some when the post-run gate ran");
+        assert!(
+            agent_gate_output_path.exists(),
+            "persisted agent-gate-output file must exist at {}",
+            agent_gate_output_path.display(),
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_gate_post_run_green_at_immediate_done_counts_as_shippable() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true".to_string());
+
+        let turns = vec![AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-finish".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }];
+        let backend = MockBackend::from_turns(turns);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
+        assert_eq!(trial.score, TrialScore::Resolved);
+        assert_eq!(trial.agent_gate_post, Some(true));
+        assert_eq!(report.shippable(), 1);
+        assert_eq!(report.resolved_gate_red(), 0);
+        assert!(trial.agent_gate_output_path.is_some());
     }
 
     #[tokio::test]
@@ -4520,6 +4772,12 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
         assert_eq!(trial.score, TrialScore::Resolved);
         assert_eq!(backend.calls(), 1);
+        // AgentGateMode::Off never runs the post-run gate: NOT-RUN, not
+        // "ran and passed".
+        assert_eq!(trial.agent_gate_post, None);
+        assert_eq!(trial.agent_gate_output_path, None);
+        assert_eq!(report.shippable(), 1);
+        assert_eq!(report.resolved_gate_red(), 0);
 
         let systems = backend.systems_seen();
         let sys = systems[0].as_deref().expect("system prompt");

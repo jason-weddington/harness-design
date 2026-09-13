@@ -90,6 +90,7 @@
 //! Full schema lives in the [`mined_eval`](harness::mined_eval) module docs.
 
 use std::env;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -387,8 +388,13 @@ async fn main() {
             // and MinedTrialResult::nudges_fired. In On mode these columns are
             // expected to vary along with mut_iters, bash_ok, edits_ok,
             // static_iters, and peak_static.
-            println!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_output: {}",
+            let gate_post_desc = match trial.agent_gate_post {
+                Some(true) => "green",
+                Some(false) => "red",
+                None => "-",
+            };
+            let mut line = format!(
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_post={gate_post_desc} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -409,6 +415,10 @@ async fn main() {
                 trial.dropped_outside_section,
                 trial.gate_output_path.display(),
             );
+            if let Some(p) = &trial.agent_gate_output_path {
+                let _ = write!(line, " | agent_gate_output: {}", p.display());
+            }
+            println!("{line}");
         };
         let report = mined_eval::run_mined_task(&backend, &parser, &config, &mut on_trial).await;
         println!(
@@ -506,7 +516,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         header.agent_gate,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
         "task",
         "resolved/val",
         "res_rate",
@@ -521,6 +531,8 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         "mean_iter",
         "cln_nudge",
         "cln_D",
+        "ship",
+        "res_red",
     );
     for r in summary {
         let claimed_done: u32 = r
@@ -563,7 +575,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             .filter(|t| !t.agent_tests_added.is_empty())
             .count();
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}  {:>9}  {:>9}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
@@ -578,6 +590,8 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             mean_iter,
             r.clean_tree_nudges(),
             r.clean_tree_dones(),
+            r.shippable(),
+            r.resolved_gate_red(),
         );
     }
 }
