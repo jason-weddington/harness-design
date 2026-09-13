@@ -58,6 +58,16 @@ pub const DEFAULT_STUCK_K: u32 = 3;
 /// untouched) so an overnight run rides out transient backend blips.
 pub const DEFAULT_MAX_DO_OVERS: u32 = 3;
 
+/// Default consecutive-backend-error cap: how many CONSECUTIVE outer
+/// iterations whose inner outcome was [`LoopOutcome::BackendError`] the
+/// outer loop tolerates before terminating with
+/// [`RalphTerminal::BackendErrorsExhausted`]. Any non-`BackendError`
+/// iteration resets the count. This breaker is INDEPENDENT of the do-over
+/// counter — a `BackendError` iteration stays EXEMPT from do-overs; the
+/// exemption means a SYSTEMATIC backend failure (not a transient blip) would
+/// otherwise churn the loop forever, so this separate cap bounds it.
+pub const DEFAULT_MAX_BACKEND_ERRORS: u32 = 5;
+
 /// Default timeout for the outer stop-command. The stop-command is the
 /// objective-met oracle; five minutes is generous for a check suite while
 /// still bounding a wedged command.
@@ -118,6 +128,14 @@ pub struct RalphConfig {
     /// [`RalphTerminal::DoOversExhausted`] (exit 20). A green `Finished(Done)`
     /// that produced no changes leaves the count UNCHANGED.
     pub max_do_overs: u32,
+    /// Consecutive-backend-error cap: this many CONSECUTIVE outer iterations
+    /// whose inner outcome was [`LoopOutcome::BackendError`] terminate with
+    /// [`RalphTerminal::BackendErrorsExhausted`]. Any non-`BackendError`
+    /// iteration resets the count. INDEPENDENT of the do-over counter above
+    /// — a `BackendError` iteration remains EXEMPT from do-overs; this
+    /// separate breaker bounds a SYSTEMATIC backend failure (which the
+    /// do-over exemption alone would let churn the loop forever).
+    pub max_backend_errors: u32,
     /// Total wall-clock budget in seconds. `0` means unbounded — mirroring
     /// [`RunConfig::wall_clock_secs`]. When non-zero, the loop terminates with
     /// [`RalphTerminal::TimeBudgetExhausted`] once elapsed ≥ this value.
@@ -138,6 +156,7 @@ impl RalphConfig {
     /// Build a config with the given `objective`, `stop_command`, outer
     /// iteration cap, and inner iteration cap. Defaults `stuck_k` to
     /// [`DEFAULT_STUCK_K`], `max_do_overs` to [`DEFAULT_MAX_DO_OVERS`],
+    /// `max_backend_errors` to [`DEFAULT_MAX_BACKEND_ERRORS`],
     /// `stop_command_timeout` to
     /// [`DEFAULT_STOP_COMMAND_TIMEOUT`], `notes_file` to `"PROGRESS.md"`,
     /// `wall_clock_secs` to `0` (unbounded), `clock` to a [`SystemClock`],
@@ -157,6 +176,7 @@ impl RalphConfig {
             max_outer_iterations,
             stuck_k: DEFAULT_STUCK_K,
             max_do_overs: DEFAULT_MAX_DO_OVERS,
+            max_backend_errors: DEFAULT_MAX_BACKEND_ERRORS,
             wall_clock_secs: 0,
             clock: Arc::new(SystemClock),
             inner_max_iterations,
@@ -177,6 +197,15 @@ impl RalphConfig {
     #[must_use]
     pub fn with_max_do_overs(mut self, max_do_overs: u32) -> Self {
         self.max_do_overs = max_do_overs;
+        self
+    }
+
+    /// Override the consecutive-backend-error cap
+    /// ([`DEFAULT_MAX_BACKEND_ERRORS`] by default). See
+    /// [`Self::max_backend_errors`].
+    #[must_use]
+    pub fn with_max_backend_errors(mut self, max_backend_errors: u32) -> Self {
+        self.max_backend_errors = max_backend_errors;
         self
     }
 
@@ -264,6 +293,17 @@ pub enum RalphTerminal {
     /// completing iteration IS appended before this terminal fires, so the
     /// do-over count the breaker tests can be inspected.
     DoOversExhausted,
+    /// `max_backend_errors` CONSECUTIVE outer iterations whose inner outcome
+    /// was [`LoopOutcome::BackendError`]. Any non-`BackendError` iteration
+    /// resets the count. INDEPENDENT of the do-over counter — a
+    /// `BackendError` iteration stays EXEMPT from do-overs (the exemption
+    /// preserved unchanged); this breaker bounds a SYSTEMATIC backend
+    /// failure, which the exemption alone would let churn the loop forever.
+    /// The completing iteration IS appended to [`RalphReport::iterations`]
+    /// before this terminal fires (same convention as
+    /// [`Self::DoOversExhausted`]), so the consecutive count the breaker
+    /// tests can be inspected.
+    BackendErrorsExhausted,
     /// A hard harness-level failure: a git-status / git-add / revert-command
     /// (`git reset --hard HEAD` or `git clean -fd`) invocation whose
     /// `exit_code != Some(0)` (or that failed to spawn), or a `git commit`
@@ -395,6 +435,11 @@ pub async fn run_ralph(
     // revert); UNCHANGED on a green no-change pass or an exempt
     // `BackendError(_)` pass.
     let mut do_over_counter: u32 = 0;
+    // Consecutive-backend-error counter (separate breaker): INCREMENT on an
+    // inner `BackendError(_)` pass; RESET to 0 on ANY other inner outcome.
+    // BackendError stays EXEMPT from the do-over counter above — this
+    // breaker alone bounds a SYSTEMATIC backend failure.
+    let mut backend_error_counter: u32 = 0;
 
     let mut i: u32 = 0;
     while i < config.max_outer_iterations {
@@ -668,7 +713,8 @@ pub async fn run_ralph(
 
         // (8) Evaluate breakers. Precedence among post-iteration terminals:
         // StopConditionMet (already returned above) -> DoOversExhausted ->
-        // Stuck -> MaxIterationsExhausted -> TimeBudgetExhausted -> continue.
+        // BackendErrorsExhausted -> Stuck -> MaxIterationsExhausted ->
+        // TimeBudgetExhausted -> continue.
         //
         // Do-over counter (three-way rule): RESET to 0 after a green
         // `Finished(Done)` commit succeeds (exit 0); INCREMENT on a non-green
@@ -685,6 +731,25 @@ pub async fn run_ralph(
             return RalphReport {
                 objective,
                 terminal: RalphTerminal::DoOversExhausted,
+                iterations,
+            };
+        }
+
+        // Consecutive-backend-error breaker (same breaker step as the do-over
+        // check above, but an INDEPENDENT counter): INCREMENT on an inner
+        // `BackendError(_)` pass, RESET on any other inner outcome. The
+        // completing iteration is already APPENDED above, matching the
+        // DoOversExhausted convention. The do-over counter semantics are
+        // UNCHANGED — a `BackendError` pass still never increments it.
+        if is_backend_error {
+            backend_error_counter += 1;
+        } else {
+            backend_error_counter = 0;
+        }
+        if backend_error_counter >= config.max_backend_errors {
+            return RalphReport {
+                objective,
+                terminal: RalphTerminal::BackendErrorsExhausted,
                 iterations,
             };
         }
@@ -1830,6 +1895,133 @@ mod tests {
             );
             assert!(!it.committed, "a BackendError pass makes no changes");
         }
+    }
+
+    #[tokio::test]
+    async fn consecutive_backend_errors_exhaust_the_backend_error_breaker() {
+        // (a) A backend that errors EVERY turn is a SYSTEMATIC failure, not a
+        // transient blip: with `max_backend_errors == 3` the loop terminates
+        // with `BackendErrorsExhausted` after EXACTLY 3 outer iterations (the
+        // BackendError do-over exemption alone would churn the loop forever).
+        // The completing iteration IS appended, so `iterations.len() == 3`.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        let ctx = ctx_for(&root_path);
+
+        // Each outer pass surfaces a BackendError after one inner turn.
+        let backend = MockBackend::new(vec![
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "systematic".to_string(),
+            }),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "systematic".to_string(),
+            }),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "systematic".to_string(),
+            }),
+        ]);
+
+        let config = RalphConfig::new("backend-breaker-objective", stop_never(), 10, 4)
+            .with_max_backend_errors(3);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert!(
+            matches!(report.terminal, RalphTerminal::BackendErrorsExhausted),
+            "terminal must be BackendErrorsExhausted; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.iterations.len(),
+            3,
+            "the breaker must fire after exactly three consecutive backend-error passes; got {}",
+            report.iterations.len()
+        );
+        assert_eq!(report.outer_iterations(), 3);
+        for it in &report.iterations {
+            assert!(
+                matches!(it.inner_outcome, LoopOutcome::BackendError(_)),
+                "every pass must record an inner BackendError; got {:?}",
+                it.inner_outcome
+            );
+            assert!(!it.committed, "a BackendError pass never commits");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_backend_error_pass_resets_the_backend_error_counter() {
+        // (b) The breaker counts CONSECUTIVE backend errors: the sequence
+        // BackendError, BackendError, <green non-error pass>, BackendError,
+        // BackendError with `max_backend_errors == 3` does NOT terminate on
+        // BackendErrorsExhausted — the middle pass RESETS the count. The loop
+        // instead bottoms out on MaxIterationsExhausted after 5 passes.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        let ctx = ctx_for(&root_path);
+
+        let backend = MockBackend::new(vec![
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "blip".to_string(),
+            }),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "blip".to_string(),
+            }),
+            // A non-error pass: a green finish with no changes. Any
+            // non-BackendError inner outcome resets the count.
+            Ok(finish_done("g")),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "blip".to_string(),
+            }),
+            Err(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message: "blip".to_string(),
+            }),
+        ]);
+
+        let config = RalphConfig::new("reset-backend-objective", stop_never(), 5, 4)
+            .with_max_backend_errors(3);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert!(
+            !matches!(report.terminal, RalphTerminal::BackendErrorsExhausted),
+            "the middle non-error pass must reset the count, so BackendErrorsExhausted \
+             must NOT fire; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.terminal,
+            RalphTerminal::MaxIterationsExhausted,
+            "with the counter reset the loop must bottom out on the iteration cap; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.iterations.len(),
+            5,
+            "all five passes must be recorded; got {}",
+            report.iterations.len()
+        );
+        // The middle pass was NOT a BackendError.
+        assert!(
+            matches!(
+                report.iterations[2].inner_outcome,
+                LoopOutcome::Finished(Disposition::Done { .. })
+            ),
+            "the reset pass must be a non-BackendError outcome; got {:?}",
+            report.iterations[2].inner_outcome
+        );
+        let backend_errors = report
+            .iterations
+            .iter()
+            .filter(|it| matches!(it.inner_outcome, LoopOutcome::BackendError(_)))
+            .count();
+        assert_eq!(backend_errors, 4, "four of the five passes error");
     }
 
     /// Make a path executable on Unix (best-effort; tests run on Linux).

@@ -28,7 +28,7 @@
 //! |------|---------|
 //! | 0    | `StopConditionMet` — objective met |
 //! | 20   | `Stuck`, `MaxIterationsExhausted`, `TimeBudgetExhausted`, or `DoOversExhausted` — task-side failure terminals |
-//! | 1    | `Error` or a harness/infra error (clap error, workspace error) |
+//! | 1    | `Error`, `BackendErrorsExhausted`, or a harness/infra error (clap error, workspace error) — sustained backend failure is an infra condition, NOT a task failure, so it must never collapse into code 20 |
 //!
 //! There is NO `10`/Blocked analog for ralph — the Ralph outer loop has no
 //! Blocked terminal. See [`ralph_exit_code`] for the rationale.
@@ -67,6 +67,15 @@
 //!   many CONSECUTIVE do-overs (a green commit resets the count) the loop
 //!   terminates with [`harness::ralph::RalphTerminal::DoOversExhausted`]
 //!   (exit 20).
+//! - `--max-backend-errors <u32>` (default `5`) — consecutive-backend-error
+//!   cap; matches [`harness::ralph::DEFAULT_MAX_BACKEND_ERRORS`]. This many
+//!   CONSECUTIVE outer iterations whose inner outcome was
+//!   `LoopOutcome::BackendError` terminate with
+//!   [`harness::ralph::RalphTerminal::BackendErrorsExhausted`] (exit 1 —
+//!   infra, NOT 20); any non-`BackendError` iteration resets the count.
+//!   Independent of the do-over cap: a `BackendError` iteration stays exempt
+//!   from do-overs, so without this breaker a SYSTEMATIC backend failure
+//!   would churn the loop forever.
 //! - `--stop-when-timeout-secs <u64>` (default `300`) — matches
 //!   [`harness::ralph::DEFAULT_STOP_COMMAND_TIMEOUT`] of 5 min.
 //! - `--gate-timeout-secs <u64>` (default `300`).
@@ -112,7 +121,8 @@ use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
 use harness::prompt::render_task_prompt_from_spec;
 use harness::ralph::{
-    DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph,
+    DEFAULT_MAX_BACKEND_ERRORS, DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport,
+    RalphTerminal, run_ralph,
 };
 use harness::run_record::Disposition;
 use harness::store::{RunStore, SqliteRunStore};
@@ -266,6 +276,15 @@ struct RalphArgs {
     #[arg(long, default_value_t = DEFAULT_MAX_DO_OVERS)]
     max_do_overs: u32,
 
+    /// Consecutive-backend-error cap: this many CONSECUTIVE outer iterations
+    /// whose inner outcome was `BackendError` terminate with
+    /// [`RalphTerminal::BackendErrorsExhausted`] (exit 1). Any
+    /// non-`BackendError` iteration resets the count. INDEPENDENT of the
+    /// do-over cap — a `BackendError` iteration remains exempt from
+    /// do-overs. Matches [`DEFAULT_MAX_BACKEND_ERRORS`].
+    #[arg(long, default_value_t = DEFAULT_MAX_BACKEND_ERRORS)]
+    max_backend_errors: u32,
+
     /// Timeout for the outer stop-command oracle, in seconds.
     #[arg(long, default_value_t = 300u64)]
     stop_when_timeout_secs: u64,
@@ -373,11 +392,14 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
 /// | `MaxIterationsExhausted` | 20 |
 /// | `TimeBudgetExhausted` | 20 |
 /// | `DoOversExhausted` | 20 |
+/// | `BackendErrorsExhausted` | 1 |
 /// | `Error(_)` | 1 |
 ///
 /// Mirrors [`exit_code`]: `0` = objective met, `20` = task-side failure
 /// terminals, `1` = harness/infra error. There is NO `10`/Blocked analog for
-/// ralph — the Ralph outer loop has no Blocked terminal.
+/// ralph — the Ralph outer loop has no Blocked terminal. A sustained
+/// backend failure (`BackendErrorsExhausted`) is an INFRA condition, so it
+/// maps to `1` — it must never collapse into the task-failure code 20.
 fn ralph_exit_code(terminal: &RalphTerminal) -> i32 {
     match terminal {
         RalphTerminal::StopConditionMet => 0,
@@ -385,7 +407,7 @@ fn ralph_exit_code(terminal: &RalphTerminal) -> i32 {
         | RalphTerminal::MaxIterationsExhausted
         | RalphTerminal::TimeBudgetExhausted
         | RalphTerminal::DoOversExhausted => 20,
-        RalphTerminal::Error(_) => 1,
+        RalphTerminal::BackendErrorsExhausted | RalphTerminal::Error(_) => 1,
     }
 }
 
@@ -403,6 +425,7 @@ fn ralph_terminal_str(terminal: &RalphTerminal) -> &'static str {
         RalphTerminal::MaxIterationsExhausted => "MaxIterationsExhausted",
         RalphTerminal::TimeBudgetExhausted => "TimeBudgetExhausted",
         RalphTerminal::DoOversExhausted => "DoOversExhausted",
+        RalphTerminal::BackendErrorsExhausted => "BackendErrorsExhausted",
         RalphTerminal::Error(_) => "Error",
     }
 }
@@ -970,6 +993,7 @@ async fn run_ralph_cmd(args: RalphArgs) {
     .with_notes_file(&args.notes_file)
     .with_stuck_k(args.stuck_k)
     .with_max_do_overs(args.max_do_overs)
+    .with_max_backend_errors(args.max_backend_errors)
     .with_wall_clock_secs(wall_clock_secs)
     .with_stop_command_timeout(Duration::from_secs(args.stop_when_timeout_secs));
     if let Some(runner) = inner_runner {
@@ -1517,7 +1541,7 @@ mod tests {
         );
     }
 
-    // ---- ralph_exit_code: all 6 arms -----------------------------------
+    // ---- ralph_exit_code: all 7 arms -----------------------------------
 
     #[test]
     fn ralph_exit_code_stop_condition_met_is_0() {
@@ -1573,10 +1597,19 @@ mod tests {
         );
     }
 
-    // ---- ralph_terminal_str: all 6 literals, no payload leak -----------
+    #[test]
+    fn ralph_exit_code_backend_errors_exhausted_is_1() {
+        assert_eq!(
+            ralph_exit_code(&RalphTerminal::BackendErrorsExhausted),
+            1,
+            "BackendErrorsExhausted is a sustained infra failure → 1, never 20"
+        );
+    }
+
+    // ---- ralph_terminal_str: all 7 literals, no payload leak -----------
 
     #[test]
-    fn ralph_terminal_str_covers_all_six_literals() {
+    fn ralph_terminal_str_covers_all_seven_literals() {
         assert_eq!(
             ralph_terminal_str(&RalphTerminal::StopConditionMet),
             "StopConditionMet"
@@ -1593,6 +1626,10 @@ mod tests {
         assert_eq!(
             ralph_terminal_str(&RalphTerminal::DoOversExhausted),
             "DoOversExhausted"
+        );
+        assert_eq!(
+            ralph_terminal_str(&RalphTerminal::BackendErrorsExhausted),
+            "BackendErrorsExhausted"
         );
     }
 
@@ -1637,6 +1674,7 @@ mod tests {
             RalphTerminal::MaxIterationsExhausted,
             RalphTerminal::TimeBudgetExhausted,
             RalphTerminal::DoOversExhausted,
+            RalphTerminal::BackendErrorsExhausted,
         ] {
             let mut out: Vec<u8> = Vec::new();
             write_ralph_error_detail(&terminal, &mut out).expect("Vec<u8> writes are infallible");
