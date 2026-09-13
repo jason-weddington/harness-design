@@ -116,7 +116,7 @@ use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::bedrock::BedrockBackend;
 use harness::engine::{LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
-use harness::exec::{CheckCommand, ChecksRunner};
+use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
 use harness::prompt::render_task_prompt_from_spec;
@@ -475,17 +475,11 @@ fn build_checks_runner(
     workspace_root: PathBuf,
     gate_timeout_secs: u64,
 ) -> Option<ChecksRunner> {
-    if gate_command.trim().is_empty() {
-        return None;
-    }
-    Some(ChecksRunner::new(
-        CheckCommand {
-            program: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), gate_command.to_string()],
-        },
+    shell_checks_runner(
+        gate_command,
         workspace_root,
         Duration::from_secs(gate_timeout_secs),
-    ))
+    )
 }
 
 /// Write a one-line `{"error": "<message>"}` JSON object to stderr.

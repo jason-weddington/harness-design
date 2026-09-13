@@ -27,7 +27,7 @@
 //!     tests/<repo-relative-path>.py  # sealed `FAIL_TO_PASS` test files
 //! ```
 //!
-//! `task.json` fields (all required except `notes`):
+//! `task.json` fields (all required except `notes` and `agent_gate_command`):
 //!
 //! | field | shape | meaning |
 //! |---|---|---|
@@ -43,6 +43,7 @@
 //! | `env.sibling_repos` | `Vec<{repo, pin}>` | worktrees to lay down beside primary |
 //! | `test_scope` | `String` | informational only |
 //! | `gate_command` | `String` | shell command run for scoring |
+//! | `agent_gate_command` | `Option<String>` | (optional) in-run agent gate; required when the agent gate is on |
 //! | `fail_to_pass` | `Vec<String>` | test ids that must be Passed at fix |
 //! | `positive_controls` | `Vec<String>` | test ids that must stay Passed |
 //! | `pass_to_pass_exclusions` | `Vec<String>` | red tests to ignore (literal or `Class::*`) |
@@ -85,7 +86,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{self, LoopOutcome, RunConfig, RunResult};
 use crate::eval::{CODING_CHECK_TIMEOUT, copy_dir_recursive};
-use crate::exec::{ExecSpec, run};
+use crate::exec::{ExecSpec, run, shell_checks_runner};
 use crate::model::ModelBackend;
 use crate::run_record::Disposition;
 use crate::tool::ToolCtx;
@@ -105,8 +106,10 @@ pub const MINED_SETUP_TIMEOUT: Duration = Duration::from_mins(10);
 /// Field names are **verbatim** matches of the on-disk schema — no
 /// `#[serde(rename)]`. Unknown top-level and nested keys are tolerated so the
 /// schema can grow additive metadata without a harness update. All listed
-/// fields are required; `notes` is optional (ignored — carried only for
-/// forward-compatibility with schema growth).
+/// fields are required except `notes` (optional — ignored, carried only for
+/// forward-compatibility with schema growth) and `agent_gate_command`
+/// (optional — `None` when the task predates the in-run agent gate; required
+/// only when [`AgentGateMode::On`] is selected, see [`resolve_agent_gate_command`]).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MinedTask {
     /// Stable task id (matches the task-dir name).
@@ -137,12 +140,33 @@ pub struct MinedTask {
     /// Shell command run in the primary workspace for the sealed re-gate.
     /// Passed to `bash -c`.
     ///
+    /// This is the SEALED SCORING gate only: it is never shown to the agent
+    /// and never registered as `run_checks` — [`AgentGateMode`] and
+    /// [`resolve_agent_gate_command`] draw a hard line between this field
+    /// and [`Self::agent_gate_command`].
+    ///
     /// Authoring invariant (verified across all eight tier-2 task.json files):
     /// every `.py` path named in `gate_command` also appears in `sealed[]`,
     /// and `copy_sealed` overwrites those files before the re-gate — which is
     /// WHY agent-authored tests cannot currently reach the scorer (open
     /// question 3).
     pub gate_command: String,
+    /// The in-run AGENT gate: the repo's real dispatch gate (incl. lint /
+    /// typecheck, not just tests). Shown to the agent (appended to its
+    /// prompt as a `## Verification` section), run by `run_checks`, by
+    /// `finish(done)` verification, and by the pre-agent baseline tripwire.
+    /// It is NEVER used for scoring — [`MinedTask::gate_command`] stays the
+    /// sealed scoring judge, unchanged.
+    ///
+    /// Must be a CHECKER: it must not mutate the tree, and it must be green
+    /// at `parent_sha` in the task env (verified by the pre-agent baseline
+    /// tripwire; see [`AgentGateMode::On`]).
+    ///
+    /// `#[serde(default)]` so existing task.json files without this key still
+    /// load (as `None`) — required for [`AgentGateMode::Off`] to keep working
+    /// as the legacy comparison row.
+    #[serde(default)]
+    pub agent_gate_command: Option<String>,
     /// Test ids that must all be Passed for a trial to resolve.
     pub fail_to_pass: Vec<String>,
     /// Test ids that MUST remain Passed (present + green).
@@ -207,6 +231,196 @@ pub fn load_task(task_dir: &Path) -> std::io::Result<MinedTask> {
             std::io::ErrorKind::InvalidData,
             format!("parse {}: {e}", path.display()),
         )
+    })
+}
+
+// ===== agent gate ==========================================================
+
+/// Default timeout for the in-run agent gate (`agent_gate_command`), and the
+/// pre-agent baseline tripwire that runs it once before the agent starts.
+///
+/// Mirrors agent-gtd-dispatch's default `TALOS_GATE_TIMEOUT_SECS = 900`,
+/// which dispatch passes to talos as `--gate-timeout-secs` and which
+/// overrides the talos clap default of 300. A host-level
+/// `TALOS_GATE_TIMEOUT_SECS` override is not tracked here; use
+/// `MINED_EVAL_GATE_TIMEOUT_SECS` to match one.
+pub const DEFAULT_AGENT_GATE_TIMEOUT: Duration = Duration::from_mins(15);
+
+/// Whether the in-run agent gate (`agent_gate_command`) is exercised this run.
+///
+/// `Off` is the legacy comparison row: no `run_checks` tool is registered,
+/// [`crate::engine::RunConfig::checks`] is `None`, a `finish(done)` claim is
+/// accepted as `Verification::NoChecksConfigured`, the system prompt carries
+/// no harness Verification section, and no pre-agent baseline tripwire runs.
+///
+/// `On` is production parity: the repo's real dispatch gate is shown to the
+/// agent, wired as `run_checks`, verifies `finish(done)`, and must be green
+/// at `parent_sha` before the agent is allowed to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentGateMode {
+    /// Legacy comparison row — no in-run agent gate.
+    Off,
+    /// Production parity — the in-run agent gate is armed with `timeout`.
+    On {
+        /// Timeout applied to every run of `agent_gate_command`: the
+        /// baseline tripwire, `run_checks`, and `finish(done)` verification.
+        timeout: Duration,
+    },
+}
+
+impl std::fmt::Display for AgentGateMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::On { timeout } => write!(f, "on(timeout={}s)", timeout.as_secs()),
+        }
+    }
+}
+
+/// Parse the `MINED_EVAL_AGENT_GATE` / `MINED_EVAL_GATE_TIMEOUT_SECS` env
+/// pair into an [`AgentGateMode`].
+///
+/// Both inputs are trimmed first. `timeout_secs` is ALWAYS parsed first, even
+/// when `enabled` selects [`AgentGateMode::Off`]: `None` or empty gives
+/// [`DEFAULT_AGENT_GATE_TIMEOUT`] (900s); a `u64 >= 1` gives that many
+/// seconds; `0` or an unparsable value is an `Err` naming
+/// `MINED_EVAL_GATE_TIMEOUT_SECS` and the offending value.
+///
+/// For `enabled`: `None`, empty, or `"1"` gives `On` (with the parsed
+/// timeout); `"0"` gives `Off`; any other value is an `Err` naming
+/// `MINED_EVAL_AGENT_GATE` and the offending value.
+///
+/// # Errors
+/// See above — every error message names the offending env var and value.
+pub fn parse_agent_gate_mode(
+    enabled: Option<&str>,
+    timeout_secs: Option<&str>,
+) -> Result<AgentGateMode, String> {
+    let timeout_raw = timeout_secs.map(str::trim).unwrap_or_default();
+    let timeout = if timeout_raw.is_empty() {
+        DEFAULT_AGENT_GATE_TIMEOUT
+    } else {
+        match timeout_raw.parse::<u64>() {
+            Ok(n) if n >= 1 => Duration::from_secs(n),
+            _ => {
+                return Err(format!(
+                    "MINED_EVAL_GATE_TIMEOUT_SECS: expected a positive integer, got `{timeout_raw}`"
+                ));
+            }
+        }
+    };
+
+    let enabled_raw = enabled.map(str::trim).unwrap_or_default();
+    match enabled_raw {
+        "" | "1" => Ok(AgentGateMode::On { timeout }),
+        "0" => Ok(AgentGateMode::Off),
+        other => Err(format!(
+            "MINED_EVAL_AGENT_GATE: expected `0`, `1`, or empty, got `{other}`"
+        )),
+    }
+}
+
+/// Resolve the `agent_gate_command` to actually run for `task` under `mode`.
+///
+/// Branches are evaluated in this order:
+/// 1. [`AgentGateMode::Off`] gives `Ok(None)`, even when the field is `Some`.
+/// 2. `On` with `task.agent_gate_command == None` is an `Err`.
+/// 3. `On` with `Some(cmd)` where `cmd.trim().is_empty()` is an `Err`.
+/// 4. `On` where `cmd.trim() == task.gate_command.trim()` is an `Err` — the
+///    agent gate must never be the same command as the sealed scoring gate.
+/// 5. `On` where `cmd` contains any non-empty `task.sealed[i].path` is an
+///    `Err` — the agent gate must never leak a sealed test path into the
+///    agent's own prompt/verification loop.
+/// 6. Otherwise `Ok(Some(cmd))`, with `cmd` returned untrimmed and verbatim.
+///
+/// There is NO fallback to `task.gate_command` on any path — a missing or
+/// invalid `agent_gate_command` under `On` is a hard, fail-loud error, never
+/// a silent substitution of the sealed scoring gate.
+///
+/// # Errors
+/// Every error message contains `task.id` and the literal `agent_gate_command`.
+/// The errors from branches 2 and 3 additionally contain `MINED_EVAL_AGENT_GATE=0`
+/// (the escape hatch: run in `Off` mode instead).
+pub fn resolve_agent_gate_command(
+    task: &MinedTask,
+    mode: AgentGateMode,
+) -> Result<Option<&str>, String> {
+    let AgentGateMode::On { .. } = mode else {
+        return Ok(None);
+    };
+    let Some(cmd) = task.agent_gate_command.as_deref() else {
+        return Err(format!(
+            "task `{}`: agent_gate_command is missing (required when the agent gate is on; \
+             set MINED_EVAL_AGENT_GATE=0 to run the legacy off row)",
+            task.id
+        ));
+    };
+    if cmd.trim().is_empty() {
+        return Err(format!(
+            "task `{}`: agent_gate_command is blank (required when the agent gate is on; \
+             set MINED_EVAL_AGENT_GATE=0 to run the legacy off row)",
+            task.id
+        ));
+    }
+    if cmd.trim() == task.gate_command.trim() {
+        return Err(format!(
+            "task `{}`: agent_gate_command equals gate_command — the in-run agent gate must \
+             differ from the sealed scoring gate",
+            task.id
+        ));
+    }
+    for entry in &task.sealed {
+        if !entry.path.is_empty() && cmd.contains(&entry.path) {
+            return Err(format!(
+                "task `{}`: agent_gate_command contains sealed path `{}` — the in-run agent \
+                 gate must never reference a sealed scoring path",
+                task.id, entry.path
+            ));
+        }
+    }
+    Ok(Some(cmd))
+}
+
+/// Parse `MINED_EVAL_TEST_FIRST` into whether the shared test-first approach
+/// guidance is appended to the tier-2 agent prompt.
+///
+/// Trimmed first. `None`, empty, or `"1"` gives `true`; `"0"` gives `false`;
+/// anything else is an `Err` naming `MINED_EVAL_TEST_FIRST` and the value.
+///
+/// This toggle exists ONLY for the tier-2 test-first A/B; the talos
+/// production prompt path (`render_task_prompt_from_spec`) hard-codes the
+/// guidance on and is untouched by this function.
+///
+/// # Errors
+/// See above.
+pub fn parse_test_first(v: Option<&str>) -> Result<bool, String> {
+    let raw = v.map(str::trim).unwrap_or_default();
+    match raw {
+        "" | "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(format!(
+            "MINED_EVAL_TEST_FIRST: expected `0`, `1`, or empty, got `{other}`"
+        )),
+    }
+}
+
+/// Parse `MINED_EVAL_WALL_CLOCK_SECS` into the wall-clock budget applied to
+/// every trial, mirroring talos production's `--wall-clock-secs` (default 0 =
+/// unbounded).
+///
+/// Trimmed first. `None` or empty gives `0` (unbounded). A `u64` gives that
+/// value verbatim — `0` is a valid, explicit "unbounded" too. Anything else is
+/// an `Err` naming `MINED_EVAL_WALL_CLOCK_SECS` and the value.
+///
+/// # Errors
+/// See above.
+pub fn parse_wall_clock_secs(v: Option<&str>) -> Result<u64, String> {
+    let raw = v.map(str::trim).unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    raw.parse::<u64>().map_err(|_| {
+        format!("MINED_EVAL_WALL_CLOCK_SECS: expected a non-negative integer, got `{raw}`")
     })
 }
 
@@ -1064,27 +1278,47 @@ pub async fn run_env_setup(
 
 // ===== tier-2 agent prompt ================================================
 
-/// Assemble the tier-2 agent prompt: the mined statement, then the shared
-/// test-first approach guidance.
+/// Assemble the tier-2 agent prompt: the mined statement, then (when
+/// `test_first`) the shared test-first approach guidance, then (when
+/// `agent_gate_command` is `Some`) the shared `## Verification` section for
+/// the in-run agent gate ([`AgentGateMode::On`]).
 ///
 /// Tier-2's prompt is the mined statement VERBATIM — it never passes through
 /// `task_spec_prompt.md`, so harness-owned guidance that lives only in that
 /// template reaches talos dispatch and the tier-1 eval but NOT this path. That
 /// asymmetry silently voided a test-first experiment (three matrix runs that
-/// measured nothing), which is why the guidance is appended here from the same
-/// template rather than restated.
+/// measured nothing), which is why both sections are appended here from the
+/// same shared templates rather than restated.
 ///
 /// The guidance is deliberately harness-owned rather than written into the
 /// talos-evals statement files: it is a property of the harness under test, not
 /// task content, and putting it in task data would contaminate every spec level
 /// of every task and make a harness behavior look like part of the mined
 /// commit.
-fn tier2_task_prompt(statement: &str) -> String {
-    format!(
-        "{}\n\n{}",
-        statement.trim_end(),
-        crate::prompt::render_test_first_approach()
-    )
+///
+/// With `test_first = true` and `agent_gate_command = None`, the output is
+/// byte-identical to the pre-agent-gate `format!("{}\n\n{}", statement.trim_end(),
+/// render_test_first_approach())`. With `agent_gate_command = Some(cmd)`, the
+/// output is exactly that string followed immediately by
+/// `render_verification_section(cmd)`, with NO separator inserted.
+fn tier2_task_prompt(
+    statement: &str,
+    agent_gate_command: Option<&str>,
+    test_first: bool,
+) -> String {
+    let mut out = if test_first {
+        format!(
+            "{}\n\n{}",
+            statement.trim_end(),
+            crate::prompt::render_test_first_approach()
+        )
+    } else {
+        statement.trim_end().to_string()
+    };
+    if let Some(cmd) = agent_gate_command {
+        out.push_str(&crate::prompt::render_verification_section(cmd));
+    }
+    out
 }
 
 // ===== agent test authorship ==============================================
@@ -1155,11 +1389,14 @@ fn parse_authored_tests(porcelain: &str) -> (Vec<String>, Vec<String>) {
 /// a git failure yields two empty vectors rather than failing the trial —
 /// this is observational telemetry and must never change a score.
 ///
-/// This is the tier-2-native way to measure test-first compliance. The engine
-/// cannot supply it: `single_trial` registers no `run_checks` tool, so the loop
-/// never observes gate state, and the file-scoped `gate_command` of every tier-2
-/// task collects only sealed paths — an agent-authored test at a new path is
-/// invisible to the re-gate entirely.
+/// This is the tier-2-native way to measure test-first compliance. Even in
+/// [`AgentGateMode::On`], the ONLY gate the engine observes is
+/// `agent_gate_command` (a full-repo checker); the file-scoped SEALED SCORING
+/// `gate_command` of every tier-2 task collects only sealed paths regardless
+/// of mode, so an agent-authored test at a new path is invisible to the
+/// sealed re-gate entirely. In [`AgentGateMode::Off`] the engine additionally
+/// registers no `run_checks` tool at all, so the loop never observes gate
+/// state in that mode either.
 async fn scan_authored_tests(workspace_root: &Path) -> (Vec<String>, Vec<String>) {
     let outcome = run(&ExecSpec {
         program: "git".to_string(),
@@ -1391,38 +1628,32 @@ pub struct MinedTrialResult {
     /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
     /// Whether finish-recovery was structurally armed for this trial: true iff
-    /// `run_checks` is in the registry AND `run_config.max_nudges > 0`. On the
-    /// tier-2 path today `single_trial` calls `standard_registry(None)`, which
-    /// omits `run_checks` when `checks.is_none()`, so this is always `false`
-    /// for tier-2 — meaning NOT-ARMED, not tried-and-failed. Computed at
+    /// `run_checks` is in the registry AND `run_config.max_nudges > 0`.
+    /// [`AgentGateMode::Off`] builds the registry with an empty `checks`
+    /// argument, which omits `run_checks`, so this is always `false` in Off mode —
+    /// meaning NOT-ARMED, not tried-and-failed. [`AgentGateMode::On`] with a
+    /// resolved `agent_gate_command` registers `run_checks`, so this is `true`
+    /// whenever `run_config.max_nudges > 0` (the default). Computed at
     /// runtime from `tools` and `run_config`; never hard-coded. Read this
     /// field alongside `gates_green_at_exit` and `nudges_fired`.
     pub finish_recovery_armed: bool,
     /// Whether the last in-loop gate (`run_checks`) was GREEN at the terminal.
-    /// Constant on the tier-2 path today: `single_trial` builds the registry
-    /// as `standard_registry(None)` (`mined_eval.rs:1313`), and
-    /// `standard_registry` registers `run_checks` only when `checks.is_some()`
-    /// (`crates/harness/src/tools/mod.rs:45-47`, pinned by the test
-    /// `registers_all_v1_tools_without_checks` at `tools/mod.rs:82-98`).
-    /// Because `last_gate_green` is set true ONLY by a `run_checks` result
-    /// (`crates/harness/src/engine.rs:1358-1359`), both finish-recovery guards
-    /// (engine.rs:1183, engine.rs:1430) are structurally unreachable in tier-2
-    /// — so `false` here means NOT-ARMED, not tried-and-failed. Read
-    /// `finish_recovery_armed` alongside this value. `mutating_iters`,
-    /// `bash_calls_ok`, `edit_file_calls_ok`, `iters_since_tree_change_at_exit`
-    /// and `peak_iters_since_tree_change` are the columns that actually vary.
+    /// Constant `false` in [`AgentGateMode::Off`]: `single_trial` builds the
+    /// registry with an empty `checks` argument, and `standard_registry`
+    /// registers `run_checks` only when `checks.is_some()` — so
+    /// `last_gate_green` can never flip true and both engine finish-recovery
+    /// guards are structurally unreachable, meaning `false` here is NOT-ARMED,
+    /// not tried-and-failed. In [`AgentGateMode::On`] this varies with the
+    /// agent's actual `run_checks` calls. Read `finish_recovery_armed`
+    /// alongside this value. `mutating_iters`, `bash_calls_ok`,
+    /// `edit_file_calls_ok`, `iters_since_tree_change_at_exit` and
+    /// `peak_iters_since_tree_change` are the columns that actually vary.
     pub gates_green_at_exit: bool,
-    /// Finish-recovery nudges injected this trial. Constant on the tier-2
-    /// path today: `single_trial` builds the registry as
-    /// `standard_registry(None)` (`mined_eval.rs:1313`), and
-    /// `standard_registry` registers `run_checks` only when `checks.is_some()`
-    /// (`crates/harness/src/tools/mod.rs:45-47`, pinned by the test
-    /// `registers_all_v1_tools_without_checks` at `tools/mod.rs:82-98`).
-    /// Because `last_gate_green` is set true ONLY by a `run_checks` result
-    /// (`crates/harness/src/engine.rs:1358-1359`), both finish-recovery guards
-    /// (engine.rs:1183, engine.rs:1430) are structurally unreachable in tier-2
-    /// — so `0` here means NOT-ARMED, not tried-and-failed. Read
-    /// `finish_recovery_armed` alongside this value. `mutating_iters`,
+    /// Finish-recovery nudges injected this trial. Constant `0` in
+    /// [`AgentGateMode::Off`], for the same reason as
+    /// [`Self::gates_green_at_exit`] — meaning NOT-ARMED, not tried-and-failed.
+    /// In [`AgentGateMode::On`] this varies with the agent's actual behavior.
+    /// Read `finish_recovery_armed` alongside this value. `mutating_iters`,
     /// `bash_calls_ok`, `edit_file_calls_ok`, `iters_since_tree_change_at_exit`
     /// and `peak_iters_since_tree_change` are the columns that actually vary.
     pub nudges_fired: u32,
@@ -1510,10 +1741,11 @@ impl MinedReport {
     /// Trials where the last in-loop gate was GREEN at exit and the agent did
     /// NOT claim Done. EVERY non-Done label counts — `Blocked`, `Failed`,
     /// `MaxIterations`, `StoppedWithoutFinish`, `BudgetExhausted`,
-    /// `BackendError`, `NotRun` (see `claimed_disposition_label`,
-    /// `mined_eval.rs:1105`). Expected to read 0 for every tier-2 report until
-    /// the tier-2 path registers a `run_checks` tool — see
-    /// `MinedTrialResult::gates_green_at_exit`.
+    /// `BackendError`, `NotRun` (see [`claimed_disposition_label`]). Always `0`
+    /// in [`AgentGateMode::Off`] (no `run_checks` tool is ever registered, so
+    /// `gates_green_at_exit` can never be true) — see
+    /// [`MinedTrialResult::gates_green_at_exit`]. Varies in
+    /// [`AgentGateMode::On`].
     #[must_use]
     pub fn post_green_stops(&self) -> u32 {
         self.trials
@@ -1533,6 +1765,37 @@ impl MinedReport {
             .filter(|t| {
                 matches!(t.score, TrialScore::Resolved) && t.claimed_disposition != CLAIMED_DONE
             })
+            .map(|_| 1u32)
+            .sum()
+    }
+
+    /// Trials with at least one finish-recovery nudge fired on an UNTOUCHED
+    /// tree (`tree_dirty == false`).
+    ///
+    /// `tree_dirty` latches on ANY successful `bash`, including read-only
+    /// commands, so this count is a conservative LOWER bound on untouched-tree
+    /// finish-recovery trips — a trial with a read-only `bash` call and a
+    /// nudge would NOT count here even though the tree itself was never
+    /// edited. This is the instrument for the deferred `tree_dirty` guard
+    /// decision (see the item that introduced [`AgentGateMode`]); it adds no
+    /// new field, only a filtered count over existing per-trial data.
+    #[must_use]
+    pub fn clean_tree_nudges(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| t.nudges_fired > 0 && !t.tree_dirty)
+            .map(|_| 1u32)
+            .sum()
+    }
+
+    /// Trials the agent claimed Done on an UNTOUCHED tree (`tree_dirty ==
+    /// false`). See [`Self::clean_tree_nudges`] for the same conservative
+    /// lower-bound caveat.
+    #[must_use]
+    pub fn clean_tree_dones(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| t.claimed_disposition == CLAIMED_DONE && !t.tree_dirty)
             .map(|_| 1u32)
             .sum()
     }
@@ -1659,11 +1922,22 @@ pub struct MinedRunConfig<'a> {
     pub k: u32,
     /// Per-trial iteration cap.
     pub max_iterations: u32,
+    /// Whether the in-run agent gate is armed this run. See [`AgentGateMode`].
+    pub agent_gate: AgentGateMode,
+    /// Whether the shared test-first approach guidance is appended to the
+    /// agent prompt. See [`parse_test_first`].
+    pub test_first: bool,
+    /// Wall-clock budget (seconds) applied to every trial via
+    /// [`crate::engine::RunConfig::with_wall_clock_secs`]. `0` is unbounded —
+    /// mirrors talos production's `--wall-clock-secs` default. See
+    /// [`parse_wall_clock_secs`].
+    pub wall_clock_secs: u64,
 }
 
 /// Run the whole mined-task eval: `k` independent trials, each with a fresh
-/// primary+sibling worktree, `env.setup`, agent loop with `checks=None`, and
-/// sealed re-gate scoring.
+/// primary+sibling worktree, `env.setup`, an agent loop (checks armed only
+/// under [`AgentGateMode::On`], `checks=None` under [`AgentGateMode::Off`]),
+/// and sealed re-gate scoring.
 ///
 /// Trials are **sequential**. Every trial gets a fresh workspace so agent
 /// edits never leak between trials.
@@ -1711,6 +1985,7 @@ pub async fn run_mined_task<B: ModelBackend>(
 /// One trial: setup worktrees + env → agent loop → sealed re-gate. Any
 /// pre-agent infra failure short-circuits to [`TrialScore::Invalid`] and the
 /// agent is not run.
+#[allow(clippy::too_many_lines)]
 async fn single_trial<B: ModelBackend>(
     backend: &B,
     parser: &(impl TestReportParser + ?Sized),
@@ -1718,6 +1993,16 @@ async fn single_trial<B: ModelBackend>(
     trial: u32,
 ) -> MinedTrialResult {
     let start = Instant::now();
+
+    // 0. Resolve the in-run agent gate BEFORE touching any worktree — a
+    //    missing/invalid `agent_gate_command` under `AgentGateMode::On` is a
+    //    hard, fail-loud pre-flight error.
+    let agent_gate_cmd = match resolve_agent_gate_command(config.task, config.agent_gate) {
+        Ok(c) => c,
+        Err(e) => {
+            return invalid_trial(config, trial, format!("agent-gate-missing: {e}"), start);
+        }
+    };
 
     // 1. Worktrees.
     let worktrees = match prepare_worktrees(config.task) {
@@ -1733,7 +2018,7 @@ async fn single_trial<B: ModelBackend>(
         return invalid_trial(config, trial, reason, start);
     }
 
-    // 3. Agent loop with checks=None self-certify.
+    // 3. Agent loop, checks armed only in AgentGateMode::On.
     let offload = match ScratchDir::new(&format!("offload-{}-{trial}", config.task.id)) {
         Ok(s) => s,
         Err(e) => {
@@ -1752,12 +2037,46 @@ async fn single_trial<B: ModelBackend>(
             return invalid_trial(config, trial, format!("offload-canon-failed: {e}"), start);
         }
     };
+    // Canonical root, captured BEFORE `workspace` is moved into the `Arc` for
+    // `ToolCtx::new` — the same root talos production `run_cmd` uses to build
+    // its `ChecksRunner`.
+    let gate_root = workspace.root().to_path_buf();
     let ctx = ToolCtx::new(
         Arc::new(workspace),
         Arc::new(DiskOffloadSink::new(offload_canon)),
     );
-    let tools = standard_registry(None);
-    let run_config = RunConfig::new(tier2_task_prompt(config.statement), config.max_iterations);
+    let checks = match (config.agent_gate, agent_gate_cmd) {
+        (AgentGateMode::On { timeout }, Some(cmd)) => shell_checks_runner(cmd, gate_root, timeout),
+        _ => None,
+    };
+    let tools = standard_registry(checks.clone());
+    let mut run_config = RunConfig::new(
+        tier2_task_prompt(config.statement, agent_gate_cmd, config.test_first),
+        config.max_iterations,
+    )
+    .with_wall_clock_secs(config.wall_clock_secs);
+    if let Some(runner) = checks.clone() {
+        run_config = run_config.with_checks(runner);
+    }
+
+    // Baseline tripwire (On only): the agent gate must be green at parent —
+    // never run the agent against a gate that is already red or unable to
+    // complete within its timeout.
+    if let Some(runner) = checks.as_ref() {
+        let baseline = runner.run(&ctx).await;
+        if !baseline.passed {
+            return invalid_trial(
+                config,
+                trial,
+                format!(
+                    "agent-gate-red-at-parent: exit={:?} timed_out={}",
+                    baseline.exit_code, baseline.timed_out
+                ),
+                start,
+            );
+        }
+    }
+
     let RunResult { outcome, stats } = engine::run(backend, &tools, &ctx, &run_config).await;
     let claimed = claimed_disposition_label(&outcome);
 
@@ -1885,12 +2204,14 @@ impl Drop for ScratchDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLAIMED_BLOCKED, CLAIMED_DONE, MinedReport, MinedTask, MinedTrialResult, PytestParser,
-        ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
-        TrialScore, build_collection_errors, claimed_disposition_label, copy_sealed, expand_home,
-        gate_fault_reason, is_test_path, load_statement, load_task, match_task_id,
-        matches_exclusion, normalize, parse_authored_tests, parse_pytest_summary_totals,
-        parse_short_summary_line, prepare_worktrees, resolve, run_env_setup, sanitize_for_filename,
+        AgentGateMode, CLAIMED_BLOCKED, CLAIMED_DONE, DEFAULT_AGENT_GATE_TIMEOUT, MinedReport,
+        MinedTask, MinedTrialResult, PytestParser, ResolveDetail, ScratchDir, SealedEntry,
+        SpecLevel, TestReportParser, TestStatus, TrialScore, build_collection_errors,
+        claimed_disposition_label, copy_sealed, expand_home, gate_fault_reason, is_test_path,
+        load_statement, load_task, match_task_id, matches_exclusion, normalize,
+        parse_agent_gate_mode, parse_authored_tests, parse_pytest_summary_totals,
+        parse_short_summary_line, parse_test_first, parse_wall_clock_secs, prepare_worktrees,
+        resolve, resolve_agent_gate_command, run_env_setup, sanitize_for_filename,
         scan_authored_tests, strip_param_suffix, tier2_task_prompt,
     };
     use crate::run_record::{Disposition, FailureMode, Verification};
@@ -2010,6 +2331,44 @@ mod tests {
         assert!(task.notes.is_empty());
     }
 
+    #[test]
+    fn load_task_omits_agent_gate_command_by_default() {
+        // SAMPLE_TASK_JSON has no `agent_gate_command` key at all.
+        let dir = tempdir().expect("tempdir");
+        write_task(dir.path(), SAMPLE_TASK_JSON);
+        let task = load_task(dir.path()).expect("load without agent_gate_command");
+        assert_eq!(task.agent_gate_command, None);
+    }
+
+    #[test]
+    fn load_task_reads_agent_gate_command_verbatim() {
+        let json = SAMPLE_TASK_JSON.replace(
+            "\"gate_command\": \"uv run --frozen pytest tests/test_cleanr.py -q\",",
+            "\"gate_command\": \"uv run --frozen pytest tests/test_cleanr.py -q\", \
+             \"agent_gate_command\": \"make check && pytest\",",
+        );
+        let dir = tempdir().expect("tempdir");
+        write_task(dir.path(), &json);
+        let task = load_task(dir.path()).expect("load with agent_gate_command");
+        assert_eq!(
+            task.agent_gate_command,
+            Some("make check && pytest".to_string())
+        );
+    }
+
+    #[test]
+    fn load_task_null_agent_gate_command_is_none() {
+        let json = SAMPLE_TASK_JSON.replace(
+            "\"gate_command\": \"uv run --frozen pytest tests/test_cleanr.py -q\",",
+            "\"gate_command\": \"uv run --frozen pytest tests/test_cleanr.py -q\", \
+             \"agent_gate_command\": null,",
+        );
+        let dir = tempdir().expect("tempdir");
+        write_task(dir.path(), &json);
+        let task = load_task(dir.path()).expect("load with null agent_gate_command");
+        assert_eq!(task.agent_gate_command, None);
+    }
+
     // ---- statements -------------------------------------------------------
 
     #[test]
@@ -2047,6 +2406,213 @@ mod tests {
             msg.contains(dir.path().to_string_lossy().as_ref()) || msg.contains("statements"),
             "error must name a path, got: {msg}"
         );
+    }
+
+    // ---- agent gate ---------------------------------------------------------
+
+    fn sample_task() -> MinedTask {
+        MinedTask {
+            id: "cleanr-abcdef1".to_string(),
+            repo: "cleanr".to_string(),
+            repo_path: "~/git/cleanr".to_string(),
+            parent_sha: "aaaa111".to_string(),
+            fix_sha: "bbbb222".to_string(),
+            rung_guess: "mid".to_string(),
+            language: "python".to_string(),
+            provenance: serde_json::Value::Null,
+            env: super::MinedEnv {
+                setup: "true".to_string(),
+                sibling_repos: Vec::new(),
+            },
+            test_scope: "tests/test_synth.py".to_string(),
+            gate_command: "true # SEALED_SCORING_GATE".to_string(),
+            agent_gate_command: None,
+            fail_to_pass: Vec::new(),
+            positive_controls: Vec::new(),
+            pass_to_pass_exclusions: Vec::new(),
+            sealed: vec![SealedEntry {
+                path: "tests/test_synth.py".to_string(),
+            }],
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn agent_gate_mode_display_pins_exact_wording() {
+        assert_eq!(AgentGateMode::Off.to_string(), "off");
+        assert_eq!(
+            AgentGateMode::On {
+                timeout: Duration::from_mins(15)
+            }
+            .to_string(),
+            "on(timeout=900s)"
+        );
+        assert_eq!(DEFAULT_AGENT_GATE_TIMEOUT, Duration::from_mins(15));
+    }
+
+    #[test]
+    fn parse_agent_gate_mode_covers_the_pinned_tuples() {
+        // (None, None) -> On{900s}
+        assert_eq!(
+            parse_agent_gate_mode(None, None),
+            Ok(AgentGateMode::On {
+                timeout: Duration::from_mins(15)
+            })
+        );
+        // (Some("1"), None) -> On{900s}
+        assert_eq!(
+            parse_agent_gate_mode(Some("1"), None),
+            Ok(AgentGateMode::On {
+                timeout: Duration::from_mins(15)
+            })
+        );
+        // (Some(""), Some("")) -> On{900s}
+        assert_eq!(
+            parse_agent_gate_mode(Some(""), Some("")),
+            Ok(AgentGateMode::On {
+                timeout: Duration::from_mins(15)
+            })
+        );
+        // (Some(" 1 "), Some(" 60 ")) -> On{60s}
+        assert_eq!(
+            parse_agent_gate_mode(Some(" 1 "), Some(" 60 ")),
+            Ok(AgentGateMode::On {
+                timeout: Duration::from_mins(1)
+            })
+        );
+        // (None, Some("1200")) -> On{1200s}
+        assert_eq!(
+            parse_agent_gate_mode(None, Some("1200")),
+            Ok(AgentGateMode::On {
+                timeout: Duration::from_mins(20)
+            })
+        );
+        // (Some("0"), None) -> Off
+        assert_eq!(
+            parse_agent_gate_mode(Some("0"), None),
+            Ok(AgentGateMode::Off)
+        );
+        // (Some(" 0 "), None) -> Off
+        assert_eq!(
+            parse_agent_gate_mode(Some(" 0 "), None),
+            Ok(AgentGateMode::Off)
+        );
+        // (Some("0"), Some("1200")) -> Off
+        assert_eq!(
+            parse_agent_gate_mode(Some("0"), Some("1200")),
+            Ok(AgentGateMode::Off)
+        );
+        // (Some("yes"), None) -> Err containing MINED_EVAL_AGENT_GATE and yes
+        let err = parse_agent_gate_mode(Some("yes"), None).expect_err("yes is invalid");
+        assert!(err.contains("MINED_EVAL_AGENT_GATE"));
+        assert!(err.contains("yes"));
+        // (None, Some("0")) -> Err containing MINED_EVAL_GATE_TIMEOUT_SECS
+        let err = parse_agent_gate_mode(None, Some("0")).expect_err("0 timeout is invalid");
+        assert!(err.contains("MINED_EVAL_GATE_TIMEOUT_SECS"));
+        // (None, Some("abc")) -> Err containing MINED_EVAL_GATE_TIMEOUT_SECS and abc
+        let err = parse_agent_gate_mode(None, Some("abc")).expect_err("abc timeout is invalid");
+        assert!(err.contains("MINED_EVAL_GATE_TIMEOUT_SECS"));
+        assert!(err.contains("abc"));
+        // (Some("0"), Some("abc")) -> Err containing MINED_EVAL_GATE_TIMEOUT_SECS and abc
+        // (timeout is parsed FIRST, even though enabled selects Off)
+        let err =
+            parse_agent_gate_mode(Some("0"), Some("abc")).expect_err("abc timeout is invalid");
+        assert!(err.contains("MINED_EVAL_GATE_TIMEOUT_SECS"));
+        assert!(err.contains("abc"));
+        // (Some("0"), Some("0")) -> Err
+        assert!(parse_agent_gate_mode(Some("0"), Some("0")).is_err());
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_off_ignores_the_field() {
+        let mut task = sample_task();
+        task.agent_gate_command = Some("x".to_string());
+        assert_eq!(
+            resolve_agent_gate_command(&task, AgentGateMode::Off),
+            Ok(None)
+        );
+    }
+
+    fn on_mode() -> AgentGateMode {
+        AgentGateMode::On {
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_on_missing_is_err() {
+        let task = sample_task();
+        let err = resolve_agent_gate_command(&task, on_mode()).expect_err("missing must error");
+        assert!(err.contains(&task.id));
+        assert!(err.contains("agent_gate_command"));
+        assert!(err.contains("MINED_EVAL_AGENT_GATE=0"));
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_on_blank_is_err() {
+        let mut task = sample_task();
+        task.agent_gate_command = Some("   ".to_string());
+        let err = resolve_agent_gate_command(&task, on_mode()).expect_err("blank must error");
+        assert!(err.contains(&task.id));
+        assert!(err.contains("agent_gate_command"));
+        assert!(err.contains("MINED_EVAL_AGENT_GATE=0"));
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_on_equal_to_gate_command_is_err() {
+        let mut task = sample_task();
+        task.agent_gate_command = Some(format!("  {}  ", task.gate_command));
+        let err =
+            resolve_agent_gate_command(&task, on_mode()).expect_err("equal to gate_command errors");
+        assert!(err.contains("equals gate_command"));
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_on_leaking_sealed_path_is_err() {
+        let mut task = sample_task();
+        task.agent_gate_command = Some("pytest tests/test_synth.py -k agent_gate".to_string());
+        let err =
+            resolve_agent_gate_command(&task, on_mode()).expect_err("sealed path leak must error");
+        assert!(err.contains("tests/test_synth.py"));
+    }
+
+    #[test]
+    fn resolve_agent_gate_command_on_returns_verbatim_untrimmed() {
+        let mut task = sample_task();
+        task.agent_gate_command = Some("  make x  ".to_string());
+        assert_eq!(
+            resolve_agent_gate_command(&task, on_mode()),
+            Ok(Some("  make x  "))
+        );
+    }
+
+    // ---- test-first toggle / wall-clock parsers ----------------------------
+
+    #[test]
+    fn parse_test_first_covers_the_pinned_tuples() {
+        assert_eq!(parse_test_first(None), Ok(true));
+        assert_eq!(parse_test_first(Some("")), Ok(true));
+        assert_eq!(parse_test_first(Some("1")), Ok(true));
+        assert_eq!(parse_test_first(Some(" 1 ")), Ok(true));
+        assert_eq!(parse_test_first(Some("0")), Ok(false));
+        assert_eq!(parse_test_first(Some(" 0 ")), Ok(false));
+        let err = parse_test_first(Some("yes")).expect_err("yes is invalid");
+        assert!(err.contains("MINED_EVAL_TEST_FIRST"));
+        assert!(err.contains("yes"));
+    }
+
+    #[test]
+    fn parse_wall_clock_secs_covers_the_pinned_tuples() {
+        assert_eq!(parse_wall_clock_secs(None), Ok(0));
+        assert_eq!(parse_wall_clock_secs(Some("")), Ok(0));
+        assert_eq!(parse_wall_clock_secs(Some("0")), Ok(0));
+        assert_eq!(parse_wall_clock_secs(Some(" 1200 ")), Ok(1200));
+        let err = parse_wall_clock_secs(Some("abc")).expect_err("abc is invalid");
+        assert!(err.contains("MINED_EVAL_WALL_CLOCK_SECS"));
+        assert!(err.contains("abc"));
+        let err = parse_wall_clock_secs(Some("-1")).expect_err("-1 is invalid");
+        assert!(err.contains("MINED_EVAL_WALL_CLOCK_SECS"));
+        assert!(err.contains("-1"));
     }
 
     // ---- normalize / matching --------------------------------------------
@@ -2255,7 +2821,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     /// is ever removed.
     #[test]
     fn tier2_task_prompt_appends_the_shared_test_first_guidance() {
-        let out = tier2_task_prompt("Fix the deadlock in the rollout executor.\n");
+        let out = tier2_task_prompt("Fix the deadlock in the rollout executor.\n", None, true);
         assert!(
             out.starts_with("Fix the deadlock in the rollout executor."),
             "statement must lead the prompt; got:\n{out}"
@@ -2273,6 +2839,53 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             out.contains(".\n\n## Approach"),
             "expected one blank line between statement and guidance; got:\n{out}"
         );
+    }
+
+    /// Parity: the tail of the agent-gate On prompt (from `## Approach`
+    /// onward) is byte-identical to the tail of the production
+    /// `render_task_prompt_from_spec` output for the same gate command — the
+    /// tier-2 agent gate must render the SAME verification framing production
+    /// talos dispatch ships, not a paraphrase.
+    #[test]
+    fn tier2_task_prompt_on_mode_matches_production_verification_tail() {
+        use crate::prompt::render_task_prompt_from_spec;
+        use crate::task_spec::TaskSpec;
+
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "AGENT_SENTINEL_CMD".to_string(),
+        };
+        let a = tier2_task_prompt("S.", Some("AGENT_SENTINEL_CMD"), true);
+        let p = render_task_prompt_from_spec(&spec);
+        assert_eq!(
+            &a[a.find("## Approach").unwrap()..],
+            &p[p.find("## Approach").unwrap()..]
+        );
+    }
+
+    #[test]
+    fn tier2_task_prompt_off_mode_has_no_verification_section() {
+        let out = tier2_task_prompt("S.", None, true);
+        assert!(!out.contains("Run the following command to verify the task is complete:"));
+        assert!(!out.contains("finish(done) immediately"));
+    }
+
+    /// `test_first = false` must remove EXACTLY the shared test-first section
+    /// (and its leading separator) and nothing else — checked with the
+    /// agent-gate off (no `## Verification` section appended) AND on (a
+    /// `## Verification` section appended after where the test-first section
+    /// would have gone), so the toggle composes correctly with both modes.
+    #[test]
+    fn tier2_task_prompt_test_first_toggle_removes_exactly_the_section_and_separator() {
+        let separator_and_section = format!("\n\n{}", crate::prompt::render_test_first_approach());
+        for gate in [None, Some("AGENT_SENTINEL_CMD")] {
+            let on = tier2_task_prompt("S.", gate, true);
+            let off = tier2_task_prompt("S.", gate, false);
+            assert_eq!(on.replace(&separator_and_section, ""), off, "gate={gate:?}");
+        }
     }
 
     // ---- agent test authorship --------------------------------------------
@@ -2877,6 +3490,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             gate_command: "true".to_string(),
+            agent_gate_command: None,
             fail_to_pass: Vec::new(),
             positive_controls: Vec::new(),
             pass_to_pass_exclusions: Vec::new(),
@@ -3137,6 +3751,32 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     }
 
     #[test]
+    fn clean_tree_nudges_and_dones_are_conservative_lower_bounds() {
+        // A nudged CLEAN trial counts toward clean_tree_nudges.
+        let nudged_clean = trial_tel(0, TrialScore::Resolved, "MaxIterations", true, 1);
+        // A nudged DIRTY trial does not.
+        let mut nudged_dirty = trial_tel(1, TrialScore::Resolved, "MaxIterations", true, 1);
+        nudged_dirty.tree_dirty = true;
+        // A Done CLEAN trial counts toward clean_tree_dones.
+        let done_clean = trial_tel(2, TrialScore::Resolved, CLAIMED_DONE, false, 0);
+        // A non-Done CLEAN trial does not count toward clean_tree_dones.
+        let non_done_clean = trial_tel(3, TrialScore::Resolved, "Blocked", false, 0);
+
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 4,
+            resolved_count: 4,
+            invalid_count: 0,
+            trials: vec![nudged_clean, nudged_dirty, done_clean, non_done_clean],
+        };
+        assert_eq!(report.clean_tree_nudges(), 1);
+        assert_eq!(report.clean_tree_dones(), 1);
+    }
+
+    #[test]
     fn mined_report_false_dones_counts_only_claimed_done_x_unresolved() {
         let report = MinedReport {
             task_id: "t".to_string(),
@@ -3306,6 +3946,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_scope: String::new(),
             // A shell script emulating pytest -rA short-summary output.
             gate_command: r"printf '=== short test summary info ===\nPASSED tests/test_x.py::T::a\nPASSED tests/test_x.py::T::b\n=== 2 passed in 0.0s ===\n'".to_string(),
+            agent_gate_command: None,
             fail_to_pass: vec!["T::a".to_string()],
             positive_controls: vec!["T::b".to_string()],
             pass_to_pass_exclusions: Vec::new(),
@@ -3346,6 +3987,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             gate_command: "true".to_string(),
+            agent_gate_command: None,
             fail_to_pass: Vec::new(),
             positive_controls: Vec::new(),
             pass_to_pass_exclusions: Vec::new(),
@@ -3486,6 +4128,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             backend_desc: "mock".to_string(),
             k,
             max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
         };
         // Silence FinishTool's `use` warning across the impl surface.
         let _ = FinishTool;
@@ -3513,8 +4158,487 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert!((report.resolved_rate() - 1.0).abs() < f64::EPSILON);
         assert!(
             !report.trials[0].finish_recovery_armed,
-            "tier-2 registers no run_checks — see standard_registry(None) at single_trial"
+            "AgentGateMode::Off registers no run_checks — see the `_ => None` arm of the \
+             `checks` match in single_trial"
         );
+    }
+
+    /// Build a synthetic primary repo + task dir for the agent-gate E2E tests:
+    /// a canned-PASSED sealed scoring gate (`gate_command`), `fail_to_pass =
+    /// ["T::pass_it"]`, and sealed `tests/test_synth.py`. The caller sets
+    /// `task.agent_gate_command` and `env.setup` as needed.
+    fn agent_gate_task_fixture() -> (tempfile::TempDir, tempfile::TempDir, MinedTask, String) {
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "main.py", "print('x')\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir statements");
+        let statement = "S.\n\n## Verification\n\nHidden tests apply.".to_string();
+        std::fs::write(task_dir.path().join("statements/s2.md"), &statement).expect("write s2");
+        std::fs::create_dir_all(task_dir.path().join("sealed/tests")).expect("mkdir sealed");
+        std::fs::write(
+            task_dir.path().join("sealed/tests/test_synth.py"),
+            "# sealed test\n",
+        )
+        .expect("write sealed");
+
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        task.gate_command =
+            r"printf '=== short test summary info ===\nPASSED tests/test_synth.py::T::pass_it\n=== 1 passed in 0.0s ===\n'"
+                .to_string();
+        task.fail_to_pass = vec!["T::pass_it".to_string()];
+        task.sealed = vec![SealedEntry {
+            path: "tests/test_synth.py".to_string(),
+        }];
+        (workroot, task_dir, task, statement)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn agent_gate_on_arms_run_checks_and_verifies_finish_done() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{
+            AssistantTurn, ContentBlock, Message, StopReason, ToolCallRequest, Usage, UserBlock,
+        };
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
+
+        let turns = vec![
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-rc".to_string(),
+                    name: "run_checks".to_string(),
+                    input: serde_json::json!({}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+            AssistantTurn {
+                content: vec![ContentBlock::Text("thinking".to_string())],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+        ];
+        let backend = MockBackend::from_turns(turns);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert!(trial.finish_recovery_armed);
+        assert_eq!(trial.nudges_fired, 1);
+        assert!(trial.gates_green_at_exit);
+        assert!(!trial.tree_dirty);
+        assert_eq!(trial.iterations, 3);
+        assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
+        assert_eq!(trial.score, TrialScore::Resolved);
+        assert_eq!(backend.calls(), 3);
+        assert_eq!(report.clean_tree_nudges(), 1);
+        assert_eq!(report.clean_tree_dones(), 1);
+
+        let systems = backend.systems_seen();
+        let sys = systems[0].as_deref().expect("system prompt");
+        assert!(sys.contains("/bin/sh -c true # AGENT_GATE_SENTINEL"));
+        assert!(!sys.contains("short test summary info"));
+
+        let Message::User { content } = &backend.messages_seen()[0][0] else {
+            panic!("expected first message of first turn to be User");
+        };
+        let first_user_text: String = content
+            .iter()
+            .filter_map(|b| match b {
+                UserBlock::Text(t) => Some(t.as_str()),
+                UserBlock::ToolResult { .. } => None,
+            })
+            .collect();
+        assert!(first_user_text.contains("AGENT_GATE_SENTINEL"));
+        assert_eq!(
+            first_user_text
+                .matches("Run the following command to verify the task is complete:")
+                .count(),
+            1
+        );
+        assert_eq!(first_user_text.matches("## Verification").count(), 2);
+        assert!(!first_user_text.contains("short test summary info"));
+    }
+
+    #[tokio::test]
+    async fn agent_gate_tripwire_threads_the_mode_timeout() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("sleep 3".to_string());
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_millis(500),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        match &report.trials[0].score {
+            TrialScore::Invalid { reason } => {
+                assert!(
+                    reason.starts_with("agent-gate-red-at-parent"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("timed_out=true"), "reason: {reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(report.trials[0].claimed_disposition, "NotRun");
+        assert_eq!(backend.calls(), 0);
+        assert_eq!(report.invalid_count, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_gate_tripwire_red_at_parent() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("exit 1".to_string());
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 2,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        assert_eq!(report.invalid_count, 2);
+        for t in &report.trials {
+            match &t.score {
+                TrialScore::Invalid { reason } => {
+                    assert!(
+                        reason.starts_with("agent-gate-red-at-parent"),
+                        "reason: {reason}"
+                    );
+                    assert!(reason.contains("exit=Some(1)"), "reason: {reason}");
+                    assert!(reason.contains("timed_out=false"), "reason: {reason}");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+            assert_eq!(t.claimed_disposition, "NotRun");
+        }
+        assert_eq!(backend.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_gate_turning_red_after_the_agent_acts_rejects_finish_done() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("test ! -e .agent_marker".to_string());
+
+        let usage = || Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        };
+        let turns = vec![
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-bash".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "touch .agent_marker"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            },
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish-1".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            },
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish-2".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            },
+        ];
+        let backend = MockBackend::from_turns(turns);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert_eq!(trial.claimed_disposition, "MaxIterations");
+        assert_eq!(trial.score, TrialScore::Resolved);
+        assert_eq!(report.resolved_unclaimed(), 1);
+        assert_eq!(report.false_dones(), 0);
+        assert_eq!(trial.nudges_fired, 0);
+        assert!(!trial.gates_green_at_exit);
+        assert!(trial.finish_recovery_armed);
+        assert!(trial.tree_dirty);
+        assert_eq!(backend.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn agent_gate_off_is_legacy() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{
+            AssistantTurn, ContentBlock, Message, StopReason, ToolCallRequest, Usage, UserBlock,
+        };
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
+
+        let turns = vec![AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-finish".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }];
+        let backend = MockBackend::from_turns(turns);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert!(!trial.finish_recovery_armed);
+        assert_eq!(trial.nudges_fired, 0);
+        assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
+        assert_eq!(trial.score, TrialScore::Resolved);
+        assert_eq!(backend.calls(), 1);
+
+        let systems = backend.systems_seen();
+        let sys = systems[0].as_deref().expect("system prompt");
+        assert!(sys.contains("No checks are configured"));
+        assert!(!sys.contains("AGENT_GATE_SENTINEL"));
+
+        let Message::User { content } = &backend.messages_seen()[0][0] else {
+            panic!("expected first message of first turn to be User");
+        };
+        let first_user_text: String = content
+            .iter()
+            .filter_map(|b| match b {
+                UserBlock::Text(t) => Some(t.as_str()),
+                UserBlock::ToolResult { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            first_user_text
+                .matches("Run the following command to verify the task is complete:")
+                .count(),
+            0
+        );
+        assert!(!first_user_text.contains("AGENT_GATE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn agent_gate_on_missing_field_fails_loud() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, task, statement) = agent_gate_task_fixture();
+        // task.agent_gate_command left at None (the fixture default).
+        assert_eq!(task.agent_gate_command, None);
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 2,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        assert_eq!(report.invalid_count, 2);
+        for t in &report.trials {
+            match &t.score {
+                TrialScore::Invalid { reason } => {
+                    assert!(reason.starts_with("agent-gate-missing"), "reason: {reason}");
+                    assert!(reason.contains(&task.id), "reason: {reason}");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+            assert_eq!(t.claimed_disposition, "NotRun");
+        }
+        assert_eq!(backend.calls(), 0);
+    }
+
+    /// Proves `MinedRunConfig::wall_clock_secs` actually reaches the engine's
+    /// `RunConfig` — fails (times out waiting for a `MockBackend` turn that
+    /// never comes) if `single_trial` ever stops calling
+    /// `RunConfig::with_wall_clock_secs`. `single_trial` has no clock-injection
+    /// seam, so this is a real-time test: a genuine `sleep 2` inside the first
+    /// iteration's `bash` call, against a 1-second budget, must trip
+    /// `LoopOutcome::BudgetExhausted` before a second turn is ever drawn.
+    #[tokio::test]
+    async fn wall_clock_secs_reaches_the_engine_run_config() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, task, statement) = agent_gate_task_fixture();
+
+        let turns = vec![AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-sleep".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "sleep 2"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }];
+        let backend = MockBackend::from_turns(turns);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 1,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        assert_eq!(
+            report.trials[0].claimed_disposition, "BudgetExhausted",
+            "a 1s wall-clock budget must trip after a 2s bash call — if this reads anything \
+             else, single_trial stopped calling RunConfig::with_wall_clock_secs"
+        );
+        assert_eq!(backend.calls(), 1);
     }
 
     #[tokio::test]
@@ -3544,6 +4668,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             backend_desc: "mock".to_string(),
             k: 1,
             max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -3585,6 +4712,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             backend_desc: "mock".to_string(),
             k: 1,
             max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -3893,6 +5023,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             gate_command: "true".to_string(),
+            agent_gate_command: None,
             fail_to_pass: Vec::new(),
             positive_controls: Vec::new(),
             pass_to_pass_exclusions: Vec::new(),
@@ -4001,6 +5132,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             backend_desc: "mock".to_string(),
             k: 1,
             max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4049,6 +5183,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             backend_desc: "mock".to_string(),
             k: 1,
             max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4422,6 +5559,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             gate_command: "sleep 5".to_string(),
+            agent_gate_command: None,
             fail_to_pass: Vec::new(),
             positive_controls: Vec::new(),
             pass_to_pass_exclusions: Vec::new(),
@@ -4475,6 +5613,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_scope: String::new(),
             gate_command: "kill -KILL $$".to_string(),
+            agent_gate_command: None,
             fail_to_pass: Vec::new(),
             positive_controls: Vec::new(),
             pass_to_pass_exclusions: Vec::new(),

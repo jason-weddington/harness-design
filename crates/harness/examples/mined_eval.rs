@@ -8,8 +8,15 @@
 //! 1. Lays down a fresh `git worktree` for the primary repo at `parent_sha`,
 //!    plus one for each sibling repo at its `pin`.
 //! 2. Runs `env.setup` under a 10-minute timeout.
-//! 3. Runs the agent loop with `checks=None` — a `finish(done)` claim is
-//!    accepted on trust. Verdicts come 100% from the sealed re-gate.
+//! 3. Runs the agent loop. Two modes, selected by `MINED_EVAL_AGENT_GATE`
+//!    (verdicts come 100% from the sealed re-gate below either way, never
+//!    from the in-run agent gate):
+//!    - **On** (the default) registers `run_checks` on `task.agent_gate_command`
+//!      (the repo's real in-run dispatch gate), verifies `finish(done)` against
+//!      it, and first requires the gate to be green at `parent_sha` — else the
+//!      trial is `Invalid` (`agent-gate-red-at-parent`) and the agent never runs.
+//!    - **Off** is the legacy comparison row: no `run_checks` is registered, a
+//!      `finish(done)` claim is accepted on trust, and no baseline tripwire runs.
 //! 4. Overwrites the agent's copies of the `sealed[]` files with the mined
 //!    truth and re-runs `gate_command` with `PYTEST_ADDOPTS="-rA"` so pytest
 //!    emits `PASSED/FAILED/...` short-summary lines the scorer parses.
@@ -53,7 +60,24 @@
 //! - `MINED_EVAL_SPEC_LEVEL` (optional) — `s1|s2|s3`, defaults to `s2`.
 //! - `MINED_EVAL_K` (optional) — number of trials; defaults to 3.
 //! - `MINED_EVAL_MAX_ITERATIONS` (optional) — per-trial agent-loop cap;
-//!   defaults to 24 (matches the talos dispatch default).
+//!   defaults to 24. Production `talos run` defaults to `--max-iterations 500`
+//!   and agent-gtd-dispatch does not override it — 24 is a tier-2 cost and
+//!   cross-run comparability choice, not a parity value. Set
+//!   `MINED_EVAL_MAX_ITERATIONS=500` for true iteration-budget parity.
+//! - `MINED_EVAL_AGENT_GATE` (optional) — `0` = off (the legacy comparison
+//!   row), any other value (including unset/empty) = on (production parity).
+//!   Unparsable input panics. See [`AgentGateMode`].
+//! - `MINED_EVAL_GATE_TIMEOUT_SECS` (optional) — timeout in seconds for the
+//!   in-run agent gate; defaults to 900, must be `>= 1`. See
+//!   `mined_eval::parse_agent_gate_mode`.
+//! - `MINED_EVAL_TEST_FIRST` (optional) — `0` = strip the shared test-first
+//!   approach guidance from the agent prompt; any other value (including
+//!   unset/empty) = include it (the default, and the only production talos
+//!   behavior). See `mined_eval::parse_test_first`.
+//! - `MINED_EVAL_WALL_CLOCK_SECS` (optional) — wall-clock budget in seconds
+//!   applied to every trial; defaults to 0 (unbounded), mirroring talos
+//!   production's `--wall-clock-secs` default. See
+//!   `mined_eval::parse_wall_clock_secs`.
 //! - `EVAL_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*` — same shape as
 //!   `examples/coding_eval.rs`. Kept as a duplicated helper (`backend_from_env`)
 //!   rather than extracted to the lib, because pulling it into the lib would
@@ -71,8 +95,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::mined_eval::{
-    self, CLAIMED_DONE, MinedReport, MinedRunConfig, MinedTrialResult, PytestParser, SpecLevel,
-    TrialScore, load_statement, load_task,
+    self, AgentGateMode, CLAIMED_DONE, MinedReport, MinedRunConfig, MinedTask, MinedTrialResult,
+    PytestParser, SpecLevel, TrialScore, load_statement, load_task, parse_agent_gate_mode,
+    parse_test_first, parse_wall_clock_secs, resolve_agent_gate_command,
 };
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
@@ -89,7 +114,10 @@ const MIN_EXPECTED_NUM_CTX: u32 = 32_768;
 /// Default trial count (`k`) when `MINED_EVAL_K` is not set.
 const DEFAULT_K: u32 = 3;
 
-/// Default per-trial iteration cap. Matches talos dispatch's `max_iterations`.
+/// Default per-trial iteration cap. Production `talos run` defaults to
+/// `--max-iterations 500` and agent-gtd-dispatch does not override it; `24`
+/// here is a tier-2 cost and cross-run comparability choice, not a parity
+/// value — set `MINED_EVAL_MAX_ITERATIONS=500` for true parity.
 const DEFAULT_MAX_ITERATIONS: u32 = 24;
 
 /// Default spec level when `MINED_EVAL_SPEC_LEVEL` is not set.
@@ -240,7 +268,26 @@ fn expand_home(raw: &str) -> String {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() {
+    let agent_gate = parse_agent_gate_mode(
+        env::var("MINED_EVAL_AGENT_GATE").ok().as_deref(),
+        env::var("MINED_EVAL_GATE_TIMEOUT_SECS").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let test_first = parse_test_first(env::var("MINED_EVAL_TEST_FIRST").ok().as_deref())
+        .unwrap_or_else(|e| {
+            panic!("{e}");
+        });
+    let wall_clock_secs =
+        parse_wall_clock_secs(env::var("MINED_EVAL_WALL_CLOCK_SECS").ok().as_deref())
+            .unwrap_or_else(|e| panic!("{e}"));
+    let wall_clock_desc = if wall_clock_secs == 0 {
+        "unbounded".to_string()
+    } else {
+        format!("{wall_clock_secs}s")
+    };
+
     let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("MINED_EVAL_K", DEFAULT_K);
     let max_iterations = env_u32("MINED_EVAL_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS);
@@ -280,24 +327,42 @@ async fn main() {
         tasks_root.display(),
     );
 
+    // Load + resolve every task ONCE, before the banner — a missing/invalid
+    // `agent_gate_command` under `AgentGateMode::On` is a hard, fail-loud
+    // pre-flight error naming the task id, not a per-trial `Invalid`.
+    let loaded: Vec<(PathBuf, MinedTask, String)> = task_dirs
+        .into_iter()
+        .map(|task_dir| {
+            let task = load_task(&task_dir).unwrap_or_else(|e| {
+                panic!("load task.json at {}: {e}", task_dir.display());
+            });
+            let statement = load_statement(&task_dir, spec_level).unwrap_or_else(|e| {
+                panic!("load statement for {}: {e}", task_dir.display());
+            });
+            if let Err(e) = resolve_agent_gate_command(&task, agent_gate) {
+                panic!("{e}");
+            }
+            (task_dir, task, statement)
+        })
+        .collect();
+
     println!(
-        "running mined_eval across {} task(s) (k={k}, spec_level={:?}, max_iterations={max_iterations}) against {backend_desc}",
-        task_dirs.len(),
-        spec_level,
+        "running mined_eval across {} task(s) (k={k}, spec_level={spec_level:?}, max_iterations={max_iterations}, agent_gate={agent_gate}, test_first={}, wall_clock={wall_clock_desc}) against {backend_desc}",
+        loaded.len(),
+        if test_first { "on" } else { "off" },
     );
 
     let parser = PytestParser;
-    let mut summary: Vec<MinedReport> = Vec::with_capacity(task_dirs.len());
-    for task_dir in &task_dirs {
-        let task = load_task(task_dir).unwrap_or_else(|e| {
-            panic!("load task.json at {}: {e}", task_dir.display());
-        });
-        let statement = load_statement(task_dir, spec_level).unwrap_or_else(|e| {
-            panic!("load statement for {}: {e}", task_dir.display());
-        });
-
+    let mut summary: Vec<MinedReport> = Vec::with_capacity(loaded.len());
+    for (task_dir, task, statement) in &loaded {
+        let agent_gate_desc = match resolve_agent_gate_command(task, agent_gate) {
+            Ok(Some(cmd)) => cmd.to_string(),
+            Ok(None) => "off".to_string(),
+            // Already validated above; unreachable in practice.
+            Err(e) => panic!("{e}"),
+        };
         println!(
-            "\n=== task: {} (rung_guess={}) ===\n  dir: {}\n",
+            "\n=== task: {} (rung_guess={}) ===\n  dir: {}\n  agent_gate: {agent_gate_desc}\n",
             task.id,
             task.rung_guess,
             task_dir.display(),
@@ -305,21 +370,25 @@ async fn main() {
 
         let config = MinedRunConfig {
             task_dir,
-            task: &task,
-            statement: &statement,
+            task,
+            statement,
             spec_level,
             backend_desc: backend_desc.clone(),
             k,
             max_iterations,
+            agent_gate,
+            test_first,
+            wall_clock_secs,
         };
         let mut on_trial = |trial: &MinedTrialResult| {
-            // On a tier-2 run today fr_armed is expected false, green_at_exit
-            // false, and nudges 0 on EVERY trial (correct behaviour, not a
-            // wiring bug — see the doc-comments on MinedTrialResult::gates_green_at_exit
-            // and MinedTrialResult::nudges_fired). The discriminating columns
-            // are mut_iters, bash_ok, edits_ok, static_iters, and peak_static.
+            // fr_armed=false, green_at_exit=false, and nudges=0 on every trial
+            // hold ONLY in AgentGateMode::Off (the legacy comparison row) —
+            // see the doc-comments on MinedTrialResult::gates_green_at_exit
+            // and MinedTrialResult::nudges_fired. In On mode these columns are
+            // expected to vary along with mut_iters, bash_ok, edits_ok,
+            // static_iters, and peak_static.
             println!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -352,7 +421,18 @@ async fn main() {
         summary.push(report);
     }
 
-    print_summary(&summary, &backend_desc, spec_level, max_iterations, k);
+    print_summary(
+        &summary,
+        &SummaryHeader {
+            backend_desc: &backend_desc,
+            spec_level,
+            max_iterations,
+            k,
+            agent_gate,
+            test_first,
+            wall_clock_secs,
+        },
+    );
 }
 
 /// Discover task dirs under `root`, sorted by path.
@@ -383,32 +463,50 @@ fn trial_score_one_liner(score: &TrialScore) -> String {
     }
 }
 
-/// Render the final one-line-per-task summary table.
-///
-/// The header records backend/model/think + `spec_level` + `max_iterations` + k
-/// so a printed summary is self-describing (per kb-02909: never compare
-/// across a think/level change).
-fn print_summary(
-    summary: &[MinedReport],
-    backend_desc: &str,
+/// Header fields for [`print_summary`], bundled into one struct so the
+/// function itself stays under clippy's argument-count ceiling.
+struct SummaryHeader<'a> {
+    backend_desc: &'a str,
     spec_level: SpecLevel,
     max_iterations: u32,
     k: u32,
-) {
+    agent_gate: AgentGateMode,
+    test_first: bool,
+    wall_clock_secs: u64,
+}
+
+/// Render the final one-line-per-task summary table.
+///
+/// The header records backend/model/think + `spec_level` + `max_iterations` +
+/// `k` + `agent_gate` + `test_first` + `wall_clock` so a printed summary is
+/// self-describing (per kb-02909: never compare across a think/level/gate-mode
+/// change).
+fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
     let name_col = summary
         .iter()
         .map(|r| r.task_id.len())
         .max()
         .unwrap_or(0)
         .max("task".len());
+    let test_first_desc = if header.test_first { "on" } else { "off" };
+    let wall_clock_desc = if header.wall_clock_secs == 0 {
+        "unbounded".to_string()
+    } else {
+        format!("{}s", header.wall_clock_secs)
+    };
 
     println!(
-        "\n=== SUMMARY (backend={backend_desc}, spec_level={spec_level:?}, max_iterations={max_iterations}, k={k}, static_tree_k={}, max_nudges={}) ===",
+        "\n=== SUMMARY (backend={}, spec_level={:?}, max_iterations={}, k={}, static_tree_k={}, max_nudges={}, agent_gate={}, test_first={test_first_desc}, wall_clock={wall_clock_desc}) ===",
+        header.backend_desc,
+        header.spec_level,
+        header.max_iterations,
+        header.k,
         harness::engine::DEFAULT_STATIC_TREE_K,
         harness::engine::DEFAULT_MAX_NUDGES,
+        header.agent_gate,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
         "task",
         "resolved/val",
         "res_rate",
@@ -421,6 +519,8 @@ fn print_summary(
         "tdd_wrote",
         "claimed_D",
         "mean_iter",
+        "cln_nudge",
+        "cln_D",
     );
     for r in summary {
         let claimed_done: u32 = r
@@ -463,7 +563,7 @@ fn print_summary(
             .filter(|t| !t.agent_tests_added.is_empty())
             .count();
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
@@ -476,6 +576,8 @@ fn print_summary(
             format!("{}/{}", tdd_wrote, r.trials.len()),
             claimed_done,
             mean_iter,
+            r.clean_tree_nudges(),
+            r.clean_tree_dones(),
         );
     }
 }

@@ -129,9 +129,25 @@ struct TaskSpecPromptTemplate<'a> {
 /// (talos dispatch, tier-1 coding eval), and [`render_test_first_approach`]
 /// renders it standalone for the tier-2 mined-task path, whose agent prompt is
 /// the raw mined statement and never passes through the task-spec template.
+/// [`VerificationSectionTemplate`] is the sibling factoring for the
+/// `## Verification` block, for the same reason.
 #[derive(Template)]
 #[template(path = "test_first_approach.md", escape = "none")]
 struct TestFirstApproachTemplate;
+
+/// The `## Verification` block, factored into its own template so the two
+/// surfaces that need it cannot drift apart: [`TaskSpecPromptTemplate`]
+/// `{% include %}`s it for the groomed-item path (talos dispatch, tier-1
+/// coding eval), and [`render_verification_section`] renders it standalone
+/// for the tier-2 mined-task path (agent-gate On mode), whose agent prompt is
+/// the raw mined statement and never passes through the task-spec template.
+/// `escape = "none"` is pinned so a `gate_command` containing `"`, `<`, `>`,
+/// or `&` passes through untouched.
+#[derive(Template)]
+#[template(path = "verification_section.md", escape = "none")]
+struct VerificationSectionTemplate<'a> {
+    gate_command: &'a str,
+}
 
 /// The ralph outer-loop per-iteration prompt template. Renders the objective,
 /// the injected progress notes, and the exact notes filename the agent must
@@ -303,13 +319,36 @@ pub fn render_test_first_approach() -> String {
         .expect("test_first_approach.md is a static variable-free template that renders infallibly")
 }
 
+/// Render the `## Verification` block on its own.
+///
+/// For callers that assemble an agent prompt WITHOUT the task-spec template —
+/// today that is the tier-2 mined-task eval in agent-gate On mode, whose
+/// prompt is the mined statement verbatim plus this section. Sharing one
+/// template with [`render_task_prompt_from_spec`] is the point: a wording
+/// change must change it for both surfaces at once, or the eval stops
+/// measuring the verification framing dispatch actually ships.
+///
+/// The render is a pure function of `gate_command` and is byte-deterministic —
+/// re-rendering with the same input produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_verification_section(gate_command: &str) -> String {
+    VerificationSectionTemplate { gate_command }
+        .render()
+        .expect(
+            "verification_section.md is a static template that renders infallibly for owned inputs",
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
         render_ralph_prompt, render_system_prompt, render_task_prompt,
         render_task_prompt_from_spec, render_task_prompt_from_spec_with,
-        render_test_first_approach, tool_lines,
+        render_test_first_approach, render_verification_section, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
     use crate::task_spec::{FileToModify, TaskSpec};
@@ -863,6 +902,49 @@ mod tests {
                  offending line: {line:?}; full output:\n{rendered}"
             );
         }
+    }
+
+    // --- verification_section factoring tests -------------------------------
+
+    /// Production byte-identity pin: the golden literal was captured from the
+    /// UNMODIFIED templates (before `verification_section.md` was factored
+    /// out) and must still match after the factoring.
+    #[test]
+    fn render_task_prompt_from_spec_production_byte_identity() {
+        const GOLDEN: &str = "## T\n\nD\n\n## Acceptance Criteria\n\n- a1\n\n## Files to Modify\n\nThe paths listed below are starting points for navigation — they are a map, not\na complete inventory. Use the bash tool (e.g., `grep`, `find`) to locate code\nwithin and around these files. Edit exactly what the task requires and no more;\nprefer edit_file for mutations (its unique-match contract is safer than sed -i).\n\n- `p`: c\n\n## Approach\n\nWrite a test that captures the acceptance criteria FIRST, before you change any\nother code, and run it. Confirm it fails, and that it fails for the reason you\nexpect — a test that passes before you have implemented anything is testing\nnothing. Then implement until it passes.\n\nIf the task genuinely has no test-shaped outcome (a pure refactor, a dependency\nbump, a docs or config change), state that in one line and go straight to the\nchange.\n## Verification\n\nRun the following command to verify the task is complete:\n\n    cargo test\n\nOnce your new test passes and this command is green, call finish(done) immediately.\nNote that this command may already be green before you start — a green gate on\nuntouched code means you have not begun, not that you are done.\nDo not re-verify individual acceptance criteria with extra reads or commands\nafter a passing check — the passing check IS the verification, and every\nadditional step spends your iteration budget without adding evidence.";
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec!["a1".to_string()],
+            files_to_modify: vec![FileToModify {
+                path: "p".to_string(),
+                change: "c".to_string(),
+            }],
+            gate_command: "cargo test".to_string(),
+        };
+        assert_eq!(render_task_prompt_from_spec(&spec), GOLDEN);
+    }
+
+    /// The shared `verification_section.md` template is the single source for
+    /// both surfaces: the task-spec-prompt tail and the standalone renderer.
+    #[test]
+    fn render_task_prompt_from_spec_ends_with_shared_verification_section() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec!["a1".to_string()],
+            files_to_modify: vec![FileToModify {
+                path: "p".to_string(),
+                change: "c".to_string(),
+            }],
+            gate_command: "cargo test".to_string(),
+        };
+        assert!(
+            render_task_prompt_from_spec(&spec)
+                .ends_with(&render_verification_section(&spec.gate_command))
+        );
+        assert!(render_verification_section("X").starts_with("## Verification\n"));
+        assert!(render_verification_section("X").contains("\n    X\n"));
     }
 
     // --- render_nudge_prompt tests ------------------------------------------

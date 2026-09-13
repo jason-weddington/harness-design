@@ -328,9 +328,42 @@ impl ChecksRunner {
     }
 }
 
+/// Build a [`ChecksRunner`] from a shell gate-command string, or `None` if the
+/// command is empty or whitespace-only.
+///
+/// A whitespace-only `gate_command` is treated as empty — closing the
+/// `/bin/sh -c ' '` exits-0 rubber-stamp false-Done vector.
+///
+/// `/bin/sh -c` is used (NOT direct exec) so the gate string can contain
+/// shell operators like `&&` and pipes. Shared by talos production dispatch
+/// (`crates/talos/src/main.rs`'s `build_checks_runner`) and the tier-2
+/// `agent_gate_command` path (`crate::mined_eval`), so both surfaces build
+/// the identical `/bin/sh -c <cmd>` shape from one place.
+#[must_use]
+pub fn shell_checks_runner(
+    gate_command: &str,
+    workspace_root: PathBuf,
+    timeout: Duration,
+) -> Option<ChecksRunner> {
+    if gate_command.trim().is_empty() {
+        return None;
+    }
+    Some(ChecksRunner::new(
+        CheckCommand {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), gate_command.to_string()],
+        },
+        workspace_root,
+        timeout,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CheckCommand, CheckReport, ChecksRunner, ExecSpec, format_duration, run, tail};
+    use super::{
+        CheckCommand, CheckReport, ChecksRunner, ExecSpec, format_duration, run,
+        shell_checks_runner, tail,
+    };
     use crate::tool::ToolCtx;
     use crate::workspace::{DiskOffloadSink, Workspace};
     use std::path::PathBuf;
@@ -647,5 +680,29 @@ mod tests {
     #[test]
     fn format_duration_is_two_decimals() {
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.50s");
+    }
+
+    // ---- shell_checks_runner -----------------------------------------------
+
+    #[test]
+    fn shell_checks_runner_empty_command_is_none() {
+        assert!(shell_checks_runner("", PathBuf::from("/"), Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn shell_checks_runner_whitespace_only_command_is_none() {
+        assert!(shell_checks_runner("   ", PathBuf::from("/"), Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn shell_checks_runner_builds_sh_c_shape() {
+        let runner = shell_checks_runner("a && b", PathBuf::from("/"), Duration::from_secs(1))
+            .expect("non-empty command builds a runner");
+        assert_eq!(runner.command().program, "/bin/sh");
+        assert_eq!(
+            runner.command().args,
+            vec!["-c".to_string(), "a && b".to_string()]
+        );
+        assert_eq!(runner.command_display(), "/bin/sh -c a && b");
     }
 }
