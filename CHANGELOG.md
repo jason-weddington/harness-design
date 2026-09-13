@@ -2,6 +2,35 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.10.0 - 2026-09-13
+#### Features
+- (**eval**) A/B toggle for the test-first guidance - (eee2d3f) - Jason Weddington, *Claude*
+- (**mined-eval**) measure agent test authorship per trial - (efdb1d9) - Jason Weddington, *Claude*
+- (**mined-eval**) surface finish-discipline telemetry per tier-2 trial - (220406a) - Claude Haiku 4.5, *Claude Opus 4.7*
+- (**mined-eval**) tier-2 mined-task eval runner (mined_eval example) - (4d67846) - Jason Weddington, *Claude Fable 5*
+- (**ollama**) resolve num_ctx from advertised context length via /api/show - (b556f6b) - Claude Haiku 4.5, *Claude Opus 4.7*
+- (**prompt**) require a failing test first and stop treating a green gate as done - (be85c75) - Jason Weddington, *Claude*
+- (**ralph**) stop after N consecutive backend errors (BackendErrorsExhausted) - (03b8970) - talos-glm, *Claude Opus 5 (1M context)*
+- (**talos**) print a ralph Error terminal's failing command to stderr - (66551b7) - talos-glm-flash, *Claude Opus 5 (1M context)*
+#### Bug Fixes
+- (**deps**) bump h2 0.4.15 -> 0.4.17 for RUSTSEC-2026-0258 - (7e00a2e) - Jason Weddington
+- (**mined-eval**) route test-first guidance into the tier-2 agent prompt - (5342e9a) - Jason Weddington, *Claude*
+- (**mined-eval**) section-scope pytest parsing and score collection errors Unresolved - (e684080) - Jason Weddington, *Claude*
+- (**mined-eval**) carry BackendError payload and strip full-width pytest banners - (74a506e) - Jason Weddington
+#### Documentation
+- (**design**) ratify eval-tier decisions — spec-level ladder resolves the known-solvable problem - (41ec5b8) - Jason Weddington, *Claude Fable 5*
+- (**design**) discriminating eval tier proposal — mined-from-history ladder (kb-03197) - (d69f426) - Jason Weddington, *Claude Fable 5*
+- (**research**) track 08 — discriminating evals (SWE-bench anatomy, METR time horizon, Harness-Bench) - (29ba1cc) - Jason Weddington, *Claude Fable 5*
+- (**roadmap**) record the glm-5.3 / glm-5.3-flash / sonnet-5 talos lane cutover - (bb9e13f) - Jason Weddington, *Claude Opus 5 (1M context)*
+- Session 17 log — test-first prompt, glm-5.3 lanes, stale fleet found (kb-03226) - (ab3c9fc) - Jason Weddington, *Claude Opus 5 (1M context)*
+- Session 16 log — tier-2 matrix v1, num_ctx foot gun closed, finish-recovery found dead (kb-03205) - (5aa5b9c) - Jason Weddington
+- Session 15 log — tier-2 pilot built end-to-end, matrix handoff (kb-03200) - (d04969b) - Jason Weddington, *Claude Fable 5*
+- Session 14 log — nemotron-3.5-lightning eval, first false-dones, pivot to discriminating evals (kb-03196) - (2a4727a) - Jason Weddington, *Claude Fable 5*
+#### Miscellaneous Chores
+- (**eval**) default the GLM eval runners to glm-5.3:cloud - (152fdcb) - Jason Weddington, *Claude Opus 5 (1M context)*
+
+- - -
+
 ## 0.9.0 - 2026-07-15
 #### Features
 - (**bedrock**) add AWS Bedrock model backend (Converse API, TALOS_BEDROCK-gated) - (886aa2f) - Jason Weddington, *talos-glm*, *Claude Opus 4.8*
