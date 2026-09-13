@@ -33,6 +33,12 @@
 //! There is NO `10`/Blocked analog for ralph — the Ralph outer loop has no
 //! Blocked terminal. See [`ralph_exit_code`] for the rationale.
 //!
+//! When the loop terminates with `Error`, the machine-readable summary on
+//! stdout stays payload-free (`{"terminal":"Error"}`); the human-readable
+//! detail — the failing git/spawn/revert command — is written to **stderr**
+//! by [`write_ralph_error_detail`] (one `talos ralph: error: <msg>` line).
+//! Non-Error terminals write nothing to stderr.
+//!
 //! ## `talos ralph` flags
 //!
 //! - `--workspace <PathBuf>` (required) — workspace root, MUST already be a
@@ -398,6 +404,28 @@ fn ralph_terminal_str(terminal: &RalphTerminal) -> &'static str {
         RalphTerminal::TimeBudgetExhausted => "TimeBudgetExhausted",
         RalphTerminal::DoOversExhausted => "DoOversExhausted",
         RalphTerminal::Error(_) => "Error",
+    }
+}
+
+/// Write the human-readable detail for an [`RalphTerminal::Error`] payload to
+/// stderr.
+///
+/// For `Error(msg)` writes exactly one line `talos ralph: error: <msg>` plus a
+/// newline; for every other terminal writes NOTHING. The stdout
+/// [`RalphSummary`] stays payload-free — this is the only channel that
+/// surfaces the failing git/spawn/revert command. Matched on `Error(_)`
+/// explicitly with a non-Error fallthrough so a future terminal variant
+/// cannot break this contract.
+///
+/// Callers should ignore the [`std::io::Result`] — a stderr write failure
+/// must never panic or change the exit code.
+fn write_ralph_error_detail(
+    terminal: &RalphTerminal,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    match terminal {
+        RalphTerminal::Error(msg) => writeln!(out, "talos ralph: error: {msg}"),
+        _ => Ok(()),
     }
 }
 
@@ -966,6 +994,10 @@ async fn run_ralph_cmd(args: RalphArgs) {
         serde_json::to_string(&summary)
             .expect("RalphSummary serializes infallibly — all fields are owned serde types")
     );
+    // Surface the Error payload on stderr (never on stdout — the summary stays
+    // payload-free). A stderr write failure is ignored: it must never panic
+    // nor change the ralph exit code.
+    let _ = write_ralph_error_detail(&report.terminal, &mut std::io::stderr());
     std::process::exit(exit_c);
 }
 
@@ -979,6 +1011,7 @@ mod tests {
         Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
         build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
         ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
+        write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
@@ -1576,6 +1609,42 @@ mod tests {
             ralph_terminal_str(&RalphTerminal::Error(String::new())),
             "Error"
         );
+    }
+
+    // ---- write_ralph_error_detail: stderr payload surface ---------------
+
+    #[test]
+    fn write_ralph_error_detail_error_writes_one_stderr_line() {
+        let mut out: Vec<u8> = Vec::new();
+        write_ralph_error_detail(
+            &RalphTerminal::Error(
+                "git status exited Some(128): fatal: not a git repository".into(),
+            ),
+            &mut out,
+        )
+        .expect("Vec<u8> writes are infallible");
+        assert_eq!(
+            out,
+            b"talos ralph: error: git status exited Some(128): fatal: not a git repository\n"
+        );
+    }
+
+    #[test]
+    fn write_ralph_error_detail_non_error_terminals_write_nothing() {
+        for terminal in [
+            RalphTerminal::StopConditionMet,
+            RalphTerminal::Stuck,
+            RalphTerminal::MaxIterationsExhausted,
+            RalphTerminal::TimeBudgetExhausted,
+            RalphTerminal::DoOversExhausted,
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            write_ralph_error_detail(&terminal, &mut out).expect("Vec<u8> writes are infallible");
+            assert!(
+                out.is_empty(),
+                "non-Error terminal {terminal:?} must write zero bytes to stderr"
+            );
+        }
     }
 
     // ---- RalphSummary: exact field set ---------------------------------
