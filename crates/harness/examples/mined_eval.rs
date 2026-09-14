@@ -60,10 +60,10 @@
 //! - `MINED_EVAL_SPEC_LEVEL` (optional) — `s1|s2|s3`, defaults to `s2`.
 //! - `MINED_EVAL_K` (optional) — number of trials; defaults to 3.
 //! - `MINED_EVAL_MAX_ITERATIONS` (optional) — per-trial agent-loop cap;
-//!   defaults to 24. Production `talos run` defaults to `--max-iterations 500`
-//!   and agent-gtd-dispatch does not override it — 24 is a tier-2 cost and
-//!   cross-run comparability choice, not a parity value. Set
-//!   `MINED_EVAL_MAX_ITERATIONS=500` for true iteration-budget parity.
+//!   defaults to 500 — production parity: `talos run` defaults to
+//!   `--max-iterations 500` and agent-gtd-dispatch does not override it. With
+//!   the real project gate in the loop, successful runs routinely need 24-43
+//!   iterations, so a lower cap measures the budget, not the model (kb-03240).
 //! - `MINED_EVAL_AGENT_GATE` (optional) — `0` = off (the legacy comparison
 //!   row), any other value (including unset/empty) = on (production parity).
 //!   Unparsable input panics. See [`AgentGateMode`].
@@ -115,11 +115,12 @@ const MIN_EXPECTED_NUM_CTX: u32 = 32_768;
 /// Default trial count (`k`) when `MINED_EVAL_K` is not set.
 const DEFAULT_K: u32 = 3;
 
-/// Default per-trial iteration cap. Production `talos run` defaults to
-/// `--max-iterations 500` and agent-gtd-dispatch does not override it; `24`
-/// here is a tier-2 cost and cross-run comparability choice, not a parity
-/// value — set `MINED_EVAL_MAX_ITERATIONS=500` for true parity.
-const DEFAULT_MAX_ITERATIONS: u32 = 24;
+/// Default per-trial iteration cap: production parity with `talos run`'s
+/// `--max-iterations 500`, which agent-gtd-dispatch never overrides. Tier-2
+/// scores are meant to show what the harness + model can actually do on
+/// production-like work; a lower cap (the old 24) truncates runs that would
+/// have shipped (kb-03240).
+const DEFAULT_MAX_ITERATIONS: u32 = 500;
 
 /// Default spec level when `MINED_EVAL_SPEC_LEVEL` is not set.
 const DEFAULT_SPEC_LEVEL: SpecLevel = SpecLevel::S2;
