@@ -41,6 +41,14 @@ Source: [llm-stats.com/benchmarks/swe-bench-pro](https://llm-stats.com/benchmark
 
 GLM-5.3 and GLM-5.3-Flash — the models behind `talos-glm` and `talos-glm-flash` since 2026-09-12 — are **not on this leaderboard yet** (re-checked 2026-09-12; the three rows above were unchanged). Until they are, don't put them in the table from another source; our own talos eval rows against the 5.2 baseline are in `kb-03220` (tier-2: both 13/24 vs 5.2's 9/24, flash with far better finish discipline).
 
+## Evals vs. real-world usage — two instruments, one constraint
+
+Every tier-2 task was mined from a past GTD dispatch that a Sonnet-class model completed from an adversarially groomed spec. We already know that once a groom workflow argues a spec into precision, a Sonnet- or GLM-class model one-shots it. So:
+
+- **Tier-2 must stay strictly harder than a perfect spec.** It runs at spec level S2 (behavioural criteria, no localization, no named tests), which is what makes it discriminate between models and measure harness changes. Do not add a groomed-spec eval tier; it would measure what we already know.
+- **Harness changes must not break the perfect-spec path.** A talos behaviour that helps under-specified work but costs or loops on an 18-31-criterion groomed spec is a regression, even if tier-2 improves. Guard it with tier-1's spec-shaped fixtures (TaskSpec `task.json`, rendered through the production `task_spec_prompt.md`; saturated by design, so any lost pass, false done, cap hit or iteration/token blowup is a regression), plus a few supervised real dispatches of groomed GTD items before any talos default flips.
+- **Design rule:** harness features must be spec-agnostic and nearly free when the spec already did the work (e.g. a named test in the spec *is* the coverage; an audit cites existing evidence rather than re-running it). Ship behind a default-off knob; flip only after tier-2 shows benefit **and** the perfect-spec guard is clean. Decision record: `kb-03268`.
+
 ## Why Rust
 
 Part of the learning goal. Rust's compiler and type system give us a layer of

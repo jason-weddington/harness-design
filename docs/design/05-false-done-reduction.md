@@ -57,6 +57,14 @@ Tier-2, cap 500, agent gate on, test-first on. Arms: baseline / A / B / A+B. Mod
 
 Success: real false dones down by at least half with resolved count not lower, and `audit_changed_tree` > 0 on the prone tasks, which shows the audit caught something rather than just adding a turn. Kill criterion: no false-done reduction, or resolution drops by more than noise (≈2-3 of 24).
 
+## Perfect-spec constraint (Jason, 2026-09-15, `kb-03268`)
+
+Tier-2 is deliberately harder than a groomed spec, and it must stay that way; we do not add a groomed-spec eval tier. But talos also runs production dispatches from adversarially groomed specs (18-31 criteria that pin test names, assertions and file:line locations), so A′ and B must be **spec-agnostic and nearly free when the spec already did the work**:
+
+- A′ applies to behavioural criteria only. A test the spec names *is* the coverage: write it as specified and do not add parallel tests. Non-behavioural criteria (doc wording, grep checks, gate passes, dependency rules) are verified by running them, not by writing tests. The independence rules (enumerate from an authoritative source, allowlist for "remove all") apply only when the agent is the one deciding the list.
+- B fires at most once and **cites evidence already produced in the run** (named test, command output, gate result); it never re-runs anything unless a criterion has no evidence. It must not reintroduce the per-criterion re-verification loop that made talos-haiku's first patrol hit MaxIterations; the existing "do not re-verify individual acceptance criteria" line stays, pinned by a test.
+- **Regression guard:** tier-1's spec-shaped fixtures (TaskSpec `task.json` through the production template, saturated) must stay at 100% with 0 false dones and 0 MaxIterations, with mean iterations and tokens within a set margin of baseline; haiku is included because it is the model that looped. Then a few supervised real dispatches of groomed GTD items with the knobs on, compared against the perf log, before the talos default flips.
+
 ## Production path
 
 Both parts reach `talos run` through the shared template and `RunConfig`, so what we measure is what ships. Ship B behind the default-off knob, flip the talos default after the data, then republish the fleet binary. A is a template change and would ship with the next binary.
