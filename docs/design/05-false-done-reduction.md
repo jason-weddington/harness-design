@@ -37,9 +37,9 @@ The **second** `finish(done)` goes through normal gate verification. It is bound
 
 Telemetry to add with it: `audit_fired`, `audit_changed_tree` (the model mutated the tree after the audit, meaning the audit found a real gap), and `audit_rubber_stamped` (second Done with no tool calls in between). Without these we could not tell a working audit from theatre.
 
-### C. Instrumentation prerequisite: persist the agent's final diff
+### C. Instrumentation prerequisite: transcripts (shipped) + the agent's final diff
 
-Tier-2 keeps the sealed and agent-gate outputs but not the agent's diff, so today we cannot see whether an agent's tests covered the clause it missed. Persist `git diff` (tracked and untracked) before `copy_sealed` overwrites the sealed paths, next to the existing captures. Pure observability, no scoring change.
+Update 2026-09-15: full run transcripts shipped overnight (`d4651b6`, `MINED_EVAL_TRANSCRIPTS=1`): every model turn, reasoning text, tool call input and tool result, per trial. That covers most of what this section asked for; the overnight qwen3.8 re-run has them on, so its false dones can be read turn by turn. Still worth adding: persist the agent's final `git diff` (tracked and untracked) before `copy_sealed` overwrites the sealed paths, because reconstructing a diff from edit_file/bash calls is lossy for bash-driven edits. Pure observability, no scoring change.
 
 ## Experiment
 
