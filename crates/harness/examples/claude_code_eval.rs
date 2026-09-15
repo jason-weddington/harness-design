@@ -513,6 +513,9 @@ async fn main() {
                 holdout_passed: Some(holdout_passed),
                 outcome,
                 stats,
+                // This runner drives Claude Code, not the talos engine — no
+                // transcript support here (see crates/talos for --transcript).
+                transcript_path: None,
             };
 
             println!(

@@ -21,6 +21,7 @@ pub mod task_spec;
 pub mod time;
 pub mod tool;
 pub mod tools;
+pub mod transcript;
 pub mod workspace;
 
 /// Crate-wide, test-only support (scripted backends, etc.). Compiled only

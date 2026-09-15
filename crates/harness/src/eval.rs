@@ -118,6 +118,12 @@ pub struct TrialResult {
     pub outcome: LoopOutcome,
     /// Mechanical stats the engine accumulated over this trial's run.
     pub stats: RunStats,
+    /// The path the transcript was directed to, when transcripts were on for
+    /// this run (see [`run_eval_with_transcripts`]); `None` when off (the
+    /// plain [`run_eval`] path always leaves this `None`). The file may be
+    /// missing or partial if the best-effort [`crate::transcript`] writer
+    /// disabled itself.
+    pub transcript_path: Option<PathBuf>,
 }
 
 /// The result of an eval run. "Pass^k" framing: `passes` out of `trials = k`,
@@ -340,6 +346,9 @@ pub struct TrialEnv {
 /// trial loop runs zero times, so neither the factory nor the backend is
 /// touched in that case.
 ///
+/// A thin delegate over [`run_eval_with_transcripts`] with transcripts off
+/// (`None`) — every [`TrialResult::transcript_path`] is `None`.
+///
 /// # Panics
 /// Panics if the holdout re-gate copy fails (broken-host semantics — the trial
 /// workspace or holdout source directory is unreadable/unwritable after the
@@ -351,6 +360,52 @@ pub async fn run_eval(
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
+    on_trial: impl FnMut(&TrialResult),
+) -> EvalReport {
+    run_eval_with_transcripts(
+        task,
+        backend,
+        env_factory,
+        k,
+        max_iterations,
+        None,
+        on_trial,
+    )
+    .await
+}
+
+/// Opt-in transcript sink for [`run_eval_with_transcripts`]: every trial `i`
+/// writes to `dir.join(format!("trial-{i}.jsonl"))` with `label` carried
+/// verbatim into each transcript's `run_start.label` (see
+/// [`crate::transcript`]).
+#[derive(Debug, Clone)]
+pub struct EvalTranscripts {
+    /// Directory each trial's `trial-<i>.jsonl` is written under.
+    pub dir: PathBuf,
+    /// Label carried verbatim into every trial's transcript.
+    pub label: String,
+}
+
+/// Same as [`run_eval`], with an extra opt-in transcript sink. `run_eval` is
+/// a one-line delegate to this function with `transcripts: None` — see the
+/// module docs on [`run_eval`] for the full trial-loop contract (per-trial
+/// isolation, holdout re-gate, `on_trial` callback timing).
+///
+/// When `transcripts` is `Some(t)`, trial `i` (0-based) runs with
+/// `config.with_transcript(t.dir.join(format!("trial-{i}.jsonl")),
+/// t.label.clone())`, and that path is recorded on the trial's
+/// [`TrialResult::transcript_path`]. When `None`, no transcript config is
+/// attached and every trial's `transcript_path` is `None`.
+///
+/// # Panics
+/// See [`run_eval`].
+pub async fn run_eval_with_transcripts(
+    task: &EvalTask,
+    backend: &impl ModelBackend,
+    env_factory: impl Fn() -> TrialEnv,
+    k: u32,
+    max_iterations: u32,
+    transcripts: Option<&EvalTranscripts>,
     mut on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
     let mut passes: u32 = 0;
@@ -360,6 +415,10 @@ pub async fn run_eval(
         let mut config = RunConfig::new(task.task.clone(), max_iterations);
         if let Some(checks) = env.checks.clone() {
             config = config.with_checks(checks);
+        }
+        let transcript_path = transcripts.map(|t| t.dir.join(format!("trial-{i}.jsonl")));
+        if let (Some(path), Some(t)) = (&transcript_path, transcripts) {
+            config = config.with_transcript(path.clone(), t.label.clone());
         }
         let RunResult { outcome, stats } =
             engine::run(backend, &env.tools, &env.ctx, &config).await;
@@ -387,6 +446,7 @@ pub async fn run_eval(
             holdout_passed,
             outcome,
             stats,
+            transcript_path,
         };
         on_trial(&trial);
         trial_results.push(trial);
@@ -729,8 +789,9 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalReport, EvalTask, TrialEnv, TrialResult, build_coding_env, coding_fix_task,
-        copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval, score_holdout,
+        EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult, build_coding_env,
+        coding_fix_task, copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
+        run_eval_with_transcripts, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -832,6 +893,54 @@ mod tests {
         assert!((report.pass_rate - 1.0).abs() < f64::EPSILON);
         // And the backend was called exactly once per trial.
         assert_eq!(backend.calls(), k);
+    }
+
+    #[tokio::test]
+    async fn run_eval_with_transcripts_writes_one_file_per_trial() {
+        let k: u32 = 2;
+        let script: Vec<AssistantTurn> = (0..k).map(|_| finish_done_turn()).collect();
+        let backend = MockBackend::from_turns(script);
+        let task = finish_task();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let transcripts = EvalTranscripts {
+            dir: dir.path().to_path_buf(),
+            label: "lbl".to_string(),
+        };
+
+        let report = run_eval_with_transcripts(
+            &task,
+            &backend,
+            echo_finish_env,
+            k,
+            10,
+            Some(&transcripts),
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(report.trial_results.len(), k as usize);
+        for (i, trial) in report.trial_results.iter().enumerate() {
+            let expected_path = dir.path().join(format!("trial-{i}.jsonl"));
+            assert_eq!(trial.transcript_path, Some(expected_path.clone()));
+            let contents = std::fs::read_to_string(&expected_path).expect("read transcript");
+            let lines: Vec<&str> = contents.lines().collect();
+            let first: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
+            assert_eq!(first["event"], "run_start");
+            assert_eq!(first["label"], "lbl");
+            let last: serde_json::Value =
+                serde_json::from_str(lines[lines.len() - 1]).expect("valid JSON line");
+            assert_eq!(last["event"], "run_end");
+        }
+
+        // Plain run_eval always leaves transcript_path None.
+        let backend2 = MockBackend::from_turns((0..k).map(|_| finish_done_turn()).collect());
+        let report2 = run_eval(&task, &backend2, echo_finish_env, k, 10, |_| {}).await;
+        assert!(
+            report2
+                .trial_results
+                .iter()
+                .all(|t| t.transcript_path.is_none())
+        );
     }
 
     #[tokio::test]
@@ -1233,6 +1342,7 @@ mod tests {
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
             },
+            transcript_path: None,
         };
         let printed = format!("{t:?}");
         assert!(printed.contains("TrialResult"));
@@ -1708,6 +1818,7 @@ mod tests {
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
             },
+            transcript_path: None,
         };
         let report = EvalReport {
             task_name: "matrix".to_string(),

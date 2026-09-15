@@ -15,6 +15,11 @@
 //! `Failed`, which would collapse engine-broke (must be 1) into task-Failed
 //! (20). See [`exit_code`] for the full rationale.
 //!
+//! `talos run --transcript <path>` opts into a full JSONL run transcript
+//! (see [`harness::transcript`]) — every model request/turn, tool call, and
+//! tool result — default OFF, flag only (no env fallback). `talos ralph` has
+//! no transcript support.
+//!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
 //! with a fresh inner context per outer iteration. `ralph` is NOT run-record
@@ -214,6 +219,20 @@ struct RunArgs {
     /// is resolved manually in `main()` via the `env_accessor` closure.
     #[arg(long)]
     wall_clock_secs: Option<u64>,
+
+    /// Opt-in JSONL transcript of every model request/turn, tool call, and
+    /// tool result — see [`harness::transcript`]. Default off (no flag = no
+    /// file, no transcript-related filesystem I/O). A relative path resolves
+    /// against the current working directory; point it OUTSIDE `--workspace`
+    /// (e.g. next to `run.sqlite` under the state dir) to keep it out of git
+    /// status and out of the agent's own context.
+    ///
+    /// FLAG ONLY — there is deliberately no `TALOS_TRANSCRIPT` env fallback:
+    /// `templates/sudoers-dispatch-svc.tmpl`'s `env_keep` omits `TALOS_*`
+    /// runtime knobs, so an env-only toggle would be a silent no-op once
+    /// dispatch's sudo boundary does its `env_reset` (kb-02979 shape).
+    #[arg(long)]
+    transcript: Option<PathBuf>,
 }
 
 /// Arguments for `talos ralph`.
@@ -381,6 +400,24 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
         LoopOutcome::BudgetExhausted { .. } => "BudgetExhausted",
         LoopOutcome::BackendError(_) => "BackendError",
     }
+}
+
+/// Compute the `--transcript` label from `model_label` and an env accessor.
+///
+/// `model_label` flows through verbatim UNLESS it is `ollama:`-prefixed, in
+/// which case the label gets `OLLAMA_THINK`/`OLLAMA_NUM_CTX` appended (raw
+/// env values, `"unset"` when absent — and NEVER an API key): those are
+/// prompt-surface knobs that make otherwise-identical ollama transcripts
+/// incomparable if left unrecorded. `Persistence.model_label` and the
+/// `Event::ModelCall` rows it feeds are UNCHANGED by this — only the
+/// transcript's `run_start.label` is affected.
+fn transcript_label(model_label: &str, env: &impl Fn(&str) -> Option<String>) -> String {
+    if !model_label.starts_with("ollama:") {
+        return model_label.to_string();
+    }
+    let think = env("OLLAMA_THINK").unwrap_or_else(|| "unset".to_string());
+    let num_ctx = env("OLLAMA_NUM_CTX").unwrap_or_else(|| "unset".to_string());
+    format!("{model_label} think={think} num_ctx={num_ctx}")
 }
 
 /// Map a [`RalphTerminal`] to the ralph exit-code contract.
@@ -870,13 +907,20 @@ async fn run_cmd(args: RunArgs) {
         .or_else(|| env_accessor("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(0);
 
-    let config = if let Some(runner) = checks {
+    let mut config = if let Some(runner) = checks {
         RunConfig::new(seed, args.max_iterations)
             .with_checks(runner)
             .with_wall_clock_secs(wall_clock_secs)
     } else {
         RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
     };
+    // Label is computed from `model_label` BEFORE it moves into `persistence`
+    // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
+    // flag was passed) and has no env fallback — see `RunArgs::transcript`.
+    if let Some(path) = args.transcript.clone() {
+        let label = transcript_label(&model_label, &env_accessor);
+        config = config.with_transcript(path, label);
+    }
 
     // 11. Assemble persistence bundle and run.
     let rid = run_id(&args.task_id, args.attempt);
@@ -1028,7 +1072,7 @@ mod tests {
     use super::{
         Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
         build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
-        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
+        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs, transcript_label,
         write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
@@ -1125,6 +1169,39 @@ mod tests {
                 message: "bad key".into(),
             })),
             "BackendError"
+        );
+    }
+
+    // ---- transcript_label ------------------------------------------------
+
+    #[test]
+    fn transcript_label_covers_the_pinned_tuples() {
+        let empty = |_: &str| None;
+        assert_eq!(
+            transcript_label("claude-haiku-4-5", &empty),
+            "claude-haiku-4-5"
+        );
+
+        let think_on = |k: &str| (k == "OLLAMA_THINK").then(|| "on".to_string());
+        assert_eq!(
+            transcript_label("bedrock:claude-haiku-4-5", &think_on),
+            "bedrock:claude-haiku-4-5",
+            "a non-ollama label is unchanged regardless of ollama env vars"
+        );
+
+        assert_eq!(
+            transcript_label("ollama:x", &empty),
+            "ollama:x think=unset num_ctx=unset"
+        );
+
+        let both = |k: &str| match k {
+            "OLLAMA_THINK" => Some("on".to_string()),
+            "OLLAMA_NUM_CTX" => Some("65536".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            transcript_label("ollama:x", &both),
+            "ollama:x think=on num_ctx=65536"
         );
     }
 

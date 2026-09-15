@@ -1702,6 +1702,12 @@ pub struct MinedTrialResult {
     /// `Some` iff [`Self::agent_gate_post`] is `Some` (the gate ran);
     /// `None` otherwise.
     pub agent_gate_output_path: Option<PathBuf>,
+    /// The path the transcript was directed to, when [`MinedRunConfig::transcripts`]
+    /// was on AND `engine::run` was reached for this trial; `None` otherwise
+    /// (transcripts off, or a pre-agent [`invalid_trial`] that never reached
+    /// `engine::run`). The file may be missing or partial if the best-effort
+    /// [`crate::transcript`] writer disabled itself.
+    pub transcript_path: Option<PathBuf>,
 }
 
 /// The full run report over `k` trials of one task.
@@ -1942,6 +1948,19 @@ fn run_id() -> &'static str {
     })
 }
 
+/// The per-trial state directory:
+/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>`. Shared by
+/// [`persist_named_output`] (gate/agent-gate captures) and, when
+/// [`MinedRunConfig::transcripts`] is on, [`single_trial`]'s
+/// `transcript.jsonl`.
+fn trial_state_dir(task_id: &str, trial: u32) -> PathBuf {
+    xdg_state_root()
+        .join("talos/mined-eval")
+        .join(run_id())
+        .join(task_id)
+        .join(format!("trial-{trial}"))
+}
+
 /// Persist `raw` under
 /// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/<filename>` and
 /// return its absolute path. A write error falls back to a temp path so a
@@ -1950,11 +1969,7 @@ fn run_id() -> &'static str {
 /// [`persist_agent_gate_output`] (`agent-gate-output.txt`) so both captures
 /// land in the same per-trial directory.
 fn persist_named_output(task_id: &str, trial: u32, filename: &str, raw: &str) -> PathBuf {
-    let dir = xdg_state_root()
-        .join("talos/mined-eval")
-        .join(run_id())
-        .join(task_id)
-        .join(format!("trial-{trial}"));
+    let dir = trial_state_dir(task_id, trial);
     let path = dir.join(filename);
     if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, raw).is_ok() {
         return path;
@@ -2041,6 +2056,12 @@ pub struct MinedRunConfig<'a> {
     /// mirrors talos production's `--wall-clock-secs` default. See
     /// [`parse_wall_clock_secs`].
     pub wall_clock_secs: u64,
+    /// Opt-in full run transcript (see [`crate::transcript`]). Default off —
+    /// set from `MINED_EVAL_TRANSCRIPTS` (see [`crate::transcript::parse_transcripts_flag`]).
+    /// When `true`, each trial's `engine::run` is configured with
+    /// `.with_transcript(trial_state_dir(&task.id, trial).join("transcript.jsonl"),
+    /// backend_desc.clone())`.
+    pub transcripts: bool,
 }
 
 /// Run the whole mined-task eval: `k` independent trials, each with a fresh
@@ -2167,6 +2188,13 @@ async fn single_trial<B: ModelBackend>(
     if let Some(runner) = checks.clone() {
         run_config = run_config.with_checks(runner);
     }
+    let transcript_path = if config.transcripts {
+        let path = trial_state_dir(&config.task.id, trial).join("transcript.jsonl");
+        run_config = run_config.with_transcript(path.clone(), config.backend_desc.clone());
+        Some(path)
+    } else {
+        None
+    };
 
     // Baseline tripwire (On only): the agent gate must be green at parent —
     // never run the agent against a gate that is already red or unable to
@@ -2257,6 +2285,7 @@ async fn single_trial<B: ModelBackend>(
         first_invalid_finish_raw: stats.first_invalid_finish_raw,
         agent_gate_post,
         agent_gate_output_path,
+        transcript_path,
     }
 }
 
@@ -2297,6 +2326,7 @@ fn invalid_trial(
         first_invalid_finish_raw: None,
         agent_gate_post: None,
         agent_gate_output_path: None,
+        transcript_path: None,
     }
 }
 
@@ -3785,6 +3815,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             first_invalid_finish_raw: None,
             agent_gate_post: None,
             agent_gate_output_path: None,
+            transcript_path: None,
         }
     }
 
@@ -4323,6 +4354,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         // Silence FinishTool's `use` warning across the impl surface.
         let _ = FinishTool;
@@ -4343,6 +4375,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             // gate_output_path was persisted with the pytest output.
             let contents = std::fs::read_to_string(&t.gate_output_path).expect("read gate out");
             assert!(contents.contains("PASSED"));
+            assert_eq!(
+                t.transcript_path, None,
+                "transcripts: false must leave every trial's transcript_path None"
+            );
         }
         assert_eq!(on_trial_calls, k);
         // Header aggregates:
@@ -4353,6 +4389,100 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             "AgentGateMode::Off registers no run_checks — see the `_ => None` arm of the \
              `checks` match in single_trial"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn run_mined_task_with_transcripts_on_writes_per_trial_transcript_jsonl() {
+        use super::{MinedRunConfig, run_mined_task, trial_state_dir};
+        use crate::engine::{FINISH_TOOL_NAME, FinishTool};
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        // Same synthetic fixture as
+        // `run_mined_task_end_to_end_scores_resolved_via_synthetic_repo`, with
+        // `transcripts: true`. Writes land wherever `xdg_state_root()`
+        // resolves in this process — same as `gate_output_path` already does
+        // for every other test in this module (no env-var override hook is
+        // used here; `set_var` is `unsafe` and this crate forbids `unsafe`).
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "main.py", "print('x')\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir statements");
+        std::fs::write(task_dir.path().join("statements/s2.md"), "Finish, please.")
+            .expect("write s2");
+        std::fs::create_dir_all(task_dir.path().join("sealed/tests")).expect("mkdir sealed");
+        std::fs::write(
+            task_dir.path().join("sealed/tests/test_synth.py"),
+            "# sealed test\n",
+        )
+        .expect("write sealed");
+
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        task.gate_command =
+            r"printf '=== short test summary info ===\nPASSED tests/test_synth.py::T::pass_it\n=== 1 passed in 0.0s ===\n'"
+                .to_string();
+        task.fail_to_pass = vec!["T::pass_it".to_string()];
+        task.sealed = vec![SealedEntry {
+            path: "tests/test_synth.py".to_string(),
+        }];
+
+        let k = 2u32;
+        let finish_turns: Vec<AssistantTurn> = (0..k)
+            .map(|_| AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+            .collect();
+        let backend = MockBackend::from_turns(finish_turns);
+
+        let statement = "Finish, please.".to_string();
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: true,
+        };
+        let _ = FinishTool;
+        let mut on_trial = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut on_trial).await;
+
+        assert_eq!(report.trials.len(), k as usize);
+        for t in &report.trials {
+            let expected = trial_state_dir(&task.id, t.trial).join("transcript.jsonl");
+            assert_eq!(t.transcript_path, Some(expected.clone()));
+            let contents = std::fs::read_to_string(&expected).expect("read transcript");
+            let lines: Vec<&str> = contents.lines().collect();
+            assert!(!lines.is_empty());
+            let first: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
+            assert_eq!(first["event"], "run_start");
+            assert_eq!(first["label"], "mock");
+            let last: serde_json::Value =
+                serde_json::from_str(lines[lines.len() - 1]).expect("valid JSON line");
+            assert_eq!(last["event"], "run_end");
+            assert_eq!(last["outcome"], "Finished");
+        }
     }
 
     /// Build a synthetic primary repo + task dir for the agent-gate E2E tests:
@@ -4458,6 +4588,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4522,6 +4653,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4563,6 +4695,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4646,6 +4779,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4721,6 +4855,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4774,6 +4909,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4838,6 +4974,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             },
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4899,6 +5036,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 1,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4941,6 +5079,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4985,6 +5124,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5405,6 +5545,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5456,6 +5597,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate: AgentGateMode::Off,
             test_first: true,
             wall_clock_secs: 0,
+            transcripts: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;

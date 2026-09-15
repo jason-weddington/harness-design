@@ -70,6 +70,7 @@
 //! [`TurnRequest`]: crate::model::TurnRequest
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,7 @@ use crate::run_record::{
 use crate::store::{RunStore, StoreError};
 use crate::time::{Clock, SystemClock, format_rfc3339};
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
+use crate::transcript::{TranscriptConfig, TranscriptWriter};
 
 /// The registered name of the finish tool — the loop recognizes termination by
 /// matching an executed call's name against this.
@@ -164,6 +166,11 @@ pub struct RunConfig {
     /// (via `Arc::clone`) and the `Debug` supertrait on [`Clock`] satisfies
     /// `#[derive(Debug)]`.
     pub clock: Arc<dyn Clock>,
+    /// Opt-in full run transcript sink (see [`crate::transcript`]). `None`
+    /// (the default set by [`RunConfig::new`]) means no transcript is
+    /// written and the loop does zero transcript-related filesystem I/O or
+    /// event-payload construction. Set via [`RunConfig::with_transcript`].
+    pub transcript: Option<TranscriptConfig>,
 }
 
 /// The default per-turn output cap. Sized for reasoning models: a model whose
@@ -221,6 +228,7 @@ impl RunConfig {
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
             wall_clock_secs: 0,
             clock: Arc::new(SystemClock),
+            transcript: None,
         }
     }
 
@@ -290,6 +298,18 @@ impl RunConfig {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Turn on the opt-in full run transcript (see [`crate::transcript`]),
+    /// writing to `path` with the given `label`. Off (`None`) by default —
+    /// see [`RunConfig::transcript`].
+    #[must_use]
+    pub fn with_transcript(mut self, path: impl Into<PathBuf>, label: impl Into<String>) -> Self {
+        self.transcript = Some(TranscriptConfig {
+            path: path.into(),
+            label: label.into(),
+        });
         self
     }
 }
@@ -847,6 +867,13 @@ struct FinishOutcome {
     /// `Some(raw)` when this call was rejected as [`FinishClaim::Invalid`];
     /// `None` on every other arm (including a checks-rejected `done`).
     invalid_raw: Option<String>,
+    /// The [`CheckReport`] `handle_finish_call` ran against `config.checks`,
+    /// when it ran one — `Some` on both the accepted-`Done` and
+    /// checks-rejected-`done` arms, `None` everywhere else (no checks
+    /// configured, `blocked`/`failed`, or `Invalid`). Transcript-only: the
+    /// `tool_result` event's `finish_verification` field is derived from
+    /// this, never from `FinishClaim` internals.
+    report: Option<CheckReport>,
 }
 
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
@@ -874,9 +901,10 @@ async fn handle_finish_call(
                         result: ack(call_id),
                         finish: Some(Disposition::Done {
                             summary,
-                            verification: Verification::Checks(report),
+                            verification: Verification::Checks(report.clone()),
                         }),
                         invalid_raw: None,
+                        report: Some(report),
                     }
                 } else {
                     FinishOutcome {
@@ -887,6 +915,7 @@ async fn handle_finish_call(
                         },
                         finish: None,
                         invalid_raw: None,
+                        report: Some(report),
                     }
                 }
             }
@@ -897,12 +926,14 @@ async fn handle_finish_call(
                     verification: Verification::NoChecksConfigured,
                 }),
                 invalid_raw: None,
+                report: None,
             },
         },
         FinishClaim::Blocked { decision_needed } => FinishOutcome {
             result: ack(call_id),
             finish: Some(Disposition::Blocked { decision_needed }),
             invalid_raw: None,
+            report: None,
         },
         FinishClaim::Failed { summary } => FinishOutcome {
             result: ack(call_id),
@@ -911,6 +942,7 @@ async fn handle_finish_call(
                 summary,
             }),
             invalid_raw: None,
+            report: None,
         },
         FinishClaim::Invalid { raw } => FinishOutcome {
             result: UserBlock::ToolResult {
@@ -923,6 +955,7 @@ async fn handle_finish_call(
             },
             finish: None,
             invalid_raw: Some(raw),
+            report: None,
         },
     }
 }
@@ -1111,7 +1144,13 @@ pub async fn run_persisted(
 /// checkpoints per the durability contract documented on [`run_persisted`].
 /// When `persistence` is `None`, no store calls are made and the function
 /// returns `Ok(outcome)` (the `Err` arm is structurally unreachable).
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+///
+/// **Transcript:** a thin wrapper around [`run_loop_body`] — it opens the
+/// [`TranscriptWriter`] from `config.transcript`, awaits the body, emits the
+/// `run_end` event from the body's `Result` (`Ok` and `Err` alike) using the
+/// post-loop `stats`, and returns that `Result` unchanged. No transcript
+/// error is ever propagated.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop_impl(
     backend: &impl model::ModelBackend,
     tools: &ToolRegistry,
@@ -1122,6 +1161,92 @@ async fn run_loop_impl(
     initial_messages: Vec<Message>,
     initial_consumed: BudgetConsumed,
     override_persist: Option<RunPersist>,
+) -> Result<LoopOutcome, StoreError> {
+    let mut writer = TranscriptWriter::open(config.transcript.as_ref());
+    let result = run_loop_body(
+        backend,
+        tools,
+        ctx,
+        config,
+        persistence,
+        stats,
+        initial_messages,
+        initial_consumed,
+        override_persist,
+        &mut writer,
+    )
+    .await;
+    emit_run_end(&mut writer, &result, stats);
+    result
+}
+
+/// Build and emit the `run_end` transcript event from `result` (the
+/// [`run_loop_body`] return value) and the post-loop `stats`. A no-op when
+/// the writer is disabled — no `serde_json::json!` payload is built in that
+/// case.
+fn emit_run_end(
+    writer: &mut TranscriptWriter,
+    result: &Result<LoopOutcome, StoreError>,
+    stats: &RunStats,
+) {
+    if !writer.is_enabled() {
+        return;
+    }
+    let (outcome_str, disposition, detail) = match result {
+        Ok(LoopOutcome::Finished(disposition)) => (
+            "Finished",
+            Some(serde_json::to_value(disposition).unwrap_or(Value::Null)),
+            None,
+        ),
+        Ok(LoopOutcome::StoppedWithoutFinish) => ("StoppedWithoutFinish", None, None),
+        Ok(LoopOutcome::MaxIterations) => ("MaxIterations", None, None),
+        Ok(LoopOutcome::BudgetExhausted { summary }) => {
+            ("BudgetExhausted", None, Some(summary.clone()))
+        }
+        Ok(LoopOutcome::BackendError(err)) => ("BackendError", None, Some(format!("{err}"))),
+        Err(err) => ("StoreError", None, Some(err.to_string())),
+    };
+    writer.emit(
+        "run_end",
+        json!({
+            "outcome": outcome_str,
+            "disposition": disposition,
+            "detail": detail,
+            "stats": {
+                "iterations": stats.iterations,
+                "input_tokens": stats.input_tokens,
+                "output_tokens": stats.output_tokens,
+                "cache_read_tokens": stats.cache_read_tokens,
+                "cache_write_tokens": stats.cache_write_tokens,
+                "gates_green_at_exit": stats.gates_green_at_exit,
+                "nudges_fired": stats.nudges_fired,
+                "tree_dirty": stats.tree_dirty,
+                "iters_since_tree_change_at_exit": stats.iters_since_tree_change_at_exit,
+                "peak_iters_since_tree_change": stats.peak_iters_since_tree_change,
+                "mutating_iters": stats.mutating_iters,
+                "bash_calls_ok": stats.bash_calls_ok,
+                "edit_file_calls_ok": stats.edit_file_calls_ok,
+            },
+        }),
+    );
+}
+
+/// The engine loop body proper — the renamed former `run_loop_impl`, now
+/// taking an extra `writer` so it can emit per-iteration transcript events.
+/// See [`run_loop_impl`] for the wrapper that opens `writer` and emits
+/// `run_end`.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn run_loop_body(
+    backend: &impl model::ModelBackend,
+    tools: &ToolRegistry,
+    ctx: &ToolCtx,
+    config: &RunConfig,
+    persistence: Option<&Persistence>,
+    stats: &mut RunStats,
+    initial_messages: Vec<Message>,
+    initial_consumed: BudgetConsumed,
+    override_persist: Option<RunPersist>,
+    writer: &mut TranscriptWriter,
 ) -> Result<LoopOutcome, StoreError> {
     // Capture the loop-start instant ONCE via the injected clock. Used both
     // for the `wall_clock_start` string on the run record and for the
@@ -1148,6 +1273,11 @@ async fn run_loop_impl(
         temperature: None,
         stop_sequences: Vec::new(),
     };
+
+    // Captured before `override_persist` is moved into the match below —
+    // `resume` is true for both ResumeMode::Crash and ResumeMode::FreshContext
+    // (both go through `resume`, which always supplies `Some(pre_persist)`).
+    let is_resume = override_persist.is_some();
 
     // Build the run-record if persistence is configured. This is kept as
     // Option<RunPersist> so the non-persistent path has zero overhead.
@@ -1208,6 +1338,34 @@ async fn run_loop_impl(
         None
     };
 
+    // `run_start` — emitted once per invocation, now that the run id (if any)
+    // is known and before the first iteration. All of `system`/`tool_schemas`/
+    // `messages` are only serialized when the writer is enabled.
+    if writer.is_enabled() {
+        writer.emit(
+            "run_start",
+            json!({
+                "transcript_version": crate::transcript::TRANSCRIPT_VERSION,
+                "harness_version": env!("CARGO_PKG_VERSION"),
+                "label": config.transcript.as_ref().map(|t| t.label.clone()),
+                "run_id": persist.as_ref().map(|p| p.rid.clone()),
+                "resume": is_resume,
+                "system": system,
+                "tools": Value::Array(tool_schemas.clone()),
+                "messages": serde_json::to_value(&messages).unwrap_or(Value::Null),
+                "config": {
+                    "max_iterations": config.max_iterations,
+                    "max_tokens": config.max_tokens,
+                    "checks": config.checks.as_ref().map(ChecksRunner::command_display),
+                    "wall_clock_secs": config.wall_clock_secs,
+                    "static_tree_k": config.static_tree_k,
+                    "max_nudges": config.max_nudges,
+                    "max_retries": config.max_retries,
+                },
+            }),
+        );
+    }
+
     // ---- finish-recovery detection state (loop-local) ----
     // The done-oracle is `last_gate_green`, driven ONLY by `run_checks`'s
     // `is_error` flag (never a model self-report). A successful mutating tool
@@ -1241,19 +1399,73 @@ async fn run_loop_impl(
         // retried within the same for-loop pass counts as ONE logical
         // iteration — `stats.iterations` is NOT re-incremented per retry.
         stats.iterations += 1;
+        if writer.is_enabled() {
+            let block_count: usize = messages
+                .iter()
+                .map(|m| match m {
+                    Message::User { content } => content.len(),
+                    Message::Assistant { content } => content.len(),
+                })
+                .sum();
+            writer.emit(
+                "model_request",
+                json!({
+                    "iteration": stats.iterations,
+                    "message_count": messages.len(),
+                    "block_count": block_count,
+                }),
+            );
+        }
         let mut attempt = 0u32;
+        // `(AssistantTurn, attempts_made, latency_of_the_successful_call)` on
+        // success — `attempts_made` is `attempt`'s value AT THE TIME of the
+        // successful call, i.e. the number of PRIOR failed attempts.
         let turn_result = loop {
-            match backend.turn(&req).await {
-                Ok(turn) => break Ok(turn),
-                Err(err) if err.is_retryable() && attempt < config.max_retries => {
-                    sleep(retry_delay(config.retry_backoff_base, attempt)).await;
-                    attempt += 1;
+            let call_start = Instant::now();
+            let call_result = backend.turn(&req).await;
+            let call_latency = call_start.elapsed();
+            match call_result {
+                Ok(turn) => break Ok((turn, attempt, call_latency)),
+                Err(err) => {
+                    let retryable = err.is_retryable();
+                    let will_retry = retryable && attempt < config.max_retries;
+                    if writer.is_enabled() {
+                        let retry_delay_ms = if will_retry {
+                            Some(
+                                u64::try_from(
+                                    retry_delay(config.retry_backoff_base, attempt).as_millis(),
+                                )
+                                .unwrap_or(u64::MAX),
+                            )
+                        } else {
+                            None
+                        };
+                        writer.emit(
+                            "backend_error",
+                            json!({
+                                "iteration": stats.iterations,
+                                "attempt": attempt,
+                                "retryable": retryable,
+                                "will_retry": will_retry,
+                                "error": format!("{err}"),
+                                "error_debug": format!("{err:?}"),
+                                "latency_ms": u64::try_from(call_latency.as_millis())
+                                    .unwrap_or(u64::MAX),
+                                "retry_delay_ms": retry_delay_ms,
+                            }),
+                        );
+                    }
+                    if will_retry {
+                        sleep(retry_delay(config.retry_backoff_base, attempt)).await;
+                        attempt += 1;
+                    } else {
+                        break Err(err);
+                    }
                 }
-                Err(err) => break Err(err),
             }
         };
-        let turn = match turn_result {
-            Ok(turn) => turn,
+        let (turn, attempts_made, success_latency) = match turn_result {
+            Ok((turn, prior_attempts, latency)) => (turn, prior_attempts + 1, latency),
             Err(err) => {
                 // Terminal path: BackendError (retries exhausted or
                 // non-retryable). Persist the disposition before returning —
@@ -1317,6 +1529,19 @@ async fn run_loop_impl(
         // for nudge-status telemetry if this turn follows a nudge without
         // producing an accepted finish(done).
         let turn_text = turn.text();
+        if writer.is_enabled() {
+            writer.emit(
+                "model_response",
+                json!({
+                    "iteration": stats.iterations,
+                    "attempts": attempts_made,
+                    "latency_ms": u64::try_from(success_latency.as_millis()).unwrap_or(u64::MAX),
+                    "stop_reason": serde_json::to_value(&turn.stop_reason).unwrap_or(Value::Null),
+                    "usage": serde_json::to_value(turn.usage).unwrap_or(Value::Null),
+                    "content": serde_json::to_value(&turn.content).unwrap_or(Value::Null),
+                }),
+            );
+        }
         messages.push(Message::from(turn));
 
         // Append ModelCall + BudgetTick events, then write the mid-iteration
@@ -1383,12 +1608,29 @@ async fn run_loop_impl(
                     // adjacent user turn, here pushing a new Message::User is
                     // correct: the sequence assistant → user is a valid
                     // alternating pair and does NOT trigger a 400.
+                    let nudge_text = prompt::render_nudge_prompt();
                     messages.push(Message::User {
-                        content: vec![UserBlock::Text(prompt::render_nudge_prompt())],
+                        content: vec![UserBlock::Text(nudge_text.clone())],
                     });
                     nudges_fired += 1;
                     stats.nudges_fired += 1;
                     nudge_awaiting_status = true;
+                    if writer.is_enabled() {
+                        writer.emit(
+                            "harness_message",
+                            json!({
+                                "iteration": stats.iterations,
+                                "kind": "nudge",
+                                "placement": "new_user_message",
+                                "text": nudge_text,
+                                "last_gate_green": last_gate_green,
+                                "iters_since_tree_change": iters_since_tree_change,
+                                "static_tree_k": config.static_tree_k,
+                                "nudge_number": nudges_fired,
+                                "max_nudges": config.max_nudges,
+                            }),
+                        );
+                    }
                     continue;
                 }
                 // AC3 — Exhaustion terminal: unified with the green-static
@@ -1476,8 +1718,38 @@ async fn run_loop_impl(
             // acknowledgement lands in the fed-back batch alongside the
             // earlier calls.
             if call.name == FINISH_TOOL_NAME && finish.is_none() {
+                let call_start = Instant::now();
                 let outcome =
                     handle_finish_call(&call.id, &call.input, config.checks.as_ref(), ctx).await;
+                let duration_ms =
+                    u64::try_from(call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if writer.is_enabled() {
+                    let UserBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } = &outcome.result
+                    else {
+                        unreachable!("handle_finish_call always returns a ToolResult");
+                    };
+                    writer.emit(
+                        "tool_result",
+                        json!({
+                            "iteration": stats.iterations,
+                            "call_id": call_id,
+                            "tool_name": call.name,
+                            "is_error": is_error,
+                            "content": content,
+                            "offload_path": Value::Null,
+                            "duration_ms": duration_ms,
+                            "finish_accepted": outcome.finish.is_some(),
+                            "finish_verification": outcome
+                                .report
+                                .as_ref()
+                                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                        }),
+                    );
+                }
                 results.push(outcome.result);
                 finish = outcome.finish;
                 if let Some(raw) = outcome.invalid_raw {
@@ -1503,7 +1775,10 @@ async fn run_loop_impl(
                         .await?;
                 }
 
+                let call_start = Instant::now();
                 let result = tools.invoke(&call.name, call.input.clone(), ctx).await;
+                let duration_ms =
+                    u64::try_from(call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
                     p.store
@@ -1524,9 +1799,28 @@ async fn run_loop_impl(
                         .await?;
                 }
 
+                let content = render_tool_result(&result);
+                if writer.is_enabled() {
+                    writer.emit(
+                        "tool_result",
+                        json!({
+                            "iteration": stats.iterations,
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "is_error": result.is_error,
+                            "content": content,
+                            "offload_path": result
+                                .offload_path
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "duration_ms": duration_ms,
+                        }),
+                    );
+                }
+
                 results.push(UserBlock::ToolResult {
                     call_id: call.id.clone(),
-                    content: render_tool_result(&result),
+                    content,
                     is_error: result.is_error,
                 });
 
@@ -1641,10 +1935,26 @@ async fn run_loop_impl(
                 // turn from the API's view.
                 let nudge_text = prompt::render_nudge_prompt();
                 if let Some(Message::User { content }) = messages.last_mut() {
-                    content.push(UserBlock::Text(nudge_text));
+                    content.push(UserBlock::Text(nudge_text.clone()));
+                    nudges_fired += 1;
+                    stats.nudges_fired += 1;
+                    if writer.is_enabled() {
+                        writer.emit(
+                            "harness_message",
+                            json!({
+                                "iteration": stats.iterations,
+                                "kind": "nudge",
+                                "placement": "appended_to_tool_results",
+                                "text": nudge_text,
+                                "last_gate_green": last_gate_green,
+                                "iters_since_tree_change": iters_since_tree_change,
+                                "static_tree_k": config.static_tree_k,
+                                "nudge_number": nudges_fired,
+                                "max_nudges": config.max_nudges,
+                            }),
+                        );
+                    }
                 }
-                nudges_fired += 1;
-                stats.nudges_fired += 1;
                 nudge_awaiting_status = true;
                 // Reset so K static iterations must re-accumulate before the
                 // next trip.
@@ -1697,6 +2007,24 @@ async fn run_loop_impl(
                 // recovery terminal from a model finish(failed) by its `mode`.
                 return Ok(LoopOutcome::Finished(disposition));
             }
+        }
+
+        // `iteration_end` — fires exactly once per iteration that reaches
+        // end-of-iteration bookkeeping (not for iterations that returned
+        // earlier above, nor for a `continue`d stop-site nudge). Reads no
+        // clock.
+        if writer.is_enabled() {
+            writer.emit(
+                "iteration_end",
+                json!({
+                    "iteration": stats.iterations,
+                    "mutated": mutated_this_iter,
+                    "last_gate_green": last_gate_green,
+                    "tree_dirty": tree_dirty,
+                    "iters_since_tree_change": iters_since_tree_change,
+                    "nudges_fired": nudges_fired,
+                }),
+            );
         }
 
         // Wall-clock breach check: evaluated BEFORE the non-terminal
@@ -2149,7 +2477,7 @@ mod tests {
     };
     use crate::store::{RunStore, SqliteRunStore, StoreError};
     use crate::test_support::MockBackend;
-    use crate::time::FakeClock;
+    use crate::time::{Clock, FakeClock};
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
     use crate::tools::standard_registry;
@@ -3740,6 +4068,17 @@ mod tests {
         // Arc<dyn Clock> in RunConfig must be Debug and Clone.
         let _ = format!("{with_clk:?}");
         let _cloned = with_clk.clone();
+
+        // transcript defaults to None; with_transcript sets it.
+        assert!(RunConfig::new("t", 1).transcript.is_none());
+        let with_transcript = RunConfig::new("t", 1).with_transcript("/x/t.jsonl", "lbl");
+        assert_eq!(
+            with_transcript.transcript,
+            Some(crate::transcript::TranscriptConfig {
+                path: "/x/t.jsonl".into(),
+                label: "lbl".to_string(),
+            })
+        );
     }
 
     // =====================================================================
@@ -7678,5 +8017,976 @@ mod tests {
             .with_max_retries(0);
         assert_eq!(disabled.static_tree_k, 0);
         assert_eq!(disabled.max_retries, 0);
+    }
+
+    // =====================================================================
+    // Opt-in full run transcript (crate::transcript)
+    // =====================================================================
+
+    fn read_transcript_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let contents = std::fs::read_to_string(path).expect("read transcript file");
+        contents
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each transcript line is valid JSON"))
+            .collect()
+    }
+
+    fn assert_ts_is_20_chars_ending_in_z(line: &serde_json::Value) {
+        let ts = line["ts"].as_str().expect("ts is a string");
+        assert_eq!(
+            ts.len(),
+            20,
+            "ts must be YYYY-MM-DDTHH:MM:SSZ (20 chars): {ts}"
+        );
+        assert!(ts.ends_with('Z'), "ts must end in Z: {ts}");
+    }
+
+    fn message_block_count(m: &Message) -> usize {
+        match m {
+            Message::User { content } => content.len(),
+            Message::Assistant { content } => content.len(),
+        }
+    }
+
+    /// One entry per `model_request` event encountered while reconstructing a
+    /// transcript's lines.
+    struct ReconstructedRequest {
+        iteration: u64,
+        messages: Vec<Message>,
+        message_count: usize,
+        block_count: usize,
+    }
+
+    /// Rebuild message history from `lines` (one run block; `lines[0]` must
+    /// be `run_start`) per the reconstruction contract documented on
+    /// [`crate::transcript`], snapshotting the rebuilt history at every
+    /// `model_request`.
+    fn reconstruct_transcript(
+        lines: &[serde_json::Value],
+    ) -> (Vec<ReconstructedRequest>, serde_json::Value) {
+        let run_start = lines.first().expect("at least one line").clone();
+        assert_eq!(run_start["event"], "run_start");
+        let mut history: Vec<Message> = serde_json::from_value(run_start["messages"].clone())
+            .expect("run_start.messages deserializes as Vec<Message>");
+        let mut pending: Vec<UserBlock> = Vec::new();
+        let mut requests = Vec::new();
+
+        for line in &lines[1..] {
+            let event = line["event"].as_str().expect("event is a string");
+            match event {
+                "model_request" => {
+                    if !pending.is_empty() {
+                        history.push(Message::User {
+                            content: std::mem::take(&mut pending),
+                        });
+                    }
+                    requests.push(ReconstructedRequest {
+                        iteration: line["iteration"].as_u64().expect("iteration"),
+                        messages: history.clone(),
+                        message_count: usize::try_from(
+                            line["message_count"].as_u64().expect("message_count"),
+                        )
+                        .expect("message_count fits usize"),
+                        block_count: usize::try_from(
+                            line["block_count"].as_u64().expect("block_count"),
+                        )
+                        .expect("block_count fits usize"),
+                    });
+                }
+                "model_response" => {
+                    if !pending.is_empty() {
+                        history.push(Message::User {
+                            content: std::mem::take(&mut pending),
+                        });
+                    }
+                    let content: Vec<ContentBlock> =
+                        serde_json::from_value(line["content"].clone())
+                            .expect("model_response.content deserializes as Vec<ContentBlock>");
+                    history.push(Message::Assistant { content });
+                }
+                "tool_result" => {
+                    pending.push(UserBlock::ToolResult {
+                        call_id: line["call_id"].as_str().expect("call_id").to_string(),
+                        content: line["content"].as_str().expect("content").to_string(),
+                        is_error: line["is_error"].as_bool().expect("is_error"),
+                    });
+                }
+                "harness_message" => {
+                    let placement = line["placement"].as_str().expect("placement");
+                    let text = line["text"].as_str().expect("text").to_string();
+                    match placement {
+                        "appended_to_tool_results" => pending.push(UserBlock::Text(text)),
+                        "new_user_message" => {
+                            if !pending.is_empty() {
+                                history.push(Message::User {
+                                    content: std::mem::take(&mut pending),
+                                });
+                            }
+                            history.push(Message::User {
+                                content: vec![UserBlock::Text(text)],
+                            });
+                        }
+                        other => panic!("unknown harness_message placement {other}"),
+                    }
+                }
+                "iteration_end" | "backend_error" | "run_end" => {}
+                other => panic!("unexpected event kind in reconstruction: {other}"),
+            }
+        }
+        (requests, run_start)
+    }
+
+    /// Assert the reconstruction contract holds for `lines` against what
+    /// `backend` actually saw: at every `model_request`, the rebuilt history
+    /// equals `backend.messages_seen()[iteration-1]`, and its length/block
+    /// total equal the event's `message_count`/`block_count`. Also checks
+    /// `run_start.system` against the first turn's system prompt.
+    fn assert_reconstruction_matches(lines: &[serde_json::Value], backend: &MockBackend) {
+        let (requests, run_start) = reconstruct_transcript(lines);
+        let seen = backend.messages_seen();
+        let systems = backend.systems_seen();
+        assert_eq!(
+            run_start["system"],
+            serde_json::Value::String(systems[0].clone().expect("system prompt was sent")),
+            "run_start.system must match the first turn's system prompt"
+        );
+        assert!(!requests.is_empty(), "at least one model_request event");
+        for req in &requests {
+            let idx = usize::try_from(req.iteration - 1).expect("iteration fits usize");
+            assert_eq!(
+                req.messages, seen[idx],
+                "rebuilt history at iteration {} must equal messages_seen()[{idx}]",
+                req.iteration
+            );
+            assert_eq!(
+                req.messages.len(),
+                req.message_count,
+                "message_count must match the rebuilt length at iteration {}",
+                req.iteration
+            );
+            let block_total: usize = req.messages.iter().map(message_block_count).sum();
+            assert_eq!(
+                block_total, req.block_count,
+                "block_count must match the rebuilt total at iteration {}",
+                req.iteration
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn ordered_events_transcript_has_pinned_13_lines_and_reconstructs() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(failing_runner())
+            .with_transcript(path.clone(), "t");
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "s"}),
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "blocked", "decision_needed": "need input"}),
+            ),
+        ]);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Blocked { .. })),
+            "expected Finished(Blocked); got {outcome:?}"
+        );
+
+        let lines = read_transcript_lines(&path);
+        assert_eq!(lines.len(), 13, "expected exactly 13 transcript lines");
+        for line in &lines {
+            let event = line["event"].as_str().expect("event is a string");
+            assert!(
+                crate::transcript::EVENT_KINDS.contains(&event),
+                "unexpected event kind {event}"
+            );
+            assert_ts_is_20_chars_ending_in_z(line);
+        }
+
+        // 1: run_start
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["resume"], false);
+        assert!(lines[0]["run_id"].is_null());
+        assert_eq!(lines[0]["label"], "t");
+        assert_eq!(
+            lines[0]["tools"],
+            serde_json::Value::Array(tools.list()),
+            "run_start.tools must carry the exact tool schema array"
+        );
+
+        // 2: model_request (iteration 1)
+        assert_eq!(lines[1]["event"], "model_request");
+        assert_eq!(lines[1]["iteration"], 1);
+        assert_eq!(lines[1]["message_count"], 1);
+        assert_eq!(lines[1]["block_count"], 1);
+
+        // 3: model_response (iteration 1) — the echo input appears verbatim.
+        assert_eq!(lines[2]["event"], "model_response");
+        assert_eq!(lines[2]["iteration"], 1);
+        assert_eq!(lines[2]["attempts"], 1);
+        assert!(
+            lines[2]["content"].to_string().contains(r#"{"i":1}"#),
+            "line 3's content must carry the echo input verbatim: {}",
+            lines[2]["content"]
+        );
+
+        // 4: tool_result (echo) — content equals the ToolResult content the
+        // backend actually saw on the NEXT turn.
+        assert_eq!(lines[3]["event"], "tool_result");
+        assert_eq!(lines[3]["tool_name"], "echo");
+        assert_eq!(lines[3]["call_id"], "c1");
+        assert_eq!(lines[3]["is_error"], false);
+        assert!(lines[3].get("finish_accepted").is_none());
+        assert!(lines[3].get("finish_verification").is_none());
+        let seen = backend.messages_seen();
+        let Message::User { content } = &seen[1][2] else {
+            panic!("expected the fed-back tool-result message");
+        };
+        let UserBlock::ToolResult {
+            content: seen_content,
+            ..
+        } = &content[0]
+        else {
+            panic!("expected a ToolResult block");
+        };
+        assert_eq!(lines[3]["content"].as_str().unwrap(), seen_content);
+
+        // 5: iteration_end (iteration 1)
+        assert_eq!(lines[4]["event"], "iteration_end");
+        assert_eq!(lines[4]["iteration"], 1);
+        assert_eq!(lines[4]["mutated"], false);
+        assert_eq!(lines[4]["last_gate_green"], false);
+        assert_eq!(lines[4]["iters_since_tree_change"], 1);
+
+        // 6: model_request (iteration 2)
+        assert_eq!(lines[5]["event"], "model_request");
+        assert_eq!(lines[5]["iteration"], 2);
+        assert_eq!(lines[5]["message_count"], 3);
+        assert_eq!(lines[5]["block_count"], 3);
+
+        // 7: model_response (iteration 2)
+        assert_eq!(lines[6]["event"], "model_response");
+        assert_eq!(lines[6]["iteration"], 2);
+
+        // 8: tool_result (finish rejected by failing checks)
+        assert_eq!(lines[7]["event"], "tool_result");
+        assert_eq!(lines[7]["tool_name"], "finish");
+        assert_eq!(lines[7]["call_id"], "c2");
+        assert_eq!(lines[7]["is_error"], true);
+        assert_eq!(lines[7]["finish_accepted"], false);
+        assert_eq!(lines[7]["finish_verification"]["passed"], false);
+        assert_eq!(lines[7]["finish_verification"]["exit_code"], 3);
+        assert!(
+            lines[7]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("finish(done) rejected: verification failed"),
+            "got {}",
+            lines[7]["content"]
+        );
+
+        // 9: iteration_end (iteration 2)
+        assert_eq!(lines[8]["event"], "iteration_end");
+        assert_eq!(lines[8]["iteration"], 2);
+        assert_eq!(lines[8]["iters_since_tree_change"], 2);
+
+        // 10: model_request (iteration 3)
+        assert_eq!(lines[9]["event"], "model_request");
+        assert_eq!(lines[9]["iteration"], 3);
+        assert_eq!(lines[9]["message_count"], 5);
+        assert_eq!(lines[9]["block_count"], 5);
+
+        // 11: model_response (iteration 3)
+        assert_eq!(lines[10]["event"], "model_response");
+        assert_eq!(lines[10]["iteration"], 3);
+
+        // 12: tool_result (finish blocked, accepted)
+        assert_eq!(lines[11]["event"], "tool_result");
+        assert_eq!(lines[11]["call_id"], "c3");
+        assert_eq!(lines[11]["is_error"], false);
+        assert_eq!(lines[11]["finish_accepted"], true);
+        assert!(lines[11]["finish_verification"].is_null());
+        assert_eq!(lines[11]["content"], "finish acknowledged");
+
+        // 13: run_end
+        assert_eq!(lines[12]["event"], "run_end");
+        assert_eq!(lines[12]["outcome"], "Finished");
+        assert_eq!(
+            lines[12]["disposition"],
+            serde_json::json!({"Blocked": {"decision_needed": "need input"}})
+        );
+
+        assert_reconstruction_matches(&lines, &backend);
+    }
+
+    #[tokio::test]
+    async fn finish_accepted_tool_result_carries_passing_verification() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_transcript(path.clone(), "t");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({"disposition": "done", "summary": "ok"}),
+        )]);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+
+        let lines = read_transcript_lines(&path);
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result")
+            .expect("a tool_result line exists");
+        assert_eq!(tool_result["finish_accepted"], true);
+        assert_eq!(tool_result["finish_verification"]["passed"], true);
+    }
+
+    #[tokio::test]
+    async fn transcript_reconstruction_matches_green_stop_nudge_finish_done() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 3)
+            .with_checks(runner)
+            .with_max_nudges(1)
+            .with_transcript(path.clone(), "t");
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("looks fixed".into())],
+                StopReason::EndTurn,
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "..."}),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.nudges_fired, 1);
+
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+
+        let nudges: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message")
+            .collect();
+        assert_eq!(nudges.len(), 1, "exactly one nudge event");
+        let nudge = nudges[0];
+        assert_eq!(nudge["placement"], "new_user_message");
+        assert_eq!(
+            nudge["text"].as_str().unwrap(),
+            prompt::render_nudge_prompt()
+        );
+        assert_eq!(nudge["last_gate_green"], true);
+        assert_eq!(nudge["nudge_number"], 1);
+        assert_eq!(nudge["max_nudges"], config.max_nudges);
+    }
+
+    #[tokio::test]
+    async fn transcript_reconstruction_matches_green_static_spin_one_nudge() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_max_nudges(2)
+            .with_transcript(path.clone(), "t");
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            echo_turn("c3"),
+            echo_turn("c4"),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(matches!(outcome, LoopOutcome::MaxIterations));
+        assert_eq!(stats.nudges_fired, 1);
+
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+
+        let nudges: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message")
+            .collect();
+        assert_eq!(nudges.len(), 1, "exactly one nudge event");
+        let nudge = nudges[0];
+        assert_eq!(nudge["placement"], "appended_to_tool_results");
+        assert_eq!(
+            nudge["text"].as_str().unwrap(),
+            prompt::render_nudge_prompt()
+        );
+        assert_eq!(nudge["last_gate_green"], true);
+        assert_eq!(nudge["nudge_number"], 1);
+        assert_eq!(nudge["max_nudges"], config.max_nudges);
+        assert_eq!(nudge["iters_since_tree_change"], config.static_tree_k);
+    }
+
+    // ---- Clock-discrimination: transcript timestamps never read config.clock
+
+    #[tokio::test]
+    async fn transcript_on_reads_the_clock_the_same_number_of_times_as_off() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                echo_turn("c2"),
+                finish_call(
+                    "c3",
+                    serde_json::json!({"disposition": "blocked", "decision_needed": "x"}),
+                ),
+            ]
+        };
+
+        let fake_off = Arc::new(FakeClock::new_auto_advance(
+            UNIX_EPOCH,
+            Duration::from_secs(1),
+        ));
+        let dyn_off: Arc<dyn crate::time::Clock> = fake_off.clone();
+        let config_off = RunConfig::new("task", 10)
+            .with_wall_clock_secs(1_000)
+            .with_clock(dyn_off);
+        let backend_off = MockBackend::from_turns(script());
+        run(&backend_off, &tools, &ctx, &config_off).await;
+
+        let fake_on = Arc::new(FakeClock::new_auto_advance(
+            UNIX_EPOCH,
+            Duration::from_secs(1),
+        ));
+        let dyn_on: Arc<dyn crate::time::Clock> = fake_on.clone();
+        let dir = TempDir::new().expect("tempdir");
+        let config_on = RunConfig::new("task", 10)
+            .with_wall_clock_secs(1_000)
+            .with_clock(dyn_on)
+            .with_transcript(dir.path().join("t.jsonl"), "t");
+        let backend_on = MockBackend::from_turns(script());
+        run(&backend_on, &tools, &ctx, &config_on).await;
+
+        assert_eq!(
+            fake_off.now(),
+            fake_on.now(),
+            "the transcript must not read config.clock at all — equal read counts \
+             mean equal post-run clock values"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_on_does_not_change_wall_clock_breach_timing() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                echo_turn("c2"),
+                echo_turn("c3"),
+                echo_turn("c4"),
+                echo_turn("c5"),
+            ]
+        };
+
+        for transcript_on in [false, true] {
+            let fake = Arc::new(FakeClock::new_auto_advance(
+                UNIX_EPOCH,
+                Duration::from_secs(10),
+            ));
+            let dyn_clock: Arc<dyn crate::time::Clock> = fake;
+            let mut config = RunConfig::new("task", 10)
+                .with_wall_clock_secs(25)
+                .with_clock(dyn_clock);
+            let dir = TempDir::new().expect("tempdir");
+            if transcript_on {
+                config = config.with_transcript(dir.path().join("t.jsonl"), "t");
+            }
+            let backend = MockBackend::from_turns(script());
+
+            let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+            assert!(
+                matches!(outcome, LoopOutcome::BudgetExhausted { .. }),
+                "transcript_on={transcript_on}: expected BudgetExhausted, got {outcome:?}"
+            );
+            assert_eq!(
+                stats.iterations, 3,
+                "transcript_on={transcript_on}: breach must fire at the same iteration"
+            );
+        }
+    }
+
+    // ---- Zero behaviour change: transcript on vs off ----------------------
+
+    #[tokio::test]
+    async fn transcript_on_vs_off_does_not_change_run_outcome_or_stats() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                echo_turn("c2"),
+                finish_call(
+                    "c3",
+                    serde_json::json!({"disposition": "done", "summary": "ok"}),
+                ),
+            ]
+        };
+
+        let config_off = RunConfig::new("task", 10);
+        let backend_off = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_off,
+            stats: mut stats_off,
+        } = run(&backend_off, &tools, &ctx, &config_off).await;
+
+        let dir = TempDir::new().expect("tempdir");
+        let config_on = RunConfig::new("task", 10).with_transcript(dir.path().join("t.jsonl"), "t");
+        let backend_on = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_on,
+            stats: mut stats_on,
+        } = run(&backend_on, &tools, &ctx, &config_on).await;
+
+        assert_eq!(backend_off.messages_seen(), backend_on.messages_seen());
+        assert_eq!(backend_off.systems_seen(), backend_on.systems_seen());
+        assert_eq!(
+            outcome_off.into_disposition(),
+            outcome_on.into_disposition()
+        );
+        stats_off.wall_clock = Duration::ZERO;
+        stats_on.wall_clock = Duration::ZERO;
+        assert_eq!(stats_off, stats_on);
+    }
+
+    #[tokio::test]
+    async fn transcript_on_vs_off_persisted_produces_equal_events_and_record() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                finish_call(
+                    "c2",
+                    serde_json::json!({"disposition": "done", "summary": "ok"}),
+                ),
+            ]
+        };
+
+        let store_off = Arc::new(SqliteRunStore::open_in_memory().expect("in-memory sqlite"));
+        let pers_off = make_persistence(store_off.clone());
+        let backend_off = MockBackend::from_turns(script());
+        let config_off = RunConfig::new("task", 10);
+        run_persisted(&backend_off, &tools, &ctx, &config_off, &pers_off)
+            .await
+            .expect("ok");
+
+        let store_on = Arc::new(SqliteRunStore::open_in_memory().expect("in-memory sqlite"));
+        let pers_on = make_persistence(store_on.clone());
+        let backend_on = MockBackend::from_turns(script());
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config_on = RunConfig::new("task", 10).with_transcript(path.clone(), "t");
+        run_persisted(&backend_on, &tools, &ctx, &config_on, &pers_on)
+            .await
+            .expect("ok");
+
+        let events_off = store_off
+            .list_events(FIXTURE_RID)
+            .await
+            .expect("list events");
+        let events_on = store_on
+            .list_events(FIXTURE_RID)
+            .await
+            .expect("list events");
+        assert_eq!(events_off, events_on);
+
+        let rec_off = store_off
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let rec_on = store_on
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(rec_off.disposition, rec_on.disposition);
+        assert_eq!(rec_off.messages, rec_on.messages);
+
+        let lines = read_transcript_lines(&path);
+        assert_eq!(lines[0]["run_id"], FIXTURE_RID);
+        assert_eq!(lines.last().unwrap()["event"], "run_end");
+    }
+
+    // ---- StoreError exit -----------------------------------------------
+
+    #[tokio::test]
+    async fn store_error_exit_writes_run_end_store_error() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let backend = MockBackend::from_turns(vec![echo_turn("c1")]);
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("task", 5).with_transcript(path.clone(), "t");
+        let pers = make_persistence(Arc::new(FailingStore));
+
+        let err = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect_err("FailingStore must abort the run");
+        assert!(matches!(err, StoreError::LockPoisoned));
+
+        let lines = read_transcript_lines(&path);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[1]["event"], "model_request");
+        assert_eq!(lines[1]["iteration"], 1);
+        assert_eq!(lines[2]["event"], "model_response");
+        assert_eq!(lines[2]["iteration"], 1);
+        assert_eq!(lines[3]["event"], "run_end");
+        assert_eq!(lines[3]["outcome"], "StoreError");
+        assert!(lines[3]["disposition"].is_null());
+        assert_eq!(
+            lines[3]["detail"].as_str().unwrap(),
+            StoreError::LockPoisoned.to_string()
+        );
+    }
+
+    // ---- Append and resume ------------------------------------------------
+
+    #[tokio::test]
+    async fn repeated_run_calls_append_two_run_blocks() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                finish_call(
+                    "c2",
+                    serde_json::json!({"disposition": "done", "summary": "ok"}),
+                ),
+            ]
+        };
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("task", 10).with_transcript(path.clone(), "t");
+
+        let backend1 = MockBackend::from_turns(script());
+        run(&backend1, &tools, &ctx, &config).await;
+        let single_run_lines = read_transcript_lines(&path);
+
+        let backend2 = MockBackend::from_turns(script());
+        run(&backend2, &tools, &ctx, &config).await;
+        let two_run_lines = read_transcript_lines(&path);
+
+        let run_start_count = two_run_lines
+            .iter()
+            .filter(|l| l["event"] == "run_start")
+            .count();
+        let run_end_count = two_run_lines
+            .iter()
+            .filter(|l| l["event"] == "run_end")
+            .count();
+        assert_eq!(run_start_count, 2);
+        assert_eq!(run_end_count, 2);
+        assert_eq!(
+            two_run_lines.len(),
+            single_run_lines.len() * 2,
+            "two runs double the single-run line count"
+        );
+
+        let single_events: Vec<&str> = single_run_lines
+            .iter()
+            .map(|l| l["event"].as_str().unwrap())
+            .collect();
+        let first_block_events: Vec<&str> = two_run_lines[..single_run_lines.len()]
+            .iter()
+            .map(|l| l["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            single_events, first_block_events,
+            "the first block's event sequence is unchanged by the second run appending"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_run_transcript_begins_with_reloaded_messages_and_ends_with_run_end() {
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let asst = Message::Assistant {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-echo".to_string(),
+                name: "echo".to_string(),
+                input: serde_json::json!({}),
+            })],
+        };
+        let tool_result = Message::User {
+            content: vec![UserBlock::ToolResult {
+                call_id: "c-echo".to_string(),
+                content: "{}".to_string(),
+                is_error: false,
+            }],
+        };
+        let pre_messages = vec![task_seed.clone(), asst.clone(), tool_result.clone()];
+
+        let mut record = make_minimal_record("clean-task", 1);
+        record.messages = pre_messages.clone();
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        store
+            .checkpoint("clean-task:1", &record)
+            .await
+            .expect("checkpoint");
+        store
+            .append_event(
+                "clean-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "test".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+            )
+            .await
+            .expect("append");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 5).with_transcript(path.clone(), "t");
+
+        let result = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "clean-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+        assert!(matches!(
+            result.outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+
+        let lines = read_transcript_lines(&path);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["resume"], true);
+        assert_eq!(lines[0]["run_id"], "clean-task:1");
+        let reloaded: Vec<Message> = serde_json::from_value(lines[0]["messages"].clone())
+            .expect("messages deserialize as Vec<Message>");
+        assert_eq!(reloaded, pre_messages);
+        assert_eq!(lines.last().unwrap()["event"], "run_end");
+    }
+
+    // ---- Backend errors -----------------------------------------------
+
+    #[tokio::test]
+    async fn transient_exhaustion_records_every_failed_attempt() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let max_retries = super::DEFAULT_MAX_RETRIES;
+        let script: Vec<Result<AssistantTurn, BackendError>> = (0..=max_retries)
+            .map(|_| {
+                Err(BackendError::Transient {
+                    kind: TransientKind::Network,
+                    retry_after: None,
+                })
+            })
+            .collect();
+        let backend = MockBackend::new(script);
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("task", 5)
+            .with_retry_backoff_base(Duration::ZERO)
+            .with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(outcome, LoopOutcome::BackendError(_)));
+        assert_eq!(backend.calls(), max_retries + 1);
+
+        let lines = read_transcript_lines(&path);
+        let backend_errors: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backend_error")
+            .collect();
+        assert_eq!(backend_errors.len(), (max_retries + 1) as usize);
+        for (i, ev) in backend_errors.iter().enumerate() {
+            let attempt = u32::try_from(i).unwrap();
+            assert_eq!(ev["attempt"], attempt);
+            assert_eq!(ev["retryable"], true);
+            let is_last = attempt == max_retries;
+            assert_eq!(ev["will_retry"], !is_last);
+            if is_last {
+                assert!(ev["retry_delay_ms"].is_null());
+            } else {
+                assert!(ev["retry_delay_ms"].is_number());
+            }
+            assert!(ev["error_debug"].as_str().unwrap().contains("Transient"));
+        }
+        assert!(
+            !lines.iter().any(|l| l["event"] == "model_response"),
+            "no successful turn was ever drawn"
+        );
+        let run_end = lines.last().unwrap();
+        assert_eq!(run_end["event"], "run_end");
+        assert_eq!(run_end["outcome"], "BackendError");
+    }
+
+    #[tokio::test]
+    async fn terminal_backend_error_records_a_single_non_retryable_entry() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let backend = MockBackend::new(vec![Err(BackendError::Terminal {
+            kind: TerminalKind::Other,
+            message: "boom".to_string(),
+        })]);
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("task", 5).with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(outcome, LoopOutcome::BackendError(_)));
+
+        let lines = read_transcript_lines(&path);
+        let backend_errors: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "backend_error")
+            .collect();
+        assert_eq!(backend_errors.len(), 1);
+        let ev = backend_errors[0];
+        assert_eq!(ev["iteration"], 1);
+        assert_eq!(ev["attempt"], 0);
+        assert_eq!(ev["retryable"], false);
+        assert_eq!(ev["will_retry"], false);
+        assert!(ev["retry_delay_ms"].is_null());
+        assert_eq!(ev["error"], "terminal backend failure (Other): boom");
+
+        let run_end = lines.last().unwrap();
+        assert_eq!(run_end["event"], "run_end");
+        assert_eq!(run_end["outcome"], "BackendError");
+        assert_eq!(run_end["detail"], "terminal backend failure (Other): boom");
+    }
+
+    // ---- Engine-level best-effort failure: never changes the outcome ------
+
+    #[tokio::test]
+    async fn best_effort_failure_parent_is_file_does_not_change_outcome() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                finish_call(
+                    "c2",
+                    serde_json::json!({"disposition": "done", "summary": "ok"}),
+                ),
+            ]
+        };
+
+        let config_off = RunConfig::new("task", 10);
+        let backend_off = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_off,
+            stats: mut stats_off,
+        } = run(&backend_off, &tools, &ctx, &config_off).await;
+
+        let parent_file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = parent_file.path().join("t.jsonl");
+        let config_bad = RunConfig::new("task", 10).with_transcript(path, "t");
+        let backend_bad = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_bad,
+            stats: mut stats_bad,
+        } = run(&backend_bad, &tools, &ctx, &config_bad).await;
+
+        assert_eq!(
+            outcome_off.into_disposition(),
+            outcome_bad.into_disposition()
+        );
+        stats_off.wall_clock = Duration::ZERO;
+        stats_bad.wall_clock = Duration::ZERO;
+        assert_eq!(stats_off, stats_bad);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn best_effort_failure_dev_full_does_not_change_outcome() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let script = || {
+            vec![
+                echo_turn("c1"),
+                finish_call(
+                    "c2",
+                    serde_json::json!({"disposition": "done", "summary": "ok"}),
+                ),
+            ]
+        };
+
+        let config_off = RunConfig::new("task", 10);
+        let backend_off = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_off,
+            stats: mut stats_off,
+        } = run(&backend_off, &tools, &ctx, &config_off).await;
+
+        let config_bad = RunConfig::new("task", 10).with_transcript("/dev/full", "t");
+        let backend_bad = MockBackend::from_turns(script());
+        let RunResult {
+            outcome: outcome_bad,
+            stats: mut stats_bad,
+        } = run(&backend_bad, &tools, &ctx, &config_bad).await;
+
+        assert_eq!(
+            outcome_off.into_disposition(),
+            outcome_bad.into_disposition()
+        );
+        stats_off.wall_clock = Duration::ZERO;
+        stats_bad.wall_clock = Duration::ZERO;
+        assert_eq!(stats_off, stats_bad);
     }
 }

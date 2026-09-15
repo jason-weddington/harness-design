@@ -61,14 +61,23 @@
 //! - `CODING_EVAL_MAX_ITERATIONS` (optional) — per-trial agent-loop cap;
 //!   defaults to 12. The task-spec-shaped tiers (taskdeck, calc) benefit from
 //!   more headroom on small models — 24 matches the talos dispatch default.
+//! - `CODING_EVAL_TRANSCRIPTS` (optional) — `1` = on, opt-in full run
+//!   transcript per trial (see `harness::transcript`), written under
+//!   `<state-root>/talos/coding-eval/<unix-secs>-<pid>/<fixture>/trial-<i>.jsonl`;
+//!   `0`/empty/unset = off (the default). See
+//!   `harness::transcript::parse_transcripts_flag`.
 
 use std::env;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::engine::{LoopOutcome, RunStats};
-use harness::eval::{EvalReport, TrialResult, coding_fix_task_with, discover_fixtures, run_eval};
+use harness::eval::{
+    EvalReport, EvalTranscripts, TrialResult, coding_fix_task_with, discover_fixtures,
+    run_eval_with_transcripts,
+};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
 use harness::run_record::{Disposition, Verification};
@@ -208,6 +217,26 @@ const DEFAULT_K: u32 = 3;
 /// fixtures (implement-to-spec, write-your-own-tests) need more headroom.
 const DEFAULT_MAX_ITERATIONS: u32 = 12;
 
+/// Root for `CODING_EVAL_TRANSCRIPTS` output:
+/// `<state-root>/talos/coding-eval/<unix-secs>-<pid>`. `state-root` follows
+/// the same precedence as `harness::mined_eval`'s equivalent resolver
+/// (`XDG_STATE_HOME`, else `HOME/.local/state`, else the process temp dir).
+/// Deliberately duplicated rather than shared — unifying the three XDG-root
+/// copies in this repo is out of scope for this item. Computed ONCE in
+/// `main` so every fixture/trial in this process shares the same root.
+fn coding_eval_transcripts_root() -> PathBuf {
+    let state_root = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(env::temp_dir);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    state_root
+        .join("talos/coding-eval")
+        .join(format!("{secs}-{}", std::process::id()))
+}
+
 /// Read a `u32` from the environment, falling back to `default` when the
 /// variable is unset or unparsable.
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -228,6 +257,12 @@ async fn main() {
     // and results must never be compared across it.
     let include_test_first = env::var("CODING_EVAL_TEST_FIRST")
         .map_or(true, |v| !matches!(v.as_str(), "0" | "off" | "false"));
+    let transcripts_on = harness::transcript::parse_transcripts_flag(
+        "CODING_EVAL_TRANSCRIPTS",
+        env::var("CODING_EVAL_TRANSCRIPTS").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let transcripts_root = transcripts_on.then(coding_eval_transcripts_root);
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears
     // the narrow-to-one-fixture override.
     let fixture_filter = env::var("CODING_EVAL_FIXTURE")
@@ -261,8 +296,10 @@ async fn main() {
 
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
-         (max_iterations={max_iterations}, test_first={include_test_first})",
+         (max_iterations={max_iterations}, test_first={include_test_first}, \
+         transcripts={})",
         fixtures.len(),
+        if transcripts_on { "on" } else { "off" },
     );
 
     // Per-fixture reports paired with the display name (the fixture directory
@@ -285,19 +322,28 @@ async fn main() {
             fixture.display(),
         );
 
-        let report = run_eval(
+        let transcripts = transcripts_root.as_ref().map(|root| EvalTranscripts {
+            dir: root.join(&fixture_name),
+            label: backend_desc.clone(),
+        });
+        let report = run_eval_with_transcripts(
             &task,
             &backend,
             env_factory,
             k,
             max_iterations,
+            transcripts.as_ref(),
             |trial: &TrialResult| {
-                println!(
+                let mut line = format!(
                     "  trial {}: {} | {}",
                     trial.trial + 1,
                     outcome_one_liner(&trial.outcome),
                     stats_one_liner(&trial.stats),
                 );
+                if let Some(p) = &trial.transcript_path {
+                    let _ = write!(line, " | transcript: {}", p.display());
+                }
+                println!("{line}");
             },
         )
         .await;

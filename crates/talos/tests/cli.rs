@@ -210,6 +210,204 @@ async fn backend_error_via_refused_port_writes_store_record() {
 }
 
 // ============================================================================
+// (c2) --transcript: opt-in JSONL transcript, off by default
+// ============================================================================
+
+/// `--transcript <path>` into a not-yet-created parent directory writes the
+/// exact 7-line transcript for the refused-port `BackendError` retry
+/// exhaustion (default `max_retries=3`, `retry_backoff_base=500ms`).
+#[tokio::test(flavor = "current_thread")]
+async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    // Parent (`t/`) is deliberately NOT pre-created — the writer must
+    // best-effort `create_dir_all` it.
+    let transcript_path = dir.path().join("t").join("run.jsonl");
+
+    let task_id = "cli-test-transcript";
+    let attempt: u32 = 1;
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            task_id,
+            "--attempt",
+            "1",
+            "--transcript",
+            transcript_path.to_str().unwrap(),
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let summary: serde_json::Value = serde_json::from_str(stdout_str.trim())
+        .unwrap_or_else(|_| panic!("stdout must be valid JSON summary; got: {stdout_str:?}"));
+    let summary_outcome = summary
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary must carry an outcome string");
+    assert_eq!(summary_outcome, "BackendError");
+
+    let contents = std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each transcript line is valid JSON"))
+        .collect();
+    assert_eq!(lines.len(), 7, "expected exactly 7 transcript lines");
+
+    // Line 1: run_start.
+    assert_eq!(lines[0]["event"], "run_start");
+    assert_eq!(
+        lines[0]["label"], "ollama:x think=unset num_ctx=unset",
+        "OLLAMA_THINK/OLLAMA_NUM_CTX are unset in the child env"
+    );
+    assert_eq!(
+        lines[0]["run_id"],
+        harness::engine::run_id(task_id, attempt)
+    );
+    assert_eq!(lines[0]["resume"], false);
+
+    // Line 2: model_request (iteration 1).
+    assert_eq!(lines[1]["event"], "model_request");
+    assert_eq!(lines[1]["iteration"], 1);
+
+    // Lines 3-6: 4 backend_error entries (DEFAULT_MAX_RETRIES=3 -> 4 calls).
+    let expected_will_retry = [true, true, true, false];
+    let expected_retry_delay_ms = [Some(500), Some(1000), Some(2000), None];
+    for attempt_idx in 0..4usize {
+        let line = &lines[2 + attempt_idx];
+        assert_eq!(line["event"], "backend_error");
+        assert_eq!(line["iteration"], 1);
+        assert_eq!(line["attempt"], attempt_idx);
+        assert_eq!(line["retryable"], true);
+        assert_eq!(line["will_retry"], expected_will_retry[attempt_idx]);
+        match expected_retry_delay_ms[attempt_idx] {
+            Some(ms) => assert_eq!(line["retry_delay_ms"], ms),
+            None => assert!(line["retry_delay_ms"].is_null()),
+        }
+    }
+
+    // Line 7: run_end, outcome matching the stdout RunSummary.
+    assert_eq!(lines[6]["event"], "run_end");
+    assert_eq!(lines[6]["outcome"], summary_outcome);
+}
+
+/// Recursively check whether `root` contains any file with a `.jsonl`
+/// extension — used to prove the transcript writer never fires when
+/// `--transcript` is absent.
+fn walk_has_jsonl(root: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if walk_has_jsonl(&path) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            return true;
+        }
+    }
+    false
+}
+
+/// No `--transcript` flag: with `XDG_STATE_HOME`/`HOME` pointed at a fresh
+/// tempdir, a run writes zero `*.jsonl` files anywhere under it, and stderr
+/// never mentions "transcript" — proving the feature is fully inert by
+/// default (no env fallback exists to accidentally trip it).
+#[tokio::test(flavor = "current_thread")]
+async fn no_transcript_flag_writes_no_jsonl_and_is_silent() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let state_home = dir.path().join("state-home");
+    std::fs::create_dir_all(&state_home).unwrap();
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            "cli-test-no-transcript",
+            "--attempt",
+            "1",
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HOME", dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    assert!(
+        !walk_has_jsonl(dir.path()),
+        "no *.jsonl file may exist anywhere under the tempdir when --transcript is absent"
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr_str.contains("transcript"),
+        "stderr must not mention \"transcript\" when the flag is absent; got: {stderr_str:?}"
+    );
+}
+
+// ============================================================================
 // (d) --help is not a usage error: plain help on stdout, exit 0
 // ============================================================================
 
