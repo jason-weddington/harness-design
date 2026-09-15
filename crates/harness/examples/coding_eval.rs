@@ -385,14 +385,24 @@ fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
 /// line — iterations, in/out tokens, and wall-clock. Wall-clock is rendered
 /// in whole seconds (small runs might round to 0s, which is fine).
 fn stats_one_liner(stats: &RunStats) -> String {
-    format!(
-        "{} iters | {} in / {} out | {}s | gate_green_at_exit={}",
+    let mut line = format!(
+        "{} iters | {} in / {} out | {}s | gate_green_at_exit={} | invalid_finish={}",
         stats.iterations,
         format_tokens_compact(stats.input_tokens),
         format_tokens_compact(stats.output_tokens),
         stats.wall_clock.as_secs(),
         stats.gates_green_at_exit,
-    )
+        stats.invalid_finish_calls,
+    );
+    if let Some(raw) = &stats.first_invalid_finish_raw {
+        use std::fmt::Write as _;
+        let _ = write!(
+            line,
+            " | invalid_raw={}",
+            raw.chars().take(80).collect::<String>()
+        );
+    }
+    line
 }
 
 /// Render a token count compactly: below `1_000` as a bare integer, otherwise as

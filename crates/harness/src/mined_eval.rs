@@ -1676,6 +1676,12 @@ pub struct MinedTrialResult {
     /// Count of successful (`!is_error`) `edit_file` tool calls this trial.
     /// From [`crate::engine::RunStats::edit_file_calls_ok`].
     pub edit_file_calls_ok: u32,
+    /// Count of `finish` calls rejected as `FinishClaim::Invalid` this trial.
+    /// From [`crate::engine::RunStats::invalid_finish_calls`].
+    pub invalid_finish_calls: u32,
+    /// The untruncated `raw` of the first rejected `finish` call this trial.
+    /// From [`crate::engine::RunStats::first_invalid_finish_raw`].
+    pub first_invalid_finish_raw: Option<String>,
     /// The post-run agent-gate verdict — THE production-shippability signal.
     /// A real dispatch pushes only when this gate is green at a
     /// claim-verified `Done`, so this is what separates a sealed-`Resolved`
@@ -2247,6 +2253,8 @@ async fn single_trial<B: ModelBackend>(
         mutating_iters: stats.mutating_iters,
         bash_calls_ok: stats.bash_calls_ok,
         edit_file_calls_ok: stats.edit_file_calls_ok,
+        invalid_finish_calls: stats.invalid_finish_calls,
+        first_invalid_finish_raw: stats.first_invalid_finish_raw,
         agent_gate_post,
         agent_gate_output_path,
     }
@@ -2285,6 +2293,8 @@ fn invalid_trial(
         mutating_iters: 0,
         bash_calls_ok: 0,
         edit_file_calls_ok: 0,
+        invalid_finish_calls: 0,
+        first_invalid_finish_raw: None,
         agent_gate_post: None,
         agent_gate_output_path: None,
     }
@@ -3771,6 +3781,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             mutating_iters: 0,
             bash_calls_ok: 0,
             edit_file_calls_ok: 0,
+            invalid_finish_calls: 0,
+            first_invalid_finish_raw: None,
             agent_gate_post: None,
             agent_gate_output_path: None,
         }

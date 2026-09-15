@@ -503,6 +503,8 @@ async fn main() {
                 mutating_iters: 0,
                 bash_calls_ok: 0,
                 edit_file_calls_ok: 0,
+                invalid_finish_calls: 0,
+                first_invalid_finish_raw: None,
             };
 
             let trial = TrialResult {

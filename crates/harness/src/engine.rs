@@ -19,6 +19,11 @@
 //! declaring defeat needs no proof; those still terminate the loop as the
 //! declaration states.
 //!
+//! A `finish` call whose `disposition` is missing, non-string, or not one of
+//! `done`/`blocked`/`failed` after trimming and ASCII-lowercasing is
+//! rejected: it is fed back as an `is_error=true` tool result and never
+//! terminates the loop.
+//!
 //! ## What lives here
 //!
 //! - [`RunConfig`] — the shape a caller hands to [`run`]: task, iteration cap,
@@ -402,22 +407,41 @@ struct RunPersist {
 /// A claim the model made in a `finish` call, parsed from its raw JSON input.
 ///
 /// This is the *pre-verification* view: it captures what the model said, and
-/// the loop then decides whether to accept it as a [`FinishDisposition`].
-/// Kept internal because callers should only ever see the post-verification
-/// [`FinishDisposition`].
+/// the loop then decides whether to accept it as a [`Disposition`]. Kept
+/// internal because callers should only ever see the post-verification
+/// [`Disposition`].
+#[derive(Debug, PartialEq, Eq)]
 enum FinishClaim {
-    Done { summary: String },
-    Blocked { decision_needed: String },
-    Failed { summary: String },
+    Done {
+        summary: String,
+    },
+    Blocked {
+        decision_needed: String,
+    },
+    Failed {
+        summary: String,
+    },
+    /// The model's `disposition` was missing, non-string, or unrecognized;
+    /// `raw` is its JSON serialization, or `<missing>` when the key is
+    /// absent or the input is not an object. Never terminates the loop.
+    Invalid {
+        raw: String,
+    },
 }
 
 impl FinishClaim {
     /// Parse the `finish` tool's raw JSON input into a claim.
     ///
-    /// `disposition` selects the variant; `summary` and `decision_needed` are
-    /// read as strings (absent → empty). An unrecognized or missing
-    /// `disposition` is treated as [`Self::Failed`] — a malformed finish is a
-    /// run problem, not a clean stop.
+    /// `disposition` selects the variant: a JSON string that, after
+    /// trimming and ASCII-lowercasing, equals `done`, `blocked`, or `failed`
+    /// selects that variant; anything else — a string outside that set, a
+    /// non-string value, or a missing/non-object input — yields
+    /// [`Self::Invalid`]. `summary` and `decision_needed` are read as
+    /// strings on the accepted variants (absent or non-string → empty).
+    ///
+    /// No other normalization is performed: no Unicode case folding, no
+    /// synonyms. `"complete"`, `"success"`, and `"finished"` are all
+    /// [`Self::Invalid`].
     fn from_input(input: &Value) -> Self {
         let field = |key: &str| {
             input
@@ -426,15 +450,23 @@ impl FinishClaim {
                 .unwrap_or_default()
                 .to_string()
         };
-        match input.get("disposition").and_then(Value::as_str) {
-            Some("done") => Self::Done {
+        let Some(disposition) = input.get("disposition") else {
+            return Self::Invalid {
+                raw: "<missing>".to_string(),
+            };
+        };
+        match disposition.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "done" => Self::Done {
                 summary: field("summary"),
             },
-            Some("blocked") => Self::Blocked {
+            Some(s) if s == "blocked" => Self::Blocked {
                 decision_needed: field("decision_needed"),
             },
-            _ => Self::Failed {
+            Some(s) if s == "failed" => Self::Failed {
                 summary: field("summary"),
+            },
+            _ => Self::Invalid {
+                raw: disposition.to_string(),
             },
         }
     }
@@ -499,6 +531,14 @@ impl FinishClaim {
 ///   (`!is_error`) `bash` / `edit_file` tool calls. Counted since THIS loop
 ///   invocation — a resumed run starts from zero; pre-crash values live in
 ///   `RunRecord::recovery_facts`.
+/// - `invalid_finish_calls`: count of `finish` calls rejected as
+///   [`FinishClaim::Invalid`] (missing, non-string, or unrecognized
+///   `disposition`). A red-verification `done` rejection is NOT counted.
+///   Counted since THIS loop invocation — a resumed run starts from zero.
+/// - `first_invalid_finish_raw`: the untruncated `raw` of the FIRST
+///   `FinishClaim::Invalid` claim this loop invocation; never overwritten
+///   after being set. Counted since THIS loop invocation — a resumed run
+///   starts from zero.
 ///
 /// Deliberately NOT `serde`: persistence wiring
 /// (into [`crate::run_record`]) is a later milestone; this type is the
@@ -580,6 +620,17 @@ pub struct RunStats {
     /// engine.rs:1808) starts from zero; pre-crash values live in
     /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
     pub edit_file_calls_ok: u32,
+    /// Count of `finish` calls rejected as [`FinishClaim::Invalid`] (a
+    /// missing, non-string, or unrecognized `disposition`). A
+    /// red-verification `done` rejection is NOT counted here. Counted since
+    /// THIS loop invocation — a resumed run (`resume`, engine.rs:1808)
+    /// starts from zero.
+    pub invalid_finish_calls: u32,
+    /// The untruncated `raw` of the FIRST `finish` call rejected as
+    /// [`FinishClaim::Invalid`] this loop invocation; never overwritten once
+    /// set. Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero.
+    pub first_invalid_finish_raw: Option<String>,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -611,7 +662,9 @@ pub enum LoopOutcome {
     /// The hard `max_iterations` cap was reached before the agent reached an
     /// accepted finish. Repeated `finish(done)` claims that fail verification
     /// bottom out here — loop/rejection-counter detection lands with a
-    /// separate item.
+    /// separate item. Repeated `finish` calls with an unrecognized or missing
+    /// disposition also end here; `RunStats::invalid_finish_calls > 0` tells
+    /// that case apart from repeated red-verification `done` rejections.
     MaxIterations,
     /// The wall-clock budget ([`RunConfig::wall_clock_secs`]) expired before
     /// the agent finished. The summary is always
@@ -689,6 +742,9 @@ impl LoopOutcome {
 /// used when no checks are configured or when the disposition is
 /// `blocked`/`failed`; a verified-red `done` bypasses it entirely and the
 /// loop synthesizes an `is_error=true` [`ToolResult`] the model can react to.
+/// An unrecognized or missing `disposition` likewise never reaches
+/// `.run`: the loop rejects it with an `is_error=true` result and the loop
+/// continues.
 ///
 /// [`ChecksRunner`]: crate::exec::ChecksRunner
 #[derive(Debug, Default, Clone, Copy)]
@@ -706,10 +762,11 @@ impl Tool for FinishTool {
     fn schema(&self) -> Value {
         json!({
             "name": FINISH_TOOL_NAME,
-            "description": "End the run. Call exactly once when the task is complete, \
+            "description": "End the run. Call it when the task is complete, \
                             blocked on a decision, or has failed. A `done` claim is \
                             verified by the harness re-running the configured checks; \
-                            a failed verification is fed back as a tool-result error \
+                            a failed verification, or a disposition other than \
+                            done/blocked/failed, is fed back as a tool-result error \
                             you can react to, not a termination.",
             "input_schema": {
                 "type": "object",
@@ -719,7 +776,10 @@ impl Tool for FinishTool {
                         "enum": ["done", "blocked", "failed"],
                         "description": "done = task complete (harness will verify via checks); \
                                         blocked = needs a decision before retrying; \
-                                        failed = the run is the problem."
+                                        failed = you could not complete the task in this \
+                                        attempt and a fresh attempt might succeed. If the \
+                                        task is complete, use done; if a human decision is \
+                                        needed, use blocked."
                     },
                     "summary": {
                         "type": "string",
@@ -784,11 +844,17 @@ fn rejection_content(report: &CheckReport) -> String {
 struct FinishOutcome {
     result: UserBlock,
     finish: Option<Disposition>,
+    /// `Some(raw)` when this call was rejected as [`FinishClaim::Invalid`];
+    /// `None` on every other arm (including a checks-rejected `done`).
+    invalid_raw: Option<String>,
 }
 
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
 /// when configured, or accept it on trust when not. `blocked` and `failed`
-/// terminate as declared with no verification.
+/// terminate as declared with no verification. An unrecognized or missing
+/// disposition ([`FinishClaim::Invalid`]) is rejected back to the model as
+/// an `is_error=true` tool result — `finish = None`, no checks run — and the
+/// loop continues.
 ///
 /// Returns the fed-back [`UserBlock::ToolResult`] plus, when the loop should
 /// terminate, the accepted [`Disposition`]. A rejected `done` returns
@@ -810,6 +876,7 @@ async fn handle_finish_call(
                             summary,
                             verification: Verification::Checks(report),
                         }),
+                        invalid_raw: None,
                     }
                 } else {
                     FinishOutcome {
@@ -819,6 +886,7 @@ async fn handle_finish_call(
                             is_error: true,
                         },
                         finish: None,
+                        invalid_raw: None,
                     }
                 }
             }
@@ -828,11 +896,13 @@ async fn handle_finish_call(
                     summary,
                     verification: Verification::NoChecksConfigured,
                 }),
+                invalid_raw: None,
             },
         },
         FinishClaim::Blocked { decision_needed } => FinishOutcome {
             result: ack(call_id),
             finish: Some(Disposition::Blocked { decision_needed }),
+            invalid_raw: None,
         },
         FinishClaim::Failed { summary } => FinishOutcome {
             result: ack(call_id),
@@ -840,14 +910,27 @@ async fn handle_finish_call(
                 mode: FailureMode::Loop,
                 summary,
             }),
+            invalid_raw: None,
+        },
+        FinishClaim::Invalid { raw } => FinishOutcome {
+            result: UserBlock::ToolResult {
+                call_id: call_id.to_string(),
+                content: format!(
+                    "finish rejected: disposition must be one of: done, blocked, failed; \
+                     got {raw}. Call finish again with one of those values."
+                ),
+                is_error: true,
+            },
+            finish: None,
+            invalid_raw: Some(raw),
         },
     }
 }
 
 /// The standard `finish acknowledged` fed-back [`UserBlock::ToolResult`] the
-/// loop hands the model for an accepted `finish` (any disposition, or a
-/// `done` with no checks configured). Kept factored so the wording matches
-/// exactly across the four accepted paths.
+/// loop hands the model for an accepted `finish` — for an accepted
+/// done/blocked/failed claim (or a `done` with no checks configured). Kept
+/// factored so the wording matches exactly across the four accepted paths.
 fn ack(call_id: &str) -> UserBlock {
     UserBlock::ToolResult {
         call_id: call_id.to_string(),
@@ -910,6 +993,8 @@ pub async fn run(
         mutating_iters: 0,
         bash_calls_ok: 0,
         edit_file_calls_ok: 0,
+        invalid_finish_calls: 0,
+        first_invalid_finish_raw: None,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -976,6 +1061,8 @@ pub async fn run_persisted(
         mutating_iters: 0,
         bash_calls_ok: 0,
         edit_file_calls_ok: 0,
+        invalid_finish_calls: 0,
+        first_invalid_finish_raw: None,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1373,7 +1460,9 @@ async fn run_loop_impl(
         // re-running the configured checks, and only a green verification
         // (or no checks at all) sets the terminal `finish` slot. A red
         // verification is fed back as an `is_error=true` result and the loop
-        // CONTINUES with the remaining calls in the same batch.
+        // CONTINUES with the remaining calls in the same batch. An
+        // unrecognized or missing disposition is likewise fed back as an
+        // `is_error=true` result and the batch continues.
         let mut results = Vec::with_capacity(calls.len());
         let mut finish: Option<Disposition> = None;
         // Per-iteration mutation flag — reset before the per-call loop. A
@@ -1391,6 +1480,12 @@ async fn run_loop_impl(
                     handle_finish_call(&call.id, &call.input, config.checks.as_ref(), ctx).await;
                 results.push(outcome.result);
                 finish = outcome.finish;
+                if let Some(raw) = outcome.invalid_raw {
+                    stats.invalid_finish_calls += 1;
+                    if stats.first_invalid_finish_raw.is_none() {
+                        stats.first_invalid_finish_raw = Some(raw);
+                    }
+                }
             } else {
                 // Non-finish tool call: append ToolCallStarted before invoke,
                 // ToolCallResult after invoke (log-then-snapshot discipline).
@@ -1935,6 +2030,8 @@ pub async fn resume(
         mutating_iters: 0,
         bash_calls_ok: 0,
         edit_file_calls_ok: 0,
+        invalid_finish_calls: 0,
+        first_invalid_finish_raw: None,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -2036,9 +2133,9 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishTool, LoopOutcome, Persistence, ResumeError, ResumeMode, RunConfig,
-        RunResult, RunStats, rejection_content, render_tool_result, resume, retry_delay, run,
-        run_id, run_persisted,
+        FINISH_TOOL_NAME, FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError,
+        ResumeMode, RunConfig, RunResult, RunStats, rejection_content, render_tool_result, resume,
+        retry_delay, run, run_id, run_persisted,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -2346,6 +2443,8 @@ mod tests {
         assert_eq!(stats.iterations, 1);
         assert_eq!(stats.input_tokens, 0);
         assert_eq!(stats.output_tokens, 0);
+        assert_eq!(stats.invalid_finish_calls, 0);
+        assert_eq!(stats.first_invalid_finish_raw, None);
     }
 
     #[tokio::test]
@@ -2442,6 +2541,8 @@ mod tests {
         // The BackendError variant carries stats too. The mock overdraws on
         // the third turn, so `iterations` counts all three drawn turns.
         assert_eq!(stats.iterations, 3);
+        // A checks rejection is NOT counted as an invalid disposition.
+        assert_eq!(stats.invalid_finish_calls, 0);
     }
 
     #[tokio::test]
@@ -2475,6 +2576,215 @@ mod tests {
         );
         // MaxIterations carries stats — iterations equals the cap exactly.
         assert_eq!(stats.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn finish_unknown_disposition_is_rejected_and_loop_continues() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "disposition": "complete", "summary": "huh" }),
+            ),
+            finish_call(
+                "c-good",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done {
+                summary,
+                verification: Verification::NoChecksConfigured,
+            }) => {
+                assert_eq!(summary, "ok");
+            }
+            other => panic!("expected Finished(Done{{NoChecksConfigured}}), got {other:?}"),
+        }
+        assert_eq!(backend.calls(), 2);
+        assert_eq!(stats.iterations, 2);
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert_eq!(
+            stats.first_invalid_finish_raw,
+            Some("\"complete\"".to_string())
+        );
+
+        let seen = backend.last_messages();
+        let rejection = seen.iter().find_map(|m| match m {
+            Message::User { content } => content.iter().find_map(|b| match b {
+                UserBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } if call_id == "c-bad" => Some((content.clone(), *is_error)),
+                _ => None,
+            }),
+            Message::Assistant { .. } => None,
+        });
+        let (content, is_error) = rejection.expect("fed-back rejection tool-result present");
+        assert!(is_error, "rejected finish result is is_error=true");
+        assert_eq!(
+            content,
+            "finish rejected: disposition must be one of: done, blocked, failed; \
+             got \"complete\". Call finish again with one of those values."
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_missing_disposition_is_rejected_and_loop_continues() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "summary": "no disposition field" }),
+            ),
+            finish_call(
+                "c-good",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done {
+                summary,
+                verification: Verification::NoChecksConfigured,
+            }) => {
+                assert_eq!(summary, "ok");
+            }
+            other => panic!("expected Finished(Done{{NoChecksConfigured}}), got {other:?}"),
+        }
+        assert_eq!(backend.calls(), 2);
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert_eq!(
+            stats.first_invalid_finish_raw,
+            Some("<missing>".to_string())
+        );
+
+        let seen = backend.last_messages();
+        let rejection = seen.iter().find_map(|m| match m {
+            Message::User { content } => content.iter().find_map(|b| match b {
+                UserBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } if call_id == "c-bad" => Some((content.clone(), *is_error)),
+                _ => None,
+            }),
+            Message::Assistant { .. } => None,
+        });
+        let (content, is_error) = rejection.expect("fed-back rejection tool-result present");
+        assert!(is_error, "rejected finish result is is_error=true");
+        assert_eq!(
+            content,
+            "finish rejected: disposition must be one of: done, blocked, failed; \
+             got <missing>. Call finish again with one of those values."
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_dispositions_only_end_at_max_iterations() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call("c1", serde_json::json!({ "disposition": "complete" })),
+            finish_call("c2", serde_json::json!({ "disposition": null })),
+            finish_call("c3", serde_json::json!({ "summary": "x" })),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 3);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "repeated invalid dispositions must hit MaxIterations, not Finished(Failed); got {outcome:?}"
+        );
+        assert_eq!(backend.calls(), 3);
+        assert_eq!(stats.iterations, 3);
+        assert_eq!(stats.invalid_finish_calls, 3);
+        assert_eq!(
+            stats.first_invalid_finish_raw,
+            Some("\"complete\"".to_string()),
+            "the first invalid raw must win over the later null and <missing>"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_disposition_does_not_run_checks() {
+        let dir = TempDir::new().expect("tempdir");
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("echo ran >> {}/checks_ran; exit 3", dir.path().display()),
+                ],
+            },
+            dir.path().to_path_buf(),
+            Duration::from_secs(10),
+        );
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "disposition": "success", "summary": "x" }),
+            ),
+            finish_call(
+                "c-red",
+                serde_json::json!({ "disposition": "done", "summary": "y" }),
+            ),
+            finish_call(
+                "c-blk",
+                serde_json::json!({ "disposition": "blocked", "decision_needed": "q" }),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10).with_checks(runner);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
+                assert_eq!(decision_needed, "q");
+            }
+            other => panic!("expected Finished(Blocked), got {other:?}"),
+        }
+        assert_eq!(backend.calls(), 3);
+        let checks_ran = std::fs::read_to_string(dir.path().join("checks_ran"))
+            .expect("checks_ran file written by the sentinel check");
+        assert_eq!(
+            checks_ran.lines().count(),
+            1,
+            "checks must run exactly once, from the red `done` — the invalid claim ran none"
+        );
+        assert_eq!(stats.invalid_finish_calls, 1);
+
+        let seen = backend.last_messages();
+        let rejection = seen.iter().find_map(|m| match m {
+            Message::User { content } => content.iter().find_map(|b| match b {
+                UserBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } if call_id == "c-bad" => Some((content.clone(), *is_error)),
+                _ => None,
+            }),
+            Message::Assistant { .. } => None,
+        });
+        let (content, is_error) = rejection.expect("fed-back rejection tool-result present");
+        assert!(is_error, "rejected finish result is is_error=true");
+        assert_eq!(
+            content,
+            "finish rejected: disposition must be one of: done, blocked, failed; \
+             got \"success\". Call finish again with one of those values."
+        );
     }
 
     #[tokio::test]
@@ -2914,25 +3224,126 @@ mod tests {
         assert_eq!(stats.iterations, 1);
     }
 
-    #[tokio::test]
-    async fn finish_unknown_disposition_defaults_to_failed() {
-        let backend = MockBackend::from_turns(vec![finish_call(
-            "c1",
-            serde_json::json!({ "disposition": "weird", "summary": "huh" }),
-        )]);
-        let tools = registry_with_finish_and_echo();
-        let ctx = ToolCtx::stub();
-        let config = RunConfig::new("task", 10);
-
-        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
-
-        match outcome {
-            LoopOutcome::Finished(Disposition::Failed { summary, .. }) => {
-                assert_eq!(summary, "huh");
-            }
-            other => panic!("expected Finished(Failed) for unknown disposition, got {other:?}"),
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn from_input_classifies_every_disposition_shape() {
+        let cases: Vec<(serde_json::Value, FinishClaim)> = vec![
+            (
+                serde_json::json!({ "disposition": "done", "summary": "s" }),
+                FinishClaim::Done {
+                    summary: "s".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "blocked", "decision_needed": "d" }),
+                FinishClaim::Blocked {
+                    decision_needed: "d".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "failed", "summary": "s" }),
+                FinishClaim::Failed {
+                    summary: "s".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": " Done \n" }),
+                FinishClaim::Done {
+                    summary: String::new(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "FAILED" }),
+                FinishClaim::Failed {
+                    summary: String::new(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "done", "summary": 5 }),
+                FinishClaim::Done {
+                    summary: String::new(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "blocked" }),
+                FinishClaim::Blocked {
+                    decision_needed: String::new(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "complete" }),
+                FinishClaim::Invalid {
+                    raw: "\"complete\"".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "success" }),
+                FinishClaim::Invalid {
+                    raw: "\"success\"".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "" }),
+                FinishClaim::Invalid {
+                    raw: "\"\"".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": 1 }),
+                FinishClaim::Invalid {
+                    raw: "1".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": true }),
+                FinishClaim::Invalid {
+                    raw: "true".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": null }),
+                FinishClaim::Invalid {
+                    raw: "null".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": ["done"] }),
+                FinishClaim::Invalid {
+                    raw: "[\"done\"]".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "summary": "x" }),
+                FinishClaim::Invalid {
+                    raw: "<missing>".to_string(),
+                },
+            ),
+            (
+                serde_json::json!("done"),
+                FinishClaim::Invalid {
+                    raw: "<missing>".to_string(),
+                },
+            ),
+            (
+                serde_json::json!(null),
+                FinishClaim::Invalid {
+                    raw: "<missing>".to_string(),
+                },
+            ),
+            (
+                serde_json::json!(["done"]),
+                FinishClaim::Invalid {
+                    raw: "<missing>".to_string(),
+                },
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                FinishClaim::from_input(&input),
+                expected,
+                "input: {input:?}"
+            );
         }
-        assert_eq!(stats.iterations, 1);
     }
 
     #[test]
@@ -3000,6 +3411,38 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.summary.contains("finish"));
+    }
+
+    #[test]
+    fn finish_schema_disposition_description_is_pinned() {
+        let schema = FinishTool.schema();
+        assert_eq!(
+            schema["description"],
+            "End the run. Call it when the task is complete, blocked on a decision, or \
+             has failed. A `done` claim is verified by the harness re-running the \
+             configured checks; a failed verification, or a disposition other than \
+             done/blocked/failed, is fed back as a tool-result error you can react to, \
+             not a termination."
+        );
+        assert_eq!(
+            schema["input_schema"]["properties"]["disposition"]["description"],
+            "done = task complete (harness will verify via checks); blocked = needs a \
+             decision before retrying; failed = you could not complete the task in this \
+             attempt and a fresh attempt might succeed. If the task is complete, use \
+             done; if a human decision is needed, use blocked."
+        );
+        let disposition_desc = schema["input_schema"]["properties"]["disposition"]["description"]
+            .as_str()
+            .expect("disposition description is a string");
+        assert!(!disposition_desc.contains("the run is the problem"));
+        assert_eq!(
+            schema["input_schema"]["properties"]["disposition"]["enum"],
+            serde_json::json!(["done", "blocked", "failed"])
+        );
+        assert_eq!(
+            schema["input_schema"]["required"],
+            serde_json::json!(["disposition", "summary"])
+        );
     }
 
     #[tokio::test]
@@ -3128,6 +3571,8 @@ mod tests {
             mutating_iters: 0,
             bash_calls_ok: 0,
             edit_file_calls_ok: 0,
+            invalid_finish_calls: 0,
+            first_invalid_finish_raw: None,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -3166,32 +3611,6 @@ mod tests {
                     mode,
                     FailureMode::Loop,
                     "model-declared failed must yield FailureMode::Loop"
-                );
-            }
-            other => panic!("expected Finished(Failed{{Loop}}), got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn finish_missing_disposition_yields_failed_with_loop_mode() {
-        // A malformed finish call (missing `disposition` field) is routed
-        // through FinishClaim::Failed — verify it produces Failed{{Loop}}.
-        let backend = MockBackend::from_turns(vec![finish_call(
-            "c1",
-            serde_json::json!({ "summary": "no disposition field" }),
-        )]);
-        let tools = registry_with_finish_and_echo();
-        let ctx = ToolCtx::stub();
-        let config = RunConfig::new("task", 10);
-
-        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
-
-        match outcome {
-            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
-                assert_eq!(
-                    mode,
-                    FailureMode::Loop,
-                    "malformed finish (missing disposition) must yield FailureMode::Loop"
                 );
             }
             other => panic!("expected Finished(Failed{{Loop}}), got {other:?}"),
@@ -3864,6 +4283,152 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::DispositionSet { .. }));
         assert!(has_disposition_set, "DispositionSet event must be in log");
+    }
+
+    #[tokio::test]
+    async fn same_batch_invalid_then_valid_finish_terminates_on_valid() {
+        // Both finish calls land in the SAME batch (one scripted turn); the
+        // first is invalid, the second is a valid `done` — the loop must
+        // reject the first and terminate on the second within that one turn.
+        let backend = MockBackend::from_turns(vec![turn_with(
+            vec![
+                tool_call(
+                    "c-bad",
+                    FINISH_TOOL_NAME,
+                    serde_json::json!({ "disposition": "complete" }),
+                ),
+                tool_call(
+                    "c-good",
+                    FINISH_TOOL_NAME,
+                    serde_json::json!({ "disposition": "done", "summary": "ok" }),
+                ),
+            ],
+            StopReason::ToolUse,
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done {
+                summary,
+                verification: Verification::NoChecksConfigured,
+            }) => {
+                assert_eq!(summary, "ok");
+            }
+            other => panic!("expected Finished(Done{{NoChecksConfigured}}), got {other:?}"),
+        }
+        assert_eq!(backend.calls(), 1);
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.invalid_finish_calls, 1);
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let last = rec.messages.last().expect("at least one message");
+        match last {
+            Message::User { content } => {
+                assert_eq!(content.len(), 2, "both fed-back results in one message");
+                match &content[0] {
+                    UserBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => {
+                        assert_eq!(call_id, "c-bad");
+                        assert!(*is_error);
+                        assert_eq!(
+                            content,
+                            "finish rejected: disposition must be one of: done, blocked, \
+                             failed; got \"complete\". Call finish again with one of those \
+                             values."
+                        );
+                    }
+                    UserBlock::Text(_) => panic!("expected ToolResult, got Text"),
+                }
+                match &content[1] {
+                    UserBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => {
+                        assert_eq!(call_id, "c-good");
+                        assert!(!is_error);
+                        assert_eq!(content, "finish acknowledged");
+                    }
+                    UserBlock::Text(_) => panic!("expected ToolResult, got Text"),
+                }
+            }
+            Message::Assistant { .. } => panic!("expected a User message, got Assistant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_finish_is_persisted_only_in_messages() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "disposition": "complete", "summary": "x" }),
+            ),
+            finish_call(
+                "c-good",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(
+            matches!(rec.disposition, Some(Disposition::Done { .. })),
+            "disposition must be Done; got {:?}",
+            rec.disposition
+        );
+
+        let events = store.list_events(FIXTURE_RID).await.expect("list");
+        let disposition_set_count = events
+            .iter()
+            .filter(|e| matches!(e, Event::DispositionSet { .. }))
+            .count();
+        assert_eq!(disposition_set_count, 1, "exactly one DispositionSet");
+        let finish_tool_call_started = events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStarted { name, .. } if name == FINISH_TOOL_NAME));
+        assert!(
+            !finish_tool_call_started,
+            "finish calls must never emit ToolCallStarted"
+        );
+
+        let has_rejected = rec.messages.iter().any(|m| match m {
+            Message::User { content } => content.iter().any(|b| {
+                matches!(b, UserBlock::ToolResult { call_id, is_error, .. }
+                    if call_id == "c-bad" && *is_error)
+            }),
+            Message::Assistant { .. } => false,
+        });
+        assert!(
+            has_rejected,
+            "rejected finish must be persisted in record.messages"
+        );
     }
 
     #[tokio::test]

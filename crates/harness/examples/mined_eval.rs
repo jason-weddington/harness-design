@@ -395,7 +395,7 @@ async fn main() {
                 None => "-",
             };
             let mut line = format!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_post={gate_post_desc} | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | invalid_finish={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_post={gate_post_desc} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -410,6 +410,7 @@ async fn main() {
                 trial.mutating_iters,
                 trial.bash_calls_ok,
                 trial.edit_file_calls_ok,
+                trial.invalid_finish_calls,
                 trial.agent_tests_added.len(),
                 trial.agent_tests_modified.len(),
                 trial.sections_seen,
@@ -418,6 +419,13 @@ async fn main() {
             );
             if let Some(p) = &trial.agent_gate_output_path {
                 let _ = write!(line, " | agent_gate_output: {}", p.display());
+            }
+            if let Some(raw) = &trial.first_invalid_finish_raw {
+                let _ = write!(
+                    line,
+                    " | invalid_raw={}",
+                    raw.chars().take(80).collect::<String>()
+                );
             }
             println!("{line}");
         };
