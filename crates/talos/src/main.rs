@@ -20,6 +20,10 @@
 //! tool result — default OFF, flag only (no env fallback). `talos ralph` has
 //! no transcript support.
 //!
+//! `talos run --criteria-rules` opts into the shared `## Criterion Coverage`
+//! prompt section (see [`harness::prompt::render_criteria_rules`]) — default
+//! OFF, flag only (no env fallback, for the same reason as `--transcript`).
+//!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
 //! with a fresh inner context per outer iteration. `ralph` is NOT run-record
@@ -124,7 +128,7 @@ use harness::engine::{LoopOutcome, Persistence, RunConfig, run_id, run_persisted
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
-use harness::prompt::render_task_prompt_from_spec;
+use harness::prompt::render_task_prompt_from_spec_with;
 use harness::ralph::{
     DEFAULT_MAX_BACKEND_ERRORS, DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport,
     RalphTerminal, run_ralph,
@@ -233,6 +237,17 @@ struct RunArgs {
     /// dispatch's sudo boundary does its `env_reset` (kb-02979 shape).
     #[arg(long)]
     transcript: Option<PathBuf>,
+
+    /// Opt-in the shared `## Criterion Coverage` prompt section (behavioural
+    /// per-criterion coverage, invariants, authoritative enumerations,
+    /// allowlists) — see [`harness::prompt::render_criteria_rules`]. Default
+    /// off.
+    ///
+    /// FLAG ONLY — there is deliberately no `TALOS_CRITERIA_RULES` env
+    /// fallback, for the same sudoers `env_keep` / `env_reset` reason
+    /// documented on [`RunArgs::transcript`] (kb-02979).
+    #[arg(long)]
+    criteria_rules: bool,
 }
 
 /// Arguments for `talos ralph`.
@@ -491,12 +506,16 @@ fn write_ralph_error_detail(
 
 /// Render the seed string passed to [`RunConfig::new`] for a task run.
 ///
-/// Returns the [`render_task_prompt_from_spec`] output byte-for-byte — the
-/// CLI never hand-formats task text. The engine re-wraps this under a
-/// `# Task` heading via `render_task_prompt`; the renderer therefore must
-/// NOT emit its own `# Task` heading.
-fn make_run_seed(spec: &TaskSpec) -> String {
-    render_task_prompt_from_spec(spec)
+/// Returns [`render_task_prompt_from_spec_with`]`(spec, true, criteria_rules)`
+/// output byte-for-byte — the CLI never hand-formats task text. Test-first
+/// guidance is always on (the literal `true`); the opt-in `## Criterion
+/// Coverage` section follows `--criteria-rules` (default off). When
+/// `criteria_rules == false` this is byte-identical to
+/// `harness::prompt::render_task_prompt_from_spec(spec)`. The engine re-wraps
+/// this under a `# Task` heading via `render_task_prompt`; the renderer
+/// therefore must NOT emit its own `# Task` heading.
+fn make_run_seed(spec: &TaskSpec, criteria_rules: bool) -> String {
+    render_task_prompt_from_spec_with(spec, true, criteria_rules)
 }
 
 /// Build a [`ChecksRunner`] from a shell gate command string, or `None` if the
@@ -897,7 +916,7 @@ async fn run_cmd(args: RunArgs) {
 
     // 10. Render the seed prompt — byte-for-byte from the renderer, never
     //     hand-formatted.
-    let seed = make_run_seed(&spec);
+    let seed = make_run_seed(&spec, args.criteria_rules);
 
     // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env > 0 (unbounded).
     // The `env` clap feature is NOT enabled (Cargo.toml features=['derive'] only),
@@ -1070,14 +1089,16 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
+        Backend, Cli, Command, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
         build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
         ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs, transcript_label,
         write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
-    use harness::prompt::render_task_prompt_from_spec;
+    use harness::prompt::{
+        render_criteria_rules, render_task_prompt_from_spec, render_task_prompt_from_spec_with,
+    };
     use harness::ralph::RalphTerminal;
     use harness::run_record::{Disposition, FailureMode, Verification};
     use harness::task_spec::{FileToModify, TaskSpec};
@@ -1439,7 +1460,7 @@ mod tests {
     #[test]
     fn seed_byte_identical_to_renderer_not_raw_description() {
         let spec = sample_spec();
-        let seed = make_run_seed(&spec);
+        let seed = make_run_seed(&spec, false);
         let expected = render_task_prompt_from_spec(&spec);
         assert_eq!(
             seed.as_bytes(),
@@ -1452,6 +1473,48 @@ mod tests {
             seed, spec.description,
             "seed must NOT be the raw description — the renderer must be used"
         );
+    }
+
+    /// The `--criteria-rules` arm must route through the same renderer with
+    /// `include_criteria_rules = true`, and must contain the shared section.
+    #[test]
+    fn seed_with_criteria_rules_matches_renderer_on_arm() {
+        let spec = sample_spec();
+        let seed = make_run_seed(&spec, true);
+        let expected = render_task_prompt_from_spec_with(&spec, true, true);
+        assert_eq!(
+            seed.as_bytes(),
+            expected.as_bytes(),
+            "seed must be byte-identical to render_task_prompt_from_spec_with(spec, true, true)"
+        );
+        assert!(
+            seed.contains(&render_criteria_rules()),
+            "seed must contain the rendered criteria-rules section; got:\n{seed}"
+        );
+    }
+
+    /// `--criteria-rules` defaults to off and flips true when passed.
+    #[test]
+    fn run_args_criteria_rules_flag_defaults_off() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["talos", "run", "--workspace", "w"])
+            .expect("parse without --criteria-rules");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(!args.criteria_rules, "--criteria-rules must default to off");
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "talos",
+            "run",
+            "--workspace",
+            "w",
+            "--criteria-rules",
+        ])
+        .expect("parse with --criteria-rules");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(args.criteria_rules, "--criteria-rules must flip to on");
     }
 
     // ---- summary: exact field set and outcome literals -----------------

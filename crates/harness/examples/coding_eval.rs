@@ -66,6 +66,10 @@
 //!   `<state-root>/talos/coding-eval/<unix-secs>-<pid>/<fixture>/trial-<i>.jsonl`;
 //!   `0`/empty/unset = off (the default). See
 //!   `harness::transcript::parse_transcripts_flag`.
+//! - `CODING_EVAL_CRITERIA_RULES` (optional) — `1` = on, opt-in the
+//!   `## Criterion Coverage` prompt section; `0`/empty/unset = off (the
+//!   default, matching production talos). See
+//!   `harness::prompt::parse_criteria_rules_flag`.
 
 use std::env;
 use std::fmt::Write as _;
@@ -262,6 +266,14 @@ async fn main() {
         env::var("CODING_EVAL_TRANSCRIPTS").ok().as_deref(),
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    // Criterion Coverage guidance is OFF by default, matching production
+    // talos. `CODING_EVAL_CRITERIA_RULES=1` opts in so the same fixtures can
+    // be run A/B.
+    let criteria_rules_on = harness::prompt::parse_criteria_rules_flag(
+        "CODING_EVAL_CRITERIA_RULES",
+        env::var("CODING_EVAL_CRITERIA_RULES").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let transcripts_root = transcripts_on.then(coding_eval_transcripts_root);
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears
     // the narrow-to-one-fixture override.
@@ -297,8 +309,9 @@ async fn main() {
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
          (max_iterations={max_iterations}, test_first={include_test_first}, \
-         transcripts={})",
+         criteria_rules={}, transcripts={})",
         fixtures.len(),
+        if criteria_rules_on { "on" } else { "off" },
         if transcripts_on { "on" } else { "off" },
     );
 
@@ -312,7 +325,8 @@ async fn main() {
             .and_then(|s| s.to_str())
             .unwrap_or("<unnamed>")
             .to_string();
-        let (mut task, env_factory) = coding_fix_task_with(fixture, include_test_first);
+        let (mut task, env_factory) =
+            coding_fix_task_with(fixture, include_test_first, criteria_rules_on);
         // Stamp the fixture name onto the task so the report says which
         // fixture ran — otherwise every report would just read `coding_fix`.
         task.name = fixture_name.clone();
@@ -364,12 +378,20 @@ async fn main() {
         .unwrap_or(0)
         .max("fixture".len());
 
-    print_summary(&summary, name_col);
+    print_summary(&summary, name_col, include_test_first, criteria_rules_on);
 }
 
 /// Render the final one-line-per-fixture summary table.
-fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
-    println!("\n=== SUMMARY ===");
+fn print_summary(
+    summary: &[(String, EvalReport)],
+    name_col: usize,
+    include_test_first: bool,
+    criteria_rules_on: bool,
+) {
+    println!(
+        "\n=== SUMMARY (test_first={include_test_first}, criteria_rules={}) ===",
+        if criteria_rules_on { "on" } else { "off" },
+    );
     println!(
         "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
         "fixture",

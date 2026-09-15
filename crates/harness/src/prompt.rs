@@ -34,6 +34,10 @@
 //! - [`render_task_prompt`] — render the task-framing prompt.
 //! - [`render_task_prompt_from_spec`] — render the task prompt from a groomed
 //!   [`crate::task_spec::TaskSpec`], producing the `{{ task }}` slot content.
+//! - [`render_criteria_rules`] — render the opt-in `## Criterion Coverage`
+//!   section (default off).
+//! - [`parse_criteria_rules_flag`] — parse the `*_CRITERIA_RULES` eval env
+//!   knobs.
 
 use askama::Template;
 use serde_json::Value;
@@ -121,6 +125,7 @@ struct TaskSpecPromptTemplate<'a> {
     files_to_modify: &'a [FileToModify],
     gate_command: &'a str,
     include_test_first: bool,
+    include_criteria_rules: bool,
 }
 
 /// The test-first ("red, green") approach guidance, factored into its own
@@ -134,6 +139,15 @@ struct TaskSpecPromptTemplate<'a> {
 #[derive(Template)]
 #[template(path = "test_first_approach.md", escape = "none")]
 struct TestFirstApproachTemplate;
+
+/// The opt-in `## Criterion Coverage` guidance, factored into its own
+/// template for the same reason as [`TestFirstApproachTemplate`]:
+/// [`TaskSpecPromptTemplate`] `{% include %}`s it for the groomed-item path,
+/// and [`render_criteria_rules`] renders it standalone for the tier-2
+/// mined-task path. Default OFF everywhere — see [`parse_criteria_rules_flag`].
+#[derive(Template)]
+#[template(path = "criteria_rules.md", escape = "none")]
+struct CriteriaRulesTemplate;
 
 /// The `## Verification` block, factored into its own template so the two
 /// surfaces that need it cannot drift apart: [`TaskSpecPromptTemplate`]
@@ -224,28 +238,39 @@ pub fn render_task_prompt(task: &str) -> String {
 /// The render is a pure function of its inputs and is byte-deterministic —
 /// re-rendering with the same [`TaskSpec`] produces identical bytes.
 ///
+/// This is the (test-first on, criteria-rules off) arm of
+/// [`render_task_prompt_from_spec_with`] — the production default.
+///
 /// # Panics
 /// Never in practice — see [`render_system_prompt`].
 #[must_use]
 pub fn render_task_prompt_from_spec(spec: &TaskSpec) -> String {
-    render_task_prompt_from_spec_with(spec, true)
+    render_task_prompt_from_spec_with(spec, true, false)
 }
 
-/// [`render_task_prompt_from_spec`] with the test-first approach section
-/// toggleable.
+/// [`render_task_prompt_from_spec`] with the test-first approach section and
+/// the opt-in `## Criterion Coverage` section independently toggleable.
 ///
-/// Exists so an eval can measure the guidance's effect by running the SAME
-/// harness with and without it. Production (talos dispatch) always renders it —
-/// `render_task_prompt_from_spec` hard-codes `true` — so a toggle can never
-/// silently disable it on the shipping path; only a caller that explicitly asks
-/// for `false` gets the stripped prompt.
+/// Exists so an eval can measure each guidance section's effect by running the
+/// SAME harness with and without it. talos's `make_run_seed` calls this
+/// function directly with a literal `true` for `include_test_first` (test-first
+/// stays on unconditionally, matching the shipping default), and forwards its
+/// `--criteria-rules` flag as `include_criteria_rules` — the criterion-coverage
+/// section is default OFF, reachable in production only via
+/// `talos run --criteria-rules`, and otherwise only via the eval knobs
+/// (`CODING_EVAL_CRITERIA_RULES` / `MINED_EVAL_CRITERIA_RULES`; see
+/// [`parse_criteria_rules_flag`]).
 ///
 /// The render is a pure function of its inputs and is byte-deterministic.
 ///
 /// # Panics
 /// Never in practice — see [`render_system_prompt`].
 #[must_use]
-pub fn render_task_prompt_from_spec_with(spec: &TaskSpec, include_test_first: bool) -> String {
+pub fn render_task_prompt_from_spec_with(
+    spec: &TaskSpec,
+    include_test_first: bool,
+    include_criteria_rules: bool,
+) -> String {
     TaskSpecPromptTemplate {
         title: &spec.title,
         description: &spec.description,
@@ -253,6 +278,7 @@ pub fn render_task_prompt_from_spec_with(spec: &TaskSpec, include_test_first: bo
         files_to_modify: &spec.files_to_modify,
         gate_command: &spec.gate_command,
         include_test_first,
+        include_criteria_rules,
     }
     .render()
     .expect("task_spec_prompt.md is a static template that renders infallibly for owned inputs")
@@ -319,6 +345,57 @@ pub fn render_test_first_approach() -> String {
         .expect("test_first_approach.md is a static variable-free template that renders infallibly")
 }
 
+/// Render the opt-in `## Criterion Coverage` guidance on its own.
+///
+/// For callers that assemble an agent prompt WITHOUT the task-spec template —
+/// today that is the tier-2 mined-task eval, whose prompt is the mined
+/// statement verbatim. Sharing one template with
+/// [`render_task_prompt_from_spec_with`] is the point: an experiment that
+/// changes the guidance must change it for both surfaces at once, or the eval
+/// stops measuring what dispatch actually ships.
+///
+/// Default OFF everywhere — see [`parse_criteria_rules_flag`] for the eval
+/// knob and `talos run --criteria-rules` for the production flag.
+///
+/// The render is a pure function of its (empty) inputs and is
+/// byte-deterministic — re-rendering produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_criteria_rules() -> String {
+    CriteriaRulesTemplate
+        .render()
+        .expect("criteria_rules.md is a static variable-free template that renders infallibly")
+}
+
+/// Parse an opt-in Criterion Coverage boolean flag read from the environment
+/// variable named `var_name` (the name is only used to build the `Err`
+/// message).
+///
+/// Deliberately mirrors [`crate::transcript::parse_transcripts_flag`]
+/// byte-for-byte in behaviour — it lives here, in `prompt`, rather than being
+/// shared with that function, so a prompt-surface knob does not read as a
+/// transcript flag.
+///
+/// The input is trimmed first. Empty (including `None`) or `"0"` means off;
+/// `"1"` means on. Anything else is an error naming `var_name` and the
+/// offending (untrimmed-echoed-as-trimmed) value.
+///
+/// # Errors
+/// Returns `Err` when the trimmed value is non-empty and neither `"0"` nor
+/// `"1"`.
+pub fn parse_criteria_rules_flag(var_name: &str, v: Option<&str>) -> Result<bool, String> {
+    let raw = v.map(str::trim).unwrap_or_default();
+    match raw {
+        "" | "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(format!(
+            "{var_name}: expected `0`, `1`, or empty, got `{other}`"
+        )),
+    }
+}
+
 /// Render the `## Verification` block on its own.
 ///
 /// For callers that assemble an agent prompt WITHOUT the task-spec template —
@@ -345,9 +422,9 @@ pub fn render_verification_section(gate_command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
-        render_ralph_prompt, render_system_prompt, render_task_prompt,
-        render_task_prompt_from_spec, render_task_prompt_from_spec_with,
+        NudgePromptTemplate, RalphPromptTemplate, ToolLine, parse_criteria_rules_flag,
+        render_criteria_rules, render_nudge_prompt, render_ralph_prompt, render_system_prompt,
+        render_task_prompt, render_task_prompt_from_spec, render_task_prompt_from_spec_with,
         render_test_first_approach, render_verification_section, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
@@ -816,8 +893,8 @@ mod tests {
             files_to_modify: vec![],
             gate_command: "cargo test".to_string(),
         };
-        let with = render_task_prompt_from_spec_with(&spec, true);
-        let without = render_task_prompt_from_spec_with(&spec, false);
+        let with = render_task_prompt_from_spec_with(&spec, true, false);
+        let without = render_task_prompt_from_spec_with(&spec, false, false);
 
         assert!(with.contains("## Approach"), "got:\n{with}");
         assert!(!without.contains("## Approach"), "got:\n{without}");
@@ -902,6 +979,197 @@ mod tests {
                  offending line: {line:?}; full output:\n{rendered}"
             );
         }
+    }
+
+    /// The rules-on arm must also carry the no-top-level-heading guarantee —
+    /// the new section must not introduce a `# ` heading of its own.
+    #[test]
+    fn render_task_prompt_from_spec_with_criteria_rules_no_top_level_heading() {
+        let spec = sentinel_spec();
+        let rendered = render_task_prompt_from_spec_with(&spec, true, true);
+        for line in rendered.lines() {
+            assert!(
+                line != "# Task",
+                "rendered slot content must not contain a line exactly equal to '# Task'; \
+                 got:\n{rendered}"
+            );
+            assert!(
+                !line.starts_with("# "),
+                "rendered slot content must not contain a top-level '# ' heading; \
+                 offending line: {line:?}; full output:\n{rendered}"
+            );
+        }
+    }
+
+    // --- render_criteria_rules tests -----------------------------------------
+
+    /// The pinned exact wording of the opt-in `## Criterion Coverage` section:
+    /// 11 lines joined by `\n` plus one trailing `\n`.
+    #[test]
+    fn render_criteria_rules_pins_exact_wording() {
+        let lines = [
+            "## Criterion Coverage",
+            "",
+            "Before you claim done, every acceptance criterion needs evidence. What counts as evidence depends on the kind of criterion:",
+            "",
+            "- A criterion that describes behaviour is covered by a test. If the task names the test (by name, file, or assertion), that test IS the coverage: write it as specified and do not add a parallel test for the same criterion.",
+            "- A criterion that is not behaviour (documentation wording, a grep or command check, a dependency or file-list rule) is covered by running that check once, not by writing a test for it. A criterion that a gate must pass is covered by the gate run itself.",
+            "- When a criterion says something must NOT change, must be preserved, or happens only under a condition, its test also checks the case where nothing should change and asserts that the thing stayed unchanged, not only that the new behaviour happened.",
+            "- When a criterion says \"all\", \"every\", \"any\", or \"not just one\", list the variants and test each one. If the task lists the variants, cover every one it lists. Whenever a variant maps to concrete identifiers defined by an external standard or library (for example metadata field IDs or protocol codes) and the task does not spell those identifiers out, derive them from an authoritative source in the environment (the library's constants, its installed docs or source, a real sample file), never from memory.",
+            "- When a criterion says to remove all of something and you are deciding what counts, prefer an allowlist of what to keep over a denylist of what to remove, so a variant you did not know about is removed by default.",
+            "",
+            "Cover the criteria as you work; this is not a checklist to re-run after your checks pass.",
+        ];
+        let expected = format!("{}\n", lines.join("\n"));
+        assert_eq!(
+            render_criteria_rules(),
+            expected,
+            "criteria-rules wording must match the pinned text exactly"
+        );
+    }
+
+    /// Phrase-guard: the section must speak in the pinned spec-agnostic
+    /// vocabulary and must NEVER slip back into asking for a test per
+    /// criterion or a re-verification pass.
+    #[test]
+    fn criteria_rules_never_asks_for_per_criterion_tests() {
+        let rendered = render_criteria_rules();
+        for phrase in [
+            "do not add a parallel test",
+            "not by writing a test",
+            "covered by the gate run itself",
+            "stayed unchanged",
+            "cover every one it lists",
+            "does not spell those identifiers out",
+            "never from memory",
+            "allowlist of what to keep",
+            "not a checklist to re-run",
+        ] {
+            assert!(
+                rendered.contains(phrase),
+                "expected phrase `{phrase}` in rendered criteria rules:\n{rendered}"
+            );
+        }
+        let lower = rendered.to_lowercase();
+        for phrase in [
+            "one test per criterion",
+            "a test for every",
+            "test for each criterion",
+            "every acceptance criterion needs a test",
+            "re-verify",
+        ] {
+            assert!(
+                !lower.contains(phrase),
+                "unexpected phrase `{phrase}` in rendered criteria rules:\n{rendered}"
+            );
+        }
+    }
+
+    /// The toggle inserts EXACTLY one copy of the shared section, in the
+    /// right slot (between Approach and Verification), and never on the
+    /// off arm — for both values of `include_test_first`.
+    #[test]
+    fn criteria_rules_toggle_inserts_exactly_one_section() {
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec!["a1".to_string()],
+            files_to_modify: vec![FileToModify {
+                path: "p".to_string(),
+                change: "c".to_string(),
+            }],
+            gate_command: "cargo test".to_string(),
+        };
+        for t in [true, false] {
+            let on = render_task_prompt_from_spec_with(&spec, t, true);
+            let off = render_task_prompt_from_spec_with(&spec, t, false);
+            assert_eq!(
+                on.replace(&render_criteria_rules(), ""),
+                off,
+                "t={t}: on:\n{on}\noff:\n{off}"
+            );
+            assert_eq!(
+                on.matches(&render_criteria_rules()).count(),
+                1,
+                "t={t}: expected exactly one section; got:\n{on}"
+            );
+            assert!(
+                on.contains(&format!("{}## Verification", render_criteria_rules())),
+                "t={t}: section must sit immediately before Verification; got:\n{on}"
+            );
+            assert!(
+                !off.contains("## Criterion Coverage"),
+                "t={t}: off arm must not contain the section; got:\n{off}"
+            );
+            if t {
+                assert!(
+                    on.contains(&format!(
+                        "{}{}",
+                        render_test_first_approach(),
+                        render_criteria_rules()
+                    )),
+                    "t=true: section must sit between Approach and Verification; got:\n{on}"
+                );
+            }
+        }
+        assert_eq!(
+            render_task_prompt_from_spec(&spec),
+            render_task_prompt_from_spec_with(&spec, true, false)
+        );
+        assert_ne!(
+            render_task_prompt_from_spec(&spec),
+            render_task_prompt_from_spec_with(&spec, true, true)
+        );
+    }
+
+    /// The finish-discipline "do not re-verify" line must survive in all four
+    /// `(include_test_first, include_criteria_rules)` combinations — the new
+    /// section must never crowd it out.
+    #[test]
+    fn do_not_reverify_line_survives_every_arm() {
+        let phrase = "Do not re-verify individual acceptance criteria with extra reads or commands";
+        let spec = TaskSpec {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            acceptance_criteria: vec![],
+            files_to_modify: vec![],
+            gate_command: "cargo test".to_string(),
+        };
+        for test_first in [true, false] {
+            for criteria_rules in [true, false] {
+                let rendered = render_task_prompt_from_spec_with(&spec, test_first, criteria_rules);
+                assert!(
+                    rendered.contains(phrase),
+                    "test_first={test_first} criteria_rules={criteria_rules}: got:\n{rendered}"
+                );
+            }
+        }
+        assert!(render_verification_section("cargo test").contains(phrase));
+    }
+
+    // --- parse_criteria_rules_flag tests --------------------------------------
+
+    #[test]
+    fn parse_criteria_rules_flag_covers_the_pinned_tuples() {
+        assert_eq!(parse_criteria_rules_flag("X", None), Ok(false));
+        assert_eq!(parse_criteria_rules_flag("X", Some("")), Ok(false));
+        assert_eq!(parse_criteria_rules_flag("X", Some("   ")), Ok(false));
+        assert_eq!(parse_criteria_rules_flag("X", Some("0")), Ok(false));
+        assert_eq!(parse_criteria_rules_flag("X", Some(" 0 ")), Ok(false));
+        assert_eq!(parse_criteria_rules_flag("X", Some("1")), Ok(true));
+        assert_eq!(parse_criteria_rules_flag("X", Some(" 1 ")), Ok(true));
+    }
+
+    #[test]
+    fn parse_criteria_rules_flag_error_is_pinned_verbatim() {
+        assert_eq!(
+            parse_criteria_rules_flag("CODING_EVAL_CRITERIA_RULES", Some("yes")),
+            Err("CODING_EVAL_CRITERIA_RULES: expected `0`, `1`, or empty, got `yes`".to_string())
+        );
+        assert_eq!(
+            parse_criteria_rules_flag("MINED_EVAL_CRITERIA_RULES", Some("true")),
+            Err("MINED_EVAL_CRITERIA_RULES: expected `0`, `1`, or empty, got `true`".to_string())
+        );
     }
 
     // --- verification_section factoring tests -------------------------------

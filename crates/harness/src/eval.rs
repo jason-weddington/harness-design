@@ -711,27 +711,33 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
 /// Panics if `fixture_src/task.json` exists but cannot be read or is not valid
 /// [`crate::task_spec::TaskSpec`] JSON — a broken fixture is a broken host.
 pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) {
-    coding_fix_task_with(fixture_src, true)
+    coding_fix_task_with(fixture_src, true, false)
 }
 
-/// [`coding_fix_task`] with the test-first approach guidance toggleable.
+/// [`coding_fix_task`] with the test-first approach guidance AND the opt-in
+/// Criterion Coverage guidance independently toggleable.
 ///
-/// Exists so the tier-1 eval can measure the guidance's effect A/B on the same
-/// fixtures. Tier-1 is the surface where the measurement is meaningful: it
-/// registers a real `run_checks` runner AND keeps a sealed holdout re-gate, so
-/// a test the agent writes counts during the run while the holdout stays an
-/// independent oracle. (Tier-2 cannot measure the benefit — its file-scoped
-/// gate never collects agent-authored tests and `copy_sealed` overwrites the
-/// ones written at sealed paths.)
+/// Exists so the tier-1 eval can measure each guidance section's effect A/B on
+/// the same fixtures. Tier-1 is the surface where the measurement is
+/// meaningful: it registers a real `run_checks` runner AND keeps a sealed
+/// holdout re-gate, so a test the agent writes counts during the run while the
+/// holdout stays an independent oracle. (Tier-2 cannot measure the benefit —
+/// its file-scoped gate never collects agent-authored tests and `copy_sealed`
+/// overwrites the ones written at sealed paths.)
+///
+/// `include_criteria_rules` is default OFF, matching production — see
+/// [`crate::prompt::parse_criteria_rules_flag`].
 ///
 /// Only affects the prompt when the fixture carries a `task.json`; the legacy
-/// bare-string prompt has no sections to toggle.
+/// bare-string prompt has no sections to toggle and `include_criteria_rules`
+/// has no effect on it.
 ///
 /// # Panics
 /// Same as [`coding_fix_task`].
 pub fn coding_fix_task_with(
     fixture_src: &Path,
     include_test_first: bool,
+    include_criteria_rules: bool,
 ) -> (EvalTask, impl Fn() -> TrialEnv) {
     let task_json_path = fixture_src.join("task.json");
     let task_prompt = if task_json_path.exists() {
@@ -739,7 +745,11 @@ pub fn coding_fix_task_with(
             .unwrap_or_else(|e| panic!("read {}: {e}", task_json_path.display()));
         let spec: crate::task_spec::TaskSpec = serde_json::from_str(&json_str)
             .unwrap_or_else(|e| panic!("parse {} as TaskSpec: {e}", task_json_path.display()));
-        crate::prompt::render_task_prompt_from_spec_with(&spec, include_test_first)
+        crate::prompt::render_task_prompt_from_spec_with(
+            &spec,
+            include_test_first,
+            include_criteria_rules,
+        )
     } else {
         "The test suite in this Rust crate fails. Find the bug, fix it, \
                and make the tests pass."
@@ -790,8 +800,8 @@ pub fn finish_task() -> EvalTask {
 mod tests {
     use super::{
         EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult, build_coding_env,
-        coding_fix_task, copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
-        run_eval_with_transcripts, score_holdout,
+        coding_fix_task, coding_fix_task_with, copy_dir_recursive, discover_fixtures, finish_env,
+        finish_task, run_eval, run_eval_with_transcripts, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -1746,6 +1756,48 @@ mod tests {
                and make the tests pass.",
             "without task.json the legacy literal must be used verbatim"
         );
+    }
+
+    /// `coding_fix_task_with(.., true, true)` routes through the SAME
+    /// production renderer as `render_task_prompt_from_spec_with` — not a
+    /// paraphrase — and the criteria-rules flag never reaches the legacy
+    /// no-`task.json` literal prompt.
+    #[test]
+    fn coding_fix_task_with_criteria_rules_routes_through_the_production_renderer() {
+        let dir = tempdir().expect("tempdir with task.json");
+        let spec_json = r#"{
+            "title": "Sentinel Task Title",
+            "description": "Does something.",
+            "acceptance_criteria": ["sentinel-acceptance-criterion"],
+            "files_to_modify": [],
+            "gate_command": "cargo test"
+        }"#;
+        std::fs::write(dir.path().join("task.json"), spec_json).expect("write task.json");
+        let spec: crate::task_spec::TaskSpec = serde_json::from_str(spec_json).expect("parse spec");
+
+        let (task_on, _) = coding_fix_task_with(dir.path(), true, true);
+        assert_eq!(
+            task_on.task,
+            crate::prompt::render_task_prompt_from_spec_with(&spec, true, true)
+        );
+        assert!(
+            task_on
+                .task
+                .contains(&crate::prompt::render_criteria_rules())
+        );
+
+        let (task_default, _) = coding_fix_task(dir.path());
+        assert!(
+            !task_default.task.contains("## Criterion Coverage"),
+            "coding_fix_task must stay criteria-rules-off by default; got:\n{}",
+            task_default.task
+        );
+
+        // Without task.json, the flag cannot reach the legacy literal prompt.
+        let dir_without = tempdir().expect("tempdir without task.json");
+        let (task_without_on, _) = coding_fix_task_with(dir_without.path(), true, true);
+        let (task_without_default, _) = coding_fix_task(dir_without.path());
+        assert_eq!(task_without_on.task, task_without_default.task);
     }
 
     /// A malformed (non-TaskSpec) `task.json` must cause a panic whose message
