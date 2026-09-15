@@ -12,6 +12,16 @@ The first cap-500 matrix produced 12 real false dones in 96 trials (glm-5.3 3, g
 2. **Exhaustiveness — "all of X, not just one."** photoqueue-privacy-metadata AC1 says no readable location may remain "anywhere in the file's metadata … it is not enough to remove one representation of the location while another remains readable." Agents strip EXIF GPS and leave IPTC and XMP place names (`Columbia, Maryland, United States` survives). flash 1, qwen3.8 2, qwen3.6 1.
 3. **Regressions outside the agent's attention.** qwen3.6 on cleanr-comment-filters broke two existing behaviours (`unexcluded_red=2`) while its project gate was green.
 
+### What the transcripts showed (overnight, 2026-09-15)
+
+The re-run with wording pinned (cap 500, k=3) had qwen3.8 at 256K with full transcripts on (`MINED_EVAL_TRANSCRIPTS=1`). All three of its false dones were on photoqueue-privacy-metadata, and the transcripts overturn my first reading of shape 2. The agent did **not** skip the "every representation" clause. It reasoned about IPTC and XMP hundreds of times and wrote a thorough test (`test_strip_location_removes_all_human_readable_location`): it builds a synthetic JPEG with location in EXIF, IPTC and XMP, then asserts that the place names are gone. But the model's recalled list of IPTC location datasets is wrong. It handles 2:90/2:91/2:92/2:99 and never 2:100/2:101 (country code/name), sometimes not 2:95 (state), and for XMP misses `Iptc4xmpCore:CountryCode`. The synthetic fixture, the stripper and the test all share that misconception, so the test passes by construction, and the sealed test with a real photo finds `{(2, 95): 'Maryland', (2, 100): 'US', (2, 101): 'United States'}` still there. The same field set recurs across all three trials, so this is a stable training-prior error, a **context failure**: the right enumeration exists in the environment (Pillow's IPTC handling, the IPTC IIM spec, any real sample photo) but the model reasoned from memory.
+
+That adds a fourth shape and changes the recommendation:
+
+4. **Self-consistent misconception.** The agent's test covers the clause but shares the implementation's wrong domain knowledge, so the gate is green and the test is vacuous. Across both cap-500 runs this was the single largest source of real false dones (7 of 12, all privacy-metadata).
+
+Implications: a per-criterion-test prompt (A) and an acceptance audit (B) both rely on the agent's own understanding, so neither catches shape 4. What does is making the evidence independent of the model's memory. Two general rules can be added to the same prompt/audit surface: **derive enumerations of standard fields from an authoritative source in the environment** (library constants, installed docs, a real sample file), not recall; and **for "remove all of X" requirements, prefer an allowlist of what to keep over a denylist of what to remove.** Either one would have fixed every privacy false done we saw: an allowlist that keeps caption and keywords and drops every other IPTC/XMP location-bearing field makes the 2:100/2:101 gap impossible.
+
 ## Why the harness lets these through
 
 The only thing standing between "I think I'm done" and an accepted Done is the project gate (`engine.rs` `handle_finish_call`: gate green → `Disposition::Done`). The gate runs the repo's existing tests plus whatever the agent wrote. The agents do write tests — nearly every false-done trial modified 1-3 test files — but those tests cover the positive path they just implemented. Nothing in the prompt or the loop makes the agent map *each* criterion, and specifically the negative and exhaustive ones, to evidence before it claims. The model has the capability (the same models resolve these tasks in other trials); the workflow never asks for the check at the moment it matters. That is an orchestration failure, not a capability gap.
@@ -65,4 +75,10 @@ Both parts reach `talos run` through the shared template and `RunConfig`, so wha
 
 ## Decision needed
 
-Approve A+B+C for the experiment above (one groomed item for B+C, a template edit for A, then a dispatch plus an overnight A/B), or pick a subset. My recommendation is to build C first, then run B alone against baseline, because B is the part most likely to move false dones and the cleanest to attribute.
+Revised after the transcripts (2026-09-15). My recommendation now is a single prompt-level change first, measured on its own, because the dominant shape is a context failure the audit cannot see:
+
+1. **A′ (revised A):** extend `test_first_approach.md` with the per-criterion rule for invariants and exhaustiveness, plus the two independence rules: derive enumerations of standard fields from an authoritative source in the environment rather than memory, and prefer allowlists for "remove all of X". One template, both surfaces (production `talos run` and tier-2), no engine change.
+2. Measure A′ against baseline on flash + qwen3.8, k=5 on the three false-done-prone tasks plus k=3 on the full 8.
+3. Build B (the acceptance audit) only if the invariant shape (rollout-deadlock) survives A′. C is mostly delivered by transcripts; the final-diff capture is a small add-on.
+
+Alternatively approve A′+B together if you would rather spend one overnight run than two. Either way this is your call, since it changes the production prompt.
