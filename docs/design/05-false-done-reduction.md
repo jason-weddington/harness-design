@@ -1,6 +1,6 @@
 # 05 — Reducing false dones: per-criterion tests + a one-shot acceptance audit
 
-Status: **PROPOSED** (2026-09-14, for Jason's review). Nothing here is built. Data: `kb-03252` (first representative tier-2 matrix), `kb-03240` (production-parity gate).
+Status: **MEASURED — NEGATIVE (2026-09-16).** A′ and B are built and merged, DEFAULT OFF everywhere, and neither shows a benefit on the shape it targets (`kb-03283`). Do not flip either default on this evidence. Details in the Result section at the end. Data: `kb-03252` (first representative tier-2 matrix), `kb-03240` (production-parity gate).
 
 ## The problem
 
@@ -98,3 +98,18 @@ Revised after the transcripts (2026-09-15). My recommendation now is a single pr
 3. Build B (the acceptance audit) only if the invariant shape (rollout-deadlock) survives A′. C is mostly delivered by transcripts; the final-diff capture is a small add-on.
 
 Alternatively approve A′+B together if you would rather spend one overnight run than two. Either way this is your call, since it changes the production prompt.
+
+## Result (2026-09-16): both knobs measured, neither earns a default flip
+
+Decisive run: photoqueue-privacy-metadata only (the dominant false-done shape), qwen3.8:27b at 256K, cap 500, **k=10 per arm**, transcripts on. Primary metric is the **probe rate** — did the agent derive the IPTC field list from an authoritative source (`PIL.IptcImagePlugin.getiptcinfo`, a real file) instead of memory — because that is the behaviour A′ is supposed to induce and it varies far less than resolution.
+
+| arm | resolved | false dones | probe rate | mentions 2:100/2:101 | allowlist language |
+|---|---|---|---|---|---|
+| baseline | 2/10 | 8 | 0/10 | 0/10 | 0/10 |
+| A′ (criteria rules on) | 3/10 | 7 | 0/10 | 0/10 | 0/10 |
+
+**A′ produced no behavioural change on its target shape.** The rule sits in the prompt and the agent does not act on it; 2/10 → 3/10 is noise. **B is equally unproven:** on every trial where an arm looked better (qwen tier-2 24/24 vs 21/24 baseline; haiku tier-1 false dones 2 → 0) `audit_changed_tree` was false — the audit fired, the model wrote a 700-3000 character evidence list, and then made no edits, so it cannot have fixed the work. The tier-1 perfect-spec guard was clean (no pass-rate or cap-hit regression; flash paid 30-40% more tokens for nothing on saturated fixtures), so the features are harmless, just not useful yet.
+
+Process note, the same shape as `kb-03201`: the first read of these arms called the mechanism confirmed from ONE k=3 transcript where the agent happened to probe PIL. The telemetry (`audit_changed_tree`) and the k=10 behavioural metric both refuted it. For a prompt or loop change, measure the behaviour the change should induce before any outcome claim.
+
+Open direction: this shape may be a model-knowledge (context) gap that prompt text cannot close, in which case it is a legitimate routing **discriminator** — glm-5.3 resolves this task where qwen3.8 does not — rather than a harness defect. Anything tried next (a metadata-inspection affordance, an allowlist default, a retrieval step) gets measured probe-rate-first at k=10 before outcomes are quoted.
