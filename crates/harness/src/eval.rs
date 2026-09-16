@@ -386,12 +386,29 @@ pub struct EvalTranscripts {
     pub label: String,
 }
 
-/// Same as [`run_eval`], with an extra opt-in transcript sink. `run_eval` is
-/// a one-line delegate to this function with `transcripts: None` — see the
-/// module docs on [`run_eval`] for the full trial-loop contract (per-trial
-/// isolation, holdout re-gate, `on_trial` callback timing).
+/// Opt-in knobs for [`run_eval_with_options`], bundled into one struct so
+/// adding a knob later doesn't force every caller to change (the same
+/// rationale as [`crate::engine::RunConfig`]).
+#[derive(Debug, Clone, Default)]
+pub struct EvalOptions {
+    /// Opt-in transcript sink — see [`EvalTranscripts`]. `None` (the
+    /// [`Default`]) means no trial writes a transcript.
+    pub transcripts: Option<EvalTranscripts>,
+    /// Opt-in one-shot acceptance audit (design doc 05 section B), applied to
+    /// every trial's [`RunConfig`] via
+    /// [`crate::engine::RunConfig::with_acceptance_audit`]. `false` (the
+    /// [`Default`]) matches production.
+    pub acceptance_audit: bool,
+}
+
+/// Same as [`run_eval`], with the opt-in knobs bundled in [`EvalOptions`].
+/// [`run_eval_with_transcripts`] is a thin delegate to this function
+/// (`EvalOptions { transcripts: transcripts.cloned(), acceptance_audit: false
+/// }`), and `run_eval` delegates to that — see the module docs on
+/// [`run_eval`] for the full trial-loop contract (per-trial isolation,
+/// holdout re-gate, `on_trial` callback timing).
 ///
-/// When `transcripts` is `Some(t)`, trial `i` (0-based) runs with
+/// When `options.transcripts` is `Some(t)`, trial `i` (0-based) runs with
 /// `config.with_transcript(t.dir.join(format!("trial-{i}.jsonl")),
 /// t.label.clone())`, and that path is recorded on the trial's
 /// [`TrialResult::transcript_path`]. When `None`, no transcript config is
@@ -399,25 +416,29 @@ pub struct EvalTranscripts {
 ///
 /// # Panics
 /// See [`run_eval`].
-pub async fn run_eval_with_transcripts(
+pub async fn run_eval_with_options(
     task: &EvalTask,
     backend: &impl ModelBackend,
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
-    transcripts: Option<&EvalTranscripts>,
+    options: &EvalOptions,
     mut on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
     let mut passes: u32 = 0;
     let mut trial_results: Vec<TrialResult> = Vec::with_capacity(k as usize);
     for i in 0..k {
         let env = env_factory();
-        let mut config = RunConfig::new(task.task.clone(), max_iterations);
+        let mut config = RunConfig::new(task.task.clone(), max_iterations)
+            .with_acceptance_audit(options.acceptance_audit);
         if let Some(checks) = env.checks.clone() {
             config = config.with_checks(checks);
         }
-        let transcript_path = transcripts.map(|t| t.dir.join(format!("trial-{i}.jsonl")));
-        if let (Some(path), Some(t)) = (&transcript_path, transcripts) {
+        let transcript_path = options
+            .transcripts
+            .as_ref()
+            .map(|t| t.dir.join(format!("trial-{i}.jsonl")));
+        if let (Some(path), Some(t)) = (&transcript_path, &options.transcripts) {
             config = config.with_transcript(path.clone(), t.label.clone());
         }
         let RunResult { outcome, stats } =
@@ -465,6 +486,37 @@ pub async fn run_eval_with_transcripts(
         pass_rate,
         trial_results,
     }
+}
+
+/// Same as [`run_eval`], with an extra opt-in transcript sink. A thin
+/// delegate over [`run_eval_with_options`] with `acceptance_audit: false` —
+/// see the module docs on [`run_eval`] for the full trial-loop contract.
+///
+/// # Panics
+/// See [`run_eval`].
+pub async fn run_eval_with_transcripts(
+    task: &EvalTask,
+    backend: &impl ModelBackend,
+    env_factory: impl Fn() -> TrialEnv,
+    k: u32,
+    max_iterations: u32,
+    transcripts: Option<&EvalTranscripts>,
+    on_trial: impl FnMut(&TrialResult),
+) -> EvalReport {
+    let options = EvalOptions {
+        transcripts: transcripts.cloned(),
+        acceptance_audit: false,
+    };
+    run_eval_with_options(
+        task,
+        backend,
+        env_factory,
+        k,
+        max_iterations,
+        &options,
+        on_trial,
+    )
+    .await
 }
 
 /// An owned scratch directory that deletes itself on drop.
@@ -799,9 +851,10 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult, build_coding_env,
-        coding_fix_task, coding_fix_task_with, copy_dir_recursive, discover_fixtures, finish_env,
-        finish_task, run_eval, run_eval_with_transcripts, score_holdout,
+        EvalOptions, EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult,
+        build_coding_env, coding_fix_task, coding_fix_task_with, copy_dir_recursive,
+        discover_fixtures, finish_env, finish_task, run_eval, run_eval_with_options,
+        run_eval_with_transcripts, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -1351,6 +1404,15 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
+                audit_armed: false,
+                audit_fired: false,
+                audit_iteration: 0,
+                audit_changed_tree: false,
+                audit_rubber_stamped: false,
+                audit_reply_text_chars: 0,
+                audit_followup_edit_file_ok: 0,
+                audit_followup_bash_ok: 0,
+                audit_followup_red_done: 0,
             },
             transcript_path: None,
         };
@@ -1869,6 +1931,15 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
+                audit_armed: false,
+                audit_fired: false,
+                audit_iteration: 0,
+                audit_changed_tree: false,
+                audit_rubber_stamped: false,
+                audit_reply_text_chars: 0,
+                audit_followup_edit_file_ok: 0,
+                audit_followup_bash_ok: 0,
+                audit_followup_red_done: 0,
             },
             transcript_path: None,
         };
@@ -2150,5 +2221,67 @@ mod tests {
         );
         let result2 = score_holdout(&holdout_src, &red_checks, &ctx2).await;
         assert!(!result2, "red gate must return false");
+    }
+
+    /// [`run_eval_with_options`]'s `acceptance_audit` knob reaches every
+    /// trial's [`RunConfig`] — on, the trial's `stats.audit_fired` is `true`
+    /// and the audit consumes an extra iteration; off (`run_eval`'s default),
+    /// it never fires.
+    #[tokio::test]
+    async fn acceptance_audit_option_reaches_every_trial_run_config() {
+        fn passing_env() -> TrialEnv {
+            TrialEnv {
+                tools: registry(),
+                ctx: ToolCtx::stub(),
+                checks: Some(ChecksRunner::new(
+                    CheckCommand {
+                        program: "/bin/sh".to_string(),
+                        args: vec!["-c".to_string(), "exit 0".to_string()],
+                    },
+                    PathBuf::from("/"),
+                    Duration::from_secs(10),
+                )),
+                holdout_src: None,
+                _scratch: Vec::new(),
+            }
+        }
+        fn finish_done_turn(call_id: &str) -> AssistantTurn {
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: call_id.to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: json!({"disposition": "done", "summary": "shipped"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            }
+        }
+        let task = finish_task();
+
+        // ON: the audit fires and consumes an extra iteration.
+        let backend_on =
+            MockBackend::from_turns(vec![finish_done_turn("c1"), finish_done_turn("c2")]);
+        let options_on = EvalOptions {
+            transcripts: None,
+            acceptance_audit: true,
+        };
+        let report_on =
+            run_eval_with_options(&task, &backend_on, passing_env, 1, 5, &options_on, |_| {}).await;
+        assert_eq!(report_on.trial_results.len(), 1);
+        assert!(report_on.trial_results[0].stats.audit_fired);
+        assert_eq!(report_on.trial_results[0].stats.iterations, 2);
+
+        // OFF: no audit, one iteration.
+        let backend_off = MockBackend::from_turns(vec![finish_done_turn("c1")]);
+        let options_off = EvalOptions {
+            transcripts: None,
+            acceptance_audit: false,
+        };
+        let report_off =
+            run_eval_with_options(&task, &backend_off, passing_env, 1, 5, &options_off, |_| {})
+                .await;
+        assert_eq!(report_off.trial_results.len(), 1);
+        assert!(!report_off.trial_results[0].stats.audit_fired);
+        assert_eq!(report_off.trial_results[0].stats.iterations, 1);
     }
 }

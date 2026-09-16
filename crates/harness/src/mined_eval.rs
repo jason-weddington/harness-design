@@ -1588,6 +1588,12 @@ pub async fn sealed_regate_score_with_timeout<P: TestReportParser + ?Sized>(
 ///
 /// The build agent may ADD fields; the pinned ones (needed by the false-done
 /// cross-tab and by the audit trail) MUST NOT be omitted.
+///
+/// `struct_excessive_bools`: each `bool` is an independent per-trial signal
+/// (finish-recovery arming, gate state, and the acceptance-audit telemetry)
+/// copied verbatim from [`crate::engine::RunStats`] — see that struct's own
+/// `struct_excessive_bools` allow for the same rationale.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct MinedTrialResult {
     /// Zero-based trial index.
@@ -1718,6 +1724,37 @@ pub struct MinedTrialResult {
     /// `engine::run`). The file may be missing or partial if the best-effort
     /// [`crate::transcript`] writer disabled itself.
     pub transcript_path: Option<PathBuf>,
+    /// Whether the acceptance audit was structurally armed this trial: true
+    /// iff [`MinedRunConfig::acceptance_audit`] AND checks are configured.
+    /// From [`crate::engine::RunStats::audit_armed`]. `false` on every
+    /// pre-agent `invalid_trial` path and in [`AgentGateMode::Off`] (which
+    /// passes `checks: None`, per [`Self::gates_green_at_exit`]'s doc).
+    pub audit_armed: bool,
+    /// Whether the acceptance audit fired this trial.
+    /// From [`crate::engine::RunStats::audit_fired`].
+    pub audit_fired: bool,
+    /// The 1-based iteration at which the audit fired; `0` when it did not.
+    /// From [`crate::engine::RunStats::audit_iteration`].
+    pub audit_iteration: u32,
+    /// Whether a real edit ran strictly after the audit fired.
+    /// From [`crate::engine::RunStats::audit_changed_tree`].
+    pub audit_changed_tree: bool,
+    /// Whether the followup turn was a single bare `finish(done)` claim.
+    /// From [`crate::engine::RunStats::audit_rubber_stamped`].
+    pub audit_rubber_stamped: bool,
+    /// Char count of the followup turn's text.
+    /// From [`crate::engine::RunStats::audit_reply_text_chars`].
+    pub audit_reply_text_chars: u32,
+    /// Successful `edit_file` calls strictly after the audit fired.
+    /// From [`crate::engine::RunStats::audit_followup_edit_file_ok`].
+    pub audit_followup_edit_file_ok: u32,
+    /// Successful `bash` calls strictly after the audit fired.
+    /// From [`crate::engine::RunStats::audit_followup_bash_ok`].
+    pub audit_followup_bash_ok: u32,
+    /// `finish(done)` calls rejected by a red gate strictly after the audit
+    /// fired — the design-05 Risk-1 churn signal.
+    /// From [`crate::engine::RunStats::audit_followup_red_done`].
+    pub audit_followup_red_done: u32,
 }
 
 /// The full run report over `k` trials of one task.
@@ -2040,6 +2077,13 @@ fn sanitize_for_filename(s: &str) -> String {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Options for [`run_mined_task`].
+///
+/// `struct_excessive_bools`: each `bool` is an independent opt-in knob
+/// (test-first guidance, transcripts, criteria rules, the acceptance audit)
+/// threaded straight into a distinct `RunConfig` builder call — see
+/// [`crate::engine::RunStats`]'s own `struct_excessive_bools` allow for the
+/// same rationale.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MinedRunConfig<'a> {
     /// The task directory holding `task.json`, `statements/`, and `sealed/`.
     pub task_dir: &'a Path,
@@ -2076,6 +2120,14 @@ pub struct MinedRunConfig<'a> {
     /// agent prompt. Default OFF — set from `MINED_EVAL_CRITERIA_RULES` (see
     /// [`crate::prompt::parse_criteria_rules_flag`]).
     pub criteria_rules: bool,
+    /// Whether the opt-in one-shot acceptance audit (design doc 05 section B)
+    /// is applied to every trial's `RunConfig`. Default OFF — set from
+    /// `MINED_EVAL_ACCEPTANCE_AUDIT` (see
+    /// [`crate::transcript::parse_transcripts_flag`], reused for its `0`/`1`
+    /// shape). Structurally inert under [`AgentGateMode::Off`], which passes
+    /// `checks: None` to every trial's `RunConfig` — the audit only fires on
+    /// a checks-verified `finish(done)`.
+    pub acceptance_audit: bool,
 }
 
 /// Run the whole mined-task eval: `k` independent trials, each with a fresh
@@ -2203,7 +2255,8 @@ async fn single_trial<B: ModelBackend>(
         ),
         config.max_iterations,
     )
-    .with_wall_clock_secs(config.wall_clock_secs);
+    .with_wall_clock_secs(config.wall_clock_secs)
+    .with_acceptance_audit(config.acceptance_audit);
     if let Some(runner) = checks.clone() {
         run_config = run_config.with_checks(runner);
     }
@@ -2305,6 +2358,15 @@ async fn single_trial<B: ModelBackend>(
         agent_gate_post,
         agent_gate_output_path,
         transcript_path,
+        audit_armed: stats.audit_armed,
+        audit_fired: stats.audit_fired,
+        audit_iteration: stats.audit_iteration,
+        audit_changed_tree: stats.audit_changed_tree,
+        audit_rubber_stamped: stats.audit_rubber_stamped,
+        audit_reply_text_chars: stats.audit_reply_text_chars,
+        audit_followup_edit_file_ok: stats.audit_followup_edit_file_ok,
+        audit_followup_bash_ok: stats.audit_followup_bash_ok,
+        audit_followup_red_done: stats.audit_followup_red_done,
     }
 }
 
@@ -2346,6 +2408,15 @@ fn invalid_trial(
         agent_gate_post: None,
         agent_gate_output_path: None,
         transcript_path: None,
+        audit_armed: false,
+        audit_fired: false,
+        audit_iteration: 0,
+        audit_changed_tree: false,
+        audit_rubber_stamped: false,
+        audit_reply_text_chars: 0,
+        audit_followup_edit_file_ok: 0,
+        audit_followup_bash_ok: 0,
+        audit_followup_red_done: 0,
     }
 }
 
@@ -3904,6 +3975,15 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate_post: None,
             agent_gate_output_path: None,
             transcript_path: None,
+            audit_armed: false,
+            audit_fired: false,
+            audit_iteration: 0,
+            audit_changed_tree: false,
+            audit_rubber_stamped: false,
+            audit_reply_text_chars: 0,
+            audit_followup_edit_file_ok: 0,
+            audit_followup_bash_ok: 0,
+            audit_followup_red_done: 0,
         }
     }
 
@@ -4444,6 +4524,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         // Silence FinishTool's `use` warning across the impl surface.
         let _ = FinishTool;
@@ -4553,6 +4634,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: true,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let _ = FinishTool;
         let mut on_trial = |_t: &MinedTrialResult| {};
@@ -4680,6 +4762,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4723,6 +4806,114 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     }
 
     #[tokio::test]
+    async fn acceptance_audit_on_with_agent_gate_on_fires_and_consumes_one_extra_turn() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
+
+        let finish_done = |call_id: &str| AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: call_id.to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        };
+        let backend = MockBackend::from_turns(vec![finish_done("c1"), finish_done("c2")]);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+            criteria_rules: false,
+            acceptance_audit: true,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert!(trial.audit_armed);
+        assert!(trial.audit_fired);
+        assert_eq!(trial.iterations, 2);
+        assert_eq!(backend.calls(), 2);
+        assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_on_with_agent_gate_off_is_structurally_inert() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, task, statement) = agent_gate_task_fixture();
+
+        let backend = MockBackend::from_turns(vec![AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c1".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }]);
+
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+            criteria_rules: false,
+            acceptance_audit: true,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert!(
+            !trial.audit_armed,
+            "Off mode passes checks: None, so the audit is structurally unreachable"
+        );
+        assert!(!trial.audit_fired);
+        assert_eq!(trial.iterations, 1);
+        assert_eq!(backend.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn agent_gate_tripwire_threads_the_mode_timeout() {
         use super::{MinedRunConfig, run_mined_task};
         use crate::test_support::MockBackend;
@@ -4746,6 +4937,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4789,6 +4981,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4874,6 +5067,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4951,6 +5145,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5006,6 +5201,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5094,6 +5290,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: true,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let _report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5142,6 +5339,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5205,6 +5403,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 1,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5249,6 +5448,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5295,6 +5495,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5717,6 +5918,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5770,6 +5972,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: false,
             criteria_rules: false,
+            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;

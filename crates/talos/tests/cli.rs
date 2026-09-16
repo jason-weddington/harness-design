@@ -312,6 +312,10 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
             .contains("## Criterion Coverage"),
         "run_start.messages must not contain the Criterion Coverage heading by default"
     );
+    assert_eq!(
+        lines[0]["config"]["acceptance_audit"], false,
+        "acceptance_audit is off by default (no --acceptance-audit flag)"
+    );
 
     // Line 2: model_request (iteration 1).
     assert_eq!(lines[1]["event"], "model_request");
@@ -336,6 +340,75 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
     // Line 7: run_end, outcome matching the stdout RunSummary.
     assert_eq!(lines[6]["event"], "run_end");
     assert_eq!(lines[6]["outcome"], summary_outcome);
+}
+
+/// Same refused-port `BackendError` retry-exhaustion shape as
+/// [`transcript_flag_writes_pinned_seven_lines_on_backend_error`], with
+/// `--acceptance-audit` added — the flag must reach `run_start.config` (the
+/// transcript's `acceptance_audit` key flips to `true`) while the pinned
+/// 7-line shape and exit code are unchanged (`BackendError` never reaches the
+/// finish path, so the audit itself cannot fire here).
+#[tokio::test(flavor = "current_thread")]
+async fn acceptance_audit_flag_reaches_run_start_config() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("t").join("run.jsonl");
+
+    let task_id = "cli-test-acceptance-audit";
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            task_id,
+            "--attempt",
+            "1",
+            "--transcript",
+            transcript_path.to_str().unwrap(),
+            "--acceptance-audit",
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    let contents = std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each transcript line is valid JSON"))
+        .collect();
+    assert_eq!(lines[0]["event"], "run_start");
+    assert_eq!(
+        lines[0]["config"]["acceptance_audit"], true,
+        "--acceptance-audit must reach run_start.config"
+    );
 }
 
 // ============================================================================

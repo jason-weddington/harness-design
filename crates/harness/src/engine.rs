@@ -171,6 +171,14 @@ pub struct RunConfig {
     /// written and the loop does zero transcript-related filesystem I/O or
     /// event-payload construction. Set via [`RunConfig::with_transcript`].
     pub transcript: Option<TranscriptConfig>,
+    /// Opt-in one-shot acceptance audit (design doc 05 section B). `false`
+    /// (the default set by [`RunConfig::new`]) means the loop never holds
+    /// back a gate-green `finish(done)`. When `true`, the FIRST gate-green
+    /// `finish(done)` per loop invocation is held back once and the model is
+    /// asked to map each acceptance criterion to evidence already produced
+    /// in the run — see [`crate::prompt::render_acceptance_audit_prompt`].
+    /// Set via [`RunConfig::with_acceptance_audit`].
+    pub acceptance_audit: bool,
 }
 
 /// The default per-turn output cap. Sized for reasoning models: a model whose
@@ -229,6 +237,7 @@ impl RunConfig {
             wall_clock_secs: 0,
             clock: Arc::new(SystemClock),
             transcript: None,
+            acceptance_audit: false,
         }
     }
 
@@ -310,6 +319,14 @@ impl RunConfig {
             path: path.into(),
             label: label.into(),
         });
+        self
+    }
+
+    /// Turn on the opt-in one-shot acceptance audit (`false` by default —
+    /// see [`RunConfig::acceptance_audit`]).
+    #[must_use]
+    pub fn with_acceptance_audit(mut self, on: bool) -> Self {
+        self.acceptance_audit = on;
         self
     }
 }
@@ -563,6 +580,12 @@ impl FinishClaim {
 /// Deliberately NOT `serde`: persistence wiring
 /// (into [`crate::run_record`]) is a later milestone; this type is the
 /// in-memory shape the loop hands its caller today.
+///
+/// `struct_excessive_bools`: each `bool` here is an independent latch or
+/// telemetry flag captured once at a distinct site in the loop (finish
+/// discipline, tree mutation, and the acceptance-audit arm) — a state
+/// machine or bitflags would obscure, not clarify, what each one means.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunStats {
     /// Logical iterations executed — one per `for`-loop pass. Retry draws
@@ -651,6 +674,68 @@ pub struct RunStats {
     /// set. Counted since THIS loop invocation — a resumed run (`resume`,
     /// engine.rs:1808) starts from zero.
     pub first_invalid_finish_raw: Option<String>,
+    /// Set ONCE at loop entry to `config.acceptance_audit &&
+    /// config.checks.is_some()` — distinguishes a structurally-inert
+    /// acceptance-audit arm (the flag is on but no checks are configured, so
+    /// the audit can never fire) from one that was armed but never
+    /// triggered. Mirrors the existing `MinedTrialResult::finish_recovery_armed`
+    /// convention. Counted since THIS loop invocation — a resumed run
+    /// (`resume`, engine.rs:1808) starts from zero.
+    pub audit_armed: bool,
+    /// Whether the opt-in one-shot acceptance audit (design doc 05 section B)
+    /// fired THIS loop invocation — the first gate-green `finish(done)` was
+    /// held back once to ask the model to cite evidence already produced in
+    /// the run. `false` when `acceptance_audit` is off, when no gate-green
+    /// `finish(done)` was ever attempted, or when the audit latch was already
+    /// seeded from resumed history. Counted since THIS loop invocation — a
+    /// resumed run (`resume`, engine.rs:1808) starts from zero.
+    pub audit_fired: bool,
+    /// The 1-based `stats.iterations` value at which the audit fired this
+    /// loop invocation; `0` when it did not fire. Counted since THIS loop
+    /// invocation — a resumed run (`resume`, engine.rs:1808) starts from
+    /// zero.
+    pub audit_iteration: u32,
+    /// `audit_fired` AND at least one successful (`!is_error`) `edit_file` or
+    /// `bash` call executed in an iteration STRICTLY AFTER `audit_iteration`
+    /// — the same classifier that drives `mutated_this_iter`/`tree_dirty`.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero.
+    pub audit_changed_tree: bool,
+    /// `audit_fired` AND the assistant turn of the iteration immediately
+    /// after `audit_iteration` contains exactly one tool call, named
+    /// `finish`, whose claimed disposition is `done` — evaluated on the
+    /// CLAIM, regardless of whether verification then accepts it. A
+    /// no-tool-call turn or a turn with any other tool call is `false`.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero.
+    pub audit_rubber_stamped: bool,
+    /// Total `char` count of the assistant turn's text (`AssistantTurn::text`,
+    /// Reasoning excluded) for the iteration immediately after
+    /// `audit_iteration`; `0` when the audit did not fire this loop
+    /// invocation. `audit_rubber_stamped && audit_reply_text_chars == 0` is
+    /// the rubber-stamp theatre signal — it separates rubber-stamping from
+    /// the ideal single-turn compliant reply. Counted since THIS loop
+    /// invocation — a resumed run (`resume`, engine.rs:1808) starts from
+    /// zero.
+    pub audit_reply_text_chars: u32,
+    /// Count of successful (`!is_error`) `edit_file` calls in iterations
+    /// STRICTLY AFTER `audit_iteration`; `0` when the audit did not fire this
+    /// loop invocation. Split out from `audit_changed_tree` so a real code
+    /// edit is distinguishable from a post-audit command re-run
+    /// (`audit_followup_bash_ok`). Counted since THIS loop invocation — a
+    /// resumed run (`resume`, engine.rs:1808) starts from zero.
+    pub audit_followup_edit_file_ok: u32,
+    /// Count of successful (`!is_error`) `bash` calls in iterations STRICTLY
+    /// AFTER `audit_iteration`; `0` when the audit did not fire this loop
+    /// invocation. Counted since THIS loop invocation — a resumed run
+    /// (`resume`, engine.rs:1808) starts from zero.
+    pub audit_followup_bash_ok: u32,
+    /// Count of `finish(done)` calls rejected by a RED gate in iterations
+    /// STRICTLY AFTER `audit_iteration` — the design-05 Risk-1 churn signal;
+    /// `0` when the audit did not fire this loop invocation. Counted since
+    /// THIS loop invocation — a resumed run (`resume`, engine.rs:1808) starts
+    /// from zero.
+    pub audit_followup_red_done: u32,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -869,11 +954,21 @@ struct FinishOutcome {
     invalid_raw: Option<String>,
     /// The [`CheckReport`] `handle_finish_call` ran against `config.checks`,
     /// when it ran one — `Some` on both the accepted-`Done` and
-    /// checks-rejected-`done` arms, `None` everywhere else (no checks
-    /// configured, `blocked`/`failed`, or `Invalid`). Transcript-only: the
-    /// `tool_result` event's `finish_verification` field is derived from
-    /// this, never from `FinishClaim` internals.
+    /// checks-rejected-`done` arms (including the audited arm below),
+    /// `None` everywhere else (no checks configured, `blocked`/`failed`, or
+    /// `Invalid`). Transcript-only: the `tool_result` event's
+    /// `finish_verification` field is derived from this, never from
+    /// `FinishClaim` internals.
     report: Option<CheckReport>,
+    /// `true` ONLY on the acceptance-audit arm (design doc 05 section B): a
+    /// green `finish(done)` was held back once to ask the model to cite
+    /// evidence already produced in the run. `false` on every other arm.
+    audited: bool,
+    /// The [`Disposition::Done`] this call's audit is holding back, stashed
+    /// so `run_loop_body`'s AUDIT-PENDING RECOVERY arm can accept it without
+    /// a second gate run if the model's very next reply produces no tool
+    /// calls. `Some` ONLY when `audited` is `true`.
+    pending_done: Option<Disposition>,
 }
 
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
@@ -883,6 +978,19 @@ struct FinishOutcome {
 /// an `is_error=true` tool result — `finish = None`, no checks run — and the
 /// loop continues.
 ///
+/// `audit` is the acceptance-audit precondition (design doc 05 section B)
+/// computed by the caller: fire conditions (a) `config.acceptance_audit`,
+/// (b) the loop-local audit latch is unset, and (e) at least one iteration
+/// remains. When `audit` is `true` AND the claim is `Done` AND `checks` is
+/// configured AND green — fire conditions (c) and (d) — the `done` is held
+/// back: the fed-back result is the acceptance-audit prompt
+/// ([`prompt::render_acceptance_audit_prompt`]) instead of the usual
+/// acknowledgement, `finish` stays `None` (the loop is NOT terminated here),
+/// and the verified [`Disposition::Done`] is stashed on
+/// [`FinishOutcome::pending_done`] for the caller to hold. Fire condition
+/// (f) — the wall-clock budget — is evaluated by the caller AFTER this
+/// function returns (the gate has already run by then); see `run_loop_body`.
+///
 /// Returns the fed-back [`UserBlock::ToolResult`] plus, when the loop should
 /// terminate, the accepted [`Disposition`]. A rejected `done` returns
 /// `finish = None`, an `is_error=true` result, and the loop continues.
@@ -891,20 +999,41 @@ async fn handle_finish_call(
     input: &Value,
     checks: Option<&ChecksRunner>,
     ctx: &ToolCtx,
+    audit: bool,
 ) -> FinishOutcome {
     match FinishClaim::from_input(input) {
         FinishClaim::Done { summary } => match checks {
             Some(runner) => {
                 let report = runner.run(ctx).await;
                 if report.passed {
-                    FinishOutcome {
-                        result: ack(call_id),
-                        finish: Some(Disposition::Done {
-                            summary,
-                            verification: Verification::Checks(report.clone()),
-                        }),
-                        invalid_raw: None,
-                        report: Some(report),
+                    if audit {
+                        FinishOutcome {
+                            result: UserBlock::ToolResult {
+                                call_id: call_id.to_string(),
+                                content: prompt::render_acceptance_audit_prompt(),
+                                is_error: false,
+                            },
+                            finish: None,
+                            invalid_raw: None,
+                            report: Some(report.clone()),
+                            audited: true,
+                            pending_done: Some(Disposition::Done {
+                                summary,
+                                verification: Verification::Checks(report),
+                            }),
+                        }
+                    } else {
+                        FinishOutcome {
+                            result: ack(call_id),
+                            finish: Some(Disposition::Done {
+                                summary,
+                                verification: Verification::Checks(report.clone()),
+                            }),
+                            invalid_raw: None,
+                            report: Some(report),
+                            audited: false,
+                            pending_done: None,
+                        }
                     }
                 } else {
                     FinishOutcome {
@@ -916,6 +1045,8 @@ async fn handle_finish_call(
                         finish: None,
                         invalid_raw: None,
                         report: Some(report),
+                        audited: false,
+                        pending_done: None,
                     }
                 }
             }
@@ -927,6 +1058,8 @@ async fn handle_finish_call(
                 }),
                 invalid_raw: None,
                 report: None,
+                audited: false,
+                pending_done: None,
             },
         },
         FinishClaim::Blocked { decision_needed } => FinishOutcome {
@@ -934,6 +1067,8 @@ async fn handle_finish_call(
             finish: Some(Disposition::Blocked { decision_needed }),
             invalid_raw: None,
             report: None,
+            audited: false,
+            pending_done: None,
         },
         FinishClaim::Failed { summary } => FinishOutcome {
             result: ack(call_id),
@@ -943,6 +1078,8 @@ async fn handle_finish_call(
             }),
             invalid_raw: None,
             report: None,
+            audited: false,
+            pending_done: None,
         },
         FinishClaim::Invalid { raw } => FinishOutcome {
             result: UserBlock::ToolResult {
@@ -956,6 +1093,8 @@ async fn handle_finish_call(
             finish: None,
             invalid_raw: Some(raw),
             report: None,
+            audited: false,
+            pending_done: None,
         },
     }
 }
@@ -971,6 +1110,15 @@ fn ack(call_id: &str) -> UserBlock {
         is_error: false,
     }
 }
+
+/// The fed-back content for every call in an assistant turn that arrives
+/// AFTER an acceptance audit has fired on an earlier call in the SAME turn
+/// (design doc 05 section B's same-batch short-circuit). Never dispatched to
+/// the tool registry or `handle_finish_call` — this is what makes the tree
+/// provably unchanged between the audit's green gate and the model's next
+/// reply, which the AUDIT-PENDING RECOVERY arm in `run_loop_body` depends on.
+const AUDIT_PENDING_SKIP: &str = "not evaluated: an acceptance audit is pending for this turn. Answer the audit above, \
+     then call your tools again.";
 
 /// Drive `backend` + `tools` through a conversation until the agent finishes
 /// or `config.max_iterations` is hit.
@@ -1028,6 +1176,15 @@ pub async fn run(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        audit_armed: false,
+        audit_fired: false,
+        audit_iteration: 0,
+        audit_changed_tree: false,
+        audit_rubber_stamped: false,
+        audit_reply_text_chars: 0,
+        audit_followup_edit_file_ok: 0,
+        audit_followup_bash_ok: 0,
+        audit_followup_red_done: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1096,6 +1253,15 @@ pub async fn run_persisted(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        audit_armed: false,
+        audit_fired: false,
+        audit_iteration: 0,
+        audit_changed_tree: false,
+        audit_rubber_stamped: false,
+        audit_reply_text_chars: 0,
+        audit_followup_edit_file_ok: 0,
+        audit_followup_bash_ok: 0,
+        audit_followup_red_done: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1226,6 +1392,15 @@ fn emit_run_end(
                 "mutating_iters": stats.mutating_iters,
                 "bash_calls_ok": stats.bash_calls_ok,
                 "edit_file_calls_ok": stats.edit_file_calls_ok,
+                "audit_armed": stats.audit_armed,
+                "audit_fired": stats.audit_fired,
+                "audit_iteration": stats.audit_iteration,
+                "audit_changed_tree": stats.audit_changed_tree,
+                "audit_rubber_stamped": stats.audit_rubber_stamped,
+                "audit_reply_text_chars": stats.audit_reply_text_chars,
+                "audit_followup_edit_file_ok": stats.audit_followup_edit_file_ok,
+                "audit_followup_bash_ok": stats.audit_followup_bash_ok,
+                "audit_followup_red_done": stats.audit_followup_red_done,
             },
         }),
     );
@@ -1361,6 +1536,7 @@ async fn run_loop_body(
                     "static_tree_k": config.static_tree_k,
                     "max_nudges": config.max_nudges,
                     "max_retries": config.max_retries,
+                    "acceptance_audit": config.acceptance_audit,
                 },
             }),
         );
@@ -1385,6 +1561,31 @@ async fn run_loop_body(
     let mut nudges_fired: u32 = 0;
     let mut nudge_awaiting_status: bool = false;
     let mut nudge_statuses: Vec<String> = Vec::new();
+
+    // ---- opt-in one-shot acceptance-audit state (loop-local, design doc 05
+    // section B) ----
+    // `audit_armed` is a structural property of this invocation's config —
+    // set once, independent of whether the audit ever actually fires.
+    // `audit_latch` gates fire condition (b): it is SEEDED from `messages`
+    // (the reconciled resume history, or just the task seed for a fresh run)
+    // rather than hard-coded `false`, so a `resume` whose reconciled history
+    // already contains an audit reply does NOT audit a second time — this is
+    // what makes the audit prompt's "it happens once per run" literally true
+    // across a crash/resume boundary. `pending_audit_done` stashes the
+    // verified-green Done the audit is holding back; it is `Some` for
+    // exactly the one turn immediately following the fire, per the
+    // AUDIT-PENDING RECOVERY arm below.
+    stats.audit_armed = config.acceptance_audit && config.checks.is_some();
+    let mut audit_latch: bool = messages.iter().any(|m| {
+        matches!(m, Message::User { content } if content.iter().any(|b| {
+            matches!(
+                b,
+                UserBlock::ToolResult { content, .. }
+                    if content.as_str() == prompt::render_acceptance_audit_prompt()
+            )
+        }))
+    });
+    let mut pending_audit_done: Option<Disposition> = None;
 
     for _ in 0..config.max_iterations {
         let req = TurnRequest {
@@ -1529,6 +1730,28 @@ async fn run_loop_body(
         // for nudge-status telemetry if this turn follows a nudge without
         // producing an accepted finish(done).
         let turn_text = turn.text();
+
+        // AUDIT-PENDING RECOVERY bookkeeping + rubber-stamp/reply-chars
+        // telemetry: `pending_audit_done` is `Some` for exactly one turn —
+        // the one immediately following the iteration the audit fired on.
+        // Capture the followup telemetry off that same boundary BEFORE
+        // consuming the stash (a non-empty-calls turn consumes it here; a
+        // zero-calls turn consumes it via `Option::take` below, at the
+        // `calls.is_empty()` site).
+        if pending_audit_done.is_some() {
+            stats.audit_reply_text_chars =
+                u32::try_from(turn_text.chars().count()).unwrap_or(u32::MAX);
+            stats.audit_rubber_stamped = calls.len() == 1
+                && calls[0].name == FINISH_TOOL_NAME
+                && matches!(
+                    FinishClaim::from_input(&calls[0].input),
+                    FinishClaim::Done { .. }
+                );
+            if !calls.is_empty() {
+                pending_audit_done = None;
+            }
+        }
+
         if writer.is_enabled() {
             writer.emit(
                 "model_response",
@@ -1576,6 +1799,42 @@ async fn run_loop_body(
         }
 
         if calls.is_empty() {
+            // AUDIT-PENDING RECOVERY (the no-regression arm): a text-only
+            // reply to the held-back audit accepts the already-verified Done
+            // rather than falling through to StoppedWithoutFinish. The
+            // stashed `Disposition::Done` carries `Verification::Checks`
+            // from a gate the HARNESS ran (never a model self-report), and
+            // the same-batch short-circuit plus this zero-tool-call turn
+            // together prove no tool executed against the workspace since
+            // that gate — so the claim-vs-verify invariant holds without a
+            // second gate run. This MUST be checked before the finish-recovery
+            // nudge guard below: `last_gate_green` is never touched by an
+            // audited finish, so a model that never called `run_checks` or
+            // last mutated the tree would otherwise fail that guard and
+            // regress a gate-verified Done into StoppedWithoutFinish.
+            if let Some(done) = pending_audit_done.take() {
+                if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                    ctx.record.messages.clone_from(&messages);
+                    ctx.record.budgets.consumed = BudgetConsumed {
+                        iterations: initial_consumed.iterations + stats.iterations,
+                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+                        cost_micros: initial_consumed.cost_micros,
+                    };
+                    ctx.record.disposition = Some(done.clone());
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::DispositionSet {
+                                seq: 0,
+                                disposition: done.clone(),
+                            },
+                        )
+                        .await?;
+                    p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+                }
+                return Ok(LoopOutcome::Finished(done));
+            }
+
             // Finish-recovery at the stop terminal: when the last in-loop gate
             // was green, nudge the model toward finish before giving up.
             // Guard: max_nudges > 0 AND last_gate_green.
@@ -1711,7 +1970,36 @@ async fn run_loop_body(
         // successful `edit_file`/`bash` latches it (driving the end-of-iteration
         // tree-counter reset) AND clears `last_gate_green`.
         let mut mutated_this_iter: bool = false;
+        // SAME-BATCH SHORT-CIRCUIT: once a `finish(done)` call in this batch
+        // is held back for the acceptance audit, every remaining call in the
+        // SAME assistant turn — `finish` or not — is short-circuited rather
+        // than dispatched, so the tree is provably unchanged between the
+        // audit's green gate and the next turn (see AUDIT-PENDING RECOVERY).
+        let mut audit_pending_this_batch: bool = false;
         for call in &calls {
+            if audit_pending_this_batch {
+                let content = AUDIT_PENDING_SKIP.to_string();
+                if writer.is_enabled() {
+                    writer.emit(
+                        "tool_result",
+                        json!({
+                            "iteration": stats.iterations,
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "is_error": false,
+                            "content": content,
+                            "offload_path": Value::Null,
+                            "duration_ms": 0,
+                        }),
+                    );
+                }
+                results.push(UserBlock::ToolResult {
+                    call_id: call.id.clone(),
+                    content,
+                    is_error: false,
+                });
+                continue;
+            }
             // Only the FIRST accepted finish in a batch gets to terminate;
             // a later finish (or a finish while one is already accepted)
             // still executes as a normal tool invocation so its
@@ -1719,19 +2007,60 @@ async fn run_loop_body(
             // earlier calls.
             if call.name == FINISH_TOOL_NAME && finish.is_none() {
                 let call_start = Instant::now();
-                let outcome =
-                    handle_finish_call(&call.id, &call.input, config.checks.as_ref(), ctx).await;
+                // Fire-condition preconditions (a), (b), (e) — see the
+                // module docs on `handle_finish_call`. (c) (the claim must be
+                // Done) and (d) (checks configured and green) are checked
+                // internally, on the Done+green arm only.
+                let audit_precondition = config.acceptance_audit
+                    && !audit_latch
+                    && stats.iterations < config.max_iterations;
+                let mut outcome = handle_finish_call(
+                    &call.id,
+                    &call.input,
+                    config.checks.as_ref(),
+                    ctx,
+                    audit_precondition,
+                )
+                .await;
+                if outcome.audited {
+                    // Fire condition (f), evaluated AFTER the gate run
+                    // returns (it just did, inside handle_finish_call above)
+                    // so the gate's own duration counts toward the budget —
+                    // same predicate as the end-of-iteration wall-clock
+                    // breach check. A breach here downgrades back to a
+                    // normal accepted Done: holding it back would convert a
+                    // gate-verified Done into MaxIterations/BudgetExhausted,
+                    // strictly worse than audit-off.
+                    let wall_clock_ok = config.wall_clock_secs == 0
+                        || config
+                            .clock
+                            .now()
+                            .duration_since(loop_start)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            < config.wall_clock_secs;
+                    if !wall_clock_ok {
+                        outcome = FinishOutcome {
+                            result: ack(&call.id),
+                            finish: outcome.pending_done.take(),
+                            invalid_raw: None,
+                            report: outcome.report.clone(),
+                            audited: false,
+                            pending_done: None,
+                        };
+                    }
+                }
                 let duration_ms =
                     u64::try_from(call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let UserBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } = &outcome.result
+                else {
+                    unreachable!("handle_finish_call always returns a ToolResult");
+                };
                 if writer.is_enabled() {
-                    let UserBlock::ToolResult {
-                        call_id,
-                        content,
-                        is_error,
-                    } = &outcome.result
-                    else {
-                        unreachable!("handle_finish_call always returns a ToolResult");
-                    };
                     writer.emit(
                         "tool_result",
                         json!({
@@ -1749,13 +2078,44 @@ async fn run_loop_body(
                                 .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
                         }),
                     );
+                    if outcome.audited {
+                        writer.emit(
+                            "harness_message",
+                            json!({
+                                "iteration": stats.iterations,
+                                "kind": "acceptance_audit",
+                                "placement": "finish_tool_result",
+                                "call_id": call_id,
+                                "text": content,
+                                "checks_passed": true,
+                                "iterations_remaining": config.max_iterations - stats.iterations,
+                                "audit_number": 1,
+                            }),
+                        );
+                    }
                 }
+                if stats.audit_fired
+                    && stats.iterations > stats.audit_iteration
+                    && outcome.report.as_ref().is_some_and(|r| !r.passed)
+                {
+                    stats.audit_followup_red_done += 1;
+                }
+                let audited = outcome.audited;
+                let pending = outcome.pending_done.clone();
                 results.push(outcome.result);
-                finish = outcome.finish;
-                if let Some(raw) = outcome.invalid_raw {
-                    stats.invalid_finish_calls += 1;
-                    if stats.first_invalid_finish_raw.is_none() {
-                        stats.first_invalid_finish_raw = Some(raw);
+                if audited {
+                    audit_latch = true;
+                    stats.audit_fired = true;
+                    stats.audit_iteration = stats.iterations;
+                    pending_audit_done = pending;
+                    audit_pending_this_batch = true;
+                } else {
+                    finish = outcome.finish;
+                    if let Some(raw) = outcome.invalid_raw {
+                        stats.invalid_finish_calls += 1;
+                        if stats.first_invalid_finish_raw.is_none() {
+                            stats.first_invalid_finish_raw = Some(raw);
+                        }
                     }
                 }
             } else {
@@ -1840,10 +2200,20 @@ async fn run_loop_body(
                     mutated_this_iter = true;
                     tree_dirty = true;
                     last_gate_green = false;
+                    let audit_followup =
+                        stats.audit_fired && stats.iterations > stats.audit_iteration;
                     if call.name == "bash" {
                         stats.bash_calls_ok += 1;
+                        if audit_followup {
+                            stats.audit_followup_bash_ok += 1;
+                            stats.audit_changed_tree = true;
+                        }
                     } else {
                         stats.edit_file_calls_ok += 1;
+                        if audit_followup {
+                            stats.audit_followup_edit_file_ok += 1;
+                            stats.audit_changed_tree = true;
+                        }
                     }
                 }
             }
@@ -1916,11 +2286,18 @@ async fn run_loop_body(
             .peak_iters_since_tree_change
             .max(iters_since_tree_change);
 
-        // Detection / high-precision trip — evaluated after the counter
-        // update, only when finish-recovery is enabled (`max_nudges > 0`).
-        // A RED gate (`last_gate_green == false`) MUST NOT trip — that case
-        // falls through unchanged to the existing MaxIterations cap.
-        if config.max_nudges > 0
+        // NUDGE INTERPLAY: an acceptance audit is not a nudge. In the
+        // iteration the audit fired on, the green-static trip below is
+        // skipped entirely and the counter is reset AFTER the peak update
+        // above — mirroring the post-nudge reset — so the model gets a
+        // fresh K-iteration window to answer the audit instead of being
+        // nudged (or force-terminated) for having "gone static" while it
+        // was asked to write a reply, not mutate the tree.
+        let audit_fired_this_iteration =
+            stats.audit_fired && stats.audit_iteration == stats.iterations;
+        if audit_fired_this_iteration {
+            iters_since_tree_change = 0;
+        } else if config.max_nudges > 0
             && last_gate_green
             && iters_since_tree_change >= config.static_tree_k
         {
@@ -2360,6 +2737,15 @@ pub async fn resume(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        audit_armed: false,
+        audit_fired: false,
+        audit_iteration: 0,
+        audit_changed_tree: false,
+        audit_rubber_stamped: false,
+        audit_reply_text_chars: 0,
+        audit_followup_edit_file_ok: 0,
+        audit_followup_bash_ok: 0,
+        audit_followup_red_done: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -2461,9 +2847,9 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError,
-        ResumeMode, RunConfig, RunResult, RunStats, rejection_content, render_tool_result, resume,
-        retry_delay, run, run_id, run_persisted,
+        AUDIT_PENDING_SKIP, FINISH_TOOL_NAME, FinishClaim, FinishTool, LoopOutcome, Persistence,
+        ResumeError, ResumeMode, RunConfig, RunResult, RunStats, rejection_content,
+        render_tool_result, resume, retry_delay, run, run_id, run_persisted,
     };
     use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -3901,6 +4287,15 @@ mod tests {
             edit_file_calls_ok: 0,
             invalid_finish_calls: 0,
             first_invalid_finish_raw: None,
+            audit_armed: false,
+            audit_fired: false,
+            audit_iteration: 0,
+            audit_changed_tree: false,
+            audit_rubber_stamped: false,
+            audit_reply_text_chars: 0,
+            audit_followup_edit_file_ok: 0,
+            audit_followup_bash_ok: 0,
+            audit_followup_red_done: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -4078,6 +4473,19 @@ mod tests {
                 path: "/x/t.jsonl".into(),
                 label: "lbl".to_string(),
             })
+        );
+
+        // acceptance_audit defaults false; with_acceptance_audit overrides it.
+        assert!(!RunConfig::new("t", 5).acceptance_audit);
+        assert!(
+            RunConfig::new("t", 5)
+                .with_acceptance_audit(true)
+                .acceptance_audit
+        );
+        assert!(
+            !RunConfig::new("t", 5)
+                .with_acceptance_audit(false)
+                .acceptance_audit
         );
     }
 
@@ -8126,6 +8534,27 @@ mod tests {
                                 content: vec![UserBlock::Text(text)],
                             });
                         }
+                        "finish_tool_result" => {
+                            // ANNOTATION-ONLY (design doc 05 section B): push
+                            // no block. `text` must equal the `content` of
+                            // the pending `ToolResult` with a matching
+                            // `call_id` — the one `tool_result` step 3 above
+                            // already appended for this same finish call.
+                            let call_id = line["call_id"].as_str().expect("call_id");
+                            let matching = pending.iter().find_map(|b| match b {
+                                UserBlock::ToolResult {
+                                    call_id: id,
+                                    content,
+                                    ..
+                                } if id == call_id => Some(content.clone()),
+                                _ => None,
+                            });
+                            assert_eq!(
+                                matching.as_deref(),
+                                Some(text.as_str()),
+                                "finish_tool_result text must equal the matching tool_result content"
+                            );
+                        }
                         other => panic!("unknown harness_message placement {other}"),
                     }
                 }
@@ -8988,5 +9417,1062 @@ mod tests {
         stats_off.wall_clock = Duration::ZERO;
         stats_bad.wall_clock = Duration::ZERO;
         assert_eq!(stats_off, stats_bad);
+    }
+
+    // =========================================================================
+    // Opt-in one-shot acceptance audit (design doc 05 section B)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn acceptance_audit_fires_on_first_gate_green_done() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(
+                outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: Verification::Checks(_),
+                    ..
+                })
+            ),
+            "expected Finished(Done{{Checks(passed)}}); got {outcome:?}"
+        );
+        assert_eq!(
+            backend.calls(),
+            2,
+            "the audit consumes exactly one extra turn"
+        );
+        assert_eq!(stats.iterations, 2);
+        assert!(stats.audit_armed);
+        assert!(stats.audit_fired);
+        assert_eq!(stats.audit_iteration, 1);
+        assert!(
+            stats.audit_rubber_stamped,
+            "the followup turn was a single bare finish(done) call"
+        );
+        assert_eq!(stats.audit_reply_text_chars, 0);
+        assert!(!stats.audit_changed_tree);
+        assert_eq!(stats.audit_followup_edit_file_ok, 0);
+        assert_eq!(stats.audit_followup_bash_ok, 0);
+        assert_eq!(stats.audit_followup_red_done, 0);
+        assert_eq!(stats.invalid_finish_calls, 0);
+
+        // The held-back audit is fed back as the finish tool result — the
+        // model actually saw the pinned prompt text on the second turn.
+        let seen = backend.messages_seen();
+        let Message::User { content } = seen[1].last().expect("second turn has messages") else {
+            panic!("expected the fed-back audit tool-result message");
+        };
+        assert!(
+            content.iter().any(|b| matches!(
+                b,
+                UserBlock::ToolResult { content, is_error, .. }
+                    if content == &prompt::render_acceptance_audit_prompt() && !is_error
+            )),
+            "the audit text must be fed back as a non-error tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_reply_text_chars_captured_when_rubber_stamped_with_text() {
+        let followup_text = "AC1: covered by the passing check";
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![
+                    ContentBlock::Text(followup_text.to_string()),
+                    tool_call(
+                        "c2",
+                        FINISH_TOOL_NAME,
+                        serde_json::json!({"disposition": "done", "summary": "shipped"}),
+                    ),
+                ],
+                StopReason::ToolUse,
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 2);
+        assert!(stats.audit_fired);
+        assert!(
+            stats.audit_rubber_stamped,
+            "exactly one tool call, named finish, claiming done"
+        );
+        assert_eq!(
+            stats.audit_reply_text_chars,
+            u32::try_from(followup_text.chars().count()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_not_rubber_stamped_when_followup_has_other_calls() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            echo_turn("c2"),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 3);
+        assert!(stats.audit_fired);
+        assert!(!stats.audit_rubber_stamped);
+        assert_eq!(stats.audit_reply_text_chars, 0);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_pending_recovery_accepts_done_on_text_only_reply() {
+        let reply_text = "AC1: covered by tests/foo.rs::bar";
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![ContentBlock::Text(reply_text.to_string())],
+                StopReason::EndTurn,
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true)
+            .with_max_nudges(0);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(
+                outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: Verification::Checks(_),
+                    ..
+                })
+            ),
+            "a text-only reply to the audit must accept the already-verified Done; got {outcome:?}"
+        );
+        assert_eq!(stats.iterations, 2);
+        assert!(
+            !stats.gates_green_at_exit,
+            "an audited finish never touches last_gate_green — the done-oracle stays unchanged"
+        );
+        assert!(stats.audit_fired);
+        assert_eq!(
+            stats.audit_reply_text_chars,
+            u32::try_from(reply_text.chars().count()).unwrap()
+        );
+        assert_eq!(stats.nudges_fired, 0);
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "the recovery return must precede the stop-terminal nudge site entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_pending_recovery_unaffected_by_max_nudges() {
+        // Same script as above but with max_nudges > 0 — the recovery arm
+        // precedes the nudge site, so the two configurations cannot diverge.
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![ContentBlock::Text("AC1: covered".to_string())],
+                StopReason::EndTurn,
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true)
+            .with_max_nudges(2);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 2);
+        assert_eq!(stats.nudges_fired, 0);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_pending_recovery_stash_cleared_by_intervening_tool_call() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            echo_turn("c2"),
+            turn_with(vec![], StopReason::EndTurn),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true)
+            .with_max_nudges(0);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "the stash must be consumed by the intervening echo call, not carried to \
+             iteration 3; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_same_batch_short_circuits_a_second_finish_call() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![
+                    tool_call(
+                        "c1",
+                        FINISH_TOOL_NAME,
+                        serde_json::json!({"disposition": "done", "summary": "shipped"}),
+                    ),
+                    tool_call(
+                        "c2",
+                        FINISH_TOOL_NAME,
+                        serde_json::json!({"disposition": "done", "summary": "shipped"}),
+                    ),
+                ],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 2);
+        assert_eq!(stats.invalid_finish_calls, 0);
+
+        let seen = backend.messages_seen();
+        let Message::User { content } = seen[1].last().expect("second turn has messages") else {
+            panic!("expected the fed-back batch from iteration 1");
+        };
+        assert_eq!(content.len(), 2, "both c1 and c2 results are fed back");
+        let UserBlock::ToolResult {
+            call_id: id0,
+            content: c0,
+            is_error: e0,
+        } = &content[0]
+        else {
+            panic!("expected a ToolResult");
+        };
+        assert_eq!(id0, "c1");
+        assert_eq!(c0, &prompt::render_acceptance_audit_prompt());
+        assert!(!e0);
+        let UserBlock::ToolResult {
+            call_id: id1,
+            content: c1,
+            is_error: e1,
+        } = &content[1]
+        else {
+            panic!("expected a ToolResult");
+        };
+        assert_eq!(id1, "c2");
+        assert_eq!(c1, AUDIT_PENDING_SKIP);
+        assert!(!e1);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_same_batch_short_circuits_mutating_and_terminal_calls() {
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+        let tools = standard_registry(Some(runner.clone()));
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(runner)
+            .with_acceptance_audit(true);
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![
+                    tool_call(
+                        "c1",
+                        FINISH_TOOL_NAME,
+                        serde_json::json!({"disposition": "done", "summary": "shipped"}),
+                    ),
+                    tool_call(
+                        "c2",
+                        "edit_file",
+                        serde_json::json!({
+                            "path": "ok",
+                            "old_string": "",
+                            "new_string": "planted\n",
+                        }),
+                    ),
+                    tool_call(
+                        "c3",
+                        FINISH_TOOL_NAME,
+                        serde_json::json!({
+                            "disposition": "blocked",
+                            "summary": "need input",
+                            "decision_needed": "?",
+                        }),
+                    ),
+                ],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c4",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            !root_path.join("ok").exists(),
+            "the short-circuited edit_file must never actually run"
+        );
+        assert_eq!(stats.edit_file_calls_ok, 0);
+        assert!(!stats.tree_dirty);
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "the short-circuited finish(blocked) must not terminate the run; got {outcome:?}"
+        );
+        assert_eq!(stats.iterations, 2);
+
+        // Persistence shape: the event log carries no ToolCallStarted (for
+        // c2's call_id) and no ToolCallResult naming "edit_file" — the only
+        // edit_file call in this script is the short-circuited c2. c3
+        // (finish(blocked)) never reaches ToolCallStarted/Result at all
+        // (finish calls are routed through handle_finish_call, not
+        // tools.invoke), so its absence is structural, not just untested.
+        let events = snap_store
+            .inner
+            .list_events(FIXTURE_RID)
+            .await
+            .expect("list_events");
+        for event in &events {
+            match event {
+                Event::ToolCallStarted { call_id, .. } => {
+                    assert_ne!(
+                        call_id, "c2",
+                        "the short-circuited c2 must never reach ToolCallStarted"
+                    );
+                }
+                Event::ToolCallResult { name, .. } => {
+                    assert_ne!(
+                        name, "edit_file",
+                        "the short-circuited edit_file call must never reach ToolCallResult"
+                    );
+                }
+                Event::ModelCall { .. }
+                | Event::PhaseTransition { .. }
+                | Event::BudgetTick { .. }
+                | Event::DispositionSet { .. } => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_red_gate_does_not_consume_the_audit() {
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "test -f ok".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+        let tools = standard_registry(Some(runner.clone()));
+        let config = RunConfig::new("do the task", 6)
+            .with_checks(runner)
+            .with_acceptance_audit(true);
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![tool_call(
+                    "c2",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "ok",
+                        "old_string": "",
+                        "new_string": "planted\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c4",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 4);
+        assert!(stats.audit_fired);
+        assert_eq!(stats.audit_iteration, 3);
+
+        let seen = backend.messages_seen();
+        let Message::User { content } = seen[1].last().expect("second turn has messages") else {
+            panic!("expected the rejected finish tool-result");
+        };
+        let UserBlock::ToolResult {
+            content, is_error, ..
+        } = &content[0]
+        else {
+            panic!("expected a ToolResult");
+        };
+        assert!(*is_error);
+        assert!(content.starts_with("finish(done) rejected: verification failed"));
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_invalid_disposition_does_not_consume_the_audit() {
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "complete", "summary": "x"}),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 3);
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert!(stats.first_invalid_finish_raw.is_some());
+        assert!(stats.audit_fired);
+        assert_eq!(stats.audit_iteration, 2);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_blocked_and_failed_terminate_without_audit() {
+        for disposition in ["blocked", "failed"] {
+            let input = if disposition == "blocked" {
+                serde_json::json!({
+                    "disposition": "blocked",
+                    "summary": "s",
+                    "decision_needed": "?",
+                })
+            } else {
+                serde_json::json!({"disposition": "failed", "summary": "s"})
+            };
+            let backend = MockBackend::from_turns(vec![finish_call("c1", input)]);
+            let tools = registry_with_finish_and_echo();
+            let ctx = ToolCtx::stub();
+            let config = RunConfig::new("do the task", 5)
+                .with_checks(passing_runner())
+                .with_acceptance_audit(true);
+
+            let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+            assert_eq!(stats.iterations, 1, "disposition={disposition}");
+            assert!(stats.audit_armed, "disposition={disposition}");
+            assert!(!stats.audit_fired, "disposition={disposition}");
+            match disposition {
+                "blocked" => assert!(
+                    matches!(outcome, LoopOutcome::Finished(Disposition::Blocked { .. })),
+                    "got {outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(outcome, LoopOutcome::Finished(Disposition::Failed { .. })),
+                    "got {outcome:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_no_checks_configured_is_structurally_inert() {
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({"disposition": "done", "summary": "shipped"}),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done {
+                verification: Verification::NoChecksConfigured,
+                ..
+            })
+        ));
+        assert_eq!(stats.iterations, 1);
+        assert!(!stats.audit_armed);
+        assert!(!stats.audit_fired);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_does_not_fire_on_the_final_iteration() {
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({"disposition": "done", "summary": "shipped"}),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 1)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 1);
+        assert!(stats.audit_armed);
+        assert!(!stats.audit_fired);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_does_not_fire_once_wall_clock_is_breached() {
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({"disposition": "done", "summary": "shipped"}),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        // Huge auto-advance step — any `now()` read after the first breaches
+        // any real budget, proving fire condition (f) downgrades the audited
+        // arm back to a normal accepted Done rather than holding it back.
+        let fake = Arc::new(FakeClock::new_auto_advance(
+            UNIX_EPOCH,
+            Duration::from_hours(87_600),
+        ));
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true)
+            .with_wall_clock_secs(30)
+            .with_clock(fake as Arc<dyn crate::time::Clock>);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(
+                outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: Verification::Checks(_),
+                    ..
+                })
+            ),
+            "a wall-clock breach must downgrade to a normal accepted Done, not \
+             BudgetExhausted; got {outcome:?}"
+        );
+        assert_eq!(stats.iterations, 1);
+        assert!(stats.audit_armed);
+        assert!(!stats.audit_fired);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_fires_at_most_once_per_invocation() {
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "test ! -f broken".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+        let tools = standard_registry(Some(runner.clone()));
+        let config = RunConfig::new("do the task", 6)
+            .with_checks(runner)
+            .with_acceptance_audit(true);
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![tool_call(
+                    "c2",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "broken",
+                        "old_string": "",
+                        "new_string": "oops\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            turn_with(
+                vec![tool_call(
+                    "c4",
+                    "bash",
+                    serde_json::json!({"command": "rm broken"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c5",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(
+                outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: Verification::Checks(_),
+                    ..
+                })
+            ),
+            "got {outcome:?}"
+        );
+        assert_eq!(stats.iterations, 5);
+        assert!(stats.audit_fired);
+        assert_eq!(stats.audit_iteration, 1);
+        assert!(stats.audit_changed_tree);
+        assert_eq!(stats.audit_followup_edit_file_ok, 1);
+        assert_eq!(stats.audit_followup_bash_ok, 1);
+        assert_eq!(stats.audit_followup_red_done, 1);
+        assert!(!stats.audit_rubber_stamped);
+
+        // The audit text appears EXACTLY once across the whole run. Each
+        // `messages_seen()` entry is the CUMULATIVE history sent on that
+        // turn, so only the LAST entry needs checking — it already contains
+        // every earlier message.
+        let audit_text = prompt::render_acceptance_audit_prompt();
+        let final_messages = backend
+            .messages_seen()
+            .last()
+            .cloned()
+            .expect("at least one turn was sent");
+        let occurrences: usize = final_messages
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content
+                    .iter()
+                    .filter(
+                        |b| matches!(b, UserBlock::ToolResult { content, .. } if content == &audit_text),
+                    )
+                    .count(),
+                Message::Assistant { .. } => 0,
+            })
+            .sum();
+        assert_eq!(occurrences, 1, "the audit text must appear exactly once");
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_resume_reentry_seeds_latch_from_history() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+
+        let task_seed = Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        };
+        let audit_text = prompt::render_acceptance_audit_prompt();
+        let mut record = make_minimal_record("audited-task", 1);
+        record.messages = vec![
+            task_seed,
+            Message::Assistant {
+                content: vec![tool_call(
+                    "c0",
+                    FINISH_TOOL_NAME,
+                    serde_json::json!({"disposition": "done", "summary": "pre-crash"}),
+                )],
+            },
+            Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: "c0".to_string(),
+                    content: audit_text,
+                    is_error: false,
+                }],
+            },
+        ];
+        store
+            .checkpoint("audited-task:1", &record)
+            .await
+            .expect("cp");
+        store
+            .append_event(
+                "audited-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                },
+            )
+            .await
+            .expect("mc");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "cf",
+            serde_json::json!({"disposition": "done", "summary": "post-crash"}),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+
+        let result = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store,
+            "audited-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        assert!(
+            matches!(
+                result.outcome,
+                LoopOutcome::Finished(Disposition::Done {
+                    verification: Verification::Checks(_),
+                    ..
+                })
+            ),
+            "got {:?}",
+            result.outcome
+        );
+        assert_eq!(result.stats.iterations, 1, "no second audit turn");
+        assert!(
+            !result.stats.audit_fired,
+            "the latch, seeded from the reconciled history, must suppress a second audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_is_not_a_nudge_gives_fresh_static_tree_window() {
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        // static_tree_k defaults to 3.
+        let config = RunConfig::new("do the task", 6)
+            .with_checks(runner)
+            .with_acceptance_audit(true)
+            .with_max_nudges(2);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            echo_turn("c2"),
+            finish_call(
+                "c3",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c4",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+        assert_eq!(stats.iterations, 4);
+        assert_eq!(stats.nudges_fired, 0);
+        assert!(stats.audit_fired);
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "the audit must not double as a nudge trip even though the static-tree \
+             counter would have reached K on the same iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_off_is_byte_identical_to_default() {
+        let script = || {
+            vec![finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            )]
+        };
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+
+        let backend_default = MockBackend::from_turns(script());
+        let config_default = RunConfig::new("do the task", 5).with_checks(passing_runner());
+        let RunResult {
+            outcome: outcome_default,
+            stats: mut stats_default,
+        } = run(&backend_default, &tools, &ctx, &config_default).await;
+
+        let backend_off = MockBackend::from_turns(script());
+        let config_off = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(false);
+        let RunResult {
+            outcome: outcome_off,
+            stats: mut stats_off,
+        } = run(&backend_off, &tools, &ctx, &config_off).await;
+
+        // Compare shape rather than deep-equality: `CheckReport::duration` is
+        // real wall-clock time from two separate `/bin/sh` invocations, so it
+        // is never bit-identical across the two runs.
+        let summarize = |o: LoopOutcome| match o.into_disposition() {
+            Disposition::Done {
+                summary,
+                verification: Verification::Checks(report),
+            } => (summary, report.passed, report.exit_code),
+            other => panic!("expected Done{{Checks}}; got {other:?}"),
+        };
+        assert_eq!(summarize(outcome_default), summarize(outcome_off));
+        assert_eq!(backend_default.calls(), 1);
+        assert_eq!(backend_off.calls(), 1);
+        assert_eq!(backend_default.messages_seen(), backend_off.messages_seen());
+        stats_default.wall_clock = Duration::ZERO;
+        stats_off.wall_clock = Duration::ZERO;
+        assert_eq!(stats_default, stats_off);
+        assert!(!stats_default.audit_armed);
+        assert!(!stats_default.audit_fired);
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_on_first_turn_byte_identical_to_off() {
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+
+        let backend_off = MockBackend::from_turns(vec![finish_call(
+            "c1",
+            serde_json::json!({"disposition": "done", "summary": "shipped"}),
+        )]);
+        let config_off = RunConfig::new("do the task", 5).with_checks(passing_runner());
+        let _ = run(&backend_off, &tools, &ctx, &config_off).await;
+
+        let backend_on = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+        let config_on = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true);
+        let _ = run(&backend_on, &tools, &ctx, &config_on).await;
+
+        assert_eq!(
+            backend_off.systems_seen()[0],
+            backend_on.systems_seen()[0],
+            "the system prompt must not depend on the acceptance_audit flag"
+        );
+        assert_eq!(
+            backend_off.messages_seen()[0],
+            backend_on.messages_seen()[0],
+            "the first turn's messages must not depend on the acceptance_audit flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_audit_harness_message_transcript_event_is_pinned() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_checks(passing_runner())
+            .with_acceptance_audit(true)
+            .with_transcript(path.clone(), "t");
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c1",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "shipped"}),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Done { .. })
+        ));
+
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["config"]["acceptance_audit"], true);
+
+        let audits: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message" && l["kind"] == "acceptance_audit")
+            .collect();
+        assert_eq!(
+            audits.len(),
+            1,
+            "exactly one acceptance_audit harness_message"
+        );
+        let audit = audits[0];
+        assert_eq!(audit["placement"], "finish_tool_result");
+        assert_eq!(audit["call_id"], "c1");
+        assert_eq!(
+            audit["text"].as_str().unwrap(),
+            prompt::render_acceptance_audit_prompt()
+        );
+        assert_eq!(audit["checks_passed"], true);
+        assert!(audit["iterations_remaining"].as_u64().unwrap() >= 1);
+        assert_eq!(audit["audit_number"], 1);
+
+        let run_end = lines.last().expect("at least one line");
+        assert_eq!(run_end["event"], "run_end");
+        assert_eq!(run_end["stats"]["audit_fired"], true);
+        assert_eq!(run_end["stats"]["audit_armed"], true);
+        assert!(stats.audit_fired);
     }
 }

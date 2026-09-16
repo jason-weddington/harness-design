@@ -24,6 +24,13 @@
 //! prompt section (see [`harness::prompt::render_criteria_rules`]) — default
 //! OFF, flag only (no env fallback, for the same reason as `--transcript`).
 //!
+//! `talos run --acceptance-audit` opts into the one-shot acceptance audit
+//! (design doc 05 section B, see
+//! [`harness::engine::RunConfig::with_acceptance_audit`]) — default OFF,
+//! flag only (no env fallback, for the same reason as `--transcript`). When
+//! passed, the stdout [`RunSummary`] gains an `acceptance_audit` object
+//! (see [`AuditSummary`]); without it the summary's key set is unchanged.
+//!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
 //! with a fresh inner context per outer iteration. `ralph` is NOT run-record
@@ -248,6 +255,18 @@ struct RunArgs {
     /// documented on [`RunArgs::transcript`] (kb-02979).
     #[arg(long)]
     criteria_rules: bool,
+
+    /// Opt-in one-shot acceptance audit (design doc 05 section B) — see
+    /// [`harness::engine::RunConfig::with_acceptance_audit`]. Default OFF:
+    /// the audit never fires unless this flag is passed.
+    ///
+    /// FLAG ONLY — there is deliberately no `TALOS_ACCEPTANCE_AUDIT` env
+    /// fallback: `templates/sudoers-dispatch-svc.tmpl`'s `env_keep` omits
+    /// `TALOS_*` runtime knobs, and an env-only toggle would be a silent
+    /// no-op past dispatch's `env_reset` (the kb-02979 shape, same rationale
+    /// already written on [`RunArgs::transcript`]).
+    #[arg(long)]
+    acceptance_audit: bool,
 }
 
 /// Arguments for `talos ralph`.
@@ -548,6 +567,37 @@ fn stderr_json_error(message: &str) {
 // stdout summary
 // ============================================================================
 
+/// Acceptance-audit telemetry attached to [`RunSummary::acceptance_audit`]
+/// (design doc 05 section B), copied verbatim from [`harness::engine::RunStats`].
+/// `Some` on [`RunSummary`] ONLY when `--acceptance-audit` was passed —
+/// without the flag the stdout bytes are unchanged from before this field
+/// existed (the dispatch worker parses the line with a bare `json.loads` +
+/// `.get()`, so an extra key is backward-compatible).
+///
+/// `struct_excessive_bools`: each `bool` is an independent telemetry field
+/// copied verbatim from [`harness::engine::RunStats`] — see that struct's
+/// own `struct_excessive_bools` allow for the same rationale.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Serialize)]
+struct AuditSummary {
+    /// From [`harness::engine::RunStats::audit_armed`].
+    armed: bool,
+    /// From [`harness::engine::RunStats::audit_fired`].
+    fired: bool,
+    /// From [`harness::engine::RunStats::audit_changed_tree`].
+    changed_tree: bool,
+    /// From [`harness::engine::RunStats::audit_rubber_stamped`].
+    rubber_stamped: bool,
+    /// From [`harness::engine::RunStats::audit_reply_text_chars`].
+    reply_text_chars: u32,
+    /// From [`harness::engine::RunStats::audit_followup_edit_file_ok`].
+    followup_edit_file_ok: u32,
+    /// From [`harness::engine::RunStats::audit_followup_bash_ok`].
+    followup_bash_ok: u32,
+    /// From [`harness::engine::RunStats::audit_followup_red_done`].
+    followup_red_done: u32,
+}
+
 /// Machine-readable JSON summary written to stdout after a successful
 /// `run_persisted` call. Printed regardless of the task's disposition.
 #[derive(Serialize)]
@@ -564,6 +614,10 @@ struct RunSummary {
     record_path: String,
     /// Number of model turns the loop drew.
     iterations: u32,
+    /// Acceptance-audit telemetry — see [`AuditSummary`]. `Some` ONLY when
+    /// `--acceptance-audit` was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_audit: Option<AuditSummary>,
 }
 
 /// Build the stdout [`RunSummary`] from a completed run.
@@ -573,6 +627,7 @@ fn build_run_summary(
     run_id_str: String,
     record_path: String,
     iterations: u32,
+    acceptance_audit: Option<AuditSummary>,
 ) -> RunSummary {
     RunSummary {
         outcome: outcome_s,
@@ -580,6 +635,7 @@ fn build_run_summary(
         run_id: run_id_str,
         record_path,
         iterations,
+        acceptance_audit,
     }
 }
 
@@ -933,6 +989,7 @@ async fn run_cmd(args: RunArgs) {
     } else {
         RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
     };
+    config = config.with_acceptance_audit(args.acceptance_audit);
     // Label is computed from `model_label` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
     // flag was passed) and has no env fallback — see `RunArgs::transcript`.
@@ -965,7 +1022,24 @@ async fn run_cmd(args: RunArgs) {
     let iterations = result.stats.iterations;
     let disposition = result.outcome.into_disposition();
     let record_path = run_store_path.display().to_string();
-    let summary = build_run_summary(outcome_s, disposition, rid, record_path, iterations);
+    let acceptance_audit_summary = args.acceptance_audit.then_some(AuditSummary {
+        armed: result.stats.audit_armed,
+        fired: result.stats.audit_fired,
+        changed_tree: result.stats.audit_changed_tree,
+        rubber_stamped: result.stats.audit_rubber_stamped,
+        reply_text_chars: result.stats.audit_reply_text_chars,
+        followup_edit_file_ok: result.stats.audit_followup_edit_file_ok,
+        followup_bash_ok: result.stats.audit_followup_bash_ok,
+        followup_red_done: result.stats.audit_followup_red_done,
+    });
+    let summary = build_run_summary(
+        outcome_s,
+        disposition,
+        rid,
+        record_path,
+        iterations,
+        acceptance_audit_summary,
+    );
     println!(
         "{}",
         serde_json::to_string(&summary)
@@ -1089,10 +1163,10 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, Cli, Command, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
-        build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
-        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs, transcript_label,
-        write_ralph_error_detail,
+        AuditSummary, Backend, Cli, Command, RalphSummary, RunSummary, backend_from_env,
+        build_checks_runner, build_ralph_summary, build_run_summary, exit_code, make_run_seed,
+        outcome_str, ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
+        transcript_label, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
@@ -1517,6 +1591,32 @@ mod tests {
         assert!(args.criteria_rules, "--criteria-rules must flip to on");
     }
 
+    #[test]
+    fn run_args_acceptance_audit_flag_defaults_off() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["talos", "run", "--workspace", "w"])
+            .expect("parse without --acceptance-audit");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(
+            !args.acceptance_audit,
+            "--acceptance-audit must default to off"
+        );
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "talos",
+            "run",
+            "--workspace",
+            "w",
+            "--acceptance-audit",
+        ])
+        .expect("parse with --acceptance-audit");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        assert!(args.acceptance_audit, "--acceptance-audit must flip to on");
+    }
+
     // ---- summary: exact field set and outcome literals -----------------
 
     #[test]
@@ -1530,6 +1630,7 @@ mod tests {
             "my-task:1".into(),
             "/tmp/run.sqlite".into(),
             3,
+            None,
         );
         let json = serde_json::to_value(&summary).expect("summary must serialize");
         let obj = json.as_object().expect("must be object");
@@ -1544,7 +1645,8 @@ mod tests {
                 "record_path",
                 "run_id"
             ],
-            "summary must have exactly the five expected fields"
+            "summary must have exactly the five expected fields when \
+             --acceptance-audit was not passed"
         );
         assert_eq!(
             obj.get("outcome").and_then(serde_json::Value::as_str),
@@ -1557,6 +1659,52 @@ mod tests {
         assert_eq!(
             obj.get("iterations").and_then(serde_json::Value::as_u64),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn summary_exact_field_set_with_acceptance_audit() {
+        let summary = build_run_summary(
+            "Finished",
+            Disposition::Done {
+                summary: "shipped".into(),
+                verification: Verification::NoChecksConfigured,
+            },
+            "my-task:1".into(),
+            "/tmp/run.sqlite".into(),
+            3,
+            Some(AuditSummary {
+                armed: true,
+                fired: true,
+                changed_tree: false,
+                rubber_stamped: true,
+                reply_text_chars: 0,
+                followup_edit_file_ok: 0,
+                followup_bash_ok: 0,
+                followup_red_done: 0,
+            }),
+        );
+        let json = serde_json::to_value(&summary).expect("summary must serialize");
+        let obj = json.as_object().expect("must be object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "acceptance_audit",
+                "disposition",
+                "iterations",
+                "outcome",
+                "record_path",
+                "run_id"
+            ],
+            "summary must have exactly six sorted keys when --acceptance-audit was passed"
+        );
+        assert_eq!(
+            obj.get("acceptance_audit")
+                .and_then(|v| v.get("fired"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 
@@ -1605,6 +1753,7 @@ mod tests {
             "task:1".into(),
             "/state/run.sqlite".into(),
             5,
+            None,
         );
         let json = serde_json::to_value(&summary).expect("must serialize");
         assert!(

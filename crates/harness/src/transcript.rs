@@ -41,7 +41,9 @@
 //!   is the reconciled history, for `FreshContext` the fresh task seed), and
 //!   `config` (an object with exactly `max_iterations`, `max_tokens`, `checks`
 //!   — the check command display string, or `null` — `wall_clock_secs`,
-//!   `static_tree_k`, `max_nudges`, `max_retries`).
+//!   `static_tree_k`, `max_nudges`, `max_retries`, `acceptance_audit` — the
+//!   opt-in one-shot acceptance audit flag, design doc 05 section B, always
+//!   present).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
@@ -50,7 +52,8 @@
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":32768,"checks":"cargo test",
-//!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
+//!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3,
+//!              "acceptance_audit":false}}
 //!   ```
 //!
 //! - **`model_request`** — emitted once per logical iteration, right after
@@ -109,7 +112,10 @@
 //!   `finish_verification` (the [`crate::exec::CheckReport`], or `null` when
 //!   no checks ran) — both keys are absent on every other `tool_result`,
 //!   including a second `finish` in the same batch (which executes as a plain
-//!   tool call).
+//!   tool call), and including a call short-circuited by a pending
+//!   acceptance audit (design doc 05 section B's same-batch short-circuit —
+//!   its `content` is the fixed `"not evaluated: an acceptance audit is
+//!   pending for this turn..."` text and `is_error` is always `false`).
 //!
 //!   ```json
 //!   {"event":"tool_result","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
@@ -122,23 +128,42 @@
 //!    "finish_verification":{"passed":false,"excerpt":"FAIL_DETAIL","exit_code":3,"offload_path":null}}
 //!   ```
 //!
-//! - **`harness_message`** — emitted for every finish-recovery nudge
-//!   injection. Fields: `iteration`, `kind` (`"nudge"` today — any future
-//!   harness-injected user-lane message gets a new `kind`, documented here,
-//!   plus its own reconstruction-test script), `placement`
-//!   (`"new_user_message"` at the stop-terminal nudge site, where a fresh
-//!   `Message::User` is pushed; `"appended_to_tool_results"` at the
-//!   green-static nudge site, where a `UserBlock::Text` is appended to the
-//!   existing tool-results `Message::User`), `text` (the exact injected
-//!   string), `last_gate_green` (always `true` — a runtime tripwire),
-//!   `iters_since_tree_change`, `static_tree_k`, `nudge_number` (1-based),
-//!   `max_nudges`.
+//! - **`harness_message`** — emitted for every harness-injected steering
+//!   message. Fields: `iteration`, `kind` (`"nudge"` | `"acceptance_audit"` —
+//!   any future harness-injected user-lane message gets a new `kind`,
+//!   documented here, plus its own reconstruction-test script), `placement`,
+//!   `text` (the exact injected/fed-back string).
+//!
+//!   When `kind == "nudge"`: `placement` is `"new_user_message"` at the
+//!   stop-terminal nudge site, where a fresh `Message::User` is pushed, or
+//!   `"appended_to_tool_results"` at the green-static nudge site, where a
+//!   `UserBlock::Text` is appended to the existing tool-results
+//!   `Message::User`. Also carries `last_gate_green` (always `true` — a
+//!   runtime tripwire), `iters_since_tree_change`, `static_tree_k`,
+//!   `nudge_number` (1-based), `max_nudges` — these five nudge-only fields
+//!   appear ONLY when `kind == "nudge"`.
+//!
+//!   When `kind == "acceptance_audit"` (design doc 05 section B): `placement`
+//!   is always `"finish_tool_result"` — an ANNOTATION-ONLY placement whose
+//!   `text` equals the `content` of the immediately preceding `tool_result`
+//!   event with the same `call_id`; reconstruction adds NO block for it (see
+//!   the reconstruction contract below). Carries exactly these eight keys:
+//!   `iteration`, `kind`, `placement`, `call_id` (the audited finish call's
+//!   id), `text`, `checks_passed` (from the gate report — always `true`, a
+//!   runtime tripwire for fire condition (d)), `iterations_remaining`
+//!   (`config.max_iterations - stats.iterations` at fire time — always `>=
+//!   1`, the tripwire for fire condition (e)), `audit_number` (always `1`,
+//!   the tripwire for the once-per-run latch).
 //!
 //!   ```json
 //!   {"event":"harness_message","ts":"2026-09-15T02:00:05Z","elapsed_ms":5000,
 //!    "iteration":4,"kind":"nudge","placement":"appended_to_tool_results",
 //!    "text":"You have not called finish...","last_gate_green":true,
 //!    "iters_since_tree_change":3,"static_tree_k":3,"nudge_number":1,"max_nudges":2}
+//!   {"event":"harness_message","ts":"2026-09-15T02:00:06Z","elapsed_ms":6000,
+//!    "iteration":2,"kind":"acceptance_audit","placement":"finish_tool_result",
+//!    "call_id":"c1","text":"finish(done) is not accepted yet...",
+//!    "checks_passed":true,"iterations_remaining":3,"audit_number":1}
 //!   ```
 //!
 //! - **`iteration_end`** — emitted immediately before the wall-clock breach
@@ -167,9 +192,14 @@
 //!   `cache_read_tokens`, `cache_write_tokens`, `gates_green_at_exit`,
 //!   `nudges_fired`, `tree_dirty`, `iters_since_tree_change_at_exit`,
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
-//!   `edit_file_calls_ok`). `wall_clock` is intentionally omitted — the
-//!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
-//!   AFTER `run_loop_impl` (and therefore this event) returns.
+//!   `edit_file_calls_ok`, `audit_armed`, `audit_fired`, `audit_iteration`,
+//!   `audit_changed_tree`, `audit_rubber_stamped`, `audit_reply_text_chars`,
+//!   `audit_followup_edit_file_ok`, `audit_followup_bash_ok`,
+//!   `audit_followup_red_done` — the last nine are design doc 05 section B's
+//!   acceptance-audit telemetry, see [`crate::engine::RunStats`]).
+//!   `wall_clock` is intentionally omitted — the caller
+//!   (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only AFTER
+//!   `run_loop_impl` (and therefore this event) returns.
 //!
 //!   The finish-recovery terminal appears as `outcome: "Finished"` with
 //!   `disposition: {"Failed":{"mode":"FinishDiscipline","summary":"..."}}`.
@@ -183,7 +213,10 @@
 //!             "cache_read_tokens":0,"cache_write_tokens":0,"gates_green_at_exit":false,
 //!             "nudges_fired":0,"tree_dirty":false,"iters_since_tree_change_at_exit":0,
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
-//!             "edit_file_calls_ok":0}}
+//!             "edit_file_calls_ok":0,"audit_armed":false,"audit_fired":false,
+//!             "audit_iteration":0,"audit_changed_tree":false,"audit_rubber_stamped":false,
+//!             "audit_reply_text_chars":0,"audit_followup_edit_file_ok":0,
+//!             "audit_followup_bash_ok":0,"audit_followup_red_done":0}}
 //!   ```
 //!
 //! ## Nested shapes (externally tagged serde)
@@ -214,7 +247,12 @@
 //! 5. On `harness_message` with `placement == "new_user_message"`, first flush
 //!    any non-empty pending batch as one `Message::User`, then push a fresh
 //!    `Message::User { content: [Text(text)] }`.
-//! 6. On the NEXT `model_request`, flush any non-empty pending batch as one
+//! 6. On `harness_message` with `placement == "finish_tool_result"`
+//!    (`kind == "acceptance_audit"`) — ANNOTATION-ONLY: push NO block. Its
+//!    `text` is asserted equal to the `content` of the immediately preceding
+//!    `tool_result` event sharing the same `call_id`, which step 3 already
+//!    appended.
+//! 7. On the NEXT `model_request`, flush any non-empty pending batch as one
 //!    `Message::User` before comparing.
 //!
 //! At every `model_request`, the rebuilt history's length and total block

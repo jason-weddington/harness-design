@@ -184,6 +184,16 @@ struct RalphPromptTemplate<'a> {
 #[template(path = "nudge_prompt.md", escape = "none")]
 struct NudgePromptTemplate;
 
+/// The opt-in one-shot acceptance-audit template (design doc 05 section B) —
+/// a variable-free string the engine feeds back as the `finish(done)` tool
+/// result when it holds back the first gate-green `finish(done)` of a loop
+/// invocation to ask the model to cite evidence already produced in the run.
+/// `escape = "none"` is pinned so the backticks around `finish(done)` and the
+/// double-quoted clause words pass through untouched.
+#[derive(Template)]
+#[template(path = "acceptance_audit_prompt.md", escape = "none")]
+struct AcceptanceAuditPromptTemplate;
+
 /// Render the system prompt.
 ///
 /// - `tools` is the ordered listing (typically from [`tool_lines`]).
@@ -324,6 +334,26 @@ pub fn render_nudge_prompt() -> String {
         .expect("nudge_prompt.md is a static variable-free template that renders infallibly")
 }
 
+/// Render the opt-in one-shot acceptance-audit steering text — the string the
+/// engine feeds back as the `finish(done)` tool result when it holds back the
+/// first gate-green `finish(done)` of a loop invocation (design doc 05
+/// section B). The exact wording is pinned by this module's
+/// `render_acceptance_audit_prompt_pins_exact_wording` test. Default OFF —
+/// see
+/// [`crate::engine::RunConfig::acceptance_audit`].
+///
+/// The render is a pure function of its (empty) inputs and is
+/// byte-deterministic — re-rendering produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_acceptance_audit_prompt() -> String {
+    AcceptanceAuditPromptTemplate.render().expect(
+        "acceptance_audit_prompt.md is a static variable-free template that renders infallibly",
+    )
+}
+
 /// Render the test-first approach guidance on its own.
 ///
 /// For callers that assemble an agent prompt WITHOUT the task-spec template —
@@ -422,9 +452,10 @@ pub fn render_verification_section(gate_command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NudgePromptTemplate, RalphPromptTemplate, ToolLine, parse_criteria_rules_flag,
-        render_criteria_rules, render_nudge_prompt, render_ralph_prompt, render_system_prompt,
-        render_task_prompt, render_task_prompt_from_spec, render_task_prompt_from_spec_with,
+        AcceptanceAuditPromptTemplate, NudgePromptTemplate, RalphPromptTemplate, ToolLine,
+        parse_criteria_rules_flag, render_acceptance_audit_prompt, render_criteria_rules,
+        render_nudge_prompt, render_ralph_prompt, render_system_prompt, render_task_prompt,
+        render_task_prompt_from_spec, render_task_prompt_from_spec_with,
         render_test_first_approach, render_verification_section, tool_lines,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool};
@@ -1256,6 +1287,70 @@ mod tests {
             .render()
             .expect("variable-free template renders infallibly");
         let via_fn = render_nudge_prompt();
+        assert_eq!(via_struct, via_fn);
+    }
+
+    // --- render_acceptance_audit_prompt tests -------------------------------
+
+    /// The acceptance-audit wording is load-bearing — an engine test pins it
+    /// against the finish tool-result content. Pin the exact text at the
+    /// prompt layer too so a template edit that drifts fails here before it
+    /// reaches the engine. Also asserts the wording does not contain
+    /// `re-verify` (the anti-loop pin lives on `render_verification_section`,
+    /// not here — this audit is a one-time evidence citation, not a
+    /// re-verification) or `Acceptance Criteria` (that heading is rendered
+    /// only by `task_spec_prompt.md`; the wording must also read correctly on
+    /// tier-2's mined-task prompt, which has no criteria list).
+    #[test]
+    fn render_acceptance_audit_prompt_pins_exact_wording() {
+        let rendered = render_acceptance_audit_prompt();
+        let expected = "finish(done) is not accepted yet: the verification checks passed, \
+            and this run asks for one acceptance audit before a done is accepted (it happens \
+            once per run). In your reply, list each acceptance criterion the task states — or, \
+            when the task states no explicit criteria list, each requirement it states — and \
+            next to each one cite evidence ALREADY produced in this run: a test that covers it \
+            (one the task names, or one you wrote), an edit you made, command output you have \
+            already seen, or the verification checks that just passed. Cover every \"must not\", \
+            \"unchanged\" or \"only when\" clause and every \"all\", \"every\" or \"not just one\" \
+            clause. Do not re-run tests or commands, and do not re-read files, for anything that \
+            already has evidence. If something has no evidence, keep working until it does. Then \
+            call finish(done) again.";
+        assert_eq!(
+            rendered, expected,
+            "acceptance-audit wording must match the pinned text exactly; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("re-verify"),
+            "the audit wording must not contain 're-verify'; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Acceptance Criteria"),
+            "the audit wording must not contain 'Acceptance Criteria'; got:\n{rendered}"
+        );
+    }
+
+    /// The audit prompt is a variable-free template — rendering it twice must
+    /// produce byte-identical output (prompt-cache correctness).
+    #[test]
+    fn render_acceptance_audit_prompt_is_byte_deterministic() {
+        let a = render_acceptance_audit_prompt();
+        let b = render_acceptance_audit_prompt();
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "same (empty) inputs must produce byte-identical acceptance-audit output"
+        );
+    }
+
+    /// `AcceptanceAuditPromptTemplate` is a unit struct with no fields — its
+    /// `render` must succeed via the askama derive (a compile-time check) and
+    /// return the same bytes as the free function.
+    #[test]
+    fn acceptance_audit_prompt_template_renders_via_derive() {
+        let via_struct = AcceptanceAuditPromptTemplate
+            .render()
+            .expect("variable-free template renders infallibly");
+        let via_fn = render_acceptance_audit_prompt();
         assert_eq!(via_struct, via_fn);
     }
 

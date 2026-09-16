@@ -70,6 +70,14 @@
 //!   `## Criterion Coverage` prompt section; `0`/empty/unset = off (the
 //!   default, matching production talos). See
 //!   `harness::prompt::parse_criteria_rules_flag`.
+//! - `CODING_EVAL_ACCEPTANCE_AUDIT` (optional) — `1` = on, opt-in the
+//!   one-shot acceptance audit (design doc 05 section B); `0`/empty/unset =
+//!   off (the default, matching production talos). See
+//!   `harness::transcript::parse_transcripts_flag` (reused for its `0`/`1`
+//!   shape) and `harness::engine::RunConfig::with_acceptance_audit`. INERT
+//!   for a fixture whose `TrialEnv` carries no `ChecksRunner` — the audit
+//!   only fires on a checks-verified `finish(done)`, so `stats.audit_armed`
+//!   stays `false` on a legacy (no-`task.json`) fixture.
 
 use std::env;
 use std::fmt::Write as _;
@@ -79,8 +87,8 @@ use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::engine::{LoopOutcome, RunStats};
 use harness::eval::{
-    EvalReport, EvalTranscripts, TrialResult, coding_fix_task_with, discover_fixtures,
-    run_eval_with_transcripts,
+    EvalOptions, EvalReport, EvalTranscripts, TrialResult, coding_fix_task_with, discover_fixtures,
+    run_eval_with_options,
 };
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
@@ -251,6 +259,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("CODING_EVAL_K", DEFAULT_K);
@@ -272,6 +281,14 @@ async fn main() {
     let criteria_rules_on = harness::prompt::parse_criteria_rules_flag(
         "CODING_EVAL_CRITERIA_RULES",
         env::var("CODING_EVAL_CRITERIA_RULES").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    // Acceptance audit is OFF by default, matching production talos.
+    // `CODING_EVAL_ACCEPTANCE_AUDIT=1` opts in so the same fixtures can be
+    // run A/B — see the module docs above for the checks-configured caveat.
+    let acceptance_audit_on = harness::transcript::parse_transcripts_flag(
+        "CODING_EVAL_ACCEPTANCE_AUDIT",
+        env::var("CODING_EVAL_ACCEPTANCE_AUDIT").ok().as_deref(),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let transcripts_root = transcripts_on.then(coding_eval_transcripts_root);
@@ -309,10 +326,11 @@ async fn main() {
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
          (max_iterations={max_iterations}, test_first={include_test_first}, \
-         criteria_rules={}, transcripts={})",
+         criteria_rules={}, transcripts={}, acceptance_audit={})",
         fixtures.len(),
         if criteria_rules_on { "on" } else { "off" },
         if transcripts_on { "on" } else { "off" },
+        if acceptance_audit_on { "on" } else { "off" },
     );
 
     // Per-fixture reports paired with the display name (the fixture directory
@@ -340,13 +358,17 @@ async fn main() {
             dir: root.join(&fixture_name),
             label: backend_desc.clone(),
         });
-        let report = run_eval_with_transcripts(
+        let options = EvalOptions {
+            transcripts,
+            acceptance_audit: acceptance_audit_on,
+        };
+        let report = run_eval_with_options(
             &task,
             &backend,
             env_factory,
             k,
             max_iterations,
-            transcripts.as_ref(),
+            &options,
             |trial: &TrialResult| {
                 let mut line = format!(
                     "  trial {}: {} | {}",
@@ -470,6 +492,16 @@ fn stats_one_liner(stats: &RunStats) -> String {
             raw.chars().take(80).collect::<String>()
         );
     }
+    let _ = write!(
+        line,
+        " | audit_armed={} | audit_fired={} | audit_changed_tree={} | \
+         audit_rubber_stamped={} | audit_reply_chars={}",
+        stats.audit_armed,
+        stats.audit_fired,
+        stats.audit_changed_tree,
+        stats.audit_rubber_stamped,
+        stats.audit_reply_text_chars,
+    );
     line
 }
 
