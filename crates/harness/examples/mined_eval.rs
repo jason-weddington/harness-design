@@ -81,18 +81,6 @@
 //! - `MINED_EVAL_TRANSCRIPTS` (optional) — `1` = on, opt-in full run
 //!   transcript per trial (see `harness::transcript`); `0`/empty/unset = off
 //!   (the default). See `harness::transcript::parse_transcripts_flag`.
-//! - `MINED_EVAL_CRITERIA_RULES` (optional) — `1` = on, opt-in the shared
-//!   `## Criterion Coverage` guidance appended to the agent prompt;
-//!   `0`/empty/unset = off (the default, matching production talos). See
-//!   `harness::prompt::parse_criteria_rules_flag`.
-//! - `MINED_EVAL_ACCEPTANCE_AUDIT` (optional) — `1` = on, opt-in the
-//!   one-shot acceptance audit (design doc 05 section B); `0`/empty/unset =
-//!   off (the default, matching production talos). See
-//!   `harness::transcript::parse_transcripts_flag` (reused for its `0`/`1`
-//!   shape) and `harness::engine::RunConfig::with_acceptance_audit`. Setting
-//!   this to `1` while `MINED_EVAL_AGENT_GATE` is off panics at startup: the
-//!   audit only fires on a checks-verified `finish(done)`, and Off mode runs
-//!   with `checks: None`, so the flag would be a silent no-op.
 //! - `EVAL_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*` — same shape as
 //!   `examples/coding_eval.rs`. Kept as a duplicated helper (`backend_from_env`)
 //!   rather than extracted to the lib, because pulling it into the lib would
@@ -310,23 +298,6 @@ async fn main() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let transcripts_desc = if transcripts { "on" } else { "off" };
-    let criteria_rules = harness::prompt::parse_criteria_rules_flag(
-        "MINED_EVAL_CRITERIA_RULES",
-        env::var("MINED_EVAL_CRITERIA_RULES").ok().as_deref(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    let criteria_rules_desc = if criteria_rules { "on" } else { "off" };
-    let acceptance_audit = harness::transcript::parse_transcripts_flag(
-        "MINED_EVAL_ACCEPTANCE_AUDIT",
-        env::var("MINED_EVAL_ACCEPTANCE_AUDIT").ok().as_deref(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    assert!(
-        !(acceptance_audit && matches!(agent_gate, AgentGateMode::Off)),
-        "MINED_EVAL_ACCEPTANCE_AUDIT=1 requires MINED_EVAL_AGENT_GATE on: the audit only \
-         fires on a checks-verified finish(done)"
-    );
-    let acceptance_audit_desc = if acceptance_audit { "on" } else { "off" };
 
     let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("MINED_EVAL_K", DEFAULT_K);
@@ -387,7 +358,7 @@ async fn main() {
         .collect();
 
     println!(
-        "running mined_eval across {} task(s) (k={k}, spec_level={spec_level:?}, max_iterations={max_iterations}, agent_gate={agent_gate}, test_first={}, criteria_rules={criteria_rules_desc}, wall_clock={wall_clock_desc}, transcripts={transcripts_desc}, acceptance_audit={acceptance_audit_desc}) against {backend_desc}",
+        "running mined_eval across {} task(s) (k={k}, spec_level={spec_level:?}, max_iterations={max_iterations}, agent_gate={agent_gate}, test_first={}, wall_clock={wall_clock_desc}, transcripts={transcripts_desc}) against {backend_desc}",
         loaded.len(),
         if test_first { "on" } else { "off" },
     );
@@ -420,8 +391,6 @@ async fn main() {
             test_first,
             wall_clock_secs,
             transcripts,
-            criteria_rules,
-            acceptance_audit,
         };
         let mut on_trial = |trial: &MinedTrialResult| {
             // fr_armed=false, green_at_exit=false, and nudges=0 on every trial
@@ -471,20 +440,6 @@ async fn main() {
             if let Some(p) = &trial.transcript_path {
                 let _ = write!(line, " | transcript: {}", p.display());
             }
-            let _ = write!(
-                line,
-                " | audit_armed={} | audit_fired={} | audit_changed_tree={} | \
-                 audit_rubber_stamped={} | audit_reply_chars={} | audit_edits={} | \
-                 audit_bash={} | audit_red_done={}",
-                trial.audit_armed,
-                trial.audit_fired,
-                trial.audit_changed_tree,
-                trial.audit_rubber_stamped,
-                trial.audit_reply_text_chars,
-                trial.audit_followup_edit_file_ok,
-                trial.audit_followup_bash_ok,
-                trial.audit_followup_red_done,
-            );
             println!("{line}");
         };
         let report = mined_eval::run_mined_task(&backend, &parser, &config, &mut on_trial).await;
@@ -508,8 +463,6 @@ async fn main() {
             agent_gate,
             test_first,
             wall_clock_secs,
-            criteria_rules,
-            acceptance_audit,
         },
     );
 }
@@ -552,8 +505,6 @@ struct SummaryHeader<'a> {
     agent_gate: AgentGateMode,
     test_first: bool,
     wall_clock_secs: u64,
-    criteria_rules: bool,
-    acceptance_audit: bool,
 }
 
 /// Render the final one-line-per-task summary table.
@@ -570,8 +521,6 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         .unwrap_or(0)
         .max("task".len());
     let test_first_desc = if header.test_first { "on" } else { "off" };
-    let criteria_rules_desc = if header.criteria_rules { "on" } else { "off" };
-    let acceptance_audit_desc = if header.acceptance_audit { "on" } else { "off" };
     let wall_clock_desc = if header.wall_clock_secs == 0 {
         "unbounded".to_string()
     } else {
@@ -579,7 +528,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
     };
 
     println!(
-        "\n=== SUMMARY (backend={}, spec_level={:?}, max_iterations={}, k={}, static_tree_k={}, max_nudges={}, agent_gate={}, test_first={test_first_desc}, criteria_rules={criteria_rules_desc}, wall_clock={wall_clock_desc}, acceptance_audit={acceptance_audit_desc}) ===",
+        "\n=== SUMMARY (backend={}, spec_level={:?}, max_iterations={}, k={}, static_tree_k={}, max_nudges={}, agent_gate={}, test_first={test_first_desc}, wall_clock={wall_clock_desc}) ===",
         header.backend_desc,
         header.spec_level,
         header.max_iterations,

@@ -505,16 +505,6 @@ async fn main() {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
-                // CC has no acceptance audit — all nine fields are inert.
-                audit_armed: false,
-                audit_fired: false,
-                audit_iteration: 0,
-                audit_changed_tree: false,
-                audit_rubber_stamped: false,
-                audit_reply_text_chars: 0,
-                audit_followup_edit_file_ok: 0,
-                audit_followup_bash_ok: 0,
-                audit_followup_red_done: 0,
             };
 
             let trial = TrialResult {

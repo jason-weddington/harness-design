@@ -20,17 +20,6 @@
 //! tool result — default OFF, flag only (no env fallback). `talos ralph` has
 //! no transcript support.
 //!
-//! `talos run --criteria-rules` opts into the shared `## Criterion Coverage`
-//! prompt section (see [`harness::prompt::render_criteria_rules`]) — default
-//! OFF, flag only (no env fallback, for the same reason as `--transcript`).
-//!
-//! `talos run --acceptance-audit` opts into the one-shot acceptance audit
-//! (design doc 05 section B, see
-//! [`harness::engine::RunConfig::with_acceptance_audit`]) — default OFF,
-//! flag only (no env fallback, for the same reason as `--transcript`). When
-//! passed, the stdout [`RunSummary`] gains an `acceptance_audit` object
-//! (see [`AuditSummary`]); without it the summary's key set is unchanged.
-//!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
 //! with a fresh inner context per outer iteration. `ralph` is NOT run-record
@@ -135,7 +124,7 @@ use harness::engine::{LoopOutcome, Persistence, RunConfig, run_id, run_persisted
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
-use harness::prompt::render_task_prompt_from_spec_with;
+use harness::prompt::render_task_prompt_from_spec;
 use harness::ralph::{
     DEFAULT_MAX_BACKEND_ERRORS, DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport,
     RalphTerminal, run_ralph,
@@ -244,29 +233,6 @@ struct RunArgs {
     /// dispatch's sudo boundary does its `env_reset` (kb-02979 shape).
     #[arg(long)]
     transcript: Option<PathBuf>,
-
-    /// Opt-in the shared `## Criterion Coverage` prompt section (behavioural
-    /// per-criterion coverage, invariants, authoritative enumerations,
-    /// allowlists) — see [`harness::prompt::render_criteria_rules`]. Default
-    /// off.
-    ///
-    /// FLAG ONLY — there is deliberately no `TALOS_CRITERIA_RULES` env
-    /// fallback, for the same sudoers `env_keep` / `env_reset` reason
-    /// documented on [`RunArgs::transcript`] (kb-02979).
-    #[arg(long)]
-    criteria_rules: bool,
-
-    /// Opt-in one-shot acceptance audit (design doc 05 section B) — see
-    /// [`harness::engine::RunConfig::with_acceptance_audit`]. Default OFF:
-    /// the audit never fires unless this flag is passed.
-    ///
-    /// FLAG ONLY — there is deliberately no `TALOS_ACCEPTANCE_AUDIT` env
-    /// fallback: `templates/sudoers-dispatch-svc.tmpl`'s `env_keep` omits
-    /// `TALOS_*` runtime knobs, and an env-only toggle would be a silent
-    /// no-op past dispatch's `env_reset` (the kb-02979 shape, same rationale
-    /// already written on [`RunArgs::transcript`]).
-    #[arg(long)]
-    acceptance_audit: bool,
 }
 
 /// Arguments for `talos ralph`.
@@ -525,16 +491,12 @@ fn write_ralph_error_detail(
 
 /// Render the seed string passed to [`RunConfig::new`] for a task run.
 ///
-/// Returns [`render_task_prompt_from_spec_with`]`(spec, true, criteria_rules)`
-/// output byte-for-byte — the CLI never hand-formats task text. Test-first
-/// guidance is always on (the literal `true`); the opt-in `## Criterion
-/// Coverage` section follows `--criteria-rules` (default off). When
-/// `criteria_rules == false` this is byte-identical to
-/// `harness::prompt::render_task_prompt_from_spec(spec)`. The engine re-wraps
-/// this under a `# Task` heading via `render_task_prompt`; the renderer
-/// therefore must NOT emit its own `# Task` heading.
-fn make_run_seed(spec: &TaskSpec, criteria_rules: bool) -> String {
-    render_task_prompt_from_spec_with(spec, true, criteria_rules)
+/// Returns the [`render_task_prompt_from_spec`] output byte-for-byte — the
+/// CLI never hand-formats task text. The engine re-wraps this under a
+/// `# Task` heading via `render_task_prompt`; the renderer therefore must
+/// NOT emit its own `# Task` heading.
+fn make_run_seed(spec: &TaskSpec) -> String {
+    render_task_prompt_from_spec(spec)
 }
 
 /// Build a [`ChecksRunner`] from a shell gate command string, or `None` if the
@@ -567,37 +529,6 @@ fn stderr_json_error(message: &str) {
 // stdout summary
 // ============================================================================
 
-/// Acceptance-audit telemetry attached to [`RunSummary::acceptance_audit`]
-/// (design doc 05 section B), copied verbatim from [`harness::engine::RunStats`].
-/// `Some` on [`RunSummary`] ONLY when `--acceptance-audit` was passed —
-/// without the flag the stdout bytes are unchanged from before this field
-/// existed (the dispatch worker parses the line with a bare `json.loads` +
-/// `.get()`, so an extra key is backward-compatible).
-///
-/// `struct_excessive_bools`: each `bool` is an independent telemetry field
-/// copied verbatim from [`harness::engine::RunStats`] — see that struct's
-/// own `struct_excessive_bools` allow for the same rationale.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Serialize)]
-struct AuditSummary {
-    /// From [`harness::engine::RunStats::audit_armed`].
-    armed: bool,
-    /// From [`harness::engine::RunStats::audit_fired`].
-    fired: bool,
-    /// From [`harness::engine::RunStats::audit_changed_tree`].
-    changed_tree: bool,
-    /// From [`harness::engine::RunStats::audit_rubber_stamped`].
-    rubber_stamped: bool,
-    /// From [`harness::engine::RunStats::audit_reply_text_chars`].
-    reply_text_chars: u32,
-    /// From [`harness::engine::RunStats::audit_followup_edit_file_ok`].
-    followup_edit_file_ok: u32,
-    /// From [`harness::engine::RunStats::audit_followup_bash_ok`].
-    followup_bash_ok: u32,
-    /// From [`harness::engine::RunStats::audit_followup_red_done`].
-    followup_red_done: u32,
-}
-
 /// Machine-readable JSON summary written to stdout after a successful
 /// `run_persisted` call. Printed regardless of the task's disposition.
 #[derive(Serialize)]
@@ -614,10 +545,6 @@ struct RunSummary {
     record_path: String,
     /// Number of model turns the loop drew.
     iterations: u32,
-    /// Acceptance-audit telemetry — see [`AuditSummary`]. `Some` ONLY when
-    /// `--acceptance-audit` was passed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    acceptance_audit: Option<AuditSummary>,
 }
 
 /// Build the stdout [`RunSummary`] from a completed run.
@@ -627,7 +554,6 @@ fn build_run_summary(
     run_id_str: String,
     record_path: String,
     iterations: u32,
-    acceptance_audit: Option<AuditSummary>,
 ) -> RunSummary {
     RunSummary {
         outcome: outcome_s,
@@ -635,7 +561,6 @@ fn build_run_summary(
         run_id: run_id_str,
         record_path,
         iterations,
-        acceptance_audit,
     }
 }
 
@@ -972,7 +897,7 @@ async fn run_cmd(args: RunArgs) {
 
     // 10. Render the seed prompt — byte-for-byte from the renderer, never
     //     hand-formatted.
-    let seed = make_run_seed(&spec, args.criteria_rules);
+    let seed = make_run_seed(&spec);
 
     // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env > 0 (unbounded).
     // The `env` clap feature is NOT enabled (Cargo.toml features=['derive'] only),
@@ -989,7 +914,6 @@ async fn run_cmd(args: RunArgs) {
     } else {
         RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
     };
-    config = config.with_acceptance_audit(args.acceptance_audit);
     // Label is computed from `model_label` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
     // flag was passed) and has no env fallback — see `RunArgs::transcript`.
@@ -1022,24 +946,7 @@ async fn run_cmd(args: RunArgs) {
     let iterations = result.stats.iterations;
     let disposition = result.outcome.into_disposition();
     let record_path = run_store_path.display().to_string();
-    let acceptance_audit_summary = args.acceptance_audit.then_some(AuditSummary {
-        armed: result.stats.audit_armed,
-        fired: result.stats.audit_fired,
-        changed_tree: result.stats.audit_changed_tree,
-        rubber_stamped: result.stats.audit_rubber_stamped,
-        reply_text_chars: result.stats.audit_reply_text_chars,
-        followup_edit_file_ok: result.stats.audit_followup_edit_file_ok,
-        followup_bash_ok: result.stats.audit_followup_bash_ok,
-        followup_red_done: result.stats.audit_followup_red_done,
-    });
-    let summary = build_run_summary(
-        outcome_s,
-        disposition,
-        rid,
-        record_path,
-        iterations,
-        acceptance_audit_summary,
-    );
+    let summary = build_run_summary(outcome_s, disposition, rid, record_path, iterations);
     println!(
         "{}",
         serde_json::to_string(&summary)
@@ -1163,16 +1070,14 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditSummary, Backend, Cli, Command, RalphSummary, RunSummary, backend_from_env,
-        build_checks_runner, build_ralph_summary, build_run_summary, exit_code, make_run_seed,
-        outcome_str, ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
-        transcript_label, write_ralph_error_detail,
+        Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
+        build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
+        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs, transcript_label,
+        write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
-    use harness::prompt::{
-        render_criteria_rules, render_task_prompt_from_spec, render_task_prompt_from_spec_with,
-    };
+    use harness::prompt::render_task_prompt_from_spec;
     use harness::ralph::RalphTerminal;
     use harness::run_record::{Disposition, FailureMode, Verification};
     use harness::task_spec::{FileToModify, TaskSpec};
@@ -1534,7 +1439,7 @@ mod tests {
     #[test]
     fn seed_byte_identical_to_renderer_not_raw_description() {
         let spec = sample_spec();
-        let seed = make_run_seed(&spec, false);
+        let seed = make_run_seed(&spec);
         let expected = render_task_prompt_from_spec(&spec);
         assert_eq!(
             seed.as_bytes(),
@@ -1547,74 +1452,6 @@ mod tests {
             seed, spec.description,
             "seed must NOT be the raw description — the renderer must be used"
         );
-    }
-
-    /// The `--criteria-rules` arm must route through the same renderer with
-    /// `include_criteria_rules = true`, and must contain the shared section.
-    #[test]
-    fn seed_with_criteria_rules_matches_renderer_on_arm() {
-        let spec = sample_spec();
-        let seed = make_run_seed(&spec, true);
-        let expected = render_task_prompt_from_spec_with(&spec, true, true);
-        assert_eq!(
-            seed.as_bytes(),
-            expected.as_bytes(),
-            "seed must be byte-identical to render_task_prompt_from_spec_with(spec, true, true)"
-        );
-        assert!(
-            seed.contains(&render_criteria_rules()),
-            "seed must contain the rendered criteria-rules section; got:\n{seed}"
-        );
-    }
-
-    /// `--criteria-rules` defaults to off and flips true when passed.
-    #[test]
-    fn run_args_criteria_rules_flag_defaults_off() {
-        let cli = <Cli as clap::Parser>::try_parse_from(["talos", "run", "--workspace", "w"])
-            .expect("parse without --criteria-rules");
-        let Command::Run(args) = cli.command else {
-            panic!("expected run")
-        };
-        assert!(!args.criteria_rules, "--criteria-rules must default to off");
-
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "talos",
-            "run",
-            "--workspace",
-            "w",
-            "--criteria-rules",
-        ])
-        .expect("parse with --criteria-rules");
-        let Command::Run(args) = cli.command else {
-            panic!("expected run")
-        };
-        assert!(args.criteria_rules, "--criteria-rules must flip to on");
-    }
-
-    #[test]
-    fn run_args_acceptance_audit_flag_defaults_off() {
-        let cli = <Cli as clap::Parser>::try_parse_from(["talos", "run", "--workspace", "w"])
-            .expect("parse without --acceptance-audit");
-        let Command::Run(args) = cli.command else {
-            panic!("expected run")
-        };
-        assert!(
-            !args.acceptance_audit,
-            "--acceptance-audit must default to off"
-        );
-
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "talos",
-            "run",
-            "--workspace",
-            "w",
-            "--acceptance-audit",
-        ])
-        .expect("parse with --acceptance-audit");
-        let Command::Run(args) = cli.command else {
-            panic!("expected run")
-        };
-        assert!(args.acceptance_audit, "--acceptance-audit must flip to on");
     }
 
     // ---- summary: exact field set and outcome literals -----------------
@@ -1630,7 +1467,6 @@ mod tests {
             "my-task:1".into(),
             "/tmp/run.sqlite".into(),
             3,
-            None,
         );
         let json = serde_json::to_value(&summary).expect("summary must serialize");
         let obj = json.as_object().expect("must be object");
@@ -1645,8 +1481,7 @@ mod tests {
                 "record_path",
                 "run_id"
             ],
-            "summary must have exactly the five expected fields when \
-             --acceptance-audit was not passed"
+            "summary must have exactly the five expected fields"
         );
         assert_eq!(
             obj.get("outcome").and_then(serde_json::Value::as_str),
@@ -1659,52 +1494,6 @@ mod tests {
         assert_eq!(
             obj.get("iterations").and_then(serde_json::Value::as_u64),
             Some(3)
-        );
-    }
-
-    #[test]
-    fn summary_exact_field_set_with_acceptance_audit() {
-        let summary = build_run_summary(
-            "Finished",
-            Disposition::Done {
-                summary: "shipped".into(),
-                verification: Verification::NoChecksConfigured,
-            },
-            "my-task:1".into(),
-            "/tmp/run.sqlite".into(),
-            3,
-            Some(AuditSummary {
-                armed: true,
-                fired: true,
-                changed_tree: false,
-                rubber_stamped: true,
-                reply_text_chars: 0,
-                followup_edit_file_ok: 0,
-                followup_bash_ok: 0,
-                followup_red_done: 0,
-            }),
-        );
-        let json = serde_json::to_value(&summary).expect("summary must serialize");
-        let obj = json.as_object().expect("must be object");
-        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
-                "acceptance_audit",
-                "disposition",
-                "iterations",
-                "outcome",
-                "record_path",
-                "run_id"
-            ],
-            "summary must have exactly six sorted keys when --acceptance-audit was passed"
-        );
-        assert_eq!(
-            obj.get("acceptance_audit")
-                .and_then(|v| v.get("fired"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
         );
     }
 
@@ -1753,7 +1542,6 @@ mod tests {
             "task:1".into(),
             "/state/run.sqlite".into(),
             5,
-            None,
         );
         let json = serde_json::to_value(&summary).expect("must serialize");
         assert!(

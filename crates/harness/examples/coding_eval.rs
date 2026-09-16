@@ -66,18 +66,6 @@
 //!   `<state-root>/talos/coding-eval/<unix-secs>-<pid>/<fixture>/trial-<i>.jsonl`;
 //!   `0`/empty/unset = off (the default). See
 //!   `harness::transcript::parse_transcripts_flag`.
-//! - `CODING_EVAL_CRITERIA_RULES` (optional) — `1` = on, opt-in the
-//!   `## Criterion Coverage` prompt section; `0`/empty/unset = off (the
-//!   default, matching production talos). See
-//!   `harness::prompt::parse_criteria_rules_flag`.
-//! - `CODING_EVAL_ACCEPTANCE_AUDIT` (optional) — `1` = on, opt-in the
-//!   one-shot acceptance audit (design doc 05 section B); `0`/empty/unset =
-//!   off (the default, matching production talos). See
-//!   `harness::transcript::parse_transcripts_flag` (reused for its `0`/`1`
-//!   shape) and `harness::engine::RunConfig::with_acceptance_audit`. INERT
-//!   for a fixture whose `TrialEnv` carries no `ChecksRunner` — the audit
-//!   only fires on a checks-verified `finish(done)`, so `stats.audit_armed`
-//!   stays `false` on a legacy (no-`task.json`) fixture.
 
 use std::env;
 use std::fmt::Write as _;
@@ -87,8 +75,8 @@ use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::engine::{LoopOutcome, RunStats};
 use harness::eval::{
-    EvalOptions, EvalReport, EvalTranscripts, TrialResult, coding_fix_task_with, discover_fixtures,
-    run_eval_with_options,
+    EvalReport, EvalTranscripts, TrialResult, coding_fix_task_with, discover_fixtures,
+    run_eval_with_transcripts,
 };
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_context_length};
@@ -259,7 +247,6 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 #[tokio::main(flavor = "current_thread")]
-#[allow(clippy::too_many_lines)]
 async fn main() {
     let (backend, backend_desc) = backend_from_env().await;
     let k = env_u32("CODING_EVAL_K", DEFAULT_K);
@@ -273,22 +260,6 @@ async fn main() {
     let transcripts_on = harness::transcript::parse_transcripts_flag(
         "CODING_EVAL_TRANSCRIPTS",
         env::var("CODING_EVAL_TRANSCRIPTS").ok().as_deref(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    // Criterion Coverage guidance is OFF by default, matching production
-    // talos. `CODING_EVAL_CRITERIA_RULES=1` opts in so the same fixtures can
-    // be run A/B.
-    let criteria_rules_on = harness::prompt::parse_criteria_rules_flag(
-        "CODING_EVAL_CRITERIA_RULES",
-        env::var("CODING_EVAL_CRITERIA_RULES").ok().as_deref(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    // Acceptance audit is OFF by default, matching production talos.
-    // `CODING_EVAL_ACCEPTANCE_AUDIT=1` opts in so the same fixtures can be
-    // run A/B — see the module docs above for the checks-configured caveat.
-    let acceptance_audit_on = harness::transcript::parse_transcripts_flag(
-        "CODING_EVAL_ACCEPTANCE_AUDIT",
-        env::var("CODING_EVAL_ACCEPTANCE_AUDIT").ok().as_deref(),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let transcripts_root = transcripts_on.then(coding_eval_transcripts_root);
@@ -326,11 +297,9 @@ async fn main() {
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
          (max_iterations={max_iterations}, test_first={include_test_first}, \
-         criteria_rules={}, transcripts={}, acceptance_audit={})",
+         transcripts={})",
         fixtures.len(),
-        if criteria_rules_on { "on" } else { "off" },
         if transcripts_on { "on" } else { "off" },
-        if acceptance_audit_on { "on" } else { "off" },
     );
 
     // Per-fixture reports paired with the display name (the fixture directory
@@ -343,8 +312,7 @@ async fn main() {
             .and_then(|s| s.to_str())
             .unwrap_or("<unnamed>")
             .to_string();
-        let (mut task, env_factory) =
-            coding_fix_task_with(fixture, include_test_first, criteria_rules_on);
+        let (mut task, env_factory) = coding_fix_task_with(fixture, include_test_first);
         // Stamp the fixture name onto the task so the report says which
         // fixture ran — otherwise every report would just read `coding_fix`.
         task.name = fixture_name.clone();
@@ -358,17 +326,13 @@ async fn main() {
             dir: root.join(&fixture_name),
             label: backend_desc.clone(),
         });
-        let options = EvalOptions {
-            transcripts,
-            acceptance_audit: acceptance_audit_on,
-        };
-        let report = run_eval_with_options(
+        let report = run_eval_with_transcripts(
             &task,
             &backend,
             env_factory,
             k,
             max_iterations,
-            &options,
+            transcripts.as_ref(),
             |trial: &TrialResult| {
                 let mut line = format!(
                     "  trial {}: {} | {}",
@@ -400,20 +364,12 @@ async fn main() {
         .unwrap_or(0)
         .max("fixture".len());
 
-    print_summary(&summary, name_col, include_test_first, criteria_rules_on);
+    print_summary(&summary, name_col);
 }
 
 /// Render the final one-line-per-fixture summary table.
-fn print_summary(
-    summary: &[(String, EvalReport)],
-    name_col: usize,
-    include_test_first: bool,
-    criteria_rules_on: bool,
-) {
-    println!(
-        "\n=== SUMMARY (test_first={include_test_first}, criteria_rules={}) ===",
-        if criteria_rules_on { "on" } else { "off" },
-    );
+fn print_summary(summary: &[(String, EvalReport)], name_col: usize) {
+    println!("\n=== SUMMARY ===");
     println!(
         "{:<name_col$}  {:>9}  {:>10}  {:>10}  {:>12}  {:>9}  {:>11}  {:>8}  {:>9}  {:>9}  {:>9}",
         "fixture",
@@ -492,16 +448,6 @@ fn stats_one_liner(stats: &RunStats) -> String {
             raw.chars().take(80).collect::<String>()
         );
     }
-    let _ = write!(
-        line,
-        " | audit_armed={} | audit_fired={} | audit_changed_tree={} | \
-         audit_rubber_stamped={} | audit_reply_chars={}",
-        stats.audit_armed,
-        stats.audit_fired,
-        stats.audit_changed_tree,
-        stats.audit_rubber_stamped,
-        stats.audit_reply_text_chars,
-    );
     line
 }
 

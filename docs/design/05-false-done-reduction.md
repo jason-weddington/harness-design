@@ -1,6 +1,6 @@
 # 05 — Reducing false dones: per-criterion tests + a one-shot acceptance audit
 
-Status: **MEASURED — NEGATIVE (2026-09-16).** A′ and B are built and merged, DEFAULT OFF everywhere, and neither shows a benefit on the shape it targets (`kb-03283`). Do not flip either default on this evidence. Details in the Result section at the end. Data: `kb-03252` (first representative tier-2 matrix), `kb-03240` (production-parity gate).
+Status: **MEASURED — NEGATIVE (2026-09-16).** A′ and B are built and merged, DEFAULT OFF everywhere, and neither shows a benefit on the shape it targets (`kb-03283`). Do not flip either default on this evidence. **The code was then REVERTED (2026-09-16) — the knobs no longer exist**; this document is kept as the record of the experiment and the shape it measured. Details in the Result section at the end. Data: `kb-03252` (first representative tier-2 matrix), `kb-03240` (production-parity gate).
 
 ## The problem
 
@@ -47,14 +47,6 @@ The **second** `finish(done)` goes through normal gate verification. It is bound
 
 Telemetry to add with it: `audit_fired`, `audit_changed_tree` (the model mutated the tree after the audit, meaning the audit found a real gap), and `audit_rubber_stamped` (second Done with no tool calls in between). Without these we could not tell a working audit from theatre.
 
-**Status (2026-09-15): B is implemented, DEFAULT OFF everywhere** — `talos run --acceptance-audit`, `CODING_EVAL_ACCEPTANCE_AUDIT=1` (tier-1), and `MINED_EVAL_ACCEPTANCE_AUDIT=1` (tier-2, requires `MINED_EVAL_AGENT_GATE` on — the audit only fires on a checks-verified `finish(done)`), plus `RunConfig::with_acceptance_audit`/`EvalOptions::acceptance_audit`/`MinedRunConfig::acceptance_audit` for programmatic callers — none of these knobs are reachable from a real GTD dispatch yet (`agent-gtd-dispatch`'s `build_talos_argv` passes neither `--transcript` nor `--acceptance-audit`; wiring that is a separate item).
-
-The audit fires at most once per loop invocation, on the FIRST `finish(done)` whose gate is green, evaluated in order: `acceptance_audit` is on; the loop-local latch is unset (seeded from resumed history, so a crash-resume whose reconciled messages already contain the audit reply does not audit a second time — this is what makes "it happens once per run" literally true across a crash boundary); the claim is `done`; checks are configured and green; at least one iteration remains after this one (so the audit itself cannot be the thing that trips `MaxIterations`); and the wall-clock budget, checked AFTER the gate run so the gate's own duration counts, is not yet breached (so the audit itself cannot trip `BudgetExhausted`) — a hit on either of the last two conditions falls through to a normal accepted Done rather than holding it back, since firing there would be strictly worse than audit-off.
-
-When the audit fires, every remaining tool call in that SAME assistant turn — another `finish` included — is short-circuited with a fixed "not evaluated" tool result rather than dispatched, so the workspace is provably unchanged between the audit's green gate and the model's next reply; and if that next reply produces zero tool calls (a text-only answer to the audit, the common case), the loop accepts the already-verified Done immediately rather than falling through to the stop-terminal nudge guard and `StoppedWithoutFinish` — the stashed Done carries a harness-run `Verification::Checks`, never a model self-report, so accepting it without a second gate run does not weaken the claim-vs-verify invariant.
-
-Nine telemetry fields land on `RunStats` (and flow through to `MinedTrialResult` and the talos `--acceptance-audit` stdout summary): `audit_armed` (structurally on: audit enabled and checks configured, independent of whether it ever fires), `audit_fired`, `audit_iteration` (the 1-based iteration it fired at, 0 if never), `audit_changed_tree` (a real `edit_file`/`bash` success strictly after the fire), `audit_rubber_stamped` (the very next turn was exactly one bare `finish(done)` call), `audit_reply_text_chars` (that next turn's text length), `audit_followup_edit_file_ok` / `audit_followup_bash_ok` (splitting `audit_changed_tree` into real edits vs. re-run commands), and `audit_followup_red_done` (a post-audit `finish(done)` rejected by a red gate — the churn signal below). This status paragraph SUPERSEDES step 3 of the `Decision needed` section below: B is built default-off ahead of the A′ measurement readout, by decision, rather than gated on it.
-
 ### C. Instrumentation prerequisite: transcripts (shipped) + the agent's final diff
 
 Update 2026-09-15: full run transcripts shipped overnight (`d4651b6`, `MINED_EVAL_TRANSCRIPTS=1`): every model turn, reasoning text, tool call input and tool result, per trial. That covers most of what this section asked for; the overnight qwen3.8 re-run has them on, so its false dones can be read turn by turn. Still worth adding: persist the agent's final `git diff` (tracked and untracked) before `copy_sealed` overwrites the sealed paths, because reconstructing a diff from edit_file/bash calls is lossy for bash-driven edits. Pure observability, no scoring change.
@@ -79,8 +71,8 @@ Both parts reach `talos run` through the shared template and `RunConfig`, so wha
 
 ## Risks
 
-- The audit induces churn — the model "finds" non-gaps and edits working code, or worse, breaks a green tree. Measured by `audit_followup_edit_file_ok` (real edits) and `audit_followup_bash_ok` (post-audit command re-runs) on tasks that were already resolved, distinct from `audit_followup_red_done` (a post-audit `finish(done)` rejected by a red gate — churn that broke what was green).
-- The model rubber-stamps the audit. Measured by `audit_rubber_stamped && audit_reply_text_chars == 0` — a rubber-stamped reply that also carries a written evidence list is the ideal single-turn compliant response, not theatre, so the escalation criterion is the two conditions together, not `audit_rubber_stamped` alone. If the combined signal dominates, the next step is requiring the evidence list in a structured `finish` field the harness can check for completeness against the task's AC list (production TaskSpecs have one).
+- The audit induces churn — the model "finds" non-gaps and edits working code. Measured by `audit_changed_tree` on tasks that were already resolved.
+- The model rubber-stamps the audit. Measured by `audit_rubber_stamped`; if it dominates, the next step is requiring the evidence list in a structured `finish` field the harness can check for completeness against the task's AC list (production TaskSpecs have one).
 - Iteration cost. At cap 500 this is budget, not failure; it will show in wall time and tokens.
 
 ## Alternatives considered
@@ -113,3 +105,5 @@ Decisive run: photoqueue-privacy-metadata only (the dominant false-done shape), 
 Process note, the same shape as `kb-03201`: the first read of these arms called the mechanism confirmed from ONE k=3 transcript where the agent happened to probe PIL. The telemetry (`audit_changed_tree`) and the k=10 behavioural metric both refuted it. For a prompt or loop change, measure the behaviour the change should induce before any outcome claim.
 
 Open direction: this shape may be a model-knowledge (context) gap that prompt text cannot close, in which case it is a legitimate routing **discriminator** — glm-5.3 resolves this task where qwen3.8 does not — rather than a harness defect. Anything tried next (a metadata-inspection affordance, an allowlist default, a retrieval step) gets measured probe-rate-first at k=10 before outcomes are quoted.
+
+The implementations were reverted on 2026-09-16 (both were dead code once measured), keeping only an explicit test pinning the anti-loop line in `verification_section.md`. The transcripts (`d4651b6`) and the finish-disposition fix (`4c8b637`) predate these knobs and stay — the transcripts are what made this negative result findable.

@@ -386,29 +386,12 @@ pub struct EvalTranscripts {
     pub label: String,
 }
 
-/// Opt-in knobs for [`run_eval_with_options`], bundled into one struct so
-/// adding a knob later doesn't force every caller to change (the same
-/// rationale as [`crate::engine::RunConfig`]).
-#[derive(Debug, Clone, Default)]
-pub struct EvalOptions {
-    /// Opt-in transcript sink — see [`EvalTranscripts`]. `None` (the
-    /// [`Default`]) means no trial writes a transcript.
-    pub transcripts: Option<EvalTranscripts>,
-    /// Opt-in one-shot acceptance audit (design doc 05 section B), applied to
-    /// every trial's [`RunConfig`] via
-    /// [`crate::engine::RunConfig::with_acceptance_audit`]. `false` (the
-    /// [`Default`]) matches production.
-    pub acceptance_audit: bool,
-}
-
-/// Same as [`run_eval`], with the opt-in knobs bundled in [`EvalOptions`].
-/// [`run_eval_with_transcripts`] is a thin delegate to this function
-/// (`EvalOptions { transcripts: transcripts.cloned(), acceptance_audit: false
-/// }`), and `run_eval` delegates to that — see the module docs on
-/// [`run_eval`] for the full trial-loop contract (per-trial isolation,
-/// holdout re-gate, `on_trial` callback timing).
+/// Same as [`run_eval`], with an extra opt-in transcript sink. `run_eval` is
+/// a one-line delegate to this function with `transcripts: None` — see the
+/// module docs on [`run_eval`] for the full trial-loop contract (per-trial
+/// isolation, holdout re-gate, `on_trial` callback timing).
 ///
-/// When `options.transcripts` is `Some(t)`, trial `i` (0-based) runs with
+/// When `transcripts` is `Some(t)`, trial `i` (0-based) runs with
 /// `config.with_transcript(t.dir.join(format!("trial-{i}.jsonl")),
 /// t.label.clone())`, and that path is recorded on the trial's
 /// [`TrialResult::transcript_path`]. When `None`, no transcript config is
@@ -416,29 +399,25 @@ pub struct EvalOptions {
 ///
 /// # Panics
 /// See [`run_eval`].
-pub async fn run_eval_with_options(
+pub async fn run_eval_with_transcripts(
     task: &EvalTask,
     backend: &impl ModelBackend,
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
-    options: &EvalOptions,
+    transcripts: Option<&EvalTranscripts>,
     mut on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
     let mut passes: u32 = 0;
     let mut trial_results: Vec<TrialResult> = Vec::with_capacity(k as usize);
     for i in 0..k {
         let env = env_factory();
-        let mut config = RunConfig::new(task.task.clone(), max_iterations)
-            .with_acceptance_audit(options.acceptance_audit);
+        let mut config = RunConfig::new(task.task.clone(), max_iterations);
         if let Some(checks) = env.checks.clone() {
             config = config.with_checks(checks);
         }
-        let transcript_path = options
-            .transcripts
-            .as_ref()
-            .map(|t| t.dir.join(format!("trial-{i}.jsonl")));
-        if let (Some(path), Some(t)) = (&transcript_path, &options.transcripts) {
+        let transcript_path = transcripts.map(|t| t.dir.join(format!("trial-{i}.jsonl")));
+        if let (Some(path), Some(t)) = (&transcript_path, transcripts) {
             config = config.with_transcript(path.clone(), t.label.clone());
         }
         let RunResult { outcome, stats } =
@@ -486,37 +465,6 @@ pub async fn run_eval_with_options(
         pass_rate,
         trial_results,
     }
-}
-
-/// Same as [`run_eval`], with an extra opt-in transcript sink. A thin
-/// delegate over [`run_eval_with_options`] with `acceptance_audit: false` —
-/// see the module docs on [`run_eval`] for the full trial-loop contract.
-///
-/// # Panics
-/// See [`run_eval`].
-pub async fn run_eval_with_transcripts(
-    task: &EvalTask,
-    backend: &impl ModelBackend,
-    env_factory: impl Fn() -> TrialEnv,
-    k: u32,
-    max_iterations: u32,
-    transcripts: Option<&EvalTranscripts>,
-    on_trial: impl FnMut(&TrialResult),
-) -> EvalReport {
-    let options = EvalOptions {
-        transcripts: transcripts.cloned(),
-        acceptance_audit: false,
-    };
-    run_eval_with_options(
-        task,
-        backend,
-        env_factory,
-        k,
-        max_iterations,
-        &options,
-        on_trial,
-    )
-    .await
 }
 
 /// An owned scratch directory that deletes itself on drop.
@@ -763,33 +711,27 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
 /// Panics if `fixture_src/task.json` exists but cannot be read or is not valid
 /// [`crate::task_spec::TaskSpec`] JSON — a broken fixture is a broken host.
 pub fn coding_fix_task(fixture_src: &Path) -> (EvalTask, impl Fn() -> TrialEnv) {
-    coding_fix_task_with(fixture_src, true, false)
+    coding_fix_task_with(fixture_src, true)
 }
 
-/// [`coding_fix_task`] with the test-first approach guidance AND the opt-in
-/// Criterion Coverage guidance independently toggleable.
+/// [`coding_fix_task`] with the test-first approach guidance toggleable.
 ///
-/// Exists so the tier-1 eval can measure each guidance section's effect A/B on
-/// the same fixtures. Tier-1 is the surface where the measurement is
-/// meaningful: it registers a real `run_checks` runner AND keeps a sealed
-/// holdout re-gate, so a test the agent writes counts during the run while the
-/// holdout stays an independent oracle. (Tier-2 cannot measure the benefit —
-/// its file-scoped gate never collects agent-authored tests and `copy_sealed`
-/// overwrites the ones written at sealed paths.)
-///
-/// `include_criteria_rules` is default OFF, matching production — see
-/// [`crate::prompt::parse_criteria_rules_flag`].
+/// Exists so the tier-1 eval can measure the guidance's effect A/B on the same
+/// fixtures. Tier-1 is the surface where the measurement is meaningful: it
+/// registers a real `run_checks` runner AND keeps a sealed holdout re-gate, so
+/// a test the agent writes counts during the run while the holdout stays an
+/// independent oracle. (Tier-2 cannot measure the benefit — its file-scoped
+/// gate never collects agent-authored tests and `copy_sealed` overwrites the
+/// ones written at sealed paths.)
 ///
 /// Only affects the prompt when the fixture carries a `task.json`; the legacy
-/// bare-string prompt has no sections to toggle and `include_criteria_rules`
-/// has no effect on it.
+/// bare-string prompt has no sections to toggle.
 ///
 /// # Panics
 /// Same as [`coding_fix_task`].
 pub fn coding_fix_task_with(
     fixture_src: &Path,
     include_test_first: bool,
-    include_criteria_rules: bool,
 ) -> (EvalTask, impl Fn() -> TrialEnv) {
     let task_json_path = fixture_src.join("task.json");
     let task_prompt = if task_json_path.exists() {
@@ -797,11 +739,7 @@ pub fn coding_fix_task_with(
             .unwrap_or_else(|e| panic!("read {}: {e}", task_json_path.display()));
         let spec: crate::task_spec::TaskSpec = serde_json::from_str(&json_str)
             .unwrap_or_else(|e| panic!("parse {} as TaskSpec: {e}", task_json_path.display()));
-        crate::prompt::render_task_prompt_from_spec_with(
-            &spec,
-            include_test_first,
-            include_criteria_rules,
-        )
+        crate::prompt::render_task_prompt_from_spec_with(&spec, include_test_first)
     } else {
         "The test suite in this Rust crate fails. Find the bug, fix it, \
                and make the tests pass."
@@ -851,9 +789,8 @@ pub fn finish_task() -> EvalTask {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalOptions, EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult,
-        build_coding_env, coding_fix_task, coding_fix_task_with, copy_dir_recursive,
-        discover_fixtures, finish_env, finish_task, run_eval, run_eval_with_options,
+        EvalReport, EvalTask, EvalTranscripts, TrialEnv, TrialResult, build_coding_env,
+        coding_fix_task, copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
         run_eval_with_transcripts, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
@@ -1404,15 +1341,6 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
-                audit_armed: false,
-                audit_fired: false,
-                audit_iteration: 0,
-                audit_changed_tree: false,
-                audit_rubber_stamped: false,
-                audit_reply_text_chars: 0,
-                audit_followup_edit_file_ok: 0,
-                audit_followup_bash_ok: 0,
-                audit_followup_red_done: 0,
             },
             transcript_path: None,
         };
@@ -1820,48 +1748,6 @@ mod tests {
         );
     }
 
-    /// `coding_fix_task_with(.., true, true)` routes through the SAME
-    /// production renderer as `render_task_prompt_from_spec_with` — not a
-    /// paraphrase — and the criteria-rules flag never reaches the legacy
-    /// no-`task.json` literal prompt.
-    #[test]
-    fn coding_fix_task_with_criteria_rules_routes_through_the_production_renderer() {
-        let dir = tempdir().expect("tempdir with task.json");
-        let spec_json = r#"{
-            "title": "Sentinel Task Title",
-            "description": "Does something.",
-            "acceptance_criteria": ["sentinel-acceptance-criterion"],
-            "files_to_modify": [],
-            "gate_command": "cargo test"
-        }"#;
-        std::fs::write(dir.path().join("task.json"), spec_json).expect("write task.json");
-        let spec: crate::task_spec::TaskSpec = serde_json::from_str(spec_json).expect("parse spec");
-
-        let (task_on, _) = coding_fix_task_with(dir.path(), true, true);
-        assert_eq!(
-            task_on.task,
-            crate::prompt::render_task_prompt_from_spec_with(&spec, true, true)
-        );
-        assert!(
-            task_on
-                .task
-                .contains(&crate::prompt::render_criteria_rules())
-        );
-
-        let (task_default, _) = coding_fix_task(dir.path());
-        assert!(
-            !task_default.task.contains("## Criterion Coverage"),
-            "coding_fix_task must stay criteria-rules-off by default; got:\n{}",
-            task_default.task
-        );
-
-        // Without task.json, the flag cannot reach the legacy literal prompt.
-        let dir_without = tempdir().expect("tempdir without task.json");
-        let (task_without_on, _) = coding_fix_task_with(dir_without.path(), true, true);
-        let (task_without_default, _) = coding_fix_task(dir_without.path());
-        assert_eq!(task_without_on.task, task_without_default.task);
-    }
-
     /// A malformed (non-TaskSpec) `task.json` must cause a panic whose message
     /// names the fixture path (or the task.json path).
     #[test]
@@ -1931,15 +1817,6 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
-                audit_armed: false,
-                audit_fired: false,
-                audit_iteration: 0,
-                audit_changed_tree: false,
-                audit_rubber_stamped: false,
-                audit_reply_text_chars: 0,
-                audit_followup_edit_file_ok: 0,
-                audit_followup_bash_ok: 0,
-                audit_followup_red_done: 0,
             },
             transcript_path: None,
         };
@@ -2221,67 +2098,5 @@ mod tests {
         );
         let result2 = score_holdout(&holdout_src, &red_checks, &ctx2).await;
         assert!(!result2, "red gate must return false");
-    }
-
-    /// [`run_eval_with_options`]'s `acceptance_audit` knob reaches every
-    /// trial's [`RunConfig`] — on, the trial's `stats.audit_fired` is `true`
-    /// and the audit consumes an extra iteration; off (`run_eval`'s default),
-    /// it never fires.
-    #[tokio::test]
-    async fn acceptance_audit_option_reaches_every_trial_run_config() {
-        fn passing_env() -> TrialEnv {
-            TrialEnv {
-                tools: registry(),
-                ctx: ToolCtx::stub(),
-                checks: Some(ChecksRunner::new(
-                    CheckCommand {
-                        program: "/bin/sh".to_string(),
-                        args: vec!["-c".to_string(), "exit 0".to_string()],
-                    },
-                    PathBuf::from("/"),
-                    Duration::from_secs(10),
-                )),
-                holdout_src: None,
-                _scratch: Vec::new(),
-            }
-        }
-        fn finish_done_turn(call_id: &str) -> AssistantTurn {
-            AssistantTurn {
-                content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                    id: call_id.to_string(),
-                    name: FINISH_TOOL_NAME.to_string(),
-                    input: json!({"disposition": "done", "summary": "shipped"}),
-                })],
-                stop_reason: StopReason::ToolUse,
-                usage: usage(),
-            }
-        }
-        let task = finish_task();
-
-        // ON: the audit fires and consumes an extra iteration.
-        let backend_on =
-            MockBackend::from_turns(vec![finish_done_turn("c1"), finish_done_turn("c2")]);
-        let options_on = EvalOptions {
-            transcripts: None,
-            acceptance_audit: true,
-        };
-        let report_on =
-            run_eval_with_options(&task, &backend_on, passing_env, 1, 5, &options_on, |_| {}).await;
-        assert_eq!(report_on.trial_results.len(), 1);
-        assert!(report_on.trial_results[0].stats.audit_fired);
-        assert_eq!(report_on.trial_results[0].stats.iterations, 2);
-
-        // OFF: no audit, one iteration.
-        let backend_off = MockBackend::from_turns(vec![finish_done_turn("c1")]);
-        let options_off = EvalOptions {
-            transcripts: None,
-            acceptance_audit: false,
-        };
-        let report_off =
-            run_eval_with_options(&task, &backend_off, passing_env, 1, 5, &options_off, |_| {})
-                .await;
-        assert_eq!(report_off.trial_results.len(), 1);
-        assert!(!report_off.trial_results[0].stats.audit_fired);
-        assert_eq!(report_off.trial_results[0].stats.iterations, 1);
     }
 }

@@ -1281,15 +1281,14 @@ pub async fn run_env_setup(
 
 /// Assemble the tier-2 agent prompt: the mined statement, then (when
 /// `test_first`) the shared test-first approach guidance, then (when
-/// `criteria_rules`) the shared opt-in `## Criterion Coverage` guidance, then
-/// (when `agent_gate_command` is `Some`) the shared `## Verification` section
-/// for the in-run agent gate ([`AgentGateMode::On`]).
+/// `agent_gate_command` is `Some`) the shared `## Verification` section for
+/// the in-run agent gate ([`AgentGateMode::On`]).
 ///
 /// Tier-2's prompt is the mined statement VERBATIM — it never passes through
 /// `task_spec_prompt.md`, so harness-owned guidance that lives only in that
 /// template reaches talos dispatch and the tier-1 eval but NOT this path. That
 /// asymmetry silently voided a test-first experiment (three matrix runs that
-/// measured nothing), which is why every section is appended here from the
+/// measured nothing), which is why both sections are appended here from the
 /// same shared templates rather than restated.
 ///
 /// The guidance is deliberately harness-owned rather than written into the
@@ -1298,33 +1297,24 @@ pub async fn run_env_setup(
 /// of every task and make a harness behavior look like part of the mined
 /// commit.
 ///
-/// `guidance` is the concatenation of `render_test_first_approach()` (when
-/// `test_first`) and `render_criteria_rules()` (when `criteria_rules`), with
-/// NO separator between them — mirroring how `task_spec_prompt.md` composes
-/// the same two `{% include %}`s back to back. When `guidance` is empty the
-/// output is `statement.trim_end()` verbatim; otherwise it is
-/// `format!("{}\n\n{}", statement.trim_end(), guidance)`. With
-/// `criteria_rules = false` this reproduces today's output byte-for-byte for
-/// every `(test_first, agent_gate_command)` combination. Finally, when
-/// `agent_gate_command` is `Some(cmd)`, `render_verification_section(cmd)` is
-/// appended with NO separator, as before.
+/// With `test_first = true` and `agent_gate_command = None`, the output is
+/// byte-identical to the pre-agent-gate `format!("{}\n\n{}", statement.trim_end(),
+/// render_test_first_approach())`. With `agent_gate_command = Some(cmd)`, the
+/// output is exactly that string followed immediately by
+/// `render_verification_section(cmd)`, with NO separator inserted.
 fn tier2_task_prompt(
     statement: &str,
     agent_gate_command: Option<&str>,
     test_first: bool,
-    criteria_rules: bool,
 ) -> String {
-    let mut guidance = String::new();
-    if test_first {
-        guidance.push_str(&crate::prompt::render_test_first_approach());
-    }
-    if criteria_rules {
-        guidance.push_str(&crate::prompt::render_criteria_rules());
-    }
-    let mut out = if guidance.is_empty() {
-        statement.trim_end().to_string()
+    let mut out = if test_first {
+        format!(
+            "{}\n\n{}",
+            statement.trim_end(),
+            crate::prompt::render_test_first_approach()
+        )
     } else {
-        format!("{}\n\n{}", statement.trim_end(), guidance)
+        statement.trim_end().to_string()
     };
     if let Some(cmd) = agent_gate_command {
         out.push_str(&crate::prompt::render_verification_section(cmd));
@@ -1588,12 +1578,6 @@ pub async fn sealed_regate_score_with_timeout<P: TestReportParser + ?Sized>(
 ///
 /// The build agent may ADD fields; the pinned ones (needed by the false-done
 /// cross-tab and by the audit trail) MUST NOT be omitted.
-///
-/// `struct_excessive_bools`: each `bool` is an independent per-trial signal
-/// (finish-recovery arming, gate state, and the acceptance-audit telemetry)
-/// copied verbatim from [`crate::engine::RunStats`] — see that struct's own
-/// `struct_excessive_bools` allow for the same rationale.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct MinedTrialResult {
     /// Zero-based trial index.
@@ -1724,37 +1708,6 @@ pub struct MinedTrialResult {
     /// `engine::run`). The file may be missing or partial if the best-effort
     /// [`crate::transcript`] writer disabled itself.
     pub transcript_path: Option<PathBuf>,
-    /// Whether the acceptance audit was structurally armed this trial: true
-    /// iff [`MinedRunConfig::acceptance_audit`] AND checks are configured.
-    /// From [`crate::engine::RunStats::audit_armed`]. `false` on every
-    /// pre-agent `invalid_trial` path and in [`AgentGateMode::Off`] (which
-    /// passes `checks: None`, per [`Self::gates_green_at_exit`]'s doc).
-    pub audit_armed: bool,
-    /// Whether the acceptance audit fired this trial.
-    /// From [`crate::engine::RunStats::audit_fired`].
-    pub audit_fired: bool,
-    /// The 1-based iteration at which the audit fired; `0` when it did not.
-    /// From [`crate::engine::RunStats::audit_iteration`].
-    pub audit_iteration: u32,
-    /// Whether a real edit ran strictly after the audit fired.
-    /// From [`crate::engine::RunStats::audit_changed_tree`].
-    pub audit_changed_tree: bool,
-    /// Whether the followup turn was a single bare `finish(done)` claim.
-    /// From [`crate::engine::RunStats::audit_rubber_stamped`].
-    pub audit_rubber_stamped: bool,
-    /// Char count of the followup turn's text.
-    /// From [`crate::engine::RunStats::audit_reply_text_chars`].
-    pub audit_reply_text_chars: u32,
-    /// Successful `edit_file` calls strictly after the audit fired.
-    /// From [`crate::engine::RunStats::audit_followup_edit_file_ok`].
-    pub audit_followup_edit_file_ok: u32,
-    /// Successful `bash` calls strictly after the audit fired.
-    /// From [`crate::engine::RunStats::audit_followup_bash_ok`].
-    pub audit_followup_bash_ok: u32,
-    /// `finish(done)` calls rejected by a red gate strictly after the audit
-    /// fired — the design-05 Risk-1 churn signal.
-    /// From [`crate::engine::RunStats::audit_followup_red_done`].
-    pub audit_followup_red_done: u32,
 }
 
 /// The full run report over `k` trials of one task.
@@ -2077,13 +2030,6 @@ fn sanitize_for_filename(s: &str) -> String {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Options for [`run_mined_task`].
-///
-/// `struct_excessive_bools`: each `bool` is an independent opt-in knob
-/// (test-first guidance, transcripts, criteria rules, the acceptance audit)
-/// threaded straight into a distinct `RunConfig` builder call — see
-/// [`crate::engine::RunStats`]'s own `struct_excessive_bools` allow for the
-/// same rationale.
-#[allow(clippy::struct_excessive_bools)]
 pub struct MinedRunConfig<'a> {
     /// The task directory holding `task.json`, `statements/`, and `sealed/`.
     pub task_dir: &'a Path,
@@ -2116,18 +2062,6 @@ pub struct MinedRunConfig<'a> {
     /// `.with_transcript(trial_state_dir(&task.id, trial).join("transcript.jsonl"),
     /// backend_desc.clone())`.
     pub transcripts: bool,
-    /// Whether the opt-in `## Criterion Coverage` guidance is appended to the
-    /// agent prompt. Default OFF — set from `MINED_EVAL_CRITERIA_RULES` (see
-    /// [`crate::prompt::parse_criteria_rules_flag`]).
-    pub criteria_rules: bool,
-    /// Whether the opt-in one-shot acceptance audit (design doc 05 section B)
-    /// is applied to every trial's `RunConfig`. Default OFF — set from
-    /// `MINED_EVAL_ACCEPTANCE_AUDIT` (see
-    /// [`crate::transcript::parse_transcripts_flag`], reused for its `0`/`1`
-    /// shape). Structurally inert under [`AgentGateMode::Off`], which passes
-    /// `checks: None` to every trial's `RunConfig` — the audit only fires on
-    /// a checks-verified `finish(done)`.
-    pub acceptance_audit: bool,
 }
 
 /// Run the whole mined-task eval: `k` independent trials, each with a fresh
@@ -2247,16 +2181,10 @@ async fn single_trial<B: ModelBackend>(
     };
     let tools = standard_registry(checks.clone());
     let mut run_config = RunConfig::new(
-        tier2_task_prompt(
-            config.statement,
-            agent_gate_cmd,
-            config.test_first,
-            config.criteria_rules,
-        ),
+        tier2_task_prompt(config.statement, agent_gate_cmd, config.test_first),
         config.max_iterations,
     )
-    .with_wall_clock_secs(config.wall_clock_secs)
-    .with_acceptance_audit(config.acceptance_audit);
+    .with_wall_clock_secs(config.wall_clock_secs);
     if let Some(runner) = checks.clone() {
         run_config = run_config.with_checks(runner);
     }
@@ -2358,15 +2286,6 @@ async fn single_trial<B: ModelBackend>(
         agent_gate_post,
         agent_gate_output_path,
         transcript_path,
-        audit_armed: stats.audit_armed,
-        audit_fired: stats.audit_fired,
-        audit_iteration: stats.audit_iteration,
-        audit_changed_tree: stats.audit_changed_tree,
-        audit_rubber_stamped: stats.audit_rubber_stamped,
-        audit_reply_text_chars: stats.audit_reply_text_chars,
-        audit_followup_edit_file_ok: stats.audit_followup_edit_file_ok,
-        audit_followup_bash_ok: stats.audit_followup_bash_ok,
-        audit_followup_red_done: stats.audit_followup_red_done,
     }
 }
 
@@ -2408,15 +2327,6 @@ fn invalid_trial(
         agent_gate_post: None,
         agent_gate_output_path: None,
         transcript_path: None,
-        audit_armed: false,
-        audit_fired: false,
-        audit_iteration: 0,
-        audit_changed_tree: false,
-        audit_rubber_stamped: false,
-        audit_reply_text_chars: 0,
-        audit_followup_edit_file_ok: 0,
-        audit_followup_bash_ok: 0,
-        audit_followup_red_done: 0,
     }
 }
 
@@ -3072,12 +2982,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     /// is ever removed.
     #[test]
     fn tier2_task_prompt_appends_the_shared_test_first_guidance() {
-        let out = tier2_task_prompt(
-            "Fix the deadlock in the rollout executor.\n",
-            None,
-            true,
-            false,
-        );
+        let out = tier2_task_prompt("Fix the deadlock in the rollout executor.\n", None, true);
         assert!(
             out.starts_with("Fix the deadlock in the rollout executor."),
             "statement must lead the prompt; got:\n{out}"
@@ -3114,7 +3019,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             files_to_modify: vec![],
             gate_command: "AGENT_SENTINEL_CMD".to_string(),
         };
-        let a = tier2_task_prompt("S.", Some("AGENT_SENTINEL_CMD"), true, false);
+        let a = tier2_task_prompt("S.", Some("AGENT_SENTINEL_CMD"), true);
         let p = render_task_prompt_from_spec(&spec);
         assert_eq!(
             &a[a.find("## Approach").unwrap()..],
@@ -3124,7 +3029,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
     #[test]
     fn tier2_task_prompt_off_mode_has_no_verification_section() {
-        let out = tier2_task_prompt("S.", None, true, false);
+        let out = tier2_task_prompt("S.", None, true);
         assert!(!out.contains("Run the following command to verify the task is complete:"));
         assert!(!out.contains("finish(done) immediately"));
     }
@@ -3138,73 +3043,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     fn tier2_task_prompt_test_first_toggle_removes_exactly_the_section_and_separator() {
         let separator_and_section = format!("\n\n{}", crate::prompt::render_test_first_approach());
         for gate in [None, Some("AGENT_SENTINEL_CMD")] {
-            let on = tier2_task_prompt("S.", gate, true, false);
-            let off = tier2_task_prompt("S.", gate, false, false);
+            let on = tier2_task_prompt("S.", gate, true);
+            let off = tier2_task_prompt("S.", gate, false);
             assert_eq!(on.replace(&separator_and_section, ""), off, "gate={gate:?}");
-        }
-    }
-
-    /// The `criteria_rules` toggle removes EXACTLY the shared section (and,
-    /// when `test_first` is off, its leading separator) and nothing else —
-    /// checked for both `test_first` values and both agent-gate modes.
-    #[test]
-    fn tier2_criteria_rules_toggle_removes_exactly_the_section() {
-        for test_first in [true, false] {
-            for gate in [None, Some("AGENT_SENTINEL_CMD")] {
-                let on = tier2_task_prompt("S.", gate, test_first, true);
-                let off = tier2_task_prompt("S.", gate, test_first, false);
-                if test_first {
-                    assert_eq!(
-                        on.replace(&crate::prompt::render_criteria_rules(), ""),
-                        off,
-                        "test_first={test_first} gate={gate:?}"
-                    );
-                } else {
-                    let separator_and_section =
-                        format!("\n\n{}", crate::prompt::render_criteria_rules());
-                    assert_eq!(
-                        on.replace(&separator_and_section, ""),
-                        off,
-                        "test_first={test_first} gate={gate:?}"
-                    );
-                }
-                assert!(
-                    !off.contains("## Criterion Coverage"),
-                    "test_first={test_first} gate={gate:?}: got:\n{off}"
-                );
-                assert_eq!(
-                    on.matches(&crate::prompt::render_criteria_rules()).count(),
-                    1,
-                    "test_first={test_first} gate={gate:?}: got:\n{on}"
-                );
-            }
-        }
-    }
-
-    /// Production parity for the criteria-rules-on tail: with the agent gate
-    /// armed, the tier-2 output's tail from `## Criterion Coverage` onward is
-    /// byte-identical to the same tail of `render_task_prompt_from_spec_with`
-    /// for the matching gate command — for both `test_first` values.
-    #[test]
-    fn tier2_criteria_rules_tail_matches_production() {
-        use crate::prompt::render_task_prompt_from_spec_with;
-        use crate::task_spec::TaskSpec;
-
-        let spec = TaskSpec {
-            title: "T".to_string(),
-            description: "D".to_string(),
-            acceptance_criteria: vec![],
-            files_to_modify: vec![],
-            gate_command: "AGENT_SENTINEL_CMD".to_string(),
-        };
-        for test_first in [true, false] {
-            let a = tier2_task_prompt("S.", Some("AGENT_SENTINEL_CMD"), test_first, true);
-            let p = render_task_prompt_from_spec_with(&spec, test_first, true);
-            assert_eq!(
-                &a[a.find("## Criterion Coverage").unwrap()..],
-                &p[p.find("## Criterion Coverage").unwrap()..],
-                "test_first={test_first}"
-            );
         }
     }
 
@@ -3975,15 +3816,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             agent_gate_post: None,
             agent_gate_output_path: None,
             transcript_path: None,
-            audit_armed: false,
-            audit_fired: false,
-            audit_iteration: 0,
-            audit_changed_tree: false,
-            audit_rubber_stamped: false,
-            audit_reply_text_chars: 0,
-            audit_followup_edit_file_ok: 0,
-            audit_followup_bash_ok: 0,
-            audit_followup_red_done: 0,
         }
     }
 
@@ -4523,8 +4355,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         // Silence FinishTool's `use` warning across the impl surface.
         let _ = FinishTool;
@@ -4633,8 +4463,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: true,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let _ = FinishTool;
         let mut on_trial = |_t: &MinedTrialResult| {};
@@ -4761,8 +4589,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4806,114 +4632,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     }
 
     #[tokio::test]
-    async fn acceptance_audit_on_with_agent_gate_on_fires_and_consumes_one_extra_turn() {
-        use super::{MinedRunConfig, run_mined_task};
-        use crate::engine::FINISH_TOOL_NAME;
-        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
-        use crate::test_support::MockBackend;
-
-        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
-        task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
-
-        let finish_done = |call_id: &str| AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: call_id.to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
-            },
-        };
-        let backend = MockBackend::from_turns(vec![finish_done("c1"), finish_done("c2")]);
-
-        let config = MinedRunConfig {
-            task_dir: task_dir.path(),
-            task: &task,
-            statement: &statement,
-            spec_level: SpecLevel::S2,
-            backend_desc: "mock".to_string(),
-            k: 1,
-            max_iterations: 5,
-            agent_gate: AgentGateMode::On {
-                timeout: Duration::from_secs(30),
-            },
-            test_first: true,
-            wall_clock_secs: 0,
-            transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: true,
-        };
-        let mut noop = |_t: &MinedTrialResult| {};
-        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
-
-        let trial = &report.trials[0];
-        assert!(trial.audit_armed);
-        assert!(trial.audit_fired);
-        assert_eq!(trial.iterations, 2);
-        assert_eq!(backend.calls(), 2);
-        assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
-    }
-
-    #[tokio::test]
-    async fn acceptance_audit_on_with_agent_gate_off_is_structurally_inert() {
-        use super::{MinedRunConfig, run_mined_task};
-        use crate::engine::FINISH_TOOL_NAME;
-        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
-        use crate::test_support::MockBackend;
-
-        let (_workroot, task_dir, task, statement) = agent_gate_task_fixture();
-
-        let backend = MockBackend::from_turns(vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c1".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
-            },
-        }]);
-
-        let config = MinedRunConfig {
-            task_dir: task_dir.path(),
-            task: &task,
-            statement: &statement,
-            spec_level: SpecLevel::S2,
-            backend_desc: "mock".to_string(),
-            k: 1,
-            max_iterations: 5,
-            agent_gate: AgentGateMode::Off,
-            test_first: true,
-            wall_clock_secs: 0,
-            transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: true,
-        };
-        let mut noop = |_t: &MinedTrialResult| {};
-        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
-
-        let trial = &report.trials[0];
-        assert!(
-            !trial.audit_armed,
-            "Off mode passes checks: None, so the audit is structurally unreachable"
-        );
-        assert!(!trial.audit_fired);
-        assert_eq!(trial.iterations, 1);
-        assert_eq!(backend.calls(), 1);
-    }
-
-    #[tokio::test]
     async fn agent_gate_tripwire_threads_the_mode_timeout() {
         use super::{MinedRunConfig, run_mined_task};
         use crate::test_support::MockBackend;
@@ -4936,8 +4654,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -4980,8 +4696,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5066,8 +4780,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5144,8 +4856,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5200,8 +4910,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5241,77 +4949,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             0
         );
         assert!(!first_user_text.contains("AGENT_GATE_SENTINEL"));
-        assert!(!first_user_text.contains("## Criterion Coverage"));
-    }
-
-    /// FAILS-IF-UNREAD: `config.criteria_rules` must actually reach the
-    /// tier-2 agent prompt. Cloned from `agent_gate_off_is_legacy` — the same
-    /// consume-side seam that once silently voided a test-first experiment
-    /// (three matrix runs that measured nothing) could just as easily void
-    /// this flag if `single_trial` ever stops forwarding it.
-    #[tokio::test]
-    async fn criteria_rules_on_reaches_the_tier2_agent_prompt() {
-        use super::{MinedRunConfig, run_mined_task};
-        use crate::engine::FINISH_TOOL_NAME;
-        use crate::model::{
-            AssistantTurn, ContentBlock, Message, StopReason, ToolCallRequest, Usage, UserBlock,
-        };
-        use crate::test_support::MockBackend;
-
-        let (_workroot, task_dir, task, statement) = agent_gate_task_fixture();
-
-        let turns = vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c-finish".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
-            },
-        }];
-        let backend = MockBackend::from_turns(turns);
-
-        let config = MinedRunConfig {
-            task_dir: task_dir.path(),
-            task: &task,
-            statement: &statement,
-            spec_level: SpecLevel::S2,
-            backend_desc: "mock".to_string(),
-            k: 1,
-            max_iterations: 5,
-            agent_gate: AgentGateMode::Off,
-            test_first: true,
-            wall_clock_secs: 0,
-            transcripts: false,
-            criteria_rules: true,
-            acceptance_audit: false,
-        };
-        let mut noop = |_t: &MinedTrialResult| {};
-        let _report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
-
-        let Message::User { content } = &backend.messages_seen()[0][0] else {
-            panic!("expected first message of first turn to be User");
-        };
-        let first_user_text: String = content
-            .iter()
-            .filter_map(|b| match b {
-                UserBlock::Text(t) => Some(t.as_str()),
-                UserBlock::ToolResult { .. } => None,
-            })
-            .collect();
-        assert_eq!(
-            first_user_text
-                .matches(&crate::prompt::render_criteria_rules())
-                .count(),
-            1,
-            "config.criteria_rules must reach the tier-2 agent prompt exactly once; got:\n{first_user_text}"
-        );
     }
 
     #[tokio::test]
@@ -5338,8 +4975,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5402,8 +5037,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 1,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5447,8 +5080,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5494,8 +5125,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5917,8 +5546,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
@@ -5971,8 +5598,6 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             test_first: true,
             wall_clock_secs: 0,
             transcripts: false,
-            criteria_rules: false,
-            acceptance_audit: false,
         };
         let mut noop = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
