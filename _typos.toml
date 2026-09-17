@@ -2,6 +2,8 @@
 # proper nouns under extend-words so legitimate identifiers aren't flagged.
 [default.extend-words]
 aci = "aci"   # agent-computer interface (Anthropic's term), not a typo of ACPI
+caf = "caf"   # leading letters of git SHAs we cite in docs (e.g. caf7549), and
+              # the truncated "café" in the text-preview fixture — never "calf"
 
 [files]
 # `fixtures/*` are eval inputs, not project code — the workspace `exclude`s
