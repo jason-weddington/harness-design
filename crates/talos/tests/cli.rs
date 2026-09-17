@@ -146,11 +146,21 @@ async fn backend_error_via_refused_port_writes_store_record() {
             task_id,
             "--attempt",
             "1",
+            "--state-retention-days",
+            "0",
         ])
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Isolate this run's implicit prune pass from the real
+        // `$HOME/.local/state/talos` — without this, an unmodified nextest
+        // run would point `remove_dir_all` at the developer's or the
+        // dispatch user's real state root. `--state-retention-days 0` is a
+        // second, independent belt: it disables pruning outright.
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -245,6 +255,8 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
             "1",
             "--transcript",
             transcript_path.to_str().unwrap(),
+            "--state-retention-days",
+            "0",
         ])
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
@@ -253,6 +265,11 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
         .env_remove("OLLAMA_THINK")
         .env_remove("OLLAMA_NUM_CTX")
         .env_remove("TALOS_BEDROCK")
+        // Isolate the implicit prune pass from the real state root — see the
+        // comment in `backend_error_via_refused_port_writes_store_record`.
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -370,6 +387,8 @@ async fn no_transcript_flag_writes_no_jsonl_and_is_silent() {
             "cli-test-no-transcript",
             "--attempt",
             "1",
+            "--state-retention-days",
+            "0",
         ])
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
@@ -379,6 +398,7 @@ async fn no_transcript_flag_writes_no_jsonl_and_is_silent() {
         .env_remove("TALOS_BEDROCK")
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -522,11 +542,18 @@ fn valid_spec_via_file_input_backend_error_via_refused_port() {
             offload_dir.to_str().unwrap(),
             "--task-id",
             task_id,
+            "--state-retention-days",
+            "0",
         ])
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Isolate the implicit prune pass from the real state root — see the
+        // comment in `backend_error_via_refused_port_writes_store_record`.
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -828,6 +855,11 @@ fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // `ralph` self-touches its own `talos-ralph` state dir (AC-19); point
+        // it at an isolated state root rather than the real
+        // `$HOME/.local/state/talos`.
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -880,4 +912,295 @@ fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
         Some(1),
         "exactly one outer pass must have run; got: {summary}"
     );
+}
+
+// ============================================================================
+// `--state-retention-days`: talos prunes its own XDG state dir on run start
+// ============================================================================
+//
+// Every test here uses `build_prune_fixture`, which creates an ISOLATED
+// `XDG_STATE_HOME`/`HOME` under a fresh tempdir. This is load-bearing: an
+// unmodified test that spawned `talos run` without pointing these at a
+// tempdir would point the implicit prune pass at the real
+// `$HOME/.local/state/talos` — exactly how the leaked
+// `mined-eval/synth-task-*` debris accumulated on the dispatch hosts.
+
+/// Seconds per day, mirroring `crates/talos/src/main.rs::SECS_PER_DAY` — kept
+/// local since integration tests cannot see the binary crate's private
+/// constants.
+const TEST_SECS_PER_DAY: u64 = 86_400;
+
+/// Age `path`'s own mtime by `days` days: `File::open` (works on a directory
+/// opened read-only on this platform) + `set_times`. No new dependency.
+fn age_dir(path: &std::path::Path, days: u64) {
+    let mtime =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(days * TEST_SECS_PER_DAY);
+    std::fs::File::open(path)
+        .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(mtime)))
+        .expect("set_times must succeed on a directory opened read-only");
+}
+
+/// Fixture for `--state-retention-days` integration tests: an isolated
+/// `XDG_STATE_HOME`/`HOME`, a `talos_root` (`<state_home>/talos`) holding a
+/// 40-day-old `stale-task` dir and a fresh `fresh-task` dir. Tests pass
+/// `--task-id live-task` and deliberately omit `--run-store`/`--offload-dir`
+/// so both default under `<state_home>/talos/live-task/` and the prune root
+/// IS `talos_root`.
+struct PruneFixture {
+    _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+    state_home: std::path::PathBuf,
+    talos_root: std::path::PathBuf,
+    aged: std::path::PathBuf,
+    fresh: std::path::PathBuf,
+}
+
+fn build_prune_fixture() -> PruneFixture {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let home = dir.path().to_path_buf();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let state_home = dir.path().join("state-home");
+    let talos_root = state_home.join("talos");
+    let aged = talos_root.join("stale-task");
+    std::fs::create_dir_all(&aged).unwrap();
+    age_dir(&aged, 40);
+    let fresh = talos_root.join("fresh-task");
+    std::fs::create_dir_all(&fresh).unwrap();
+
+    PruneFixture {
+        _dir: dir,
+        home,
+        workspace,
+        state_home,
+        talos_root,
+        aged,
+        fresh,
+    }
+}
+
+/// Spawn `talos run` against `fx` with the given extra CLI args and env
+/// overrides, feeding `valid_spec_json()` on stdin, and return the process
+/// output.
+fn spawn_prune_run(
+    fx: &PruneFixture,
+    extra_args: &[&str],
+    env_overrides: &[(&str, Option<&str>)],
+) -> std::process::Output {
+    let mut cmd = Command::new(TALOS_BIN);
+    cmd.args([
+        "run",
+        "--workspace",
+        fx.workspace.to_str().unwrap(),
+        "--task-id",
+        "live-task",
+        "--attempt",
+        "1",
+    ])
+    .args(extra_args)
+    .env("TALOS_BACKEND", "ollama")
+    .env("OLLAMA_MODEL", "x")
+    // Port 1 on loopback is reserved; connections are always refused.
+    .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+    .env_remove("OLLAMA_THINK")
+    .env_remove("OLLAMA_NUM_CTX")
+    .env_remove("TALOS_BEDROCK")
+    .env("XDG_STATE_HOME", &fx.state_home)
+    .env("HOME", &fx.home)
+    .env_remove("TALOS_STATE_RETENTION_DAYS");
+    for (key, value) in env_overrides {
+        match value {
+            Some(v) => {
+                cmd.env(key, v);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("wait for talos")
+}
+
+fn read_prune_report(fx: &PruneFixture) -> serde_json::Value {
+    let report_path = fx.talos_root.join("prune-last.json");
+    let contents =
+        std::fs::read_to_string(&report_path).expect("prune-last.json must exist after a run");
+    serde_json::from_str(&contents).expect("prune-last.json must be valid JSON")
+}
+
+/// `--state-retention-days 1`: the 40-day `stale-task` dir is older than the
+/// 1-day window and gets removed; `fresh-task` and this run's own
+/// `live-task` dir (both created "now") survive; stdout stays a single
+/// `BackendError` summary line; stderr never mentions pruning;
+/// `prune-last.json` records the removal.
+#[test]
+fn state_retention_flag_one_day_prunes_aged_leaves_fresh_and_live() {
+    let fx = build_prune_fixture();
+    assert!(
+        fx.aged.exists(),
+        "fixture invariant: aged dir must exist before spawn"
+    );
+    let live_task_dir = fx.talos_root.join("live-task");
+
+    let output = spawn_prune_run(&fx, &["--state-retention-days", "1"], &[]);
+
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+    assert!(
+        !fx.aged.exists(),
+        "40-day dir must be pruned under 1-day retention"
+    );
+    assert!(fx.fresh.exists(), "fresh dir must survive");
+    assert!(
+        live_task_dir.exists(),
+        "this run's own live-task dir must survive"
+    );
+
+    // Worker-contract safety: exactly one stdout line, parsing as JSON with
+    // outcome == "BackendError" — a prune line must never become plausible
+    // last-stdout/last-stderr noise on the exit-1 infra-failure path the
+    // dispatch worker classifies on.
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout_str.trim().lines().count(),
+        1,
+        "expected exactly one stdout line; got: {stdout_str:?}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(stdout_str.trim()).expect("stdout line must be valid JSON");
+    assert_eq!(
+        summary.get("outcome").and_then(serde_json::Value::as_str),
+        Some("BackendError")
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr_str.contains("prune"),
+        "stderr must never mention pruning; got: {stderr_str:?}"
+    );
+
+    let report = read_prune_report(&fx);
+    assert_eq!(report["removed"], 1);
+    assert_eq!(report["retention_days"], 1);
+    assert_eq!(report["source"], "flag");
+    assert_eq!(report["disabled"], false);
+    assert!(
+        report["removed_names"]
+            .as_array()
+            .expect("removed_names must be an array")
+            .iter()
+            .any(|v| v == "stale-task"),
+        "removed_names must contain \"stale-task\"; got: {report}"
+    );
+}
+
+/// `--state-retention-days 0` disables pruning entirely: the aged dir
+/// survives, and `prune-last.json` still gets written with `disabled: true`
+/// and zero counts, so an operator can confirm retention is off on a host.
+#[test]
+fn state_retention_flag_zero_disables_pruning() {
+    let fx = build_prune_fixture();
+    assert!(fx.aged.exists());
+
+    let output = spawn_prune_run(&fx, &["--state-retention-days", "0"], &[]);
+
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+    assert!(
+        fx.aged.exists(),
+        "disabled retention (flag=0) must not remove anything"
+    );
+
+    let report = read_prune_report(&fx);
+    assert_eq!(report["disabled"], true);
+    assert_eq!(report["removed"], 0);
+    assert_eq!(report["examined"], 0);
+    assert_eq!(report["retention_days"], 0);
+    assert_eq!(report["source"], "flag");
+}
+
+/// No `--state-retention-days` flag, `TALOS_STATE_RETENTION_DAYS=0` in the
+/// child env: this proves the env fallback is wired through `env_accessor`
+/// in `run_cmd` itself, not only in the pure resolver's unit tests.
+#[test]
+fn state_retention_env_zero_disables_pruning_wired_through_run_cmd() {
+    let fx = build_prune_fixture();
+    assert!(fx.aged.exists());
+
+    let output = spawn_prune_run(&fx, &[], &[("TALOS_STATE_RETENTION_DAYS", Some("0"))]);
+
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+    assert!(
+        fx.aged.exists(),
+        "disabled retention (env=0) must not remove anything"
+    );
+
+    let report = read_prune_report(&fx);
+    assert_eq!(report["source"], "env");
+    assert_eq!(report["retention_days"], 0);
+}
+
+/// No flag, no env: the compiled 30-day default applies, so the 40-day
+/// `stale-task` dir is still pruned.
+#[test]
+fn state_retention_default_thirty_days_prunes_aged() {
+    let fx = build_prune_fixture();
+    assert!(fx.aged.exists());
+
+    let output = spawn_prune_run(&fx, &[], &[]);
+
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+    assert!(
+        !fx.aged.exists(),
+        "40-day dir must be pruned under the 30-day default"
+    );
+    assert!(fx.fresh.exists());
+
+    let report = read_prune_report(&fx);
+    assert_eq!(report["source"], "default");
+    assert_eq!(report["retention_days"], 30);
+}
+
+/// Silence: a run that DOES prune (removes the aged dir) produces stderr
+/// byte-identical to the same run with `--state-retention-days 0` (which
+/// prunes nothing) — pruning has NO stdout/stderr writer on any path.
+#[test]
+fn prune_pass_produces_byte_identical_stderr_whether_or_not_it_prunes() {
+    let fx_pruning = build_prune_fixture();
+    let fx_disabled = build_prune_fixture();
+
+    let pruning_output = spawn_prune_run(&fx_pruning, &["--state-retention-days", "1"], &[]);
+    let disabled_output = spawn_prune_run(&fx_disabled, &["--state-retention-days", "0"], &[]);
+
+    assert!(
+        !fx_pruning.aged.exists(),
+        "the pruning run must actually have removed the aged dir"
+    );
+    assert!(
+        fx_disabled.aged.exists(),
+        "the disabled run must not have removed anything"
+    );
+
+    assert_eq!(
+        pruning_output.stderr, disabled_output.stderr,
+        "stderr must be byte-identical whether or not a prune pass actually removed anything"
+    );
+    for stderr in [&pruning_output.stderr, &disabled_output.stderr] {
+        let text = String::from_utf8_lossy(stderr);
+        assert!(
+            !text.contains("prune"),
+            "stderr must never mention pruning; got: {text:?}"
+        );
+    }
 }

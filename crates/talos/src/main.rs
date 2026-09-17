@@ -111,11 +111,25 @@
 //!   wall-clock budget. Overridden by `--wall-clock-secs` when the flag is
 //!   present. The harness self-terminates gracefully before the worker's hard
 //!   kill when this budget is reached.
+//! - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based
+//!   retention for talos's own XDG state dir (`run.sqlite`, `offload/`, and
+//!   opt-in transcripts under `${XDG_STATE_HOME:-$HOME/.local/state}/talos/`).
+//!   Precedence: `--state-retention-days` flag > `TALOS_STATE_RETENTION_DAYS`
+//!   env > the compiled default of `30`. `0` disables pruning entirely. This
+//!   is a `talos run` flag only — `talos ralph` does not prune (see
+//!   [`RalphArgs`]). Like `--transcript`, the env fallback does NOT survive
+//!   dispatch's sudo boundary: `templates/sudoers-dispatch-svc.tmpl`'s
+//!   `env_keep` carries exactly one `TALOS_*` var (`TALOS_BACKEND`), so under
+//!   `env_reset` this variable never reaches the process and the fleet always
+//!   uses the compiled 30-day default until the worker passes the flag
+//!   (kb-02979 shape). Each `talos run` overwrites
+//!   `<state-root>/talos/prune-last.json` with a retention report (last
+//!   writer wins under concurrency; the file's own mtime is the timestamp).
 
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
@@ -136,6 +150,28 @@ use harness::tool::{OffloadSink, ToolCtx};
 use harness::tools::standard_registry;
 use harness::workspace::{DiskOffloadSink, Workspace};
 use serde::Serialize;
+
+/// Default age-based retention, in days, for talos's own XDG state dir.
+/// Precedence: `--state-retention-days` flag > `TALOS_STATE_RETENTION_DAYS`
+/// env > this default. See [`resolve_state_retention_days`].
+const DEFAULT_STATE_RETENTION_DAYS: u64 = 30;
+
+/// Seconds per day, used to convert a retention day-count into a
+/// [`Duration`] for [`prune_state_root`].
+const SECS_PER_DAY: u64 = 86_400;
+
+/// Immediate children of the talos state root whose own children — not the
+/// aggregate directory itself — are subject to age-based pruning. See the
+/// doc comment on [`prune_state_root`] for the rationale.
+const AGGREGATE_DIRS: [&str; 2] = ["coding-eval", "mined-eval"];
+
+/// Cap on how many removed directory names [`PruneReport::removed_names`]
+/// records, to keep `prune-last.json` bounded.
+const MAX_REPORT_NAMES: usize = 8;
+
+/// Filename of the per-host retention report written under the talos state
+/// root on every `talos run`.
+const PRUNE_REPORT_FILENAME: &str = "prune-last.json";
 
 // ============================================================================
 // CLI types
@@ -233,6 +269,20 @@ struct RunArgs {
     /// dispatch's sudo boundary does its `env_reset` (kb-02979 shape).
     #[arg(long)]
     transcript: Option<PathBuf>,
+
+    /// Age-based retention, in days, for talos's own XDG state dir
+    /// (`${XDG_STATE_HOME:-$HOME/.local/state}/talos/`). Precedence: this
+    /// flag > `TALOS_STATE_RETENTION_DAYS` env > the compiled default of
+    /// `30`. `0` disables pruning entirely (a retention report is still
+    /// written, with `"disabled":true`).
+    ///
+    /// The env fallback does NOT survive dispatch's sudo boundary — see
+    /// `RunArgs::transcript` above and the module doc's `TALOS_STATE_RETENTION_DAYS`
+    /// entry: `templates/sudoers-dispatch-svc.tmpl`'s `env_keep` carries only
+    /// `TALOS_BACKEND`, so under `env_reset` the fleet always uses the
+    /// compiled default until the worker passes this flag explicitly.
+    #[arg(long)]
+    state_retention_days: Option<u64>,
 }
 
 /// Arguments for `talos ralph`.
@@ -608,6 +658,25 @@ fn resolve_ralph_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Optio
         .unwrap_or(0)
 }
 
+/// Resolve the state-dir retention window, in days: `--state-retention-days`
+/// flag > `TALOS_STATE_RETENTION_DAYS` env > [`DEFAULT_STATE_RETENTION_DAYS`].
+/// Pure — reads no `std::env` directly, only the injected `env` accessor, and
+/// never panics. Returns the resolved day-count AND the source literal
+/// (`"flag"` / `"env"` / `"default"`) for the `prune-last.json` report. A
+/// non-numeric, negative, or empty env value falls through to the default.
+fn resolve_state_retention_days(
+    flag: Option<u64>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> (u64, &'static str) {
+    if let Some(v) = flag {
+        return (v, "flag");
+    }
+    if let Some(v) = env("TALOS_STATE_RETENTION_DAYS").and_then(|v| v.parse::<u64>().ok()) {
+        return (v, "env");
+    }
+    (DEFAULT_STATE_RETENTION_DAYS, "default")
+}
+
 // ============================================================================
 // Backend selection from environment
 // ============================================================================
@@ -743,9 +812,12 @@ fn backend_from_env(env: &impl Fn(&str) -> Option<String>) -> Result<(Backend, S
 // Filesystem helpers
 // ============================================================================
 
-/// Compute the default per-task state directory:
-/// `${XDG_STATE_HOME:-$HOME/.local/state}/talos/<task-id>`.
-fn talos_state_dir(task_id: &str) -> PathBuf {
+/// Compute talos's own XDG state root:
+/// `${XDG_STATE_HOME:-$HOME/.local/state}/talos`. This is ALWAYS the prune
+/// root passed to [`prune_state_root`] — never a `state_dir.parent()`, since
+/// a `--task-id` containing a path separator would otherwise aim pruning at
+/// the wrong directory.
+fn talos_root_dir() -> PathBuf {
     let state_home = std::env::var("XDG_STATE_HOME").map_or_else(
         |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -753,7 +825,237 @@ fn talos_state_dir(task_id: &str) -> PathBuf {
         },
         PathBuf::from,
     );
-    state_home.join("talos").join(task_id)
+    state_home.join("talos")
+}
+
+/// Compute the default per-task state directory:
+/// `${XDG_STATE_HOME:-$HOME/.local/state}/talos/<task-id>`.
+fn talos_state_dir(task_id: &str) -> PathBuf {
+    talos_root_dir().join(task_id)
+}
+
+/// Best-effort refresh of `dir`'s own mtime to "now", by opening it
+/// read-only and calling `set_times`. Every error is swallowed — a run's
+/// outcome and exit code must never depend on this succeeding — and it
+/// writes no output. Used to protect a live run's state directory from a
+/// LATER run's [`prune_state_root`] call even when nothing inside the
+/// directory changed (rewriting a file inside a directory does not refresh
+/// that directory's own mtime).
+fn touch_dir_mtime(dir: &Path) {
+    let _ = std::fs::File::open(dir)
+        .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now())));
+}
+
+/// Counts from a single [`prune_state_root`] pass. `examined` is the bucket
+/// total: `examined == removed + kept_keep + kept_young + skipped +
+/// aggregates`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PruneReport {
+    /// Total candidates looked at (top-level entries plus aggregate
+    /// children), including aggregate directories themselves.
+    examined: usize,
+    /// Directories removed via `remove_dir_all`.
+    removed: usize,
+    /// Expired directories that survived because they (or an ancestor of
+    /// them) appear in the `keep` list.
+    kept_keep: usize,
+    /// Directories not yet older than `max_age`.
+    kept_young: usize,
+    /// Non-directories, symlinks, unreadable metadata, or a failed
+    /// `remove_dir_all` call.
+    skipped: usize,
+    /// Immediate children of the root whose name is in [`AGGREGATE_DIRS`]
+    /// (descended into, never removed themselves).
+    aggregates: usize,
+    /// Names of removed directories, capped at [`MAX_REPORT_NAMES`]. A
+    /// top-level removal records the entry's own file name; an aggregate
+    /// child records `"<aggregate>/<entry file name>"`.
+    removed_names: Vec<String>,
+    /// How many additional removals occurred past the [`MAX_REPORT_NAMES`]
+    /// cap on `removed_names`.
+    removed_truncated: usize,
+}
+
+/// True when `candidate` is `keep`-protected: `candidate` itself, or an
+/// ancestor of some entry in `keep`, appears in `keep`. Component-wise via
+/// [`Path::starts_with`], so `<root>/abc` does not spuriously match
+/// `<root>/abc-def`.
+fn is_kept(candidate: &Path, keep: &[PathBuf]) -> bool {
+    keep.iter().any(|k| k.starts_with(candidate))
+}
+
+/// Classify one candidate directory by age against `max_age`, apply the
+/// `keep` list, and remove it via `remove_dir_all` if both checks fall
+/// through — updating `report` in place. `label` is what gets recorded into
+/// `report.removed_names` on a successful removal.
+///
+/// A single combinator chain with one diverging `else` decides "is this a
+/// directory we can read the mtime of": `std::fs::symlink_metadata` (NEVER
+/// `std::fs::metadata`, which follows symlinks) is filtered to directories
+/// and its modification time compared against `now`. Anything that fails
+/// that chain — a plain file, a symlink (even one pointing at a directory),
+/// a broken symlink, or unreadable metadata — is `skipped`. An `Err` from
+/// `duration_since` (an mtime in the future relative to `now`) is also
+/// `skipped` by this same chain.
+fn classify_and_maybe_remove(
+    candidate: &Path,
+    now: SystemTime,
+    max_age: Duration,
+    keep: &[PathBuf],
+    label: String,
+    report: &mut PruneReport,
+) {
+    let Some(age) = std::fs::symlink_metadata(candidate)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .and_then(|m| m.modified().ok())
+        .and_then(|mtime| now.duration_since(mtime).ok())
+    else {
+        report.skipped += 1;
+        return;
+    };
+    if age <= max_age {
+        report.kept_young += 1;
+        return;
+    }
+    if is_kept(candidate, keep) {
+        report.kept_keep += 1;
+        return;
+    }
+    let ok = std::fs::remove_dir_all(candidate).is_ok();
+    report.removed += usize::from(ok);
+    report.skipped += usize::from(!ok);
+    if ok {
+        if report.removed_names.len() < MAX_REPORT_NAMES {
+            report.removed_names.push(label);
+        } else {
+            report.removed_truncated += 1;
+        }
+    }
+}
+
+/// Age-based retention pass over talos's own XDG state root.
+///
+/// Every input is a parameter — this function reads no process environment
+/// and calls no clock, so it is fully unit-testable against a synthetic
+/// `tempdir`. Deletion is confined to the immediate children of `talos_root`
+/// plus the immediate children of each [`AGGREGATE_DIRS`] entry, and nothing
+/// else is ever passed to `remove_dir_all`. Every filesystem error is
+/// swallowed (no `unwrap`, `expect`, or `?` anywhere in this function, and it
+/// never returns an `Err`) so a run's outcome and exit code are never
+/// affected by a pruning failure.
+///
+/// ## Aggregate directories
+///
+/// An immediate child of the root whose name is in [`AGGREGATE_DIRS`] is
+/// NEVER removed regardless of its own mtime; instead pruning descends
+/// exactly one level and applies the identical age/keep/remove rules to that
+/// directory's immediate children. This is because a directory's own mtime
+/// refreshes whenever a child is added, so treating an aggregator as a
+/// single unit would either never expire it (while evals run) or delete
+/// every historical capture at once the moment it finally did age out. Both
+/// current producers of this shape write `<state>/talos/<aggregate>/<run-id>/...`:
+/// [`harness::mined_eval`]'s `trial_state_dir` (not `pub`, hence not linked)
+/// and the `coding_eval` example's `coding_eval_transcripts_root`. Any future
+/// writer of a `<state>/talos/<aggregator>/<run-id>/...` tree must add its
+/// directory name to [`AGGREGATE_DIRS`]. Note that an aggregate directory's
+/// immediate children are a MIX of shapes (well-formed `<run-id>` dirs and
+/// leaked `synth-task-<pid>-N` dirs) — the age rule treats them identically.
+///
+/// ## Concurrency
+///
+/// With the dispatch concurrency cap of 6, concurrent `talos run` processes
+/// on one host cannot prune each other's live directories: each run
+/// mtime-touches its own state dir at start (see the `touch_dir_mtime` call
+/// in `run_cmd`) AND every path it writes to is in its own `keep` list — the
+/// `keep` list is the load-bearing protection, the touch is belt-and-braces.
+/// If both held false, the residual failure mode is a `SqliteRunStore` write
+/// error surfacing as exit 1 (an engine error, re-dispatchable), never silent
+/// corruption.
+///
+/// ## Post-mortem evidence
+///
+/// The run record under a pruned state dir is the ONLY post-mortem evidence
+/// a run leaves — `RunSummary.record_path` is printed on stdout but never
+/// persisted downstream (the dispatch worker's comment body reads only
+/// `outcome`, `iterations`, and `disposition`), so anything needed for a
+/// later post-mortem must be copied out of the state dir before it expires.
+fn prune_state_root(
+    talos_root: &Path,
+    now: SystemTime,
+    max_age: Duration,
+    keep: &[PathBuf],
+) -> PruneReport {
+    let mut report = PruneReport::default();
+    if max_age == Duration::ZERO {
+        return report;
+    }
+    let root = std::fs::canonicalize(talos_root).unwrap_or_else(|_| talos_root.to_path_buf());
+    let keep: Vec<PathBuf> = keep
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return report;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().into_owned();
+        let candidate = root.join(&name);
+        report.examined += 1;
+
+        if AGGREGATE_DIRS.contains(&name_str.as_str()) {
+            report.aggregates += 1;
+            let Ok(children) = std::fs::read_dir(&candidate) else {
+                continue;
+            };
+            for child in children.filter_map(Result::ok) {
+                let child_name = child.file_name();
+                let child_candidate = candidate.join(&child_name);
+                report.examined += 1;
+                let label = format!("{name_str}/{}", child_name.to_string_lossy());
+                classify_and_maybe_remove(
+                    &child_candidate,
+                    now,
+                    max_age,
+                    &keep,
+                    label,
+                    &mut report,
+                );
+            }
+            continue;
+        }
+
+        classify_and_maybe_remove(&candidate, now, max_age, &keep, name_str, &mut report);
+    }
+    report
+}
+
+/// Serialize a [`PruneReport`] as a single-line JSON object for
+/// `<talos-root>/prune-last.json`. `disabled` is `true` exactly when
+/// `retention_days == 0`.
+fn prune_report_json(
+    root: &Path,
+    retention_days: u64,
+    source: &str,
+    report: &PruneReport,
+) -> String {
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "retention_days": retention_days,
+        "source": source,
+        "disabled": retention_days == 0,
+        "examined": report.examined,
+        "removed": report.removed,
+        "kept_keep": report.kept_keep,
+        "kept_young": report.kept_young,
+        "skipped": report.skipped,
+        "aggregates": report.aggregates,
+        "removed_names": report.removed_names,
+        "removed_truncated": report.removed_truncated,
+    })
+    .to_string()
 }
 
 /// Read the raw spec JSON from `--file <path>` or stdin.
@@ -864,6 +1166,37 @@ async fn run_cmd(args: RunArgs) {
         ));
         std::process::exit(1);
     }
+
+    // 5.5. Prune talos's own XDG state root (age-based retention), silently.
+    //      Touch this run's own state dir first so a later run's prune pass
+    //      cannot treat a freshly-created-but-not-yet-modified directory as
+    //      stale; then resolve the retention window and prune everything
+    //      else under the root, protecting this run's own paths via `keep`.
+    //      No stdout/stderr writer on any path — see `prune_state_root`'s and
+    //      `touch_dir_mtime`'s doc comments.
+    touch_dir_mtime(&state_dir);
+    let talos_root = talos_root_dir();
+    let (retention_days, retention_source) =
+        resolve_state_retention_days(args.state_retention_days, &env_accessor);
+    let report = if retention_days == 0 {
+        PruneReport::default()
+    } else {
+        let keep = [
+            state_dir.clone(),
+            store_parent.to_path_buf(),
+            offload_dir.clone(),
+        ];
+        prune_state_root(
+            &talos_root,
+            SystemTime::now(),
+            Duration::from_secs(retention_days.saturating_mul(SECS_PER_DAY)),
+            &keep,
+        )
+    };
+    let _ = std::fs::write(
+        talos_root.join(PRUNE_REPORT_FILENAME),
+        prune_report_json(&talos_root, retention_days, retention_source, &report),
+    );
 
     // 6. Build Workspace (canonicalizes and validates the roots).
     let workspace = match Workspace::new(args.workspace.clone(), Some(offload_dir.clone())) {
@@ -994,6 +1327,18 @@ async fn run_ralph_cmd(args: RalphArgs) {
         std::process::exit(1);
     }
 
+    // 3.5. Self-protect `talos-ralph`'s own state dir against a later `talos
+    //      run`'s prune pass. `run_ralph` is not persisted and never adds
+    //      `talos-ralph` (or `offload_dir`, unless overridden below the
+    //      default) to any `keep` list, and this handler only ever
+    //      `create_dir_all`s the `offload` CHILD — a no-op once it exists —
+    //      so without this touch the `talos-ralph` directory's own mtime
+    //      freezes at first-ever ralph run and a live loop's state dir could
+    //      be deleted out from under it. No pruning happens here — ralph
+    //      never prunes (see `RalphArgs`) — and this writes no output.
+    let ralph_state_dir = talos_state_dir("talos-ralph");
+    touch_dir_mtime(&ralph_state_dir);
+
     // 4. Build Workspace (canonicalizes and validates the roots) + ToolCtx
     //    with a disk-offload sink, exactly like the run handler.
     let workspace = match Workspace::new(args.workspace.clone(), Some(offload_dir.clone())) {
@@ -1070,10 +1415,11 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, RalphSummary, RunSummary, backend_from_env, build_checks_runner,
-        build_ralph_summary, build_run_summary, exit_code, make_run_seed, outcome_str,
-        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs, transcript_label,
-        write_ralph_error_detail,
+        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunSummary, SECS_PER_DAY,
+        backend_from_env, build_checks_runner, build_ralph_summary, build_run_summary, exit_code,
+        make_run_seed, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
+        ralph_terminal_str, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
+        touch_dir_mtime, transcript_label, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
@@ -1082,6 +1428,7 @@ mod tests {
     use harness::run_record::{Disposition, FailureMode, Verification};
     use harness::task_spec::{FileToModify, TaskSpec};
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
 
     // ---- exit_code: all 6 arms ----------------------------------------
 
@@ -1846,5 +2193,463 @@ mod tests {
             0,
             "invalid env value must fall back to 0 (unbounded)"
         );
+    }
+
+    // ---- resolve_state_retention_days: all six branches, with source -----
+
+    #[test]
+    fn state_retention_days_flag_beats_env() {
+        let env = env_with(&[("TALOS_STATE_RETENTION_DAYS", "99")]);
+        assert_eq!(resolve_state_retention_days(Some(7), &env), (7, "flag"));
+    }
+
+    #[test]
+    fn state_retention_days_env_beats_default() {
+        let env = env_with(&[("TALOS_STATE_RETENTION_DAYS", "99")]);
+        assert_eq!(resolve_state_retention_days(None, &env), (99, "env"));
+    }
+
+    #[test]
+    fn state_retention_days_default_when_both_absent() {
+        let env = env_with(&[]);
+        assert_eq!(resolve_state_retention_days(None, &env), (30, "default"));
+    }
+
+    #[test]
+    fn state_retention_days_invalid_env_falls_back_to_default() {
+        let env = env_with(&[("TALOS_STATE_RETENTION_DAYS", "abc")]);
+        assert_eq!(resolve_state_retention_days(None, &env), (30, "default"));
+    }
+
+    #[test]
+    fn state_retention_days_flag_zero_disables() {
+        let env = env_with(&[]);
+        assert_eq!(resolve_state_retention_days(Some(0), &env), (0, "flag"));
+    }
+
+    #[test]
+    fn state_retention_days_env_zero_disables() {
+        let env = env_with(&[("TALOS_STATE_RETENTION_DAYS", "0")]);
+        assert_eq!(resolve_state_retention_days(None, &env), (0, "env"));
+    }
+
+    // ---- touch_dir_mtime --------------------------------------------------
+
+    /// Age `path`'s own mtime by `days` days, per the pinned no-new-dependency
+    /// mechanism: `File::open` (works on a directory opened read-only, on
+    /// this platform) + `set_times`.
+    fn age_dir(path: &std::path::Path, days: u64) {
+        let mtime = SystemTime::now() - Duration::from_secs(days * SECS_PER_DAY);
+        std::fs::File::open(path)
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(mtime)))
+            .expect("set_times must succeed on a directory opened read-only");
+    }
+
+    #[test]
+    fn touch_dir_mtime_refreshes_an_aged_directory() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("aged");
+        std::fs::create_dir_all(&target).unwrap();
+        age_dir(&target, 40);
+
+        touch_dir_mtime(&target);
+
+        let mtime = std::fs::metadata(&target)
+            .expect("metadata")
+            .modified()
+            .expect("modified");
+        let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+        assert!(
+            age < Duration::from_mins(1),
+            "touched dir must be less than 60s old; age={age:?}"
+        );
+    }
+
+    #[test]
+    fn touch_dir_mtime_on_missing_path_is_a_silent_noop() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("does-not-exist");
+        touch_dir_mtime(&missing);
+        assert!(
+            !missing.exists(),
+            "touch_dir_mtime must never create the path"
+        );
+    }
+
+    // ---- prune_state_root ---------------------------------------------
+
+    #[test]
+    fn prune_zero_max_age_disables_pruning_before_any_io() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let stale = dir.path().join("stale-task");
+        std::fs::create_dir_all(&stale).unwrap();
+        age_dir(&stale, 40);
+
+        let report = prune_state_root(dir.path(), SystemTime::now(), Duration::ZERO, &[]);
+        assert_eq!(report, PruneReport::default());
+        assert!(stale.exists(), "disabled pruning must not touch anything");
+    }
+
+    #[test]
+    fn prune_nonexistent_root_returns_default_report() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("does-not-exist");
+        let report = prune_state_root(
+            &missing,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report, PruneReport::default());
+    }
+
+    #[test]
+    fn prune_removes_dir_older_than_max_age() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let stale = dir.path().join("stale-task");
+        std::fs::create_dir_all(&stale).unwrap();
+        age_dir(&stale, 40);
+
+        let report = prune_state_root(
+            dir.path(),
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.removed, 1);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn prune_keeps_dir_younger_than_max_age() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let stale = dir.path().join("stale-task");
+        std::fs::create_dir_all(&stale).unwrap();
+        age_dir(&stale, 40);
+
+        let report = prune_state_root(
+            dir.path(),
+            SystemTime::now(),
+            Duration::from_secs(60 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.kept_young, 1);
+        assert!(stale.exists());
+    }
+
+    #[test]
+    fn prune_future_mtime_is_skipped_not_removed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let future = dir.path().join("future-task");
+        std::fs::create_dir_all(&future).unwrap();
+        let now = SystemTime::now();
+        let mtime = now + Duration::from_secs(SECS_PER_DAY);
+        std::fs::File::open(&future)
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(mtime)))
+            .expect("set_times must succeed");
+
+        let report = prune_state_root(dir.path(), now, Duration::from_secs(30 * SECS_PER_DAY), &[]);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.removed, 0);
+        assert!(future.exists());
+    }
+
+    #[test]
+    fn prune_keep_list_direct_and_ancestor_survive_sibling_removed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let direct_keep = root.join("direct-keep");
+        let ancestor_keep = root.join("ancestor-keep");
+        let sibling = root.join("sibling-task");
+        for p in [&direct_keep, &ancestor_keep, &sibling] {
+            std::fs::create_dir_all(p).unwrap();
+            age_dir(p, 40);
+        }
+        // `ancestor_keep` is not itself in `keep` — a path NESTED under it is,
+        // so `ancestor_keep` must survive as its ancestor.
+        let nested = ancestor_keep.join("run.sqlite");
+        let keep = vec![direct_keep.clone(), nested];
+
+        let report = prune_state_root(
+            root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &keep,
+        );
+        assert_eq!(report.kept_keep, 2);
+        assert_eq!(report.removed, 1);
+        assert!(direct_keep.exists());
+        assert!(ancestor_keep.exists());
+        assert!(!sibling.exists());
+    }
+
+    #[test]
+    fn prune_keep_normalization_dotdot_and_cwd_relative() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().join("talos");
+        std::fs::create_dir_all(&root).unwrap();
+        let keepme = root.join("keepme");
+        std::fs::create_dir_all(&keepme).unwrap();
+        age_dir(&keepme, 40);
+
+        // `..`-segment normalization: `<root>/keepme/../keepme` must still
+        // canonicalize to `<root>/keepme`.
+        let keep_dotdot = root.join("keepme").join("..").join("keepme");
+        let report = prune_state_root(
+            &root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[keep_dotdot],
+        );
+        assert_eq!(report.kept_keep, 1, "dotdot-normalized keep must protect");
+        assert!(keepme.exists());
+
+        // cwd-relative normalization: a bare relative path equal to `keepme`
+        // when resolved against the test process's cwd.
+        let old_cwd = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(&root).expect("set_current_dir");
+        let keep_relative = PathBuf::from("keepme");
+        let report2 = prune_state_root(
+            &root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[keep_relative],
+        );
+        std::env::set_current_dir(&old_cwd).expect("restore cwd");
+        assert_eq!(report2.kept_keep, 1, "cwd-relative keep must protect");
+        assert!(keepme.exists());
+    }
+
+    #[test]
+    fn prune_skips_non_directories_files_symlinks_broken_symlinks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().join("talos");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel.txt");
+        std::fs::write(&sentinel, "keep me").unwrap();
+
+        let stale_file = root.join("stale.txt");
+        std::fs::write(&stale_file, "x").unwrap();
+        age_dir(&stale_file, 40);
+
+        let link = root.join("link-to-dir");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let broken_target = root.join("does-not-exist-target");
+        let broken = root.join("broken");
+        std::os::unix::fs::symlink(&broken_target, &broken).expect("symlink");
+
+        let report = prune_state_root(
+            &root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 3);
+        assert!(stale_file.exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(std::fs::symlink_metadata(&broken).is_ok());
+        assert!(outside.exists());
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn prune_aggregate_dirs_descend_one_level_never_removed_themselves() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        for agg in ["mined-eval", "coding-eval"] {
+            let agg_dir = root.join(agg);
+            std::fs::create_dir_all(&agg_dir).unwrap();
+            // The aggregate's own mtime is aged too — it must not matter.
+            age_dir(&agg_dir, 40);
+
+            let old_child = agg_dir.join("old-run");
+            std::fs::create_dir_all(&old_child).unwrap();
+            age_dir(&old_child, 40);
+
+            let fresh_child = agg_dir.join("fresh-run");
+            std::fs::create_dir_all(&fresh_child).unwrap();
+        }
+
+        let report = prune_state_root(
+            root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.aggregates, 2);
+        assert_eq!(report.removed, 2);
+        for agg in ["mined-eval", "coding-eval"] {
+            let agg_dir = root.join(agg);
+            assert!(agg_dir.exists(), "{agg} aggregate dir itself must survive");
+            assert!(!agg_dir.join("old-run").exists());
+            assert!(agg_dir.join("fresh-run").exists());
+        }
+    }
+
+    #[test]
+    fn prune_mixed_fixture_bucket_invariant_and_removed_names() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        let expired_a = root.join("expired-a");
+        let expired_b = root.join("expired-b");
+        let fresh = root.join("fresh-task");
+        let keep_dir = root.join("keep-task");
+        for p in [&expired_a, &expired_b, &keep_dir] {
+            std::fs::create_dir_all(p).unwrap();
+            age_dir(p, 40);
+        }
+        std::fs::create_dir_all(&fresh).unwrap();
+
+        let agg = root.join("mined-eval");
+        std::fs::create_dir_all(&agg).unwrap();
+        let agg_child = agg.join("old-trial");
+        std::fs::create_dir_all(&agg_child).unwrap();
+        age_dir(&agg_child, 40);
+
+        let report = prune_state_root(
+            root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            std::slice::from_ref(&keep_dir),
+        );
+
+        assert_eq!(report.removed, 3);
+        assert_eq!(report.kept_young, 1);
+        assert_eq!(report.kept_keep, 1);
+        assert_eq!(report.aggregates, 1);
+        assert_eq!(
+            report.examined,
+            report.removed
+                + report.kept_keep
+                + report.kept_young
+                + report.skipped
+                + report.aggregates,
+            "bucket invariant must hold"
+        );
+        assert!(report.removed_names.contains(&"expired-a".to_string()));
+        assert!(report.removed_names.contains(&"expired-b".to_string()));
+        assert!(
+            report
+                .removed_names
+                .contains(&"mined-eval/old-trial".to_string())
+        );
+        assert!(fresh.exists());
+        assert!(keep_dir.exists());
+    }
+
+    #[test]
+    fn prune_removed_names_capped_at_max_report_names() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        for i in 0..9 {
+            let p = root.join(format!("expired-{i}"));
+            std::fs::create_dir_all(&p).unwrap();
+            age_dir(&p, 40);
+        }
+        let report = prune_state_root(
+            root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.removed, 9);
+        assert_eq!(report.removed_names.len(), MAX_REPORT_NAMES);
+        assert_eq!(report.removed_truncated, 1);
+    }
+
+    #[test]
+    fn prune_confines_removal_to_root_children_sibling_survives() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().join("talos");
+        std::fs::create_dir_all(&root).unwrap();
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        age_dir(&sibling, 40);
+
+        let stale = root.join("stale-task");
+        std::fs::create_dir_all(&stale).unwrap();
+        age_dir(&stale, 40);
+
+        let report = prune_state_root(
+            &root,
+            SystemTime::now(),
+            Duration::from_secs(30 * SECS_PER_DAY),
+            &[],
+        );
+        assert_eq!(report.removed, 1);
+        assert!(!stale.exists());
+        assert!(
+            sibling.exists(),
+            "a sibling outside the prune root must never be touched"
+        );
+    }
+
+    // ---- prune_report_json -------------------------------------------
+
+    #[test]
+    fn prune_report_json_shape_no_error_key_single_line() {
+        let root = PathBuf::from("/tmp/talos");
+        let report = PruneReport::default();
+        let s = prune_report_json(&root, 30, "flag", &report);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("must parse as JSON");
+        assert!(v.is_object());
+        assert!(v.get("error").is_none(), "must not contain an `error` key");
+        assert!(!s.contains('\n'), "must be single-line");
+        assert_eq!(
+            v.get("disabled").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn prune_report_json_disabled_true_when_retention_zero() {
+        let root = PathBuf::from("/tmp/talos");
+        let report = PruneReport::default();
+        let s = prune_report_json(&root, 0, "flag", &report);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            v.get("disabled").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            v.get("removed").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            v.get("examined").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn prune_report_json_round_trips_mixed_fixture_counts() {
+        let root = PathBuf::from("/tmp/talos");
+        let report = PruneReport {
+            examined: 6,
+            removed: 3,
+            kept_young: 1,
+            kept_keep: 1,
+            skipped: 0,
+            aggregates: 1,
+            removed_names: vec![
+                "expired-a".to_string(),
+                "expired-b".to_string(),
+                "mined-eval/old-trial".to_string(),
+            ],
+            removed_truncated: 0,
+        };
+        let s = prune_report_json(&root, 30, "default", &report);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["examined"], 6);
+        assert_eq!(v["removed"], 3);
+        assert_eq!(v["kept_young"], 1);
+        assert_eq!(v["kept_keep"], 1);
+        assert_eq!(v["aggregates"], 1);
+        assert_eq!(v["removed_names"].as_array().unwrap().len(), 3);
     }
 }

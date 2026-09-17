@@ -46,6 +46,7 @@ cargo test --doc --workspace       # doctests (nextest skips these)
 - `OLLAMA_API_KEY` — optional bearer token.
 - `OLLAMA_NUM_CTX` — optional `u32`; defaults to 32 768 for localhost.
 - `OLLAMA_THINK` — `off|on|low|medium|high|max`.
+- `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based retention talos applies to its own XDG state dir (`run.sqlite`, `offload/`, transcripts) on every `talos run` start; precedence is `--state-retention-days` flag > this env var > the compiled default of `30`, `0` disables pruning entirely, the env fallback does NOT survive dispatch's sudo boundary (only `TALOS_BACKEND` is kept), and the result is recorded per host in `<state-root>/talos/prune-last.json`.
 
 ## Ralph mode (`talos ralph`)
 
