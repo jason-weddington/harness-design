@@ -428,6 +428,173 @@ async fn no_transcript_flag_writes_no_jsonl_and_is_silent() {
 }
 
 // ============================================================================
+// (c3) --transcript with no value: bare flag defaults into the state dir
+// ============================================================================
+
+/// Bare `--transcript` (no path argument) defaults to
+/// `<state_home>/talos/<task-id>/transcript.jsonl`, sitting next to the run's
+/// `run.sqlite`. Also pins the dispatch worker's stdout contract
+/// (`agent_gtd_dispatch/talos.py::map_talos_result` reads the LAST stdout
+/// line): a bare-flag run must still emit exactly one stdout line, and that
+/// line must parse as a JSON object.
+#[tokio::test(flavor = "current_thread")]
+async fn bare_transcript_flag_defaults_into_state_dir() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let state_home = dir.path().join("state-home");
+    std::fs::create_dir_all(&state_home).unwrap();
+
+    let task_id = "cli-test-bare-transcript";
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--task-id",
+            task_id,
+            "--attempt",
+            "1",
+            "--transcript",
+            "--state-retention-days",
+            "0",
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stdout_lines: Vec<&str> = stdout_str.trim_end().lines().collect();
+    assert_eq!(
+        stdout_lines.len(),
+        1,
+        "bare --transcript must not add any stdout line beyond the single \
+         RunSummary line the dispatch worker reads as the run's classification; \
+         got: {stdout_str:?}"
+    );
+    let summary: serde_json::Value = serde_json::from_str(stdout_lines[0])
+        .unwrap_or_else(|_| panic!("stdout line must be valid JSON; got: {stdout_str:?}"));
+    assert!(summary.is_object(), "stdout summary must be a JSON object");
+
+    let state_dir = state_home.join("talos").join(task_id);
+    let transcript_path = state_dir.join("transcript.jsonl");
+    let run_store_path = state_dir.join("run.sqlite");
+    assert!(
+        transcript_path.exists(),
+        "bare --transcript must write transcript.jsonl into the run's state dir; \
+         expected {}",
+        transcript_path.display()
+    );
+    assert!(
+        run_store_path.exists(),
+        "run.sqlite must exist next to transcript.jsonl in the same state dir"
+    );
+
+    let contents = std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+    let first_line = contents
+        .lines()
+        .next()
+        .expect("transcript must have at least one line");
+    let first: serde_json::Value =
+        serde_json::from_str(first_line).expect("first transcript line must be valid JSON");
+    assert_eq!(first["event"], "run_start");
+}
+
+/// `--transcript <path>` with an explicit value must still write exactly that
+/// file, and must NOT ALSO write a `transcript.jsonl` into the run's default
+/// state dir — pins that the new bare-flag default cannot silently redirect
+/// an explicit caller.
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let state_home = dir.path().join("state-home");
+    std::fs::create_dir_all(&state_home).unwrap();
+    let custom_path = dir.path().join("custom.jsonl");
+
+    let task_id = "cli-test-explicit-transcript";
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--task-id",
+            task_id,
+            "--attempt",
+            "1",
+            "--transcript",
+            custom_path.to_str().unwrap(),
+            "--state-retention-days",
+            "0",
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    assert!(
+        custom_path.exists(),
+        "an explicit --transcript path must be written exactly as given"
+    );
+
+    let default_transcript = state_home
+        .join("talos")
+        .join(task_id)
+        .join("transcript.jsonl");
+    assert!(
+        !default_transcript.exists(),
+        "an explicit --transcript path must not ALSO write transcript.jsonl \
+         into the run's default state dir"
+    );
+}
+
+// ============================================================================
 // (d) --help is not a usage error: plain help on stdout, exit 0
 // ============================================================================
 

@@ -15,10 +15,11 @@
 //! `Failed`, which would collapse engine-broke (must be 1) into task-Failed
 //! (20). See [`exit_code`] for the full rationale.
 //!
-//! `talos run --transcript <path>` opts into a full JSONL run transcript
+//! `talos run --transcript [path]` opts into a full JSONL run transcript
 //! (see [`harness::transcript`]) — every model request/turn, tool call, and
-//! tool result — default OFF, flag only (no env fallback). `talos ralph` has
-//! no transcript support.
+//! tool result — default OFF, flag only (no env fallback); a bare
+//! `--transcript` defaults to `transcript.jsonl` in the run's state dir.
+//! `talos ralph` has no transcript support.
 //!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
@@ -258,17 +259,23 @@ struct RunArgs {
 
     /// Opt-in JSONL transcript of every model request/turn, tool call, and
     /// tool result — see [`harness::transcript`]. Default off (no flag = no
-    /// file, no transcript-related filesystem I/O). A relative path resolves
-    /// against the current working directory; point it OUTSIDE `--workspace`
-    /// (e.g. next to `run.sqlite` under the state dir) to keep it out of git
-    /// status and out of the agent's own context.
+    /// file, no transcript-related filesystem I/O). Bare `--transcript`
+    /// writes `transcript.jsonl` into the run's own state dir, next to
+    /// `run.sqlite`. `--transcript <path>` uses that path verbatim instead; a
+    /// relative path resolves against the current working directory — point
+    /// it OUTSIDE `--workspace` to keep it out of git status and out of the
+    /// agent's own context.
     ///
     /// FLAG ONLY — there is deliberately no `TALOS_TRANSCRIPT` env fallback:
     /// `templates/sudoers-dispatch-svc.tmpl`'s `env_keep` omits `TALOS_*`
     /// runtime knobs, so an env-only toggle would be a silent no-op once
     /// dispatch's sudo boundary does its `env_reset` (kb-02979 shape).
-    #[arg(long)]
-    transcript: Option<PathBuf>,
+    // `Option<Option<PathBuf>>` is the deliberate clap idiom for a flag whose
+    // value is itself optional (flag absent / bare flag / flag with a value)
+    // — see `resolve_transcript_path`'s doc for the three-branch resolution.
+    #[allow(clippy::option_option)]
+    #[arg(long, num_args = 0..=1, value_name = "PATH")]
+    transcript: Option<Option<PathBuf>>,
 
     /// Age-based retention, in days, for talos's own XDG state dir
     /// (`${XDG_STATE_HOME:-$HOME/.local/state}/talos/`). Precedence: this
@@ -449,6 +456,23 @@ fn outcome_str(outcome: &LoopOutcome) -> &'static str {
         LoopOutcome::MaxIterations => "MaxIterations",
         LoopOutcome::BudgetExhausted { .. } => "BudgetExhausted",
         LoopOutcome::BackendError(_) => "BackendError",
+    }
+}
+
+/// Resolve `--transcript`'s effective output path from the three-state clap
+/// flag: flag absent -> `None` (no transcript); bare `--transcript` ->
+/// `Some(state_dir.join("transcript.jsonl"))`, alongside `run.sqlite`; an
+/// explicit `--transcript <path>` -> that path verbatim, NOT joined against
+/// `state_dir`. Pure — reads no process env, touches no filesystem, and never
+/// resolves or canonicalizes a relative explicit path; it flows through
+/// exactly as given, to be resolved against the process CWD downstream
+/// exactly as it is today.
+#[allow(clippy::option_option)]
+fn resolve_transcript_path(flag: Option<Option<PathBuf>>, state_dir: &Path) -> Option<PathBuf> {
+    match flag {
+        None => None,
+        Some(None) => Some(state_dir.join("transcript.jsonl")),
+        Some(Some(path)) => Some(path),
     }
 }
 
@@ -1250,7 +1274,7 @@ async fn run_cmd(args: RunArgs) {
     // Label is computed from `model_label` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
     // flag was passed) and has no env fallback — see `RunArgs::transcript`.
-    if let Some(path) = args.transcript.clone() {
+    if let Some(path) = resolve_transcript_path(args.transcript.clone(), &state_dir) {
         let label = transcript_label(&model_label, &env_accessor);
         config = config.with_transcript(path, label);
     }
@@ -1419,7 +1443,7 @@ mod tests {
         backend_from_env, build_checks_runner, build_ralph_summary, build_run_summary, exit_code,
         make_run_seed, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
         ralph_terminal_str, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
-        touch_dir_mtime, transcript_label, write_ralph_error_detail,
+        resolve_transcript_path, touch_dir_mtime, transcript_label, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::model::{BackendError, TerminalKind, TransientKind};
@@ -1549,6 +1573,39 @@ mod tests {
         assert_eq!(
             transcript_label("ollama:x", &both),
             "ollama:x think=on num_ctx=65536"
+        );
+    }
+
+    // ---- resolve_transcript_path: flag absent / bare / explicit ----------
+
+    #[test]
+    fn resolve_transcript_path_absent_flag_yields_none() {
+        let state_dir = PathBuf::from("/nonexistent/state-dir");
+        assert_eq!(
+            resolve_transcript_path(None, &state_dir),
+            None,
+            "no --transcript flag must resolve to no transcript at all"
+        );
+    }
+
+    #[test]
+    fn resolve_transcript_path_bare_flag_joins_state_dir() {
+        let state_dir = PathBuf::from("/nonexistent/state-dir");
+        assert_eq!(
+            resolve_transcript_path(Some(None), &state_dir),
+            Some(state_dir.join("transcript.jsonl")),
+            "bare --transcript must default to transcript.jsonl in the state dir"
+        );
+    }
+
+    #[test]
+    fn resolve_transcript_path_explicit_path_is_used_verbatim() {
+        let state_dir = PathBuf::from("/nonexistent/state-dir");
+        let explicit = PathBuf::from("rel/x.jsonl");
+        assert_eq!(
+            resolve_transcript_path(Some(Some(explicit.clone())), &state_dir),
+            Some(explicit),
+            "an explicit --transcript path must flow through verbatim, not joined to state_dir"
         );
     }
 
