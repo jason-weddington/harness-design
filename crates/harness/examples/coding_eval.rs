@@ -219,8 +219,9 @@ const DEFAULT_MAX_ITERATIONS: u32 = 12;
 
 /// Root for `CODING_EVAL_TRANSCRIPTS` output:
 /// `<state-root>/talos/coding-eval/<unix-secs>-<pid>`. `state-root` follows
-/// the same precedence as `harness::mined_eval`'s equivalent resolver
-/// (`XDG_STATE_HOME`, else `HOME/.local/state`, else the process temp dir).
+/// the same base precedence as `harness::mined_eval::default_state_root`
+/// (`XDG_STATE_HOME`, else `HOME/.local/state`, else the process temp dir),
+/// but this copy has no `TALOS_MINED_STATE_ROOT`-equivalent override branch.
 /// Deliberately duplicated rather than shared — unifying the three XDG-root
 /// copies in this repo is out of scope for this item. Computed ONCE in
 /// `main` so every fixture/trial in this process shares the same root.

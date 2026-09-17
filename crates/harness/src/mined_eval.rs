@@ -1626,7 +1626,7 @@ pub struct MinedTrialResult {
     /// reverted — worth seeing, and never scored.
     pub agent_tests_modified: Vec<String>,
     /// Absolute path to the persisted raw re-gate stdout+stderr under
-    /// `${XDG_STATE_HOME:-~/.local/state}/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`.
+    /// `<MinedRunConfig::state_root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`.
     pub gate_output_path: PathBuf,
     /// Whether finish-recovery was structurally armed for this trial: true iff
     /// `run_checks` is in the registry AND `run_config.max_nudges > 0`.
@@ -1900,10 +1900,13 @@ pub fn claimed_disposition_label(outcome: &LoopOutcome) -> String {
 /// `on_trial`). The runner uses it to stream one line per trial.
 pub type OnMinedTrial<'a> = &'a mut dyn FnMut(&MinedTrialResult);
 
-/// Root of the XDG-state-shaped output directory the runner writes per-trial
-/// gate output under. Overridable for tests via the `TALOS_MINED_STATE_ROOT`
-/// env var (a private test hook; not part of the public schema).
-fn xdg_state_root() -> PathBuf {
+/// Default root for mined-eval per-trial captures, resolved from
+/// `TALOS_MINED_STATE_ROOT`, then `XDG_STATE_HOME`, then
+/// `$HOME/.local/state`, then the process temp dir. The runner resolves this
+/// ONCE and injects it as [`MinedRunConfig::state_root`]; tests inject a
+/// tempdir instead, so no library code below the runner reads process env
+/// for the state root.
+pub fn default_state_root() -> PathBuf {
     resolve_state_root(
         std::env::var_os("TALOS_MINED_STATE_ROOT"),
         std::env::var_os("XDG_STATE_HOME"),
@@ -1911,9 +1914,9 @@ fn xdg_state_root() -> PathBuf {
     )
 }
 
-/// Pure precedence rule for [`xdg_state_root`]: extracted so each branch can
-/// be tested without mutating process env (edition-2024 `set_var` is unsafe
-/// and `unsafe_code` is `forbid`-den project-wide).
+/// Pure precedence rule for [`default_state_root`]: extracted so each branch
+/// can be tested without mutating process env (edition-2024 `set_var` is
+/// unsafe and `unsafe_code` is `forbid`-den project-wide).
 fn resolve_state_root(
     override_root: Option<std::ffi::OsString>,
     xdg_state_home: Option<std::ffi::OsString>,
@@ -1949,12 +1952,13 @@ fn run_id() -> &'static str {
 }
 
 /// The per-trial state directory:
-/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>`. Shared by
-/// [`persist_named_output`] (gate/agent-gate captures) and, when
-/// [`MinedRunConfig::transcripts`] is on, [`single_trial`]'s
+/// `<state-root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>`. `state_root`
+/// is supplied by the caller ([`MinedRunConfig::state_root`]), not read from
+/// env. Shared by [`persist_named_output`] (gate/agent-gate captures) and,
+/// when [`MinedRunConfig::transcripts`] is on, [`single_trial`]'s
 /// `transcript.jsonl`.
-fn trial_state_dir(task_id: &str, trial: u32) -> PathBuf {
-    xdg_state_root()
+fn trial_state_dir(state_root: &Path, task_id: &str, trial: u32) -> PathBuf {
+    state_root
         .join("talos/mined-eval")
         .join(run_id())
         .join(task_id)
@@ -1962,14 +1966,21 @@ fn trial_state_dir(task_id: &str, trial: u32) -> PathBuf {
 }
 
 /// Persist `raw` under
-/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/<filename>` and
-/// return its absolute path. A write error falls back to a temp path so a
-/// trial never fails just because the state dir is unwritable. Shared by
+/// `<state-root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/<filename>` and
+/// return its absolute path. `state_root` is the caller's
+/// [`MinedRunConfig::state_root`]. A write error falls back to a temp path so
+/// a trial never fails just because the state dir is unwritable. Shared by
 /// [`persist_gate_output`] (`gate-output.txt`) and
 /// [`persist_agent_gate_output`] (`agent-gate-output.txt`) so both captures
 /// land in the same per-trial directory.
-fn persist_named_output(task_id: &str, trial: u32, filename: &str, raw: &str) -> PathBuf {
-    let dir = trial_state_dir(task_id, trial);
+fn persist_named_output(
+    state_root: &Path,
+    task_id: &str,
+    trial: u32,
+    filename: &str,
+    raw: &str,
+) -> PathBuf {
+    let dir = trial_state_dir(state_root, task_id, trial);
     let path = dir.join(filename);
     if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, raw).is_ok() {
         return path;
@@ -1985,20 +1996,21 @@ fn persist_named_output(task_id: &str, trial: u32, filename: &str, raw: &str) ->
 }
 
 /// Persist raw re-gate output under
-/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`
-/// and return its absolute path. A write error falls back to a temp path so a
-/// trial never fails just because the state dir is unwritable.
-fn persist_gate_output(task_id: &str, trial: u32, raw: &str) -> PathBuf {
-    persist_named_output(task_id, trial, "gate-output.txt", raw)
+/// `<state-root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/gate-output.txt`
+/// and return its absolute path. `state_root` is the caller's
+/// [`MinedRunConfig::state_root`]. A write error falls back to a temp path so
+/// a trial never fails just because the state dir is unwritable.
+fn persist_gate_output(state_root: &Path, task_id: &str, trial: u32, raw: &str) -> PathBuf {
+    persist_named_output(state_root, task_id, trial, "gate-output.txt", raw)
 }
 
 /// Persist the post-run agent-gate's captured output under
-/// `<xdg-state>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/agent-gate-output.txt`,
+/// `<state-root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/agent-gate-output.txt`,
 /// next to [`persist_gate_output`]'s capture, and return its absolute path.
-/// Same best-effort fallback behavior — a write failure never fails the
-/// trial.
-fn persist_agent_gate_output(task_id: &str, trial: u32, raw: &str) -> PathBuf {
-    persist_named_output(task_id, trial, "agent-gate-output.txt", raw)
+/// `state_root` is the caller's [`MinedRunConfig::state_root`]. Same
+/// best-effort fallback behavior — a write failure never fails the trial.
+fn persist_agent_gate_output(state_root: &Path, task_id: &str, trial: u32, raw: &str) -> PathBuf {
+    persist_named_output(state_root, task_id, trial, "agent-gate-output.txt", raw)
 }
 
 /// Best-effort full text of a post-run [`CheckReport`] for persistence:
@@ -2033,6 +2045,10 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct MinedRunConfig<'a> {
     /// The task directory holding `task.json`, `statements/`, and `sealed/`.
     pub task_dir: &'a Path,
+    /// Root directory under which per-trial captures (`gate-output.txt`,
+    /// `agent-gate-output.txt`, `transcript.jsonl`) are written. See
+    /// [`default_state_root`] for the default resolution the runner uses.
+    pub state_root: &'a Path,
     /// Parsed task spec (already loaded via [`load_task`]).
     pub task: &'a MinedTask,
     /// The statement text to hand the agent (already loaded via
@@ -2059,7 +2075,7 @@ pub struct MinedRunConfig<'a> {
     /// Opt-in full run transcript (see [`crate::transcript`]). Default off —
     /// set from `MINED_EVAL_TRANSCRIPTS` (see [`crate::transcript::parse_transcripts_flag`]).
     /// When `true`, each trial's `engine::run` is configured with
-    /// `.with_transcript(trial_state_dir(&task.id, trial).join("transcript.jsonl"),
+    /// `.with_transcript(trial_state_dir(config.state_root, &task.id, trial).join("transcript.jsonl"),
     /// backend_desc.clone())`.
     pub transcripts: bool,
 }
@@ -2189,7 +2205,8 @@ async fn single_trial<B: ModelBackend>(
         run_config = run_config.with_checks(runner);
     }
     let transcript_path = if config.transcripts {
-        let path = trial_state_dir(&config.task.id, trial).join("transcript.jsonl");
+        let path =
+            trial_state_dir(config.state_root, &config.task.id, trial).join("transcript.jsonl");
         run_config = run_config.with_transcript(path.clone(), config.backend_desc.clone());
         Some(path)
     } else {
@@ -2225,7 +2242,7 @@ async fn single_trial<B: ModelBackend>(
     let (agent_gate_post, agent_gate_output_path) = if let Some(runner) = checks.as_ref() {
         let report = runner.run(&ctx).await;
         let raw = agent_gate_output_raw(&report);
-        let path = persist_agent_gate_output(&config.task.id, trial, &raw);
+        let path = persist_agent_gate_output(config.state_root, &config.task.id, trial, &raw);
         (Some(report.passed), Some(path))
     } else {
         (None, None)
@@ -2239,7 +2256,7 @@ async fn single_trial<B: ModelBackend>(
     // 5. Sealed re-gate + scoring.
     let (score, raw) =
         sealed_regate_score(config.task, config.task_dir, &workspace_root, parser).await;
-    let gate_output_path = persist_gate_output(&config.task.id, trial, &raw);
+    let gate_output_path = persist_gate_output(config.state_root, &config.task.id, trial, &raw);
 
     // Re-parse to capture the raw status map on the trial record (empty on
     // Invalid trials that never ran the parser).
@@ -2298,7 +2315,7 @@ fn invalid_trial(
 ) -> MinedTrialResult {
     // Persist an empty gate-output file so the provenance path always
     // exists on disk — even for a pre-agent Invalid trial.
-    let gate_output_path = persist_gate_output(&config.task.id, trial, "");
+    let gate_output_path = persist_gate_output(config.state_root, &config.task.id, trial, "");
     MinedTrialResult {
         trial,
         score: TrialScore::Invalid { reason },
@@ -4256,30 +4273,62 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         );
     }
 
-    // ---- persist_gate_output writes to state root, sanitizes id --------
+    // ---- persist_gate_output writes under the INJECTED state root -------
 
     #[test]
     fn persist_gate_output_writes_under_state_root_override() {
-        // Set the private test hook so we don't have to guess XDG_STATE_HOME.
-        // std::env::set_var is unsafe in edition 2024 (forbidden here), so
-        // we set it via a child process: run persist through a helper that
-        // reads TALOS_MINED_STATE_ROOT if present. Since we can't set env
-        // vars in-process, we instead verify the fallback branch (no state
-        // root) DOES write to a temp path and it contains the content.
-        // The XDG_STATE_HOME/HOME branches are hit implicitly on any test
-        // build since HOME is always set — persist_gate_output writes to
-        // ~/.local/state/talos/mined-eval/... which is a real filesystem
-        // write we then read back to verify.
+        let root = tempdir().expect("state root");
         let raw = "hello mined world";
-        let out_path = super::persist_gate_output("some-task-id/with:weird chars", 7, raw);
-        // The path must exist and contain our content.
+        let out_path =
+            super::persist_gate_output(root.path(), "some-task-id/with:weird chars", 7, raw);
+        let expected = root
+            .path()
+            .join("talos/mined-eval")
+            .join(super::run_id())
+            .join("some-task-id/with:weird chars")
+            .join("trial-7")
+            .join("gate-output.txt");
+        assert_eq!(out_path, expected);
         let contents = std::fs::read_to_string(&out_path).expect("read gate output");
         assert_eq!(contents, raw);
-        // The path must live somewhere under the state root; simplest check:
-        // its file name should mention the trial and its filename is
-        // gate-output.txt when we went through the primary write path OR a
-        // temp fallback file otherwise. Either way, the content assertion is
-        // enough — path shape is an implementation detail.
+    }
+
+    // ---- persist_gate_output temp-path fallback when state_root is unusable
+
+    #[test]
+    fn persist_gate_output_falls_back_to_temp_path_when_state_root_is_not_a_dir() {
+        let root = tempdir().expect("root");
+        let not_a_dir = root.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "i am a file, not a directory").expect("write blocker file");
+
+        let out_path = super::persist_gate_output(
+            &not_a_dir,
+            "some-task-id/with:weird chars",
+            7,
+            "fallback text",
+        );
+
+        assert!(
+            out_path.starts_with(std::env::temp_dir()),
+            "fallback path {out_path:?} should live under the process temp dir"
+        );
+        let file_name = out_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("fallback path has a filename")
+            .to_string();
+        assert!(
+            file_name.starts_with("talos-mined-eval-some-task-id_with_weird_chars-7-"),
+            "unexpected fallback filename: {file_name}"
+        );
+        assert!(
+            file_name.ends_with("-gate-output.txt"),
+            "unexpected fallback filename: {file_name}"
+        );
+        let contents = std::fs::read_to_string(&out_path).expect("read fallback output");
+        assert_eq!(contents, "fallback text");
+
+        let _ = std::fs::remove_file(&out_path);
     }
 
     // ---- run_mined_task end-to-end with MockBackend ----------------------
@@ -4343,8 +4392,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let backend = MockBackend::from_turns(finish_turns);
 
         let statement = "Finish, please.".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4401,10 +4452,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         // Same synthetic fixture as
         // `run_mined_task_end_to_end_scores_resolved_via_synthetic_repo`, with
-        // `transcripts: true`. Writes land wherever `xdg_state_root()`
-        // resolves in this process — same as `gate_output_path` already does
-        // for every other test in this module (no env-var override hook is
-        // used here; `set_var` is `unsafe` and this crate forbids `unsafe`).
+        // `transcripts: true`. `state_root` is injected as a dedicated
+        // tempdir so this test asserts the real path shape instead of
+        // reaching into the developer's or dispatch host's real home.
         let workroot = tempdir().expect("workroot");
         let primary_src = workroot.path().join("primary");
         std::fs::create_dir_all(&primary_src).expect("mkdir");
@@ -4451,8 +4501,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let backend = MockBackend::from_turns(finish_turns);
 
         let statement = "Finish, please.".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4470,7 +4522,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         assert_eq!(report.trials.len(), k as usize);
         for t in &report.trials {
-            let expected = trial_state_dir(&task.id, t.trial).join("transcript.jsonl");
+            let expected =
+                trial_state_dir(state_root.path(), &task.id, t.trial).join("transcript.jsonl");
             assert_eq!(t.transcript_path, Some(expected.clone()));
             let contents = std::fs::read_to_string(&expected).expect("read transcript");
             let lines: Vec<&str> = contents.lines().collect();
@@ -4575,8 +4628,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         ];
         let backend = MockBackend::from_turns(turns);
 
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4640,8 +4695,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         task.agent_gate_command = Some("sleep 3".to_string());
 
         let backend = MockBackend::from_turns(Vec::new());
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4682,8 +4739,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         task.agent_gate_command = Some("exit 1".to_string());
 
         let backend = MockBackend::from_turns(Vec::new());
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4766,8 +4825,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         ];
         let backend = MockBackend::from_turns(turns);
 
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4842,8 +4903,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         }];
         let backend = MockBackend::from_turns(turns);
 
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4867,6 +4930,70 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(report.shippable(), 1);
         assert_eq!(report.resolved_gate_red(), 0);
         assert!(trial.agent_gate_output_path.is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn run_mined_task_writes_all_three_captures_only_under_injected_state_root() {
+        use super::{MinedRunConfig, default_state_root, run_id, run_mined_task, trial_state_dir};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true".to_string());
+
+        let turns = vec![AssistantTurn {
+            content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                id: "c-finish".to_string(),
+                name: FINISH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+            })],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }];
+        let backend = MockBackend::from_turns(turns);
+
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: true,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        assert_eq!(report.trials.len(), 1);
+
+        let trial_dir = trial_state_dir(state_root.path(), &task.id, 0);
+        assert!(trial_dir.join("gate-output.txt").exists());
+        assert!(trial_dir.join("agent-gate-output.txt").exists());
+        assert!(trial_dir.join("transcript.jsonl").exists());
+
+        // Guard: nothing landed under the real default state root for this
+        // process-unique task id.
+        let leaked = default_state_root()
+            .join("talos/mined-eval")
+            .join(run_id())
+            .join(&task.id);
+        assert!(!leaked.exists());
     }
 
     #[tokio::test]
@@ -4898,8 +5025,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         }];
         let backend = MockBackend::from_turns(turns);
 
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -4961,8 +5090,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(task.agent_gate_command, None);
 
         let backend = MockBackend::from_turns(Vec::new());
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5025,8 +5156,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         }];
         let backend = MockBackend::from_turns(turns);
 
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5068,8 +5201,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         // Backend is never called since setup fails before the agent runs.
         let backend = MockBackend::from_turns(Vec::new());
         let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5113,8 +5248,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let task = task_pointing_at(not_a_repo.path(), None, "deadbeef");
         let backend = MockBackend::from_turns(Vec::new());
         let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5449,13 +5586,13 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         task.repo_path = "/".to_string(); // no-op reassignment, keeps clippy quiet.
     }
 
-    // ---- xdg_state_root — call the wrapper (covers env-read branches) ----
+    // ---- default_state_root — call the wrapper (covers env-read branches) --
 
     #[test]
-    fn xdg_state_root_returns_a_directory_shaped_path() {
-        // Runs the actual `xdg_state_root` wrapper so its `env::var_os` branch
-        // predicates get exercised (the pure worker is tested separately).
-        let path = super::xdg_state_root();
+    fn default_state_root_returns_a_directory_shaped_path() {
+        // Runs the actual `default_state_root` wrapper so its `env::var_os`
+        // branch predicates get exercised (the pure worker is tested separately).
+        let path = super::default_state_root();
         // It should be non-empty, and either an override, XDG root, HOME's
         // .local/state, or the temp dir — all are valid shapes.
         assert!(!path.as_os_str().is_empty());
@@ -5534,8 +5671,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         }]);
         let _ = FinishTool;
         let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5586,8 +5725,10 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let backend = MockBackend::from_turns(Vec::new());
         let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
             task_dir: task_dir.path(),
+            state_root: state_root.path(),
             task: &task,
             statement: &statement,
             spec_level: SpecLevel::S2,
@@ -5605,6 +5746,68 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         // OR Workspace::new fails afterwards. Both produce Invalid.
         assert_eq!(report.invalid_count, 1);
         assert!(matches!(report.trials[0].score, TrialScore::Invalid { .. }));
+    }
+
+    // ---- invalid_trial's gate-output write lands under the injected root -
+
+    #[tokio::test]
+    async fn run_mined_task_invalid_trial_writes_gate_output_only_under_injected_state_root() {
+        // Same Workspace::new failure fixture as
+        // `run_mined_task_invalid_when_workspace_root_is_a_file`, but this
+        // test's focus is `invalid_trial`'s own `persist_gate_output` call
+        // (mined_eval.rs's pre-agent Invalid path): it must write under the
+        // injected `state_root`, never under the real default state root.
+        use super::{MinedRunConfig, default_state_root, run_id, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "x.py", "x\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir stmts");
+        std::fs::write(task_dir.path().join("statements/s2.md"), "hi").expect("write s2");
+
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        // Trip Workspace::new by scrubbing the worktree dir out from under it.
+        task.env.setup = "rm -rf $(pwd) && touch $(pwd)".to_string();
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+        assert_eq!(report.invalid_count, 1);
+
+        let gate_output = state_root
+            .path()
+            .join("talos/mined-eval")
+            .join(run_id())
+            .join(&task.id)
+            .join("trial-0")
+            .join("gate-output.txt");
+        assert!(gate_output.exists());
+
+        let leaked = default_state_root()
+            .join("talos/mined-eval")
+            .join(run_id())
+            .join(&task.id);
+        assert!(!leaked.exists());
     }
 
     // ---- copy_sealed: recursive copy dst-exists-as-file failure ----------
