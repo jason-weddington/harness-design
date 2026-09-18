@@ -119,8 +119,9 @@ use crate::exec::{
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
 use crate::run_record::{
-    BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event, FailureMode, Phase,
-    ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task, Verification,
+    BackendSettings, BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event,
+    FailureMode, Phase, ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task,
+    Verification,
 };
 use crate::store::{RunStore, StoreError};
 use crate::time::{Clock, SystemClock, format_rfc3339};
@@ -454,6 +455,12 @@ pub struct Persistence {
     /// Carried on every [`Event::ModelCall`]; the model backend deliberately
     /// does not expose its own id at the trait level.
     pub model_label: String,
+    /// The resolved backend the run was CONSTRUCTED with (see
+    /// [`crate::run_record::BackendSettings`] — construction-time settings,
+    /// NOT proof of served identity), stamped on the [`RunRecord`] and the
+    /// transcript's `run_start` line. Invariant: when this is `Some`,
+    /// `model_label` MUST equal `backend_settings.model_label()`.
+    pub backend_settings: Option<BackendSettings>,
 }
 
 impl std::fmt::Debug for Persistence {
@@ -462,6 +469,7 @@ impl std::fmt::Debug for Persistence {
             .field("task_id", &self.task_id)
             .field("attempt_n", &self.attempt_n)
             .field("model_label", &self.model_label)
+            .field("backend_settings", &self.backend_settings)
             .field("store", &"<dyn RunStore>")
             .finish()
     }
@@ -2367,6 +2375,7 @@ async fn run_loop_body(
             last_gate_result: None,
             disposition: None,
             recovery_facts: None,
+            backend_settings: p.backend_settings.clone(),
             messages: messages.clone(),
         };
         Some(RunPersist { rid, record })
@@ -2400,6 +2409,12 @@ async fn run_loop_body(
                 "harness_version": env!("CARGO_PKG_VERSION"),
                 "label": config.transcript.as_ref().map(|t| t.label.clone()),
                 "run_id": persist.as_ref().map(|p| p.rid.clone()),
+                // The SAME value stamped on the [`RunRecord`] (single source)
+                // — `null` for the non-persisted `engine::run` path.
+                "backend_settings": persist
+                    .as_ref()
+                    .and_then(|p| p.record.backend_settings.as_ref())
+                    .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
                 "resume": is_resume,
                 "tree_baseline": render_tree_observation(&tree_baseline),
                 "system": system,
@@ -3528,6 +3543,7 @@ pub async fn resume(
         task_id: String::new(),
         attempt_n: 0,
         model_label: String::new(),
+        backend_settings: None,
     };
 
     let outcome = run_loop_impl(
@@ -3591,8 +3607,9 @@ mod tests {
     };
     use crate::prompt;
     use crate::run_record::{
-        BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event, FailureMode,
-        Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task, Verification,
+        BackendKind, BackendSettings, BudgetConsumed, BudgetLimits, Budgets, Disposition,
+        DurableFacts, Event, FailureMode, Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task,
+        Verification,
     };
     use crate::store::{RunStore, SqliteRunStore, StoreError};
     use crate::test_support::MockBackend;
@@ -3751,6 +3768,7 @@ mod tests {
             task_id: "task-t".to_string(),
             attempt_n: 1,
             model_label: "test-model".to_string(),
+            backend_settings: None,
         }
     }
 
@@ -5786,6 +5804,66 @@ mod tests {
         );
     }
 
+    /// `backend_settings` is stamped onto the persisted record, and the
+    /// persisted `Event::ModelCall`'s `model` equals
+    /// `backend_settings.model_label()` — the twin identity sources must
+    /// agree from a single construction site.
+    #[tokio::test]
+    async fn run_persisted_stamps_backend_settings_on_record_and_model_calls() {
+        let s = BackendSettings {
+            kind: BackendKind::Ollama,
+            model: "m".to_string(),
+            think: Some("on".to_string()),
+            num_ctx: Some(32768),
+            num_ctx_source: Some("localhost_default".to_string()),
+        };
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = Persistence {
+            store: store.clone(),
+            task_id: "task-42".to_string(),
+            attempt_n: 1,
+            model_label: s.model_label(),
+            backend_settings: Some(s.clone()),
+        };
+
+        run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let rid = run_id("task-42", 1);
+        let rec = store
+            .load(&rid)
+            .await
+            .expect("load")
+            .expect("record present");
+        assert_eq!(
+            rec.backend_settings,
+            Some(s.clone()),
+            "the record must carry the constructed backend settings"
+        );
+
+        let events = store.list_events(&rid).await.expect("list");
+        let first_call = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ModelCall { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .expect("at least one ModelCall event");
+        assert_eq!(
+            first_call,
+            s.model_label(),
+            "the persisted ModelCall's model must equal backend_settings.model_label()"
+        );
+    }
+
     #[tokio::test]
     async fn loaded_checkpoint_has_correct_run_id_schema_version_phase_and_run_checks() {
         // Verifies RunRecord construction: run_id format, schema_version == 2,
@@ -5805,6 +5883,7 @@ mod tests {
             task_id: "task-42".to_string(),
             attempt_n: 1,
             model_label: "test-model".to_string(),
+            backend_settings: None,
         };
 
         run_persisted(&backend, &tools, &ctx, &config, &pers)
@@ -6323,6 +6402,7 @@ mod tests {
             last_gate_result: None,
             disposition: None,
             recovery_facts: None,
+            backend_settings: None,
             messages: vec![],
         }
     }
@@ -6913,6 +6993,157 @@ mod tests {
         );
     }
 
+    // Resume must carry the constructed backend settings forward and never
+    // clear them — FreshContext clears ONLY `disposition`.
+
+    /// `FreshContext` resume carries `backend_settings` forward into the new
+    /// run id and clears ONLY `disposition` — visible on the resumed run's
+    /// first checkpoint, where the disposition is still pre-terminal.
+    #[tokio::test]
+    async fn fresh_context_resume_carries_backend_settings_and_clears_only_disposition() {
+        let snap = Arc::new(SnapshotStore::new());
+        let s = BackendSettings {
+            kind: BackendKind::Ollama,
+            model: "m".to_string(),
+            think: Some("on".to_string()),
+            num_ctx: Some(32768),
+            num_ctx_source: Some("localhost_default".to_string()),
+        };
+        let mut record = make_minimal_record("bs-fc-task", 1);
+        record.backend_settings = Some(s.clone());
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("old context".to_string())],
+        }];
+        snap.inner
+            .checkpoint("bs-fc-task:1", &record)
+            .await
+            .expect("cp");
+        let store: Arc<dyn RunStore> = snap.clone();
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store.clone(),
+            "bs-fc-task:1",
+            ResumeMode::FreshContext,
+        )
+        .await
+        .expect("resume must succeed");
+
+        let new_rid = run_id("bs-fc-task", 2);
+        // The FINAL record under the new run id keeps the carried settings.
+        let final_rec = store
+            .load(&new_rid)
+            .await
+            .expect("load")
+            .expect("new run_id must be checkpointed");
+        assert_eq!(
+            final_rec.backend_settings,
+            Some(s.clone()),
+            "FreshContext resume must carry backend_settings forward, never clear it"
+        );
+        // ...and the resumed run's FIRST checkpoint (pre-terminal) proves the
+        // arm cleared ONLY `disposition`: `None` there, settings carried.
+        let snaps: Vec<RunRecord> = snap
+            .all_snapshots()
+            .into_iter()
+            .filter(|rec| rec.run_id == new_rid)
+            .collect();
+        assert!(
+            !snaps.is_empty(),
+            "resumed run must checkpoint under the new run id"
+        );
+        let first = snaps.into_iter().next().expect("just asserted non-empty");
+        assert_eq!(
+            first.backend_settings,
+            Some(s),
+            "the first post-resume checkpoint must already carry backend_settings"
+        );
+        assert_eq!(
+            first.disposition, None,
+            "FreshContext must clear disposition on the new attempt"
+        );
+    }
+
+    /// `Crash` resume carries `backend_settings` forward under the SAME
+    /// run id — the crash arm clones the record and leaves the field
+    /// untouched.
+    #[tokio::test]
+    async fn crash_resume_carries_backend_settings() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let s = BackendSettings {
+            kind: BackendKind::Ollama,
+            model: "m".to_string(),
+            think: Some("on".to_string()),
+            num_ctx: Some(32768),
+            num_ctx_source: Some("localhost_default".to_string()),
+        };
+        let mut record = make_minimal_record("bs-crash-task", 1);
+        record.backend_settings = Some(s.clone());
+        // Minimal messages so reconcile finds no dangling tail.
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }];
+        store
+            .checkpoint("bs-crash-task:1", &record)
+            .await
+            .expect("cp");
+        // Append a non-ToolCallStarted event so the tail is clean.
+        store
+            .append_event(
+                "bs-crash-task:1",
+                Event::ModelCall {
+                    seq: 0,
+                    model: "t".to_string(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                },
+            )
+            .await
+            .expect("mc");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-fin",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            store.clone(),
+            "bs-crash-task:1",
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume must succeed");
+
+        let rec = store
+            .load("bs-crash-task:1")
+            .await
+            .expect("load")
+            .expect("original run_id must still be checkpointed");
+        assert_eq!(
+            rec.backend_settings,
+            Some(s),
+            "Crash resume must carry backend_settings forward, never clear it"
+        );
+    }
+
     // AC-8: Prompt byte-identity on resume — system prompt rendered fresh.
     #[tokio::test]
     async fn resume_system_prompt_byte_identical_to_fresh_run() {
@@ -7155,6 +7386,7 @@ mod tests {
                 task_id: TASK_ID.to_string(),
                 attempt_n: ATTEMPT_N,
                 model_label: "test-model".to_string(),
+                backend_settings: None,
             };
             // PanickyTool::run() panics here; the spawned task catches it.
             run_persisted(&*leg1_backend_for_spawn, &tools, &ctx, &config, &pers).await
@@ -7563,6 +7795,7 @@ mod tests {
                 task_id: TASK_ID.to_string(),
                 attempt_n: ATTEMPT_N,
                 model_label: "test-model".to_string(),
+                backend_settings: None,
             };
             run_persisted(&backend, &tools, &ctx, &config, &pers).await
         });
@@ -9229,6 +9462,10 @@ mod tests {
         assert!(
             dbg.contains("model_label") && dbg.contains("\"test-model\""),
             "Debug must surface model_label, got {dbg}",
+        );
+        assert!(
+            dbg.contains("backend_settings"),
+            "Debug must surface backend_settings, got {dbg}"
         );
         assert!(
             dbg.contains("\"<dyn RunStore>\""),

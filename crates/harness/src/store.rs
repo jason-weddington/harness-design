@@ -473,6 +473,7 @@ mod tests {
             }),
             disposition: None,
             recovery_facts: None,
+            backend_settings: None,
             messages: vec![
                 Message::User {
                     content: vec![UserBlock::Text("do the task".to_string())],

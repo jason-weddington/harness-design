@@ -36,6 +36,74 @@ use crate::model::Message;
 /// can migrate or refuse stale data.
 pub const SCHEMA_VERSION: u32 = 2;
 
+// ===== Backend settings (additive on the v2 wire) =====================
+
+/// Provider family a [`BackendSettings`] describes.
+///
+/// Externally tagged (the serde default for a plain enum), so the wire forms
+/// are the bare strings `"Anthropic"`, `"Bedrock"`, and `"Ollama"` — the
+/// same convention [`Phase`] and [`FailureMode`] already use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendKind {
+    /// Anthropic API direct.
+    Anthropic,
+    /// AWS Bedrock (Converse API).
+    Bedrock,
+    /// Ollama (local daemon or cloud over the same `/api/chat` wire).
+    Ollama,
+}
+
+/// Resolved backend construction settings, recorded on every [`RunRecord`].
+///
+/// These are the settings the backend was CONSTRUCTED with — the model id,
+/// the think level, and the `num_ctx` the adapter was pinned with — NOT
+/// what any server reported back: no backend currently echoes the SERVED
+/// model (Ollama's `ResponseBody`, `ollama.rs:894-902`, does not
+/// deserialize the `model` field the server returns), so this field is NOT
+/// proof of served identity (the `kb-02979` "engine LABEL != IDENTITY"
+/// lesson). Deliberately closed: exactly `kind`, `model`, `think`,
+/// `num_ctx`, and `num_ctx_source` — no api key, base URL, or credential
+/// field may ever be added here (the record is a plaintext blob; the
+/// exact-key unit test pins that mechanically).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSettings {
+    /// Which provider family the backend was constructed as.
+    pub kind: BackendKind,
+    /// The model id as constructed — provider-verbatim, with NO
+    /// `ollama:`/`bedrock:` prefix (see [`Self::model_label`]).
+    pub model: String,
+    /// The resolved think level (the `OLLAMA_THINK` env spelling, via
+    /// [`crate::ollama::ThinkLevel::as_str`]); `None` = the knob was unset.
+    /// `None` serializes as explicit `null`.
+    #[serde(default)]
+    pub think: Option<String>,
+    /// The `num_ctx` the backend was pinned with; `None` = unset (the
+    /// provider's own default applies). `None` serializes as explicit
+    /// `null`.
+    #[serde(default)]
+    pub num_ctx: Option<u32>,
+    /// How `num_ctx` was chosen (`"env"` or `"localhost_default"`); `None`
+    /// exactly when `num_ctx` is `None`. `None` serializes as explicit
+    /// `null`.
+    #[serde(default)]
+    pub num_ctx_source: Option<String>,
+}
+
+impl BackendSettings {
+    /// The human-readable model label — BYTE-IDENTICAL to the label talos
+    /// carried as the second element of `backend_from_env`'s tuple before
+    /// this field existed: Anthropic is the model id verbatim, Bedrock and
+    /// Ollama are prefixed.
+    #[must_use]
+    pub fn model_label(&self) -> String {
+        match self.kind {
+            BackendKind::Anthropic => self.model.clone(),
+            BackendKind::Bedrock => format!("bedrock:{}", self.model),
+            BackendKind::Ollama => format!("ollama:{}", self.model),
+        }
+    }
+}
+
 // ===== Top-level run record ============================================
 
 /// The single serializable state the inner loop reduces over.
@@ -78,6 +146,13 @@ pub struct RunRecord {
     /// `finish` after N nudges). See [`RecoveryFacts`].
     #[serde(default)]
     pub recovery_facts: Option<RecoveryFacts>,
+    /// The resolved backend the run was CONSTRUCTED with (see
+    /// [`BackendSettings`] — construction-time settings, NOT proof of served
+    /// identity). `None` for records written before this field existed:
+    /// `#[serde(default)]` makes the omission deserialize to `None`, so
+    /// [`SCHEMA_VERSION`] stays 2 and no migration is written.
+    #[serde(default)]
+    pub backend_settings: Option<BackendSettings>,
 
     // ---- DISPOSABLE CONTEXT (scratch; may be dropped/compacted) ----
     /// Current model context window. Rebuildable from the event log on
@@ -517,10 +592,10 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceptanceCriterion, BudgetConsumed, BudgetLimits, Budgets, ChecklistItem, CriterionStatus,
-        Disposition, DispositionReport, DurableFacts, Event, Evidence, FailureMode, GateOutcome,
-        GateResult, Phase, ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task,
-        Verification,
+        AcceptanceCriterion, BackendKind, BackendSettings, BudgetConsumed, BudgetLimits, Budgets,
+        ChecklistItem, CriterionStatus, Disposition, DispositionReport, DurableFacts, Event,
+        Evidence, FailureMode, GateOutcome, GateResult, Phase, ProjectConfig, RecoveryFacts,
+        RunRecord, SCHEMA_VERSION, Task, Verification,
     };
     use crate::exec::ChangeEvidence;
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -686,6 +761,7 @@ mod tests {
             last_gate_result: Some(sample_gate_result()),
             disposition: None,
             recovery_facts: None,
+            backend_settings: None,
             messages: sample_messages(),
         }
     }
@@ -1172,6 +1248,108 @@ mod tests {
         assert!(!parsed.gates_green_at_exit);
         assert!(!parsed.tree_dirty);
         assert!(parsed.nudge_statuses.is_empty());
+    }
+
+    // ---- backend_settings: exact key set, label, legacy deser, round-trip ----
+
+    /// The wire shape is EXACTLY these five keys — nothing more. This is the
+    /// mechanical guard that an api key, base URL, or AWS credential field is
+    /// never added to a value that gets persisted as a plaintext blob.
+    #[test]
+    fn backend_settings_serializes_to_exactly_five_keys() {
+        let s = BackendSettings {
+            kind: BackendKind::Anthropic,
+            model: "m".to_string(),
+            think: None,
+            num_ctx: None,
+            num_ctx_source: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&s).expect("serialize");
+        let obj = v.as_object().expect("must be an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["kind", "model", "num_ctx", "num_ctx_source", "think"],
+            "exact key set — a credential-bearing field must never be added"
+        );
+        // Externally tagged unit variant → the bare provider string.
+        assert_eq!(v["kind"], "Anthropic");
+        // `None` serializes as EXPLICIT null (no `skip_serializing_if`).
+        assert!(v["think"].is_null(), "unset think must be explicit null");
+        assert!(
+            v["num_ctx"].is_null(),
+            "unset num_ctx must be explicit null"
+        );
+        assert!(
+            v["num_ctx_source"].is_null(),
+            "unset num_ctx_source must be explicit null"
+        );
+    }
+
+    /// `model_label` returns BYTE-IDENTICAL labels to the second tuple
+    /// element `backend_from_env` used to return per provider.
+    #[test]
+    fn backend_settings_model_label_matches_the_historical_labels() {
+        fn settings(kind: BackendKind, model: &str) -> BackendSettings {
+            BackendSettings {
+                kind,
+                model: model.to_string(),
+                think: None,
+                num_ctx: None,
+                num_ctx_source: None,
+            }
+        }
+        assert_eq!(
+            settings(BackendKind::Anthropic, "claude-haiku-4-5").model_label(),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            settings(BackendKind::Bedrock, "claude-haiku-4-5").model_label(),
+            "bedrock:claude-haiku-4-5"
+        );
+        assert_eq!(
+            settings(BackendKind::Ollama, "qwen3.8:27b").model_label(),
+            "ollama:qwen3.8:27b"
+        );
+    }
+
+    /// A pre-existing v2 `RunRecord` JSON that OMITS the `backend_settings`
+    /// key (every record written before this field existed) must deserialize
+    /// with `backend_settings == None` — the `#[serde(default)]` guarantee at
+    /// the wire boundary: additive, no migration, no `SCHEMA_VERSION` bump.
+    #[test]
+    fn backend_settings_omitted_key_deserializes_to_none() {
+        let r = sample_run_record();
+        let json = serde_json::to_string(&r).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as Value");
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.remove("backend_settings");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let parsed: RunRecord = serde_json::from_str(&stripped).expect("deserialize");
+        assert_eq!(
+            parsed.backend_settings, None,
+            "omitted backend_settings key must default to None (pre-additive v2 records)"
+        );
+        // And the rest of the record is unchanged.
+        assert_eq!(parsed.run_id, r.run_id);
+        assert_eq!(parsed.schema_version, r.schema_version);
+    }
+
+    /// A `RunRecord` carrying `Some(BackendSettings { .. })` with every field
+    /// populated must round-trip through serde without loss.
+    #[test]
+    fn backend_settings_some_round_trips() {
+        let mut r = sample_run_record();
+        r.backend_settings = Some(BackendSettings {
+            kind: BackendKind::Ollama,
+            model: "qwen3.8:27b".to_string(),
+            think: Some("high".to_string()),
+            num_ctx: Some(131_072),
+            num_ctx_source: Some("env".to_string()),
+        });
+        round_trip(&r);
     }
 
     // ---- copy/clone/derive smoke ----

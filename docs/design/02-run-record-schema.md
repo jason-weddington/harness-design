@@ -53,6 +53,10 @@ RunRecord {
   budgets         // consumed + limits: iterations, tokens, cost, wall_clock_start
   last_gate_result// latest run_checks structured result
   disposition     // None until finish: Done | Blocked(reason) | Failed(retryable) + report
+  recovery_facts  // finish-recovery telemetry (gates_green_at_exit, tree_dirty,
+                  //   nudge_statuses); None unless the run reached the recovery terminal
+  backend_settings// resolved backend the run was constructed with: kind, model, think,
+                  //   num_ctx, num_ctx_source — additive, #[serde(default)]
 
   // ---- DISPOSABLE CONTEXT (scratch; may be dropped/compacted) ----
   messages        // the current model context window; rebuildable, not authoritative

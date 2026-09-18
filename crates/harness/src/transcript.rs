@@ -34,7 +34,12 @@
 //!   [`TRANSCRIPT_VERSION`]), `harness_version` (`CARGO_PKG_VERSION`),
 //!   `label` (the [`TranscriptConfig::label`] verbatim), `run_id` (the
 //!   persisted run id, or `null` for the no-persistence [`crate::engine::run`]
-//!   path), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
+//!   path), `backend_settings` (the SAME structured
+//!   [`crate::run_record::BackendSettings`] value stamped on the record —
+//!   `kind`, `model`, `think`, `num_ctx`, `num_ctx_source` of the backend
+//!   the run was CONSTRUCTED with; `null` for the no-persistence
+//!   [`crate::engine::run`] path — additive on the v1 wire, so
+//!   [`TRANSCRIPT_VERSION`] stays 1), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
 //!   [`crate::engine::ResumeMode::FreshContext`]), `tree_baseline` (the
 //!   serialized [`crate::exec::TreeObservation`] the leg-3 precondition
 //!   compares against, with `porcelain` capped for rendering and its
@@ -54,7 +59,9 @@
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
 //!    "transcript_version":1,"harness_version":"0.10.0","label":"claude-sonnet-5",
-//!    "run_id":"task-42:1","resume":false,
+//!    "run_id":"task-42:1",
+//!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null},
+//!    "resume":false,
 //!    "tree_baseline":{"Observed":{"porcelain":"","porcelain_chars":0,"head":"abc123"}},
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],

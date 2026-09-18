@@ -151,12 +151,17 @@ async fn backend_error_via_refused_port_writes_store_record() {
         ])
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
-        // Port 1 on loopback is reserved; connections are always refused.
+        // Port 1 on loopback is reserved; connections are always refused:
+        // the FIRST TURN must fail (BackendError at run time), not backend
+        // construction — with `num_ctx` coming from the RESOLVED localhost
+        // default, not an env pin.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
-        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
-        // port must fail the FIRST TURN (BackendError at run time), not
-        // backend construction (which would exit 1 before any artifacts).
-        .env("OLLAMA_NUM_CTX", "32768")
+        // The talos dispatch lanes export these into the talos process env
+        // (inherited through cargo nextest) — scrub them so the recorded
+        // `backend_settings` below is deterministic on every lane.
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
         // Isolate this run's implicit prune pass from the real
         // `$HOME/.local/state/talos` — without this, an unmodified nextest
         // run would point `remove_dir_all` at the developer's or the
@@ -221,6 +226,41 @@ async fn backend_error_via_refused_port_writes_store_record() {
         "disposition must be Failed{{TransientInfra}}; got: {:?}",
         record.disposition
     );
+
+    assert_resolved_backend_settings(&record, &summary);
+}
+
+/// The record and the stdout summary carry the SAME resolved Ollama
+/// construction settings: the verbatim model, no think knob, and the
+/// RESOLVED localhost default `num_ctx` (the test scrubs the env, so this
+/// value is a construction default, not an env pin).
+fn assert_resolved_backend_settings(
+    record: &harness::run_record::RunRecord,
+    summary: &serde_json::Value,
+) {
+    assert_eq!(
+        record.backend_settings,
+        Some(harness::run_record::BackendSettings {
+            kind: harness::run_record::BackendKind::Ollama,
+            model: "x".into(),
+            think: None,
+            num_ctx: Some(32768),
+            num_ctx_source: Some("localhost_default".into()),
+        }),
+        "record.backend_settings must be the resolved construction settings"
+    );
+    // ...and the stdout summary carries the SAME structured value.
+    assert_eq!(summary["backend_settings"]["kind"], "Ollama");
+    assert_eq!(summary["backend_settings"]["model"], "x");
+    assert!(
+        summary["backend_settings"]["think"].is_null(),
+        "unset think must be explicit null in the summary"
+    );
+    assert_eq!(summary["backend_settings"]["num_ctx"], 32768);
+    assert_eq!(
+        summary["backend_settings"]["num_ctx_source"],
+        "localhost_default"
+    );
 }
 
 // ============================================================================
@@ -267,7 +307,7 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env("OLLAMA_NUM_CTX", "32768")
+        .env_remove("OLLAMA_NUM_CTX")
         .env_remove("TALOS_BEDROCK")
         // Isolate the implicit prune pass from the real state root — see the
         // comment in `backend_error_via_refused_port_writes_store_record`.
@@ -308,10 +348,7 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
 
     // Line 1: run_start.
     assert_eq!(lines[0]["event"], "run_start");
-    assert_eq!(
-        lines[0]["label"], "ollama:x think=unset num_ctx=32768",
-        "OLLAMA_THINK unset; OLLAMA_NUM_CTX pinned to keep the probe off"
-    );
+    assert_run_start_label_and_settings(&lines[0]);
     assert_eq!(
         lines[0]["run_id"],
         harness::engine::run_id(task_id, attempt)
@@ -341,6 +378,29 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
     // Line 7: run_end, outcome matching the stdout RunSummary.
     assert_eq!(lines[6]["event"], "run_end");
     assert_eq!(lines[6]["outcome"], summary_outcome);
+}
+
+/// The `run_start` line's free-text `label` and structured
+/// `backend_settings` must agree — one source, two renderings — and the
+/// label's `num_ctx` is the RESOLVED localhost default (the test scrubs
+/// `OLLAMA_NUM_CTX`, so the raw env said nothing).
+fn assert_run_start_label_and_settings(run_start: &serde_json::Value) {
+    assert_eq!(
+        run_start["label"], "ollama:x think=unset num_ctx=32768",
+        "num_ctx is the RESOLVED localhost default (OLLAMA_NUM_CTX scrubbed) — \
+         not the raw env, which said nothing"
+    );
+    assert_eq!(
+        run_start["backend_settings"],
+        serde_json::json!({
+            "kind": "Ollama",
+            "model": "x",
+            "think": null,
+            "num_ctx": 32768,
+            "num_ctx_source": "localhost_default"
+        }),
+        "run_start.backend_settings must carry the resolved construction settings"
+    );
 }
 
 /// Recursively check whether `root` contains any file with a `.jsonl`

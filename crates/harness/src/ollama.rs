@@ -109,6 +109,28 @@ impl Serialize for ThinkLevel {
     }
 }
 
+impl ThinkLevel {
+    /// The `OLLAMA_THINK` env spelling of this level.
+    ///
+    /// These are the ENV spellings talos's `OLLAMA_THINK` variable accepts —
+    /// DELIBERATELY NOT the Ollama wire forms the hand-written `Serialize`
+    /// impl emits (`off`/`on` serialize to the booleans `false`/`true` on
+    /// the wire; the graded levels are the same strings in both). Recording
+    /// the env spelling on a run record is what keeps the record honest
+    /// about what the operator actually set.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// Ollama-backed [`ModelBackend`], serving both a local daemon and Ollama
 /// cloud over the same `/api/chat` wire.
 ///
@@ -1811,6 +1833,23 @@ mod tests {
             json!("high")
         );
         assert_eq!(serde_json::to_value(ThinkLevel::Max).unwrap(), json!("max"));
+    }
+
+    /// The `OLLAMA_THINK` env spellings (`as_str`) and the Ollama wire forms
+    /// (the hand-written `Serialize`) are pinned apart in ONE place: the
+    /// env vocabulary is `off|on|low|medium|high|max` strings, while `off`
+    /// and `on` serialize to the booleans `false`/`true` on the wire.
+    #[test]
+    fn think_level_as_str_is_the_env_spelling_not_the_wire_form() {
+        assert_eq!(ThinkLevel::Off.as_str(), "off");
+        assert_eq!(ThinkLevel::On.as_str(), "on");
+        assert_eq!(ThinkLevel::Low.as_str(), "low");
+        assert_eq!(ThinkLevel::Medium.as_str(), "medium");
+        assert_eq!(ThinkLevel::High.as_str(), "high");
+        assert_eq!(ThinkLevel::Max.as_str(), "max");
+        // Re-pinned here: `as_str("off")` and the wire form (`false`) must
+        // never be conflated — the record carries the env spelling.
+        assert_eq!(serde_json::to_value(ThinkLevel::Off).unwrap(), json!(false));
     }
 
     // ---- (g) context guard -------------------------------------------------
