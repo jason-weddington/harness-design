@@ -95,7 +95,7 @@ use std::time::Duration;
 use harness::engine::{LoopOutcome, RunStats};
 use harness::eval::{
     CODING_CHECK_TIMEOUT, EvalReport, TrialResult, copy_fixture_into_workspace, discover_fixtures,
-    score_holdout,
+    git_init_trial_workspace, score_holdout,
 };
 use harness::exec::{ChangeEvidence, CheckCommand, ChecksRunner};
 use harness::prompt::render_task_prompt_from_spec;
@@ -365,6 +365,10 @@ async fn main() {
             // Cargo.lock) via the single-sourced pub fn — do NOT reimplement.
             copy_fixture_into_workspace(fixture, ws_tmp.path())
                 .expect("copy fixture into CC trial workspace");
+            // Same git baseline as the talos tier-1 lane — the two runners must
+            // hand their agents the same environment or their rows are not
+            // comparable (do-not-fork requirement).
+            git_init_trial_workspace(ws_tmp.path());
 
             // Build the workspace + ToolCtx for the holdout scorer.  Must use
             // Workspace::new (not stub) so score_holdout's file-copy side-effect

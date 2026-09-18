@@ -624,6 +624,63 @@ pub fn copy_fixture_into_workspace(
     Ok(())
 }
 
+/// Make a freshly-copied tier-1 trial workspace a git repository with one
+/// commit, so it matches the environment production hands an agent.
+///
+/// Tier-1 fixtures are stored as plain directories inside this repo (a
+/// committed directory cannot carry a nested `.git`), so
+/// [`copy_fixture_into_workspace`] reproduces plain directories. That made
+/// tier-1 differ from production on an environmental axis rather than on
+/// difficulty, which is the only axis that should separate the tiers: a
+/// `talos run` dispatch always executes inside a git clone, and tier-2
+/// materializes its tasks as `git worktree` checkouts. The divergence was
+/// load-bearing — the leg-3 tree-change precondition
+/// ([`crate::exec::observe_tree`]) is invisible to a workspace git cannot
+/// report on, so every tier-1 trial took the fail-open path and the
+/// perfect-spec guard could not see the mechanism it exists to guard.
+///
+/// Commits rather than merely `git init`-ing, so the baseline observation is
+/// a CLEAN tree exactly like a fresh clone; a bare `init` would leave every
+/// file untracked and the baseline permanently dirty. The fixtures' own
+/// `.gitignore` files are copied in and therefore honoured. The commit passes
+/// an explicit identity (mirroring `ralph`) so it works on a host with no
+/// global git config.
+///
+/// Best-effort by design: any git failure leaves a non-repo workspace, which
+/// is exactly the state every tier-1 trial was in before this existed, and
+/// the precondition then fails open as it always did. An eval trial must
+/// never die because the host's git is unhappy.
+///
+/// Synchronous (`std::process`) rather than [`crate::exec::run`], so the
+/// [`TrialEnv`] factory stays a plain `fn` — this is fixture setup alongside
+/// blocking `std::fs` copies, not agent-loop work.
+pub fn git_init_trial_workspace(root: &Path) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.name=talos-eval",
+            "-c",
+            "user.email=talos-eval@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "fixture baseline",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            return;
+        }
+    }
+}
+
 /// Build one fresh coding-fix trial environment: copy the fixture into a new
 /// scratch workspace (excluding top-level `task.json` and `holdout/`), wire a
 /// fresh offload dir + [`ToolCtx`], and a `cargo test` [`ChecksRunner`] whose
@@ -638,6 +695,7 @@ fn build_coding_env(fixture_src: &Path) -> TrialEnv {
         ScratchDir::new("workspace").expect("create trial workspace scratch dir");
     copy_fixture_into_workspace(fixture_src, workspace_scratch.path())
         .expect("copy fixture into trial workspace");
+    git_init_trial_workspace(workspace_scratch.path());
     let offload_scratch = ScratchDir::new("offload").expect("create trial offload scratch dir");
 
     let workspace = Workspace::new(
@@ -1053,6 +1111,50 @@ mod tests {
                 message: "no creds".to_string(),
             }
         )));
+    }
+
+    /// Tier-1 must hand its agent the same ENVIRONMENT as production and
+    /// tier-2 — difficulty is the only axis that should separate the tiers.
+    /// Before this, tier-1 workspaces were plain directory copies, so
+    /// `observe_tree` reported `Unobservable` and every trial took the
+    /// leg-3 fail-open path: the perfect-spec guard structurally could not
+    /// see the tree-change precondition it exists to guard.
+    #[tokio::test]
+    async fn tier1_trial_workspace_is_an_observable_clean_git_repo() {
+        let src = tempdir().expect("fixture src");
+        std::fs::write(src.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+        std::fs::create_dir(src.path().join("src")).expect("mkdir src");
+        std::fs::write(src.path().join("src/lib.rs"), "pub fn f() {}\n").expect("write lib");
+
+        let ws = tempdir().expect("workspace");
+        super::copy_fixture_into_workspace(src.path(), ws.path()).expect("copy fixture");
+        super::git_init_trial_workspace(ws.path());
+
+        match crate::exec::observe_tree(ws.path(), crate::exec::TREE_OBSERVE_TIMEOUT).await {
+            crate::exec::TreeObservation::Observed { porcelain, head } => {
+                assert!(
+                    porcelain.is_empty(),
+                    "a fresh trial workspace must start CLEAN like a fresh clone, \
+                     else the baseline is permanently dirty; porcelain was {porcelain:?}"
+                );
+                assert!(
+                    head.is_some(),
+                    "the baseline commit must give the trial a HEAD"
+                );
+            }
+            other @ crate::exec::TreeObservation::Unobservable { .. } => panic!(
+                "tier-1 trial workspaces must be git-observable so the leg-3 \
+                 precondition applies; got {other:?}"
+            ),
+        }
+    }
+
+    /// The helper is best-effort: a workspace git cannot initialise must not
+    /// kill the trial, it just falls back to the pre-existing fail-open path.
+    #[test]
+    fn git_init_trial_workspace_on_a_missing_dir_does_not_panic() {
+        let dir = tempdir().expect("tempdir");
+        super::git_init_trial_workspace(&dir.path().join("does-not-exist"));
     }
 
     #[test]
