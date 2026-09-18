@@ -97,7 +97,7 @@ use harness::eval::{
     CODING_CHECK_TIMEOUT, EvalReport, TrialResult, copy_fixture_into_workspace, discover_fixtures,
     score_holdout,
 };
-use harness::exec::{CheckCommand, ChecksRunner};
+use harness::exec::{ChangeEvidence, CheckCommand, ChecksRunner};
 use harness::prompt::render_task_prompt_from_spec;
 use harness::run_record::{Disposition, FailureMode, Verification};
 use harness::task_spec::TaskSpec;
@@ -457,6 +457,15 @@ async fn main() {
                 Some("success") => LoopOutcome::Finished(Disposition::Done {
                     summary: result_str,
                     verification: Verification::NoChecksConfigured,
+                    // An external-harness adapter may NEVER synthesize leg-3
+                    // evidence the loop did not observe: Claude Code reports
+                    // no tree observation, so this is `Unobservable` — the
+                    // mirror of the `NoChecksConfigured` above it. Writing
+                    // `TreeChanged` here would make the new invariant false
+                    // at the one surface that mirrors the production path.
+                    change: ChangeEvidence::Unobservable {
+                        reason: "claude-code harness reports no tree observation".to_string(),
+                    },
                 }),
                 Some("error_during_execution") => LoopOutcome::Finished(Disposition::Failed {
                     mode: FailureMode::PersistentToolError,
@@ -505,6 +514,9 @@ async fn main() {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
+                no_change_rejections: 0,
+                already_satisfied_check_rejections: 0,
+                tree_baseline_unobservable: false,
             };
 
             let trial = TrialResult {
@@ -656,6 +668,9 @@ fn outcome_one_liner(outcome: &LoopOutcome) -> String {
             verification: Verification::NoChecksConfigured,
             ..
         }) => "Done — NO CHECKS (unverified)".to_string(),
+        LoopOutcome::Finished(Disposition::AlreadySatisfied { reason, .. }) => {
+            format!("AlreadySatisfied — {reason}")
+        }
         LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
             format!("Blocked — {decision_needed}")
         }

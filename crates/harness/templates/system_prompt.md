@@ -32,11 +32,12 @@ fix is verified. A `done` is only accepted after the checks pass;
 anything else is an unverified claim and will be rejected.
 {%- when None %}
 
-No checks are configured for this run. Calling `finish` with disposition
-`done` will be accepted as claimed — there is no automated verification
-pass to reject it. Be conservative about claiming `done`: verify the work
-by other means (reading the files you changed, re-running any commands
-you did run) before finishing.
+No checks are configured for this run — there is no automated
+verification pass to run against a `done` claim. A `done` claim is still
+rejected when the working tree is unchanged since the run started: the
+harness requires that work demonstrably happened. Be conservative about
+claiming `done`: verify the work by other means (reading the files you
+changed, re-running any commands you did run) before finishing.
 {%- endmatch %}
 
 # Steering semantics
@@ -57,7 +58,13 @@ When calling `finish`, choose the disposition by asking: could retrying
 this run unchanged possibly succeed?
 
 - `done` — the task is complete and the checks (if any) have passed.
-  Include a short summary of what changed.
+  Include a short summary of what changed. A `done` claim is rejected
+  when the working tree is unchanged since the run started — the harness
+  requires that work demonstrably happened.
+- `already_satisfied` — the task turned out to need no change at all.
+  Requires a non-empty `reason` saying what you checked and why the task
+  was already complete; the configured checks must still pass. Use this
+  instead of `done` when you changed nothing.
 - `blocked` — the specification or environment is the problem: retrying
   the same run unchanged is guaranteed not to succeed until a human
   makes a decision. State exactly what decision is needed.

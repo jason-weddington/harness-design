@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::{self, LoopOutcome, RunConfig, RunResult};
-use crate::exec::{self, CheckCommand, ExecSpec};
+use crate::exec::{self, CheckCommand, ExecSpec, TreeObservation};
 use crate::model::ModelBackend;
 use crate::prompt;
 use crate::run_record::Disposition;
@@ -479,33 +479,50 @@ pub async fn run_ralph(
             LoopOutcome::Finished(Disposition::Done { .. })
         );
         let is_backend_error = matches!(result.outcome, LoopOutcome::BackendError(_));
+        // `is_green` stays `Done`-only, so an `AlreadySatisfied` iteration
+        // commits nothing — there is nothing to commit. And because ralph's
+        // completion authority is the external `--stop-when` oracle rather
+        // than the agent's claim, an `AlreadySatisfied` iteration whose stop
+        // command is still non-zero is strong evidence the agent is simply
+        // wrong: it therefore counts as a DO-OVER via the existing
+        // `(!is_green && !is_backend_error)` arm below, bounded by
+        // `RalphTerminal::DoOversExhausted` after `DEFAULT_MAX_DO_OVERS`.
+        // `RalphTerminal`'s variant set is deliberately unchanged. An
+        // `AlreadySatisfied` iteration that left an incidental dirty file IS
+        // reverted by the existing `made_changes && (!is_green ||
+        // commit_failed)` condition — intended, since there is nothing to
+        // keep.
+        let is_already_satisfied = matches!(
+            result.outcome,
+            LoopOutcome::Finished(Disposition::AlreadySatisfied { .. })
+        );
 
         // (5) Detect changes via the FULL `git status --porcelain` (INCLUDING
-        // the notes file — the journal commits even on a notes-only pass).
-        let status = exec::run(&ExecSpec::new(
-            "git",
-            vec!["status".to_string(), "--porcelain".to_string()],
-            root.clone(),
-            GIT_TIMEOUT,
-        ))
-        .await;
-        if status.exit_code != Some(0) {
-            return RalphReport {
-                objective,
-                terminal: RalphTerminal::Error(format!(
-                    "git status exited {:?}: {}",
-                    status.exit_code,
-                    status.stderr.trim()
-                )),
-                iterations,
-            };
-        }
-        let made_changes = !status.stdout.trim().is_empty();
+        // the notes file — the journal commits even on a notes-only pass),
+        // routed through `exec::observe_tree` so ralph's notion of "changed"
+        // and the engine's leg-3 precondition cannot drift apart. Ralph passes
+        // its OWN `GIT_TIMEOUT`, so its status bound is unchanged, and
+        // discards the observation's `head` field — the extra
+        // `git rev-parse HEAD` per outer iteration is the accepted cost of
+        // sharing one primitive.
+        let made_changes = match exec::observe_tree(&root, GIT_TIMEOUT).await {
+            TreeObservation::Observed { porcelain, .. } => !porcelain.is_empty(),
+            TreeObservation::Unobservable { reason } => {
+                return RalphReport {
+                    objective,
+                    terminal: RalphTerminal::Error(reason),
+                    iterations,
+                };
+            }
+        };
 
         // Stuck progress signal: `git status --porcelain` EXCLUDING the notes
         // file. A notes-only pass still commits (full status non-empty) but
         // STILL counts toward stuck (progress signal empty). Distinct from
-        // the commit decision above, which uses the full status.
+        // the commit decision above, which uses the full status. Deliberately
+        // NOT routed through `observe_tree`: it is a DIFFERENT query
+        // (progress, notes excluded) over the same command, and its pathspec
+        // args have no place in the shared primitive.
         let progress = exec::run(&ExecSpec::new(
             "git",
             vec![
@@ -722,6 +739,14 @@ pub async fn run_ralph(
         // exemption) or a green outcome whose commit exited non-zero (after
         // the revert); UNCHANGED on a green no-change pass or an exempt
         // `BackendError(_)` pass.
+        // An `AlreadySatisfied` iteration is neither green nor a backend
+        // error, so it lands in the do-over arm by construction — asserted
+        // rather than special-cased, so the arithmetic below stays
+        // byte-for-byte what it was.
+        debug_assert!(
+            !is_already_satisfied || (!is_green && !is_backend_error),
+            "an AlreadySatisfied iteration must take the do-over arm"
+        );
         if is_green && committed {
             do_over_counter = 0;
         } else if (is_green && commit_failed) || (!is_green && !is_backend_error) {
@@ -814,7 +839,9 @@ pub async fn run_ralph(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph};
+    use super::{
+        DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph,
+    };
     use crate::engine::{FINISH_TOOL_NAME, LoopOutcome};
     use crate::exec::{CheckCommand, ChecksRunner, ExecSpec, run as exec_run};
     use crate::model::{
@@ -899,6 +926,19 @@ mod tests {
         )
     }
 
+    /// A `finish(already_satisfied)` turn with a non-empty `reason` — the
+    /// deliberate no-op off-ramp the engine accepts on a green gate.
+    fn finish_already_satisfied(id: &str) -> AssistantTurn {
+        finish_call(
+            id,
+            serde_json::json!({
+                "disposition": "already_satisfied",
+                "summary": "ok",
+                "reason": "nothing needed changing",
+            }),
+        )
+    }
+
     /// A no-tool assistant turn that ends the turn (`StopReason::EndTurn`). The
     /// inner loop sees no tool call to dispatch and stops with
     /// `LoopOutcome::StoppedWithoutFinish` — a non-green inner outcome that,
@@ -965,6 +1005,14 @@ mod tests {
         CheckCommand {
             program: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "exit 1".to_string()],
+        }
+    }
+
+    /// A stop-command that ALWAYS reports the objective met (exit 0).
+    fn stop_always() -> CheckCommand {
+        CheckCommand {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
         }
     }
 
@@ -1140,19 +1188,23 @@ mod tests {
     }
 
     // ===================================================================
-    // Scenario 3a: STUCK-INERT (no edits at all)
+    // Scenario 3a: INERT AGENT (no edits at all)
     // ===================================================================
 
     #[tokio::test]
-    async fn stuck_inert_when_agent_never_edits() {
+    async fn do_overs_exhausted_when_agent_never_edits() {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
         let ctx = ctx_for(&root_path);
 
-        // The agent calls ONLY finish(done) — no file edit at all. Each inner
-        // run returns Finished(Done) after one turn; no changes; no commit;
-        // the stuck counter increments each pass.
+        // The agent calls ONLY finish(done) — no file edit at all. The
+        // engine's leg-3 precondition rejects a `done` claim on an unchanged
+        // tree, so the inner run can no longer reach `Finished(Done)`: with
+        // `inner_max_iterations == 1` each pass ends `MaxIterations`, which is
+        // neither green nor a backend error and therefore counts as a
+        // DO-OVER. The honest terminal for a never-editing agent is now
+        // `DoOversExhausted`, not `Stuck` (which only moves on GREEN passes).
         let backend = MockBackend::from_turns(vec![
             finish_done("f0"),
             finish_done("f1"),
@@ -1160,25 +1212,88 @@ mod tests {
             finish_done("f3"),
         ]);
 
-        let config = RalphConfig::new("stuck-inert-objective", stop_never(), 10, 4).with_stuck_k(3);
+        let config = RalphConfig::new("inert-objective", stop_never(), 10, 1).with_stuck_k(3);
 
         let report = run_ralph(&backend, &ctx, &config).await;
         assert_eq!(
             report.terminal,
-            RalphTerminal::Stuck,
-            "terminal must be Stuck; got {:?}",
+            RalphTerminal::DoOversExhausted,
+            "terminal must be DoOversExhausted; got {:?}",
             report.terminal
         );
         assert_eq!(
             report.outer_iterations(),
-            DEFAULT_STUCK_K,
-            "Stuck must fire after stuck_k passes"
+            DEFAULT_MAX_DO_OVERS,
+            "DoOversExhausted must fire after max_do_overs passes"
         );
         // ZERO commits: every pass had no changes.
         for it in &report.iterations {
             assert!(!it.made_changes, "inert pass must report no changes");
             assert!(!it.committed, "inert pass must not commit");
         }
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_iterations_count_as_do_overs() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        let ctx = ctx_for(&root_path);
+
+        // Ralph's completion authority is the external `--stop-when` oracle,
+        // not the agent's claim. An `AlreadySatisfied` iteration whose stop
+        // command is still non-zero is strong evidence the agent is simply
+        // wrong, so it takes the existing non-green do-over arm.
+        let backend = MockBackend::from_turns(vec![
+            finish_already_satisfied("a0"),
+            finish_already_satisfied("a1"),
+            finish_already_satisfied("a2"),
+            finish_already_satisfied("a3"),
+        ]);
+
+        let config = RalphConfig::new("already-satisfied-objective", stop_never(), 10, 1);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert_eq!(
+            report.terminal,
+            RalphTerminal::DoOversExhausted,
+            "an AlreadySatisfied pass is a do-over; got {:?}",
+            report.terminal
+        );
+        assert_eq!(report.outer_iterations(), DEFAULT_MAX_DO_OVERS);
+        for it in &report.iterations {
+            assert!(
+                matches!(
+                    it.inner_outcome,
+                    LoopOutcome::Finished(Disposition::AlreadySatisfied { .. })
+                ),
+                "every pass must record an AlreadySatisfied inner outcome; got {:?}",
+                it.inner_outcome
+            );
+            assert!(!it.committed, "an AlreadySatisfied pass never commits");
+        }
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_with_green_stop_command_stops() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        let ctx = ctx_for(&root_path);
+
+        // The oracle is consulted BEFORE the breakers, so a green stop
+        // command wins over the do-over arm the pass would otherwise take.
+        let backend = MockBackend::from_turns(vec![finish_already_satisfied("a0")]);
+        let config = RalphConfig::new("already-satisfied-stop", stop_always(), 10, 1);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert_eq!(
+            report.terminal,
+            RalphTerminal::StopConditionMet,
+            "a green stop command wins; got {:?}",
+            report.terminal
+        );
+        assert_eq!(report.outer_iterations(), 1);
     }
 
     // ===================================================================
@@ -1213,7 +1328,11 @@ mod tests {
             "notes-only journaling must NOT defeat stuck; got {:?}",
             report.terminal
         );
-        assert_eq!(report.outer_iterations(), 3, "Stuck after stuck_k passes");
+        assert_eq!(
+            report.outer_iterations(),
+            DEFAULT_STUCK_K,
+            "Stuck after stuck_k passes"
+        );
         // Each pass committed (the journal), proving the notes file is
         // excluded only from the stuck signal, not from the commit.
         for it in &report.iterations {
@@ -1972,8 +2091,10 @@ mod tests {
                 kind: TerminalKind::Other,
                 message: "blip".to_string(),
             }),
-            // A non-error pass: a green finish with no changes. Any
-            // non-BackendError inner outcome resets the count.
+            // A non-error pass: one edit (the engine's leg-3 precondition
+            // rejects a `done` claim on an unchanged tree) then a green
+            // finish. Any non-BackendError inner outcome resets the count.
+            Ok(edit_create_call("g-edit", "reset.txt", "x\n")),
             Ok(finish_done("g")),
             Err(BackendError::Terminal {
                 kind: TerminalKind::Other,

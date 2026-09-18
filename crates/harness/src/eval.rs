@@ -749,6 +749,9 @@ pub fn coding_fix_task_with(
     let task = EvalTask {
         name: "coding_fix".to_string(),
         task: task_prompt,
+        // Deliberately `Done`-only: a `Disposition::AlreadySatisfied` is NOT
+        // a tier-1 pass. The fixture is a broken repo, so "nothing needed
+        // changing" is always the wrong answer here.
         success: Box::new(|outcome| {
             matches!(
                 outcome,
@@ -773,13 +776,16 @@ pub fn coding_fix_task_with(
 /// **any** [`LoopOutcome::Finished`] carrying [`FinishDisposition::Done`] —
 /// including the `NoChecksConfigured` variant, which is what the eval yields
 /// today (no [`crate::exec::ChecksRunner`] is wired). Every other terminal
-/// outcome (blocked, failed, hit max iterations, stopped without finishing,
-/// backend error) is a failure.
+/// outcome (`already_satisfied`, blocked, failed, hit max iterations, stopped
+/// without finishing, backend error) is a failure.
 #[must_use]
 pub fn finish_task() -> EvalTask {
     EvalTask {
         name: "finish".to_string(),
         task: "Acknowledge and finish.".to_string(),
+        // Deliberately `Done`-only: a `Disposition::AlreadySatisfied` is NOT
+        // a tier-1 pass — this rung measures whether the loop can reach an
+        // accepted `done`, not whether the model can decline to work.
         success: Box::new(|outcome| {
             matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. }))
         }),
@@ -794,7 +800,7 @@ mod tests {
         run_eval_with_transcripts, score_holdout,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
-    use crate::exec::{CheckCommand, ChecksRunner};
+    use crate::exec::{ChangeEvidence, CheckCommand, ChecksRunner};
     use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
     use crate::run_record::{Disposition, FailureMode, Verification};
     use crate::test_support::MockBackend;
@@ -1024,6 +1030,7 @@ mod tests {
         assert!((task.success)(&LoopOutcome::Finished(Disposition::Done {
             summary: "ok".to_string(),
             verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::default(),
         })));
 
         assert!(!(task.success)(&LoopOutcome::Finished(
@@ -1069,6 +1076,7 @@ mod tests {
         assert!(!(task.success)(&LoopOutcome::Finished(Disposition::Done {
             summary: String::new(),
             verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::default(),
         })));
     }
 
@@ -1341,6 +1349,9 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
+                no_change_rejections: 0,
+                already_satisfied_check_rejections: 0,
+                tree_baseline_unobservable: false,
             },
             transcript_path: None,
         };
@@ -1585,6 +1596,7 @@ mod tests {
             (task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "fixed".to_string(),
                 verification: Verification::Checks(green),
+                change: ChangeEvidence::default(),
             })),
             "a green Checks-verified Done must pass"
         );
@@ -1594,6 +1606,7 @@ mod tests {
             !(task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "claimed".to_string(),
                 verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::default(),
             })),
             "an unverified (NoChecksConfigured) Done must NOT count"
         );
@@ -1614,6 +1627,7 @@ mod tests {
             !(task.success)(&LoopOutcome::Finished(Disposition::Done {
                 summary: "lie".to_string(),
                 verification: Verification::Checks(red),
+                change: ChangeEvidence::default(),
             })),
             "a red Checks Done must NOT count"
         );
@@ -1817,6 +1831,9 @@ mod tests {
                 edit_file_calls_ok: 0,
                 invalid_finish_calls: 0,
                 first_invalid_finish_raw: None,
+                no_change_rejections: 0,
+                already_satisfied_check_rejections: 0,
+                tree_baseline_unobservable: false,
             },
             transcript_path: None,
         };

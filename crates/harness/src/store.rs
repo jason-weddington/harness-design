@@ -394,6 +394,7 @@ impl RunStore for SqliteRunStore {
 #[cfg(test)]
 mod tests {
     use super::{RunStore, SqliteRunStore, StoreError, event_kind, with_seq};
+    use crate::exec::ChangeEvidence;
     use crate::model::{ContentBlock, Message, ToolCallRequest, UserBlock};
     use crate::run_record::{
         AcceptanceCriterion, BudgetConsumed, BudgetLimits, Budgets, ChecklistItem, CriterionStatus,
@@ -692,6 +693,7 @@ mod tests {
                     disposition: Disposition::Done {
                         summary: "done".to_string(),
                         verification: Verification::NoChecksConfigured,
+                        change: ChangeEvidence::default(),
                     },
                 },
             )
@@ -978,6 +980,7 @@ mod tests {
                     disposition: Disposition::Done {
                         summary: "done".to_string(),
                         verification: Verification::NoChecksConfigured,
+                        change: ChangeEvidence::default(),
                     },
                 },
                 "DispositionSet",

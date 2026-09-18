@@ -522,6 +522,21 @@ struct SummaryHeader<'a> {
 /// `k` + `agent_gate` + `test_first` + `wall_clock` so a printed summary is
 /// self-describing (per kb-02909: never compare across a think/level/gate-mode
 /// change).
+/// Fraction of a report's loop iterations that were classified as mutating.
+/// `0.0` when the report recorded no iterations at all — never `NaN`.
+// `u64 → f64` for the ratio: iteration counts can't approach f64's precision
+// limit (same rationale as `EvalReport::mean_iterations`).
+#[allow(clippy::cast_precision_loss)]
+fn mutation_rate(trials: &[harness::mined_eval::MinedTrialResult]) -> f64 {
+    let iter_sum: u64 = trials.iter().map(|t| u64::from(t.iterations)).sum();
+    let mut_sum: u64 = trials.iter().map(|t| u64::from(t.mutating_iters)).sum();
+    if iter_sum == 0 {
+        0.0_f64
+    } else {
+        mut_sum as f64 / iter_sum as f64
+    }
+}
+
 fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
     let name_col = summary
         .iter()
@@ -547,7 +562,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         header.agent_gate,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
         "task",
         "resolved/val",
         "res_rate",
@@ -564,6 +579,8 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         "cln_D",
         "ship",
         "res_red",
+        "alr_sat",
+        "no_chg_rj",
     );
     for r in summary {
         let claimed_done: u32 = r
@@ -581,22 +598,18 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             let sum: u64 = r.trials.iter().map(|t| u64::from(t.iterations)).sum();
             sum as f64 / r.trials.len() as f64
         };
-        #[allow(clippy::cast_precision_loss)]
-        let mut_rate = {
-            let iter_sum: u64 = r.trials.iter().map(|t| u64::from(t.iterations)).sum();
-            let mut_sum: u64 = r.trials.iter().map(|t| u64::from(t.mutating_iters)).sum();
-            if iter_sum == 0 {
-                0.0_f64
-            } else {
-                mut_sum as f64 / iter_sum as f64
-            }
-        };
+        let mut_rate = mutation_rate(&r.trials);
         let peak_stat: u32 = r
             .trials
             .iter()
             .map(|t| t.peak_iters_since_tree_change)
             .max()
             .unwrap_or(0);
+        // How often the leg-3 precondition actually bit this wave. A column
+        // of zeros alongside a `tree_baseline_unobservable` trial is the
+        // inert-detector: the precondition did nothing because it could not
+        // observe the workspace, not because no claim needed diverting.
+        let no_change_rejections: u32 = r.trials.iter().map(|t| t.no_change_rejections).sum();
         // Test-first compliance: trials in which the agent authored at least
         // one test file of its own. Authorship only — these files do not reach
         // the sealed re-gate under today's file-scoped gate_commands.
@@ -606,7 +619,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             .filter(|t| !t.agent_tests_added.is_empty())
             .count();
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}  {:>9}  {:>9}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
@@ -623,6 +636,8 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             r.clean_tree_dones(),
             r.shippable(),
             r.resolved_gate_red(),
+            r.already_satisfied_count(),
+            no_change_rejections,
         );
     }
 }

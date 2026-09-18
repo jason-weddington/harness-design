@@ -15,14 +15,34 @@
 //! [`Verification`] evidence that justifies it — the two are unified in a
 //! single struct so a `Done` value in the outcome always carries proof.
 //!
+//! ## Leg 3 — work demonstrably happened
+//!
+//! Green checks are not enough: on a repo whose gate was *already* green, a
+//! run that touched nothing could otherwise claim a fully "verified" `Done`.
+//! So the completion contract has three legs — **the agent claimed**, **the
+//! checks verified**, and **work demonstrably happened**. The loop observes
+//! the workspace once at start ([`crate::exec::observe_tree`]) and again when
+//! a `done` claim passes verification, and
+//! [`crate::exec::classify_change`] turns the pair into
+//! [`ChangeEvidence`]. An unchanged tree rejects the claim back to the model
+//! exactly like a red gate; an *unobservable* tree (a non-git workspace, a
+//! missing `git`, a timed-out status call) fails **open** with a loud stderr
+//! warning, because under-enforcing beats rejecting honest work.
+//!
+//! `finish(already_satisfied)` is the deliberate off-ramp for a task that
+//! turned out to need no change: it requires a non-empty `reason`, is still
+//! held to the configured checks, imposes no tree constraint, and terminates
+//! with [`Disposition::AlreadySatisfied`] — which is never pushable.
+//!
 //! `finish(blocked)` and `finish(failed)` are **not** verified — the model
 //! declaring defeat needs no proof; those still terminate the loop as the
 //! declaration states.
 //!
 //! A `finish` call whose `disposition` is missing, non-string, or not one of
-//! `done`/`blocked`/`failed` after trimming and ASCII-lowercasing is
-//! rejected: it is fed back as an `is_error=true` tool result and never
-//! terminates the loop.
+//! `done`/`blocked`/`failed`/`already_satisfied` after trimming and
+//! ASCII-lowercasing is rejected: it is fed back as an `is_error=true` tool
+//! result and never terminates the loop. So is an `already_satisfied` claim
+//! with no `reason`.
 //!
 //! ## What lives here
 //!
@@ -78,7 +98,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
-use crate::exec::{CheckReport, ChecksRunner};
+use crate::exec::{
+    self, ChangeEvidence, CheckReport, ChecksRunner, TREE_OBSERVE_TIMEOUT, TreeObservation,
+};
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
 use crate::run_record::{
@@ -435,6 +457,12 @@ enum FinishClaim {
     Done {
         summary: String,
     },
+    /// The task was already complete and nothing needed changing. Carries the
+    /// non-empty `reason` the model supplied; any `summary` on this branch is
+    /// deliberately discarded.
+    AlreadySatisfied {
+        reason: String,
+    },
     Blocked {
         decision_needed: String,
     },
@@ -443,21 +471,32 @@ enum FinishClaim {
     },
     /// The model's `disposition` was missing, non-string, or unrecognized;
     /// `raw` is its JSON serialization, or `<missing>` when the key is
-    /// absent or the input is not an object. Never terminates the loop.
+    /// absent or the input is not an object. `"complete"`, `"success"` and
+    /// `"finished"` all land here. Never terminates the loop.
     Invalid {
         raw: String,
     },
+    /// The disposition was `already_satisfied` but the `reason` key was
+    /// missing, non-string, or blank after trimming. Never terminates the
+    /// loop; counted as a malformed finish call.
+    MissingReason,
 }
 
 impl FinishClaim {
     /// Parse the `finish` tool's raw JSON input into a claim.
     ///
     /// `disposition` selects the variant: a JSON string that, after
-    /// trimming and ASCII-lowercasing, equals `done`, `blocked`, or `failed`
-    /// selects that variant; anything else — a string outside that set, a
-    /// non-string value, or a missing/non-object input — yields
-    /// [`Self::Invalid`]. `summary` and `decision_needed` are read as
+    /// trimming and ASCII-lowercasing, equals `done`, `already_satisfied`,
+    /// `blocked`, or `failed` selects that variant; anything else — a string
+    /// outside that set, a non-string value, or a missing/non-object input —
+    /// yields [`Self::Invalid`]. `summary` and `decision_needed` are read as
     /// strings on the accepted variants (absent or non-string → empty).
+    ///
+    /// The `already_satisfied` branch reads ONLY the `reason` key — a
+    /// supplied `summary` is deliberately discarded, because
+    /// [`Disposition::AlreadySatisfied`] carries no summary field and
+    /// `reason` is the human-readable text. A missing, non-string, or
+    /// blank-after-trimming `reason` yields [`Self::MissingReason`].
     ///
     /// No other normalization is performed: no Unicode case folding, no
     /// synonyms. `"complete"`, `"success"`, and `"finished"` are all
@@ -479,6 +518,14 @@ impl FinishClaim {
             Some(s) if s == "done" => Self::Done {
                 summary: field("summary"),
             },
+            Some(s) if s == "already_satisfied" => {
+                let reason = field("reason");
+                if reason.trim().is_empty() {
+                    Self::MissingReason
+                } else {
+                    Self::AlreadySatisfied { reason }
+                }
+            }
             Some(s) if s == "blocked" => Self::Blocked {
                 decision_needed: field("decision_needed"),
             },
@@ -551,14 +598,31 @@ impl FinishClaim {
 ///   (`!is_error`) `bash` / `edit_file` tool calls. Counted since THIS loop
 ///   invocation — a resumed run starts from zero; pre-crash values live in
 ///   `RunRecord::recovery_facts`.
-/// - `invalid_finish_calls`: count of `finish` calls rejected as
+/// - `invalid_finish_calls`: count of MALFORMED `finish` calls — rejected as
 ///   [`FinishClaim::Invalid`] (missing, non-string, or unrecognized
-///   `disposition`). A red-verification `done` rejection is NOT counted.
+///   `disposition`) or as [`FinishClaim::MissingReason`] (an
+///   `already_satisfied` with no usable `reason`). A red-verification or
+///   unchanged-tree rejection is NOT counted here — those have their own
+///   fields (`no_change_rejections`, `already_satisfied_check_rejections`).
 ///   Counted since THIS loop invocation — a resumed run starts from zero.
 /// - `first_invalid_finish_raw`: the untruncated `raw` of the FIRST
-///   `FinishClaim::Invalid` claim this loop invocation; never overwritten
-///   after being set. Counted since THIS loop invocation — a resumed run
-///   starts from zero.
+///   malformed claim this loop invocation (the literal
+///   `already_satisfied without reason` for a
+///   [`FinishClaim::MissingReason`]); never overwritten after being set.
+///   Counted since THIS loop invocation — a resumed run starts from zero.
+/// - `no_change_rejections`: count of `finish(done)` claims rejected because
+///   the working tree was unchanged since the run started (leg 3). Counted
+///   since THIS loop invocation — a resumed run starts from zero.
+/// - `already_satisfied_check_rejections`: count of
+///   `finish(already_satisfied)` claims rejected by a red gate. Counted
+///   since THIS loop invocation — a resumed run starts from zero.
+/// - `tree_baseline_unobservable`: whether the run-start tree observation
+///   failed, which makes the leg-3 precondition INERT for the whole run (it
+///   fails open). The inert-detector: without it, a precondition that
+///   silently disabled itself in production is observationally identical to
+///   one that is working. Counted since THIS loop invocation — a resumed run
+///   always reports `true`, since `resume` supplies an unobservable baseline
+///   by construction.
 ///
 /// Deliberately NOT `serde`: persistence wiring
 /// (into [`crate::run_record`]) is a later milestone; this type is the
@@ -640,17 +704,39 @@ pub struct RunStats {
     /// engine.rs:1808) starts from zero; pre-crash values live in
     /// `RunRecord::recovery_facts` (`crates/harness/src/run_record.rs`).
     pub edit_file_calls_ok: u32,
-    /// Count of `finish` calls rejected as [`FinishClaim::Invalid`] (a
-    /// missing, non-string, or unrecognized `disposition`). A
-    /// red-verification `done` rejection is NOT counted here. Counted since
-    /// THIS loop invocation — a resumed run (`resume`, engine.rs:1808)
-    /// starts from zero.
+    /// Count of MALFORMED `finish` calls — rejected as
+    /// [`FinishClaim::Invalid`] (a missing, non-string, or unrecognized
+    /// `disposition`) or as [`FinishClaim::MissingReason`] (an
+    /// `already_satisfied` with no usable `reason`). A red-verification or
+    /// unchanged-tree rejection is NOT counted here; see
+    /// [`Self::no_change_rejections`] and
+    /// [`Self::already_satisfied_check_rejections`]. Counted since THIS loop
+    /// invocation — a resumed run (`resume`, engine.rs:1808) starts from
+    /// zero.
     pub invalid_finish_calls: u32,
-    /// The untruncated `raw` of the FIRST `finish` call rejected as
-    /// [`FinishClaim::Invalid`] this loop invocation; never overwritten once
-    /// set. Counted since THIS loop invocation — a resumed run (`resume`,
+    /// The untruncated `raw` of the FIRST malformed `finish` call this loop
+    /// invocation — the literal `already_satisfied without reason` when it
+    /// was a [`FinishClaim::MissingReason`]; never overwritten once set.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
     /// engine.rs:1808) starts from zero.
     pub first_invalid_finish_raw: Option<String>,
+    /// Count of `finish(done)` claims rejected because the working tree was
+    /// unchanged since the run started (leg 3 of the completion contract).
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero.
+    pub no_change_rejections: u32,
+    /// Count of `finish(already_satisfied)` claims rejected by a red gate.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) starts from zero.
+    pub already_satisfied_check_rejections: u32,
+    /// Whether the run-start tree observation failed, making the leg-3
+    /// precondition INERT for this run (it fails open). The inert-detector:
+    /// a precondition that silently disabled itself in production would
+    /// otherwise be observationally identical to one that is working.
+    /// Counted since THIS loop invocation — a resumed run (`resume`,
+    /// engine.rs:1808) always reports `true`, since it supplies an
+    /// unobservable baseline by construction.
+    pub tree_baseline_unobservable: bool,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -783,23 +869,27 @@ impl Tool for FinishTool {
         json!({
             "name": FINISH_TOOL_NAME,
             "description": "End the run. Call it when the task is complete, \
-                            blocked on a decision, or has failed. A `done` claim is \
-                            verified by the harness re-running the configured checks; \
-                            a failed verification, or a disposition other than \
-                            done/blocked/failed, is fed back as a tool-result error \
-                            you can react to, not a termination.",
+                            already satisfied, blocked on a decision, or has failed. A \
+                            `done` claim is verified by the harness re-running the \
+                            configured checks AND requiring that the working tree \
+                            changed since the run started; an unchanged tree, a failed \
+                            verification, or a disposition other than \
+                            done/already_satisfied/blocked/failed is fed back as a \
+                            tool-result error you can react to, not a termination.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "disposition": {
                         "type": "string",
-                        "enum": ["done", "blocked", "failed"],
-                        "description": "done = task complete (harness will verify via checks); \
-                                        blocked = needs a decision before retrying; \
+                        "enum": ["done", "blocked", "failed", "already_satisfied"],
+                        "description": "done = task complete and you changed something \
+                                        (harness verifies via checks AND requires a changed \
+                                        working tree); already_satisfied = the task was \
+                                        already complete and nothing needed changing \
+                                        (requires `reason`; harness still verifies via \
+                                        checks); blocked = needs a decision before retrying; \
                                         failed = you could not complete the task in this \
-                                        attempt and a fresh attempt might succeed. If the \
-                                        task is complete, use done; if a human decision is \
-                                        needed, use blocked."
+                                        attempt and a fresh attempt might succeed."
                     },
                     "summary": {
                         "type": "string",
@@ -808,6 +898,12 @@ impl Tool for FinishTool {
                     "decision_needed": {
                         "type": "string",
                         "description": "Required when blocked: the decision a human must make."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required when the disposition is already_satisfied: \
+                                        what you checked and why the task was already \
+                                        complete."
                     }
                 },
                 "required": ["disposition", "summary"]
@@ -831,16 +927,18 @@ fn render_tool_result(result: &ToolResult) -> String {
     }
 }
 
-/// Build the `is_error=true` fed-back content for a REJECTED `finish(done)`:
-/// the "rejected" header + the check report's excerpt + a pointer to the
-/// full offloaded output when the runner offloaded it.
+/// Build the `is_error=true` fed-back content for a finish claim REJECTED by
+/// a red verification: the "rejected" header + the check report's excerpt +
+/// a pointer to the full offloaded output when the runner offloaded it.
 ///
-/// The wording ("finish(done) rejected: verification failed") is load-bearing
-/// — a test in this module pins the substring "rejected" as the steering
-/// signal the model must see.
-fn rejection_content(report: &CheckReport) -> String {
+/// `claim` is the disposition label that was rejected (`done` or
+/// `already_satisfied`), so the header names what the model actually asked
+/// for. The wording ("finish(<claim>) rejected: verification failed") is
+/// load-bearing — a test in this module pins the substring "rejected" as the
+/// steering signal the model must see.
+fn rejection_content(claim: &str, report: &CheckReport) -> String {
     use std::fmt::Write as _;
-    let mut content = String::from("finish(done) rejected: verification failed");
+    let mut content = format!("finish({claim}) rejected: verification failed");
     if !report.excerpt.is_empty() {
         content.push('\n');
         content.push_str(&report.excerpt);
@@ -853,6 +951,40 @@ fn rejection_content(report: &CheckReport) -> String {
             .expect("write! into String is infallible");
     }
     content
+}
+
+/// The `is_error=true` fed-back content for a `finish(done)` rejected by the
+/// leg-3 precondition: the checks were green, but the working tree is exactly
+/// what the run started from. Points at both ways forward — do the work, or
+/// take the `already_satisfied` off-ramp.
+fn no_change_rejection_content() -> String {
+    "finish(done) rejected: the working tree is unchanged since this run started — no work \
+     was done. Make the change the task requires and finish again, or call finish with \
+     disposition `already_satisfied` and a `reason` if the task was already complete."
+        .to_string()
+}
+
+/// The `is_error=true` fed-back content for an `already_satisfied` claim with
+/// no usable `reason`.
+fn missing_reason_rejection_content() -> String {
+    "finish rejected: already_satisfied requires a non-empty `reason` explaining what you \
+     checked and why the task was already complete. Call finish again with a reason, or with \
+     a different disposition."
+        .to_string()
+}
+
+/// Which rejection a well-formed-but-unaccepted `finish` call produced. Read
+/// by the loop to increment the matching [`RunStats`] counter — the same
+/// discriminator-on-[`FinishOutcome`] shape `invalid_raw` already uses. A
+/// checks-rejected `done` has no variant here: it is the pre-existing
+/// rejection and has never been counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishRejection {
+    /// A `done` claim whose checks were green but whose working tree was
+    /// unchanged since the run started.
+    NoChange,
+    /// An `already_satisfied` claim rejected by a red gate.
+    AlreadySatisfiedChecks,
 }
 
 /// One dispatched `finish` call's outcome from the loop's point of view: the
@@ -868,18 +1000,133 @@ struct FinishOutcome {
     /// `None` on every other arm (including a checks-rejected `done`).
     invalid_raw: Option<String>,
     /// The [`CheckReport`] `handle_finish_call` ran against `config.checks`,
-    /// when it ran one — `Some` on both the accepted-`Done` and
-    /// checks-rejected-`done` arms, `None` everywhere else (no checks
-    /// configured, `blocked`/`failed`, or `Invalid`). Transcript-only: the
-    /// `tool_result` event's `finish_verification` field is derived from
-    /// this, never from `FinishClaim` internals.
+    /// when it ran one — `Some` on the five arms that ran the checks:
+    /// accepted-`Done`-with-checks, checks-rejected-`done`,
+    /// tree-unchanged-rejected-`done`-with-checks,
+    /// accepted-`AlreadySatisfied`-with-checks, and
+    /// checks-rejected-`already_satisfied`. `None` on every no-checks path,
+    /// on `blocked`/`failed`, on `Invalid`, and on `MissingReason`.
+    /// Transcript-only: the `tool_result` event's `finish_verification` field
+    /// is derived from this, never from `FinishClaim` internals.
     report: Option<CheckReport>,
+    /// The leg-3 [`ChangeEvidence`] this call computed, when it observed the
+    /// tree at all — `Some` on exactly the arms that reached the observation
+    /// (accepted `Done`, tree-unchanged-rejected `done`, accepted
+    /// `AlreadySatisfied`), `None` on `blocked`/`failed`/`Invalid`/
+    /// `MissingReason` and on a checks-rejected claim, which returns before
+    /// observing. Transcript-only.
+    change: Option<ChangeEvidence>,
+    /// The [`TreeObservation`] taken at the moment of the claim, paired with
+    /// `change`. `Some` on exactly the same arms. Transcript-only.
+    current_tree: Option<TreeObservation>,
+    /// Which [`RunStats`] rejection counter this call should bump, if any.
+    rejection: Option<FinishRejection>,
+}
+
+impl FinishOutcome {
+    /// An accepted claim: the standard acknowledgement plus the terminal
+    /// `disposition`, with no checks run and no tree observed.
+    fn accepted(call_id: &str, disposition: Disposition) -> Self {
+        Self {
+            result: ack(call_id),
+            finish: Some(disposition),
+            invalid_raw: None,
+            report: None,
+            change: None,
+            current_tree: None,
+            rejection: None,
+        }
+    }
+
+    /// A rejected claim fed back as an `is_error=true` tool result. The loop
+    /// continues; `invalid_raw` and `rejection` select which [`RunStats`]
+    /// counter (if any) the loop bumps.
+    fn rejected(
+        call_id: &str,
+        content: String,
+        invalid_raw: Option<String>,
+        rejection: Option<FinishRejection>,
+    ) -> Self {
+        Self {
+            result: UserBlock::ToolResult {
+                call_id: call_id.to_string(),
+                content,
+                is_error: true,
+            },
+            finish: None,
+            invalid_raw,
+            report: None,
+            change: None,
+            current_tree: None,
+            rejection,
+        }
+    }
+}
+
+/// The outcome of running (or skipping) `config.checks` for a finish claim.
+enum ChecksVerdict {
+    /// The checks passed, or there were none to run.
+    Green {
+        report: Option<CheckReport>,
+        verification: Verification,
+    },
+    /// The checks ran and came back red.
+    Red(CheckReport),
+}
+
+/// Run `checks` for a finish claim, or record [`Verification::NoChecksConfigured`]
+/// when the run has none wired in.
+async fn verify_against_checks(checks: Option<&ChecksRunner>, ctx: &ToolCtx) -> ChecksVerdict {
+    match checks {
+        Some(runner) => {
+            let report = runner.run(ctx).await;
+            if report.passed {
+                let verification = Verification::Checks(report.clone());
+                ChecksVerdict::Green {
+                    report: Some(report),
+                    verification,
+                }
+            } else {
+                ChecksVerdict::Red(report)
+            }
+        }
+        None => ChecksVerdict::Green {
+            report: None,
+            verification: Verification::NoChecksConfigured,
+        },
+    }
+}
+
+/// The red-gate rejection for `claim`, carrying the report as evidence.
+fn checks_rejected(
+    call_id: &str,
+    claim: &str,
+    report: CheckReport,
+    rejection: Option<FinishRejection>,
+) -> FinishOutcome {
+    FinishOutcome {
+        result: UserBlock::ToolResult {
+            call_id: call_id.to_string(),
+            content: rejection_content(claim, &report),
+            is_error: true,
+        },
+        finish: None,
+        invalid_raw: None,
+        report: Some(report),
+        change: None,
+        current_tree: None,
+        rejection,
+    }
 }
 
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
-/// when configured, or accept it on trust when not. `blocked` and `failed`
+/// when configured, or accept it on trust when not — and, on a green verdict,
+/// additionally require that the workspace actually moved since the run
+/// started (leg 3 of the completion contract). `already_satisfied` is held to
+/// the same checks but imposes no tree constraint. `blocked` and `failed`
 /// terminate as declared with no verification. An unrecognized or missing
-/// disposition ([`FinishClaim::Invalid`]) is rejected back to the model as
+/// disposition ([`FinishClaim::Invalid`]) and an `already_satisfied` with no
+/// `reason` ([`FinishClaim::MissingReason`]) are rejected back to the model as
 /// an `is_error=true` tool result — `finish = None`, no checks run — and the
 /// loop continues.
 ///
@@ -890,73 +1137,117 @@ async fn handle_finish_call(
     call_id: &str,
     input: &Value,
     checks: Option<&ChecksRunner>,
+    baseline: &TreeObservation,
     ctx: &ToolCtx,
 ) -> FinishOutcome {
     match FinishClaim::from_input(input) {
-        FinishClaim::Done { summary } => match checks {
-            Some(runner) => {
-                let report = runner.run(ctx).await;
-                if report.passed {
-                    FinishOutcome {
-                        result: ack(call_id),
-                        finish: Some(Disposition::Done {
-                            summary,
-                            verification: Verification::Checks(report.clone()),
-                        }),
-                        invalid_raw: None,
-                        report: Some(report),
-                    }
-                } else {
-                    FinishOutcome {
-                        result: UserBlock::ToolResult {
-                            call_id: call_id.to_string(),
-                            content: rejection_content(&report),
-                            is_error: true,
-                        },
-                        finish: None,
-                        invalid_raw: None,
-                        report: Some(report),
-                    }
+        FinishClaim::Done { summary } => {
+            // Ordering is load-bearing and unchanged: the checks run FIRST,
+            // and a red report still returns exactly the rejection it always
+            // did. Only a green verdict — including the
+            // no-checks-configured path, because "no gate configured" is not
+            // a reason to accept work that did not happen — reaches the tree
+            // precondition.
+            let (report, verification) = match verify_against_checks(checks, ctx).await {
+                ChecksVerdict::Red(report) => {
+                    return checks_rejected(call_id, "done", report, None);
                 }
-            }
-            None => FinishOutcome {
-                result: ack(call_id),
-                finish: Some(Disposition::Done {
+                ChecksVerdict::Green {
+                    report,
+                    verification,
+                } => (report, verification),
+            };
+            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let change = exec::classify_change(baseline, &current);
+            // The `Unobservable` arm is a DELIBERATE fail-open and must not
+            // be "fixed" into a rejection: every existing engine / `eval.rs` /
+            // `crates/talos/tests/cli.rs` test workspace is a non-git temp
+            // directory, and — more importantly — a workspace the harness
+            // cannot observe is no evidence that work did not happen.
+            let accepted = change != ChangeEvidence::TreeUnchanged;
+            FinishOutcome {
+                result: if accepted {
+                    ack(call_id)
+                } else {
+                    UserBlock::ToolResult {
+                        call_id: call_id.to_string(),
+                        content: no_change_rejection_content(),
+                        is_error: true,
+                    }
+                },
+                finish: accepted.then(|| Disposition::Done {
                     summary,
-                    verification: Verification::NoChecksConfigured,
+                    verification,
+                    change: change.clone(),
                 }),
                 invalid_raw: None,
-                report: None,
-            },
-        },
-        FinishClaim::Blocked { decision_needed } => FinishOutcome {
-            result: ack(call_id),
-            finish: Some(Disposition::Blocked { decision_needed }),
-            invalid_raw: None,
-            report: None,
-        },
-        FinishClaim::Failed { summary } => FinishOutcome {
-            result: ack(call_id),
-            finish: Some(Disposition::Failed {
+                report,
+                change: Some(change),
+                current_tree: Some(current),
+                rejection: (!accepted).then_some(FinishRejection::NoChange),
+            }
+        }
+        FinishClaim::AlreadySatisfied { reason } => {
+            // A no-op claim on a red repo is never legitimate, so the checks
+            // still gate it. The tree does NOT: a `TreeChanged` observation
+            // is RECORDED, not rejected — rejecting it would trap an agent
+            // that wrote an incidental scratch file, and the run is
+            // non-pushable either way.
+            let (report, verification) = match verify_against_checks(checks, ctx).await {
+                ChecksVerdict::Red(report) => {
+                    return checks_rejected(
+                        call_id,
+                        "already_satisfied",
+                        report,
+                        Some(FinishRejection::AlreadySatisfiedChecks),
+                    );
+                }
+                ChecksVerdict::Green {
+                    report,
+                    verification,
+                } => (report, verification),
+            };
+            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let change = exec::classify_change(baseline, &current);
+            FinishOutcome {
+                result: ack(call_id),
+                finish: Some(Disposition::AlreadySatisfied {
+                    reason,
+                    verification,
+                    change: change.clone(),
+                }),
+                invalid_raw: None,
+                report,
+                change: Some(change),
+                current_tree: Some(current),
+                rejection: None,
+            }
+        }
+        FinishClaim::Blocked { decision_needed } => {
+            FinishOutcome::accepted(call_id, Disposition::Blocked { decision_needed })
+        }
+        FinishClaim::Failed { summary } => FinishOutcome::accepted(
+            call_id,
+            Disposition::Failed {
                 mode: FailureMode::Loop,
                 summary,
-            }),
-            invalid_raw: None,
-            report: None,
-        },
-        FinishClaim::Invalid { raw } => FinishOutcome {
-            result: UserBlock::ToolResult {
-                call_id: call_id.to_string(),
-                content: format!(
-                    "finish rejected: disposition must be one of: done, blocked, failed; \
-                     got {raw}. Call finish again with one of those values."
-                ),
-                is_error: true,
             },
-            finish: None,
-            invalid_raw: Some(raw),
-            report: None,
-        },
+        ),
+        FinishClaim::Invalid { raw } => FinishOutcome::rejected(
+            call_id,
+            format!(
+                "finish rejected: disposition must be one of: done, blocked, failed, \
+                 already_satisfied; got {raw}. Call finish again with one of those values."
+            ),
+            Some(raw),
+            None,
+        ),
+        FinishClaim::MissingReason => FinishOutcome::rejected(
+            call_id,
+            missing_reason_rejection_content(),
+            Some("already_satisfied without reason".to_string()),
+            None,
+        ),
     }
 }
 
@@ -969,6 +1260,29 @@ fn ack(call_id: &str) -> UserBlock {
         call_id: call_id.to_string(),
         content: "finish acknowledged".to_string(),
         is_error: false,
+    }
+}
+
+/// Bound on a rendered [`TreeObservation`]'s `porcelain`, in characters.
+/// RENDERING ONLY — the in-memory value [`exec::classify_change`] compares is
+/// never truncated.
+const TREE_PORCELAIN_RENDER_CAP: usize = 4_000;
+
+/// Serialize a [`TreeObservation`] for the transcript, capping `porcelain` at
+/// [`TREE_PORCELAIN_RENDER_CAP`] characters and emitting the untruncated
+/// character count alongside it so a reader can tell the excerpt is partial.
+fn render_tree_observation(obs: &TreeObservation) -> Value {
+    match obs {
+        TreeObservation::Observed { porcelain, head } => json!({
+            "Observed": {
+                "porcelain": exec::tail(porcelain, TREE_PORCELAIN_RENDER_CAP),
+                "porcelain_chars": porcelain.chars().count(),
+                "head": head,
+            }
+        }),
+        TreeObservation::Unobservable { reason } => json!({
+            "Unobservable": { "reason": reason }
+        }),
     }
 }
 
@@ -1028,6 +1342,9 @@ pub async fn run(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        no_change_rejections: 0,
+        already_satisfied_check_rejections: 0,
+        tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1045,6 +1362,7 @@ pub async fn run(
         &mut stats,
         initial_messages,
         BudgetConsumed::default(),
+        None,
         None,
     )
     .await
@@ -1096,6 +1414,9 @@ pub async fn run_persisted(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        no_change_rejections: 0,
+        already_satisfied_check_rejections: 0,
+        tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -1110,6 +1431,7 @@ pub async fn run_persisted(
         &mut stats,
         initial_messages,
         BudgetConsumed::default(),
+        None,
         None,
     )
     .await?;
@@ -1161,8 +1483,16 @@ async fn run_loop_impl(
     initial_messages: Vec<Message>,
     initial_consumed: BudgetConsumed,
     override_persist: Option<RunPersist>,
+    baseline_override: Option<TreeObservation>,
 ) -> Result<LoopOutcome, StoreError> {
     let mut writer = TranscriptWriter::open(config.transcript.as_ref());
+    // Mirrors `run_loop_body`'s own rid derivation (override first, else
+    // derived from the persistence handle) so the `contract_violation` audit
+    // can name the run without threading state back out of the body.
+    let run_id_hint = override_persist
+        .as_ref()
+        .map(|p| p.rid.clone())
+        .or_else(|| persistence.map(|p| run_id(&p.task_id, p.attempt_n)));
     let result = run_loop_body(
         backend,
         tools,
@@ -1173,10 +1503,11 @@ async fn run_loop_impl(
         initial_messages,
         initial_consumed,
         override_persist,
+        baseline_override,
         &mut writer,
     )
     .await;
-    emit_run_end(&mut writer, &result, stats);
+    emit_run_end(&mut writer, &result, stats, run_id_hint.as_deref());
     result
 }
 
@@ -1188,7 +1519,33 @@ fn emit_run_end(
     writer: &mut TranscriptWriter,
     result: &Result<LoopOutcome, StoreError>,
     stats: &RunStats,
+    run_id: Option<&str>,
 ) {
+    // The cheap runtime audit of the leg-3 invariant. Unlike `Verification`,
+    // `Disposition::Done` is a public struct variant with a public `change`
+    // field constructed at many sites, so "unconstructible without observed
+    // change" is enforced by one code path plus convention — not by the type
+    // system. This is the single choke point every terminal passes through,
+    // so a regression that lets a `TreeUnchanged` `Done` escape shows up here
+    // rather than silently reaching a push.
+    if let Ok(LoopOutcome::Finished(Disposition::Done {
+        change: change @ ChangeEvidence::TreeUnchanged,
+        ..
+    })) = result
+    {
+        eprintln!(
+            "warning: contract violation — a Done disposition reached the terminal with an \
+             unchanged working tree; the done-requires-change precondition did not hold"
+        );
+        writer.emit(
+            "contract_violation",
+            json!({
+                "kind": "done_with_unchanged_tree",
+                "run_id": run_id,
+                "change": serde_json::to_value(change).unwrap_or(Value::Null),
+            }),
+        );
+    }
     if !writer.is_enabled() {
         return;
     }
@@ -1226,6 +1583,9 @@ fn emit_run_end(
                 "mutating_iters": stats.mutating_iters,
                 "bash_calls_ok": stats.bash_calls_ok,
                 "edit_file_calls_ok": stats.edit_file_calls_ok,
+                "no_change_rejections": stats.no_change_rejections,
+                "already_satisfied_check_rejections": stats.already_satisfied_check_rejections,
+                "tree_baseline_unobservable": stats.tree_baseline_unobservable,
             },
         }),
     );
@@ -1246,6 +1606,7 @@ async fn run_loop_body(
     initial_messages: Vec<Message>,
     initial_consumed: BudgetConsumed,
     override_persist: Option<RunPersist>,
+    baseline_override: Option<TreeObservation>,
     writer: &mut TranscriptWriter,
 ) -> Result<LoopOutcome, StoreError> {
     // Capture the loop-start instant ONCE via the injected clock. Used both
@@ -1338,6 +1699,21 @@ async fn run_loop_body(
         None
     };
 
+    // ---- leg-3 baseline: observed ONCE per loop invocation ----
+    // `baseline_override` is `Some` only on the resume path, which supplies
+    // its own `Unobservable` baseline (see `resume`).
+    let tree_baseline = match baseline_override {
+        Some(obs) => obs,
+        None => exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await,
+    };
+    if let TreeObservation::Unobservable { reason } = &tree_baseline {
+        stats.tree_baseline_unobservable = true;
+        eprintln!(
+            "warning: tree observation unavailable ({reason}) — the done-requires-change \
+             precondition is INERT for this run"
+        );
+    }
+
     // `run_start` — emitted once per invocation, now that the run id (if any)
     // is known and before the first iteration. All of `system`/`tool_schemas`/
     // `messages` are only serialized when the writer is enabled.
@@ -1350,6 +1726,7 @@ async fn run_loop_body(
                 "label": config.transcript.as_ref().map(|t| t.label.clone()),
                 "run_id": persist.as_ref().map(|p| p.rid.clone()),
                 "resume": is_resume,
+                "tree_baseline": render_tree_observation(&tree_baseline),
                 "system": system,
                 "tools": Value::Array(tool_schemas.clone()),
                 "messages": serde_json::to_value(&messages).unwrap_or(Value::Null),
@@ -1719,8 +2096,14 @@ async fn run_loop_body(
             // earlier calls.
             if call.name == FINISH_TOOL_NAME && finish.is_none() {
                 let call_start = Instant::now();
-                let outcome =
-                    handle_finish_call(&call.id, &call.input, config.checks.as_ref(), ctx).await;
+                let outcome = handle_finish_call(
+                    &call.id,
+                    &call.input,
+                    config.checks.as_ref(),
+                    &tree_baseline,
+                    ctx,
+                )
+                .await;
                 let duration_ms =
                     u64::try_from(call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if writer.is_enabled() {
@@ -1747,8 +2130,25 @@ async fn run_loop_body(
                                 .report
                                 .as_ref()
                                 .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                            "finish_change": outcome
+                                .change
+                                .as_ref()
+                                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null)),
+                            "tree_current": outcome
+                                .current_tree
+                                .as_ref()
+                                .map(render_tree_observation),
                         }),
                     );
+                }
+                // Discriminate the two verified-but-rejected outcomes off
+                // `FinishOutcome`, the same shape `invalid_raw` already uses.
+                match outcome.rejection {
+                    Some(FinishRejection::NoChange) => stats.no_change_rejections += 1,
+                    Some(FinishRejection::AlreadySatisfiedChecks) => {
+                        stats.already_satisfied_check_rejections += 1;
+                    }
+                    None => {}
                 }
                 results.push(outcome.result);
                 finish = outcome.finish;
@@ -1868,7 +2268,12 @@ async fn run_loop_body(
         // wanted). Otherwise push the (possibly empty for a tool-calls-only
         // turn) captured text and clear.
         if nudge_awaiting_status {
-            let is_done = matches!(finish, Some(Disposition::Done { .. }));
+            // An accepted `already_satisfied` after a nudge is a clean
+            // success on the newly-advertised off-ramp, not a failed nudge.
+            let is_done = matches!(
+                finish,
+                Some(Disposition::Done { .. } | Disposition::AlreadySatisfied { .. })
+            );
             if !is_done {
                 nudge_statuses.push(turn_text);
             }
@@ -2360,6 +2765,9 @@ pub async fn resume(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        no_change_rejections: 0,
+        already_satisfied_check_rejections: 0,
+        tree_baseline_unobservable: false,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -2433,6 +2841,15 @@ pub async fn resume(
         initial_messages,
         initial_consumed,
         Some(pre_persist),
+        // A resumed run's TRUE starting tree predates the crash. Observing at
+        // resume time would fold the pre-crash edits into the baseline and
+        // then reject a run that legitimately needs no further edit — so the
+        // baseline is deliberately `Unobservable`, which under
+        // `classify_change` makes every resumed `done` claim accepted on
+        // trust. Honest under-enforcement for a crash-recovery path.
+        Some(TreeObservation::Unobservable {
+            reason: "resumed run — the pre-crash starting tree is unavailable".to_string(),
+        }),
     )
     .await
     .map_err(ResumeError::Store)?;
@@ -2462,10 +2879,11 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 mod tests {
     use super::{
         FINISH_TOOL_NAME, FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError,
-        ResumeMode, RunConfig, RunResult, RunStats, rejection_content, render_tool_result, resume,
-        retry_delay, run, run_id, run_persisted,
+        ResumeMode, RunConfig, RunResult, RunStats, emit_run_end, missing_reason_rejection_content,
+        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
+        run, run_id, run_persisted,
     };
-    use crate::exec::{CheckCommand, CheckReport, ChecksRunner};
+    use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
         ToolCallRequest, TransientKind, Usage, UserBlock,
@@ -2481,6 +2899,7 @@ mod tests {
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
     use crate::tools::standard_registry;
+    use crate::transcript::{TranscriptConfig, TranscriptWriter};
     use crate::workspace::Workspace;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -2760,6 +3179,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::NoChecksConfigured,
+                change: _,
             }) => {
                 assert_eq!(summary, "all set");
             }
@@ -2791,6 +3211,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::Checks(report),
+                change: _,
             }) => {
                 assert_eq!(summary, "shipped");
                 assert!(report.passed, "checks report must be green");
@@ -2928,6 +3349,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::NoChecksConfigured,
+                change: _,
             }) => {
                 assert_eq!(summary, "ok");
             }
@@ -2957,8 +3379,8 @@ mod tests {
         assert!(is_error, "rejected finish result is is_error=true");
         assert_eq!(
             content,
-            "finish rejected: disposition must be one of: done, blocked, failed; \
-             got \"complete\". Call finish again with one of those values."
+            "finish rejected: disposition must be one of: done, blocked, failed, \
+             already_satisfied; got \"complete\". Call finish again with one of those values."
         );
     }
 
@@ -2984,6 +3406,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::NoChecksConfigured,
+                change: _,
             }) => {
                 assert_eq!(summary, "ok");
             }
@@ -3012,8 +3435,8 @@ mod tests {
         assert!(is_error, "rejected finish result is is_error=true");
         assert_eq!(
             content,
-            "finish rejected: disposition must be one of: done, blocked, failed; \
-             got <missing>. Call finish again with one of those values."
+            "finish rejected: disposition must be one of: done, blocked, failed, \
+             already_satisfied; got <missing>. Call finish again with one of those values."
         );
     }
 
@@ -3110,8 +3533,8 @@ mod tests {
         assert!(is_error, "rejected finish result is is_error=true");
         assert_eq!(
             content,
-            "finish rejected: disposition must be one of: done, blocked, failed; \
-             got \"success\". Call finish again with one of those values."
+            "finish rejected: disposition must be one of: done, blocked, failed, \
+             already_satisfied; got \"success\". Call finish again with one of those values."
         );
     }
 
@@ -3226,6 +3649,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::Checks(report),
+                change: _,
             }) => {
                 assert_eq!(summary, "flag planted");
                 assert!(
@@ -3599,6 +4023,47 @@ mod tests {
                 },
             ),
             (
+                serde_json::json!({ "disposition": "already_satisfied", "reason": "r" }),
+                FinishClaim::AlreadySatisfied {
+                    reason: "r".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": " Already_Satisfied ", "reason": "r" }),
+                FinishClaim::AlreadySatisfied {
+                    reason: "r".to_string(),
+                },
+            ),
+            (
+                // The schema still requires `summary`, so a conforming
+                // already_satisfied call supplies one — it is DISCARDED, never
+                // smuggled into `reason`.
+                serde_json::json!({
+                    "disposition": "already_satisfied",
+                    "summary": "s",
+                    "reason": "r",
+                }),
+                FinishClaim::AlreadySatisfied {
+                    reason: "r".to_string(),
+                },
+            ),
+            (
+                serde_json::json!({ "disposition": "already_satisfied" }),
+                FinishClaim::MissingReason,
+            ),
+            (
+                serde_json::json!({ "disposition": "already_satisfied", "reason": "" }),
+                FinishClaim::MissingReason,
+            ),
+            (
+                serde_json::json!({ "disposition": "already_satisfied", "reason": "  \t " }),
+                FinishClaim::MissingReason,
+            ),
+            (
+                serde_json::json!({ "disposition": "already_satisfied", "reason": 7 }),
+                FinishClaim::MissingReason,
+            ),
+            (
                 serde_json::json!({ "disposition": "complete" }),
                 FinishClaim::Invalid {
                     raw: "\"complete\"".to_string(),
@@ -3698,7 +4163,7 @@ mod tests {
             offload_path: Some(PathBuf::from("/tmp/offload-0001.txt")),
             duration: Duration::from_millis(100),
         };
-        let content = rejection_content(&report);
+        let content = rejection_content("done", &report);
         assert!(
             content.starts_with("finish(done) rejected: verification failed"),
             "rejection header first; got:\n{content}"
@@ -3715,7 +4180,7 @@ mod tests {
             offload_path: None,
             duration: Duration::from_secs(1),
         };
-        let bare_content = rejection_content(&bare);
+        let bare_content = rejection_content("done", &bare);
         assert_eq!(
             bare_content, "finish(done) rejected: verification failed",
             "bare report yields just the header"
@@ -3746,18 +4211,26 @@ mod tests {
         let schema = FinishTool.schema();
         assert_eq!(
             schema["description"],
-            "End the run. Call it when the task is complete, blocked on a decision, or \
-             has failed. A `done` claim is verified by the harness re-running the \
-             configured checks; a failed verification, or a disposition other than \
-             done/blocked/failed, is fed back as a tool-result error you can react to, \
-             not a termination."
+            "End the run. Call it when the task is complete, already satisfied, blocked \
+             on a decision, or has failed. A `done` claim is verified by the harness \
+             re-running the configured checks AND requiring that the working tree \
+             changed since the run started; an unchanged tree, a failed verification, or \
+             a disposition other than done/already_satisfied/blocked/failed is fed back \
+             as a tool-result error you can react to, not a termination."
         );
         assert_eq!(
             schema["input_schema"]["properties"]["disposition"]["description"],
-            "done = task complete (harness will verify via checks); blocked = needs a \
-             decision before retrying; failed = you could not complete the task in this \
-             attempt and a fresh attempt might succeed. If the task is complete, use \
-             done; if a human decision is needed, use blocked."
+            "done = task complete and you changed something (harness verifies via checks \
+             AND requires a changed working tree); already_satisfied = the task was \
+             already complete and nothing needed changing (requires `reason`; harness \
+             still verifies via checks); blocked = needs a decision before retrying; \
+             failed = you could not complete the task in this attempt and a fresh \
+             attempt might succeed."
+        );
+        assert_eq!(
+            schema["input_schema"]["properties"]["reason"]["description"],
+            "Required when the disposition is already_satisfied: what you checked and \
+             why the task was already complete."
         );
         let disposition_desc = schema["input_schema"]["properties"]["disposition"]["description"]
             .as_str()
@@ -3765,7 +4238,7 @@ mod tests {
         assert!(!disposition_desc.contains("the run is the problem"));
         assert_eq!(
             schema["input_schema"]["properties"]["disposition"]["enum"],
-            serde_json::json!(["done", "blocked", "failed"])
+            serde_json::json!(["done", "blocked", "failed", "already_satisfied"])
         );
         assert_eq!(
             schema["input_schema"]["required"],
@@ -3901,6 +4374,9 @@ mod tests {
             edit_file_calls_ok: 0,
             invalid_finish_calls: 0,
             first_invalid_finish_raw: None,
+            no_change_rejections: 0,
+            already_satisfied_check_rejections: 0,
+            tree_baseline_unobservable: false,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -3953,6 +4429,7 @@ mod tests {
         let d = Disposition::Done {
             summary: "ok".to_string(),
             verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::default(),
         };
         let out = LoopOutcome::Finished(d.clone()).into_disposition();
         assert_eq!(out, d);
@@ -4658,6 +5135,7 @@ mod tests {
             LoopOutcome::Finished(Disposition::Done {
                 summary,
                 verification: Verification::NoChecksConfigured,
+                change: _,
             }) => {
                 assert_eq!(summary, "ok");
             }
@@ -4687,8 +5165,8 @@ mod tests {
                         assert_eq!(
                             content,
                             "finish rejected: disposition must be one of: done, blocked, \
-                             failed; got \"complete\". Call finish again with one of those \
-                             values."
+                             failed, already_satisfied; got \"complete\". Call finish again \
+                             with one of those values."
                         );
                     }
                     UserBlock::Text(_) => panic!("expected ToolResult, got Text"),
@@ -6872,6 +7350,8 @@ mod tests {
     /// `crates/harness/templates/nudge_prompt.md` verbatim.
     const NUDGE_TEXT: &str = "The quality gates are currently green. \
         If the acceptance criteria are met, call `finish(done)` now. \
+        If nothing needed changing because the task was already complete, \
+        call `finish(already_satisfied)` with a `reason`. \
         If they are not yet met, reply with a one-sentence status: \
         what remains, and why you are still working.";
 
@@ -8988,5 +9468,726 @@ mod tests {
         stats_off.wall_clock = Duration::ZERO;
         stats_bad.wall_clock = Duration::ZERO;
         assert_eq!(stats_off, stats_bad);
+    }
+
+    // =====================================================================
+    // Leg 3 of the completion contract — `done` requires observed change
+    // =====================================================================
+
+    /// A `RunStats` with every counter at zero — for unit-testing
+    /// `emit_run_end` directly.
+    fn zero_stats() -> RunStats {
+        RunStats {
+            iterations: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            wall_clock: Duration::ZERO,
+            gates_green_at_exit: false,
+            nudges_fired: 0,
+            tree_dirty: false,
+            iters_since_tree_change_at_exit: 0,
+            peak_iters_since_tree_change: 0,
+            mutating_iters: 0,
+            bash_calls_ok: 0,
+            edit_file_calls_ok: 0,
+            invalid_finish_calls: 0,
+            first_invalid_finish_raw: None,
+            no_change_rejections: 0,
+            already_satisfied_check_rejections: 0,
+            tree_baseline_unobservable: false,
+        }
+    }
+
+    /// `git init` `root` and return a `ToolCtx` rooted there.
+    fn git_ctx(root: &std::path::Path) -> ToolCtx {
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git init runs");
+        assert!(out.status.success(), "git init failed: {out:?}");
+        let workspace = Workspace::new(root, None).expect("workspace");
+        ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink))
+    }
+
+    /// Run `git` with `args` in `dir`, asserting success. Commits carry an
+    /// explicit identity so no global git config is required.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    fn registry_with_finish_and_edit() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register("edit_file", Arc::new(EditFileTool));
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        registry
+    }
+
+    #[tokio::test]
+    async fn bare_finish_done_on_unchanged_git_tree_is_rejected_and_loop_continues() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bare",
+                serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+            ),
+            finish_call(
+                "c-bare-2",
+                serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+            ),
+        ]);
+        let config = RunConfig::new("do the work", 2);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "an unchanged tree must NOT terminate as Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(stats.no_change_rejections, 2);
+        assert!(!stats.tree_baseline_unobservable);
+        let fed_back = backend.last_messages();
+        assert!(
+            fed_back.iter().any(|m| matches!(
+                m,
+                Message::User { content }
+                    if content.iter().any(|b| matches!(
+                        b,
+                        UserBlock::ToolResult { content, is_error, .. }
+                            if *is_error && *content == no_change_rejection_content()
+                    ))
+            )),
+            "the fed-back result must be the pinned no-change rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_done_after_an_edit_is_accepted_with_tree_changed_evidence() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "work.txt",
+                        "old_string": "",
+                        "new_string": "done\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "edited" }),
+            ),
+        ]);
+        let config = RunConfig::new("do the work", 5);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.no_change_rejections, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_dirty_attachments_dir_does_not_mask_a_no_work_run() {
+        // THE PRODUCTION SEAM. `agent-gtd-dispatch`'s `stage_attachments`
+        // creates an untracked `<run_id>-attachments/` directory inside the
+        // clone root BEFORE the agent starts, and tells the agent never to
+        // commit it. A bare `current`-dirtiness test would read TreeChanged
+        // for the whole run on every attachment-carrying item — exactly the
+        // code path where a false Done costs a real push. The comparison is
+        // baseline-RELATIVE, so the pre-existing entry cancels.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir(root_path.join("run-123-attachments")).expect("mkdir attachments");
+        std::fs::write(root_path.join("run-123-attachments/spec.md"), "spec\n").expect("write");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-bare",
+            serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+        )]);
+        let config = RunConfig::new("do the work", 1);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a pre-dirty workspace must not mask a no-work run; got {outcome:?}"
+        );
+        assert_eq!(stats.no_change_rejections, 1);
+
+        // Mirror case: the same pre-dirty workspace, but the agent edits a
+        // tracked file — accepted.
+        let root2 = TempDir::new().expect("tempdir");
+        let root2_path = root2.path().canonicalize().expect("canonicalize");
+        std::fs::write(root2_path.join("tracked.txt"), "before\n").expect("write");
+        let ctx2 = git_ctx(&root2_path);
+        git_in(&root2_path, &["add", "tracked.txt"]);
+        git_in(&root2_path, &["commit", "-qm", "seed"]);
+        std::fs::create_dir(root2_path.join("run-123-attachments")).expect("mkdir attachments");
+        std::fs::write(root2_path.join("run-123-attachments/spec.md"), "spec\n").expect("write");
+
+        let backend2 = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "tracked.txt",
+                        "old_string": "before",
+                        "new_string": "after",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "edited" }),
+            ),
+        ]);
+        let config2 = RunConfig::new("do the work", 5);
+        let RunResult { outcome, .. } = run(&backend2, &tools, &ctx2, &config2).await;
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_git_workspace_fails_open_and_accepts_a_bare_done() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        // Pin the load-bearing fail-open assumption with a test rather than
+        // leaving it to the ambient environment: this root really is NOT a
+        // git work tree.
+        let probe = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&root_path)
+            .output()
+            .expect("git runs");
+        assert!(
+            !probe.status.success(),
+            "the fail-open assumption requires a non-git workspace root"
+        );
+
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+        let tools = registry_with_finish_and_edit();
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-bare",
+            serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+        )]);
+        let config = RunConfig::new("do the work", 2);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert!(
+                    matches!(change, ChangeEvidence::Unobservable { .. }),
+                    "an unobservable workspace must fail OPEN; got {change:?}"
+                );
+            }
+            other => panic!("expected Finished(Done{{Unobservable}}); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+        assert_eq!(stats.no_change_rejections, 0);
+    }
+
+    #[tokio::test]
+    async fn committed_work_moves_head_and_reads_as_tree_changed() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        std::fs::write(root_path.join("seed.txt"), "seed\n").expect("write");
+        let ctx = git_ctx(&root_path);
+        git_in(&root_path, &["add", "seed.txt"]);
+        git_in(&root_path, &["commit", "-qm", "seed"]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register("bash", Arc::new(crate::tools::bash::BashTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+
+        // The agent commits its own change: the tree is CLEAN at finish time
+        // but HEAD moved. No template instructs a commit, but `bash` permits
+        // one — and the moved-HEAD arm must read as TreeChanged.
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-bash",
+                    "bash",
+                    serde_json::json!({
+                        "command": "printf 'more\\n' >> seed.txt && \
+                                    git -c user.name=t -c user.email=t@example.com \
+                                    commit -qam agent",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "committed" }),
+            ),
+        ]);
+        let config = RunConfig::new("commit the work", 5);
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged, "HEAD moved");
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_with_green_checks_terminates_and_records_the_tree() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-as",
+            serde_json::json!({
+                "disposition": "already_satisfied",
+                "summary": "s",
+                "reason": "the flag was already set",
+            }),
+        )]);
+        let config = RunConfig::new("confirm the flag", 3).with_checks(runner);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::AlreadySatisfied {
+                reason,
+                verification: Verification::Checks(report),
+                change,
+            }) => {
+                assert_eq!(reason, "the flag was already set");
+                assert!(report.passed);
+                assert_eq!(change, ChangeEvidence::TreeUnchanged);
+            }
+            other => panic!("expected Finished(AlreadySatisfied); got {other:?}"),
+        }
+        assert_eq!(stats.already_satisfied_check_rejections, 0);
+        assert_eq!(stats.invalid_finish_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_records_an_incidental_tree_change_rather_than_rejecting() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "incidental\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-as",
+                serde_json::json!({
+                    "disposition": "already_satisfied",
+                    "reason": "nothing needed changing",
+                }),
+            ),
+        ]);
+        let config = RunConfig::new("confirm", 3);
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        match outcome {
+            LoopOutcome::Finished(Disposition::AlreadySatisfied { change, .. }) => {
+                assert_eq!(
+                    change,
+                    ChangeEvidence::TreeChanged,
+                    "an incidental scratch file is RECORDED, not rejected"
+                );
+            }
+            other => panic!("expected Finished(AlreadySatisfied); got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_on_a_red_gate_is_rejected_and_counted() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 1".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-as",
+                serde_json::json!({
+                    "disposition": "already_satisfied",
+                    "reason": "nothing needed changing",
+                }),
+            ),
+            finish_call(
+                "c-as-2",
+                serde_json::json!({
+                    "disposition": "already_satisfied",
+                    "reason": "still nothing",
+                }),
+            ),
+        ]);
+        let config = RunConfig::new("confirm", 2).with_checks(runner);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a no-op claim on a red repo is never legitimate; got {outcome:?}"
+        );
+        assert_eq!(stats.already_satisfied_check_rejections, 2);
+    }
+
+    #[tokio::test]
+    async fn already_satisfied_without_reason_is_a_malformed_finish_call() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-as",
+                serde_json::json!({ "disposition": "already_satisfied", "reason": "" }),
+            ),
+            finish_call(
+                "c-as-2",
+                serde_json::json!({ "disposition": "already_satisfied", "reason": "   " }),
+            ),
+        ]);
+        let config = RunConfig::new("confirm", 2);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(outcome, LoopOutcome::MaxIterations));
+        assert_eq!(stats.invalid_finish_calls, 2);
+        assert_eq!(
+            stats.first_invalid_finish_raw.as_deref(),
+            Some("already_satisfied without reason")
+        );
+        let fed_back = backend.last_messages();
+        assert!(fed_back.iter().any(|m| matches!(
+            m,
+            Message::User { content }
+                if content.iter().any(|b| matches!(
+                    b,
+                    UserBlock::ToolResult { content, is_error, .. }
+                        if *is_error && *content == missing_reason_rejection_content()
+                ))
+        )));
+    }
+
+    #[test]
+    fn rejection_content_strings_are_pinned_and_all_say_rejected() {
+        assert_eq!(
+            no_change_rejection_content(),
+            "finish(done) rejected: the working tree is unchanged since this run started — \
+             no work was done. Make the change the task requires and finish again, or call \
+             finish with disposition `already_satisfied` and a `reason` if the task was \
+             already complete."
+        );
+        assert_eq!(
+            missing_reason_rejection_content(),
+            "finish rejected: already_satisfied requires a non-empty `reason` explaining what \
+             you checked and why the task was already complete. Call finish again with a \
+             reason, or with a different disposition."
+        );
+        assert!(no_change_rejection_content().contains("rejected"));
+        assert!(missing_reason_rejection_content().contains("rejected"));
+        let report = CheckReport {
+            passed: false,
+            exit_code: Some(1),
+            timed_out: false,
+            excerpt: String::new(),
+            offload_path: None,
+            duration: Duration::from_millis(1),
+        };
+        assert!(rejection_content("already_satisfied", &report).contains("rejected"));
+        assert!(
+            rejection_content("already_satisfied", &report)
+                .starts_with("finish(already_satisfied) rejected:")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_supplies_an_unobservable_baseline_so_a_bare_done_is_accepted() {
+        let dir = TempDir::new().expect("tempdir");
+        let root_path = dir.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        // The workspace already carries edits, as it would after a crash.
+        std::fs::write(root_path.join("pre_crash.txt"), "wip\n").expect("write");
+        let tools = registry_with_finish_and_edit();
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let mut record = make_minimal_record("resumed-leg3", 1);
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }];
+        store
+            .checkpoint(&record.run_id, &record)
+            .await
+            .expect("checkpoint");
+        let rid = record.run_id.clone();
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "already fixed pre-crash" }),
+        )]);
+        let config = RunConfig::new("finish the pre-crash work", 2);
+        let RunResult { outcome, stats } = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            Arc::clone(&store),
+            &rid,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume");
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert!(
+                    matches!(change, ChangeEvidence::Unobservable { .. }),
+                    "a resumed run's pre-crash baseline is unavailable, so it fails open; \
+                     got {change:?}"
+                );
+            }
+            other => panic!("expected Finished(Done{{Unobservable}}); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+    }
+
+    #[tokio::test]
+    async fn transcript_records_the_no_change_decision_inputs_and_the_baseline() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+
+        let transcript = root_path.join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-bare",
+            serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+        )]);
+        let config = RunConfig::new("do the work", 1)
+            .with_checks(runner)
+            .with_transcript(transcript.clone(), "leg3");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let lines = read_transcript_lines(&transcript);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert!(
+            lines[0]["tree_baseline"]["Observed"].is_object(),
+            "run_start must carry the observed baseline: {}",
+            lines[0]
+        );
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert_eq!(tool_result["finish_accepted"], false);
+        assert_eq!(
+            tool_result["finish_change"],
+            serde_json::json!("TreeUnchanged")
+        );
+        assert!(
+            tool_result["tree_current"]["Observed"].is_object(),
+            "tool_result must carry the observation it classified: {tool_result}"
+        );
+        assert_eq!(
+            tool_result["finish_verification"]["passed"], true,
+            "the checks passed; only the tree precondition failed"
+        );
+        let run_end = lines
+            .iter()
+            .find(|l| l["event"] == "run_end")
+            .expect("a run_end event");
+        assert_eq!(run_end["stats"]["no_change_rejections"], 1);
+        assert_eq!(run_end["stats"]["tree_baseline_unobservable"], false);
+        assert_eq!(run_end["stats"]["already_satisfied_check_rejections"], 0);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_a_moved_head_between_baseline_and_accept() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        std::fs::write(root_path.join("seed.txt"), "seed\n").expect("write");
+        let ctx = git_ctx(&root_path);
+        git_in(&root_path, &["add", "seed.txt"]);
+        git_in(&root_path, &["commit", "-qm", "seed"]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register("bash", Arc::new(crate::tools::bash::BashTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+
+        let transcript = root_path.join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-bash",
+                    "bash",
+                    serde_json::json!({
+                        "command": "printf 'more\\n' >> seed.txt && \
+                                    git -c user.name=t -c user.email=t@example.com \
+                                    commit -qam agent",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "committed" }),
+            ),
+        ]);
+        let config =
+            RunConfig::new("commit the work", 5).with_transcript(transcript.clone(), "leg3-head");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let lines = read_transcript_lines(&transcript);
+        let baseline_head = lines[0]["tree_baseline"]["Observed"]["head"].clone();
+        let finish_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a finish tool_result");
+        let current_head = finish_result["tree_current"]["Observed"]["head"].clone();
+        assert!(baseline_head.is_string() && current_head.is_string());
+        assert_ne!(baseline_head, current_head, "HEAD must have moved");
+        assert_eq!(
+            finish_result["finish_change"],
+            serde_json::json!("TreeChanged")
+        );
+    }
+
+    #[tokio::test]
+    async fn unobservable_baseline_warns_and_still_records_the_baseline_in_run_start() {
+        let dir = TempDir::new().expect("tempdir");
+        let root_path = dir.path().canonicalize().expect("canonicalize");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+        let tools = registry_with_finish_and_echo();
+
+        let transcript = root_path.join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config = RunConfig::new("t", 1).with_transcript(transcript.clone(), "inert");
+        let RunResult { stats, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(stats.tree_baseline_unobservable);
+
+        let lines = read_transcript_lines(&transcript);
+        assert!(
+            lines[0]["tree_baseline"]["Unobservable"]["reason"]
+                .as_str()
+                .expect("a reason string")
+                .contains("git status"),
+            "run_start must carry the unobservable baseline reason: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn emit_run_end_audits_a_done_that_reached_the_terminal_with_an_unchanged_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "audit".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Done {
+                summary: "hand-built".to_string(),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            }));
+        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"));
+        drop(writer);
+
+        let lines = read_transcript_lines(&path);
+        let violation = lines
+            .iter()
+            .find(|l| l["event"] == "contract_violation")
+            .expect("a contract_violation event");
+        assert_eq!(violation["kind"], "done_with_unchanged_tree");
+        assert_eq!(violation["run_id"], "task:1");
+        assert_eq!(violation["change"], serde_json::json!("TreeUnchanged"));
+    }
+
+    #[test]
+    fn emit_run_end_does_not_audit_an_honest_done() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("clean.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "clean".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Done {
+                summary: "real".to_string(),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeChanged,
+            }));
+        emit_run_end(&mut writer, &result, &zero_stats(), None);
+        drop(writer);
+
+        let lines = read_transcript_lines(&path);
+        assert!(lines.iter().all(|l| l["event"] != "contract_violation"));
     }
 }

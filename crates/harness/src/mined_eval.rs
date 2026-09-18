@@ -1578,6 +1578,11 @@ pub async fn sealed_regate_score_with_timeout<P: TestReportParser + ?Sized>(
 ///
 /// The build agent may ADD fields; the pinned ones (needed by the false-done
 /// cross-tab and by the audit trail) MUST NOT be omitted.
+// This is a flat telemetry row, not an API surface with a meaningful state
+// space — each bool is an independent per-trial fact straight off
+// `engine::RunStats`, so collapsing them into an enum would obscure rather
+// than clarify. Tripped when `tree_baseline_unobservable` joined the row.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct MinedTrialResult {
     /// Zero-based trial index.
@@ -1682,6 +1687,15 @@ pub struct MinedTrialResult {
     /// The untruncated `raw` of the first rejected `finish` call this trial.
     /// From [`crate::engine::RunStats::first_invalid_finish_raw`].
     pub first_invalid_finish_raw: Option<String>,
+    /// Count of `finish(done)` claims rejected because the working tree was
+    /// unchanged since the run started.
+    /// From [`crate::engine::RunStats::no_change_rejections`].
+    pub no_change_rejections: u32,
+    /// Whether the run-start tree observation failed, making the leg-3
+    /// precondition inert for this trial. One tier-2 matrix column answers
+    /// "did the soundness fix silently do nothing across 24 trials?".
+    /// From [`crate::engine::RunStats::tree_baseline_unobservable`].
+    pub tree_baseline_unobservable: bool,
     /// The post-run agent-gate verdict — THE production-shippability signal.
     /// A real dispatch pushes only when this gate is green at a
     /// claim-verified `Done`, so this is what separates a sealed-`Resolved`
@@ -1772,9 +1786,11 @@ impl MinedReport {
     }
 
     /// Trials where the last in-loop gate was GREEN at exit and the agent did
-    /// NOT claim Done. EVERY non-Done label counts — `Blocked`, `Failed`,
-    /// `MaxIterations`, `StoppedWithoutFinish`, `BudgetExhausted`,
-    /// `BackendError`, `NotRun` (see [`claimed_disposition_label`]). Always `0`
+    /// NOT claim Done. EVERY non-Done label counts — `AlreadySatisfied`,
+    /// `Blocked`, `Failed`, `MaxIterations`, `StoppedWithoutFinish`,
+    /// `BudgetExhausted`, `BackendError`, `NotRun` (see
+    /// [`claimed_disposition_label`]). `AlreadySatisfied` keeps counting here
+    /// deliberately: it IS a green-gate non-Done stop. Always `0`
     /// in [`AgentGateMode::Off`] (no `run_checks` tool is ever registered, so
     /// `gates_green_at_exit` can never be true) — see
     /// [`MinedTrialResult::gates_green_at_exit`]. Varies in
@@ -1791,6 +1807,10 @@ impl MinedReport {
     /// Trials the sealed re-gate scored `Resolved` where the agent did NOT
     /// claim Done — the finish-discipline gap. `Invalid` and `Unresolved`
     /// trials are never `Resolved`, so they never count.
+    ///
+    /// An `AlreadySatisfied` trial the sealed gate scores `Resolved` DOES
+    /// count toward the gap. That sign is intended: such a run would not have
+    /// been pushed, which is exactly what this instrument measures.
     #[must_use]
     pub fn resolved_unclaimed(&self) -> u32 {
         self.trials
@@ -1824,6 +1844,12 @@ impl MinedReport {
     /// Trials the agent claimed Done on an UNTOUCHED tree (`tree_dirty ==
     /// false`). See [`Self::clean_tree_nudges`] for the same conservative
     /// lower-bound caveat.
+    ///
+    /// Post-precondition this reads differently than it used to: a clean-tree
+    /// `Done` is now reachable ONLY via the leg-3 fail-open, so a ZERO means
+    /// the precondition is holding, and a NON-zero means the workspace was
+    /// unobservable and the claim was accepted on trust. Do not misread a 0
+    /// as "the behaviour went away".
     #[must_use]
     pub fn clean_tree_dones(&self) -> u32 {
         self.trials
@@ -1835,7 +1861,9 @@ impl MinedReport {
 
     /// Trials that are actually production-shippable: the sealed re-gate
     /// scored [`TrialScore::Resolved`] AND the agent's claimed terminal was
-    /// `Done`. Deliberately stricter than `resolved_count` alone — a real
+    /// `Done`. An `AlreadySatisfied` trial is therefore automatically
+    /// non-shippable, which is the bound on the accepted risk that the new
+    /// disposition gives a model another way to stop without working. Deliberately stricter than `resolved_count` alone — a real
     /// dispatch pushes only on a claim-verified `Done`, so a `Resolved`
     /// trial that ended `MaxIterations` (or any other non-`Done` claim) is
     /// correct-but-NOT-shippable and must not count here.
@@ -1858,6 +1886,19 @@ impl MinedReport {
     /// end. A trial where the post-run gate never ran
     /// (`agent_gate_post == None`, e.g. [`AgentGateMode::Off`]) never counts
     /// here — that is NOT-ARMED, not tried-and-failed.
+    /// Trials whose claimed terminal was [`CLAIMED_ALREADY_SATISFIED`] — the
+    /// rate at which the leg-3 precondition diverts a claim onto the
+    /// deliberate no-op off-ramp. Printed in the tier-2 report row so a
+    /// wave's use of the new disposition is visible in the matrix.
+    #[must_use]
+    pub fn already_satisfied_count(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| t.claimed_disposition == CLAIMED_ALREADY_SATISFIED)
+            .map(|_| 1u32)
+            .sum()
+    }
+
     #[must_use]
     pub fn resolved_gate_red(&self) -> u32 {
         self.trials
@@ -1874,6 +1915,9 @@ pub const CLAIMED_DONE: &str = "Done";
 pub const CLAIMED_BLOCKED: &str = "Blocked";
 /// Label used for a Failed disposition.
 pub const CLAIMED_FAILED: &str = "Failed";
+/// Label used for an `AlreadySatisfied` disposition — the agent's deliberate
+/// "nothing needed changing" off-ramp.
+pub const CLAIMED_ALREADY_SATISFIED: &str = "AlreadySatisfied";
 
 /// Render a terminal [`LoopOutcome`] as the compact string stored on
 /// [`MinedTrialResult::claimed_disposition`].
@@ -1881,6 +1925,9 @@ pub const CLAIMED_FAILED: &str = "Failed";
 pub fn claimed_disposition_label(outcome: &LoopOutcome) -> String {
     match outcome {
         LoopOutcome::Finished(Disposition::Done { .. }) => CLAIMED_DONE.to_string(),
+        LoopOutcome::Finished(Disposition::AlreadySatisfied { .. }) => {
+            CLAIMED_ALREADY_SATISFIED.to_string()
+        }
         LoopOutcome::Finished(Disposition::Blocked { .. }) => CLAIMED_BLOCKED.to_string(),
         LoopOutcome::Finished(Disposition::Failed { .. }) => CLAIMED_FAILED.to_string(),
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish".to_string(),
@@ -2300,6 +2347,8 @@ async fn single_trial<B: ModelBackend>(
         edit_file_calls_ok: stats.edit_file_calls_ok,
         invalid_finish_calls: stats.invalid_finish_calls,
         first_invalid_finish_raw: stats.first_invalid_finish_raw,
+        no_change_rejections: stats.no_change_rejections,
+        tree_baseline_unobservable: stats.tree_baseline_unobservable,
         agent_gate_post,
         agent_gate_output_path,
         transcript_path,
@@ -2341,6 +2390,8 @@ fn invalid_trial(
         edit_file_calls_ok: 0,
         invalid_finish_calls: 0,
         first_invalid_finish_raw: None,
+        no_change_rejections: 0,
+        tree_baseline_unobservable: false,
         agent_gate_post: None,
         agent_gate_output_path: None,
         transcript_path: None,
@@ -2382,16 +2433,18 @@ impl Drop for ScratchDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentGateMode, CLAIMED_BLOCKED, CLAIMED_DONE, DEFAULT_AGENT_GATE_TIMEOUT, MinedReport,
-        MinedTask, MinedTrialResult, PytestParser, ResolveDetail, ScratchDir, SealedEntry,
-        SpecLevel, TestReportParser, TestStatus, TrialScore, build_collection_errors,
-        claimed_disposition_label, copy_sealed, expand_home, gate_fault_reason, is_test_path,
-        load_statement, load_task, match_task_id, matches_exclusion, normalize,
-        parse_agent_gate_mode, parse_authored_tests, parse_pytest_summary_totals,
-        parse_short_summary_line, parse_test_first, parse_wall_clock_secs, prepare_worktrees,
-        resolve, resolve_agent_gate_command, run_env_setup, sanitize_for_filename,
-        scan_authored_tests, strip_param_suffix, tier2_task_prompt,
+        AgentGateMode, CLAIMED_ALREADY_SATISFIED, CLAIMED_BLOCKED, CLAIMED_DONE,
+        DEFAULT_AGENT_GATE_TIMEOUT, MinedReport, MinedTask, MinedTrialResult, PytestParser,
+        ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
+        TrialScore, build_collection_errors, claimed_disposition_label, copy_sealed, expand_home,
+        gate_fault_reason, is_test_path, load_statement, load_task, match_task_id,
+        matches_exclusion, normalize, parse_agent_gate_mode, parse_authored_tests,
+        parse_pytest_summary_totals, parse_short_summary_line, parse_test_first,
+        parse_wall_clock_secs, prepare_worktrees, resolve, resolve_agent_gate_command,
+        run_env_setup, sanitize_for_filename, scan_authored_tests, strip_param_suffix,
+        tier2_task_prompt,
     };
+    use crate::exec::ChangeEvidence;
     use crate::run_record::{Disposition, FailureMode, Verification};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -3067,6 +3120,38 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
     }
 
     // ---- agent test authorship --------------------------------------------
+
+    /// A scripted turn that writes a scratch file into the trial workspace.
+    ///
+    /// The engine's leg-3 precondition rejects a `finish(done)` on an
+    /// unchanged tree, and mined-eval trials run in REAL git work trees — so
+    /// a script that finishes immediately must first do something observable.
+    /// `scratch_note.txt` is not a test path, so `scan_authored_tests` is
+    /// unaffected, and the turn carries ZERO usage so per-trial token
+    /// assertions stay exact.
+    fn scratch_edit_turn() -> crate::model::AssistantTurn {
+        crate::model::AssistantTurn {
+            content: vec![crate::model::ContentBlock::ToolCall(
+                crate::model::ToolCallRequest {
+                    id: "c-scratch-edit".to_string(),
+                    name: "edit_file".to_string(),
+                    input: serde_json::json!({
+                        "path": "scratch_note.txt",
+                        "old_string": "",
+                        "new_string": "work happened\n",
+                    }),
+                },
+            )],
+            stop_reason: crate::model::StopReason::ToolUse,
+            usage: crate::model::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        }
+    }
 
     #[test]
     fn is_test_path_matches_pytest_discovery_conventions() {
@@ -3772,6 +3857,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             claimed_disposition_label(&LoopOutcome::Finished(Disposition::Done {
                 summary: "ok".to_string(),
                 verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::default(),
             })),
             CLAIMED_DONE,
         );
@@ -3795,6 +3881,73 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(
             claimed_disposition_label(&LoopOutcome::MaxIterations),
             "MaxIterations",
+        );
+    }
+
+    /// The new label is its own row, and the accepted-risk bound holds: an
+    /// `AlreadySatisfied` trial is never counted a false done and is never
+    /// shippable, because both instruments compare against
+    /// [`CLAIMED_DONE`]. That is what keeps "the model has another way to
+    /// stop without working" from silently inflating the matrix.
+    #[test]
+    fn already_satisfied_is_labelled_counted_and_never_shippable() {
+        use crate::engine::LoopOutcome;
+        assert_eq!(
+            claimed_disposition_label(&LoopOutcome::Finished(Disposition::AlreadySatisfied {
+                reason: "nothing needed changing".to_string(),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            })),
+            CLAIMED_ALREADY_SATISFIED,
+        );
+
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 3,
+            resolved_count: 2,
+            invalid_count: 0,
+            trials: vec![
+                trial_tel(0, TrialScore::Resolved, CLAIMED_ALREADY_SATISFIED, true, 0),
+                trial_tel(1, TrialScore::Resolved, CLAIMED_DONE, true, 0),
+                trial_tel(
+                    2,
+                    TrialScore::Unresolved {
+                        reason: ResolveDetail {
+                            fail_to_pass_status: Vec::new(),
+                            unexcluded_red: Vec::new(),
+                            missing_fail_to_pass: vec!["x".to_string()],
+                            collection_errors: Vec::new(),
+                        },
+                    },
+                    CLAIMED_ALREADY_SATISFIED,
+                    true,
+                    0,
+                ),
+            ],
+        };
+        assert_eq!(report.already_satisfied_count(), 2);
+        assert_eq!(
+            report.false_dones(),
+            0,
+            "an AlreadySatisfied trial is never a false done"
+        );
+        assert_eq!(
+            report.shippable(),
+            1,
+            "only the CLAIMED_DONE trial is shippable"
+        );
+        assert_eq!(
+            report.resolved_unclaimed(),
+            1,
+            "a Resolved AlreadySatisfied DOES count toward the finish-discipline gap —              that run would not have been pushed"
+        );
+        assert_eq!(
+            report.post_green_stops(),
+            2,
+            "AlreadySatisfied is a green-gate non-Done stop"
         );
     }
 
@@ -3830,6 +3983,8 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             edit_file_calls_ok: 0,
             invalid_finish_calls: 0,
             first_invalid_finish_raw: None,
+            no_change_rejections: 0,
+            tree_baseline_unobservable: false,
             agent_gate_post: None,
             agent_gate_output_path: None,
             transcript_path: None,
@@ -4372,21 +4527,30 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         // 4. A MockBackend that calls finish(done) immediately, once per trial.
         let k = 2u32;
+        // One observable edit per trial before the claim: the engine's leg-3
+        // precondition rejects `finish(done)` on an unchanged tree, and these
+        // trials run in real git work trees. `scratch_edit_turn` carries zero
+        // usage, so the per-trial token assertions below are unchanged.
         let finish_turns: Vec<AssistantTurn> = (0..k)
-            .map(|_| AssistantTurn {
-                content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                    id: "c-finish".to_string(),
-                    name: FINISH_TOOL_NAME.to_string(),
-                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-                })],
-                stop_reason: StopReason::ToolUse,
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    reasoning_tokens: None,
-                },
+            .flat_map(|_| {
+                [
+                    scratch_edit_turn(),
+                    AssistantTurn {
+                        content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                            id: "c-finish".to_string(),
+                            name: FINISH_TOOL_NAME.to_string(),
+                            input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                        })],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            reasoning_tokens: None,
+                        },
+                    },
+                ]
             })
             .collect();
         let backend = MockBackend::from_turns(finish_turns);
@@ -4481,21 +4645,30 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         }];
 
         let k = 2u32;
+        // One observable edit per trial before the claim: the engine's leg-3
+        // precondition rejects `finish(done)` on an unchanged tree, and these
+        // trials run in real git work trees. `scratch_edit_turn` carries zero
+        // usage, so the per-trial token assertions below are unchanged.
         let finish_turns: Vec<AssistantTurn> = (0..k)
-            .map(|_| AssistantTurn {
-                content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                    id: "c-finish".to_string(),
-                    name: FINISH_TOOL_NAME.to_string(),
-                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-                })],
-                stop_reason: StopReason::ToolUse,
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    reasoning_tokens: None,
-                },
+            .flat_map(|_| {
+                [
+                    scratch_edit_turn(),
+                    AssistantTurn {
+                        content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                            id: "c-finish".to_string(),
+                            name: FINISH_TOOL_NAME.to_string(),
+                            input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                        })],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            reasoning_tokens: None,
+                        },
+                    },
+                ]
             })
             .collect();
         let backend = MockBackend::from_turns(finish_turns);
@@ -4583,7 +4756,15 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
         task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
 
+        // The scratch edit comes FIRST so the later `run_checks` green is not
+        // invalidated by a mutating call: the engine clears `last_gate_green`
+        // on every successful `edit_file`/`bash`, and this test's nudge
+        // depends on the gate still being green when the model stops calling
+        // tools. It also satisfies the leg-3 precondition, without which the
+        // `finish(done)` below could no longer be accepted in this real git
+        // work tree.
         let turns = vec![
+            scratch_edit_turn(),
             AssistantTurn {
                 content: vec![ContentBlock::ToolCall(ToolCallRequest {
                     id: "c-rc".to_string(),
@@ -4652,13 +4833,18 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert!(trial.finish_recovery_armed);
         assert_eq!(trial.nudges_fired, 1);
         assert!(trial.gates_green_at_exit);
-        assert!(!trial.tree_dirty);
-        assert_eq!(trial.iterations, 3);
+        // The scratch edit latches `tree_dirty`, so this trial is no longer a
+        // clean-tree row — the clean-tree telemetry is pinned instead by
+        // `clean_tree_nudge_then_no_change_rejection_never_reaches_done`.
+        assert!(trial.tree_dirty);
+        assert_eq!(trial.iterations, 4);
         assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
         assert_eq!(trial.score, TrialScore::Resolved);
-        assert_eq!(backend.calls(), 3);
-        assert_eq!(report.clean_tree_nudges(), 1);
-        assert_eq!(report.clean_tree_dones(), 1);
+        assert_eq!(backend.calls(), 4);
+        assert_eq!(report.clean_tree_nudges(), 0);
+        assert_eq!(report.clean_tree_dones(), 0);
+        assert_eq!(trial.no_change_rejections, 0);
+        assert!(!trial.tree_baseline_unobservable);
 
         let systems = backend.systems_seen();
         let sys = systems[0].as_deref().expect("system prompt");
@@ -4684,6 +4870,98 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         );
         assert_eq!(first_user_text.matches("## Verification").count(), 2);
         assert!(!first_user_text.contains("short test summary info"));
+    }
+
+    /// The clean-tree telemetry in the post-precondition world: a nudge can
+    /// still fire on an untouched tree, but the `finish(done)` that follows is
+    /// rejected by the leg-3 precondition, so `clean_tree_dones` is ZERO —
+    /// which now reads "the precondition is holding", NOT "the behaviour went
+    /// away". Tier-2 trials run in real git work trees, so a non-zero
+    /// `clean_tree_dones` would mean the workspace was unobservable.
+    #[tokio::test]
+    async fn clean_tree_nudge_then_no_change_rejection_never_reaches_done() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
+        task.agent_gate_command = Some("true".to_string());
+
+        let usage = || Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        };
+        let turns = vec![
+            // 1: run_checks goes green on an untouched tree.
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-rc".to_string(),
+                    name: "run_checks".to_string(),
+                    input: serde_json::json!({}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            },
+            // 2: the model stops calling tools → the nudge fires.
+            AssistantTurn {
+                content: vec![ContentBlock::Text("thinking".to_string())],
+                stop_reason: StopReason::EndTurn,
+                usage: usage(),
+            },
+            // 3: it claims done anyway — rejected, tree unchanged.
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: usage(),
+            },
+        ];
+        let backend = MockBackend::from_turns(turns);
+
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            task_dir: task_dir.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_secs(30),
+            },
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+
+        let trial = &report.trials[0];
+        assert!(!trial.tree_dirty, "the agent never touched the tree");
+        assert_eq!(trial.nudges_fired, 1);
+        assert_eq!(trial.claimed_disposition, "MaxIterations");
+        assert_eq!(trial.no_change_rejections, 1);
+        assert!(
+            !trial.tree_baseline_unobservable,
+            "a tier-2 worktree IS observable — a true here would mean the precondition \
+             silently did nothing"
+        );
+        assert_eq!(report.clean_tree_nudges(), 1);
+        assert_eq!(
+            report.clean_tree_dones(),
+            0,
+            "post-precondition a clean-tree Done is reachable ONLY via the fail-open"
+        );
+        assert_eq!(report.already_satisfied_count(), 0);
     }
 
     #[tokio::test]
@@ -4886,21 +5164,27 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
         task.agent_gate_command = Some("true".to_string());
 
-        let turns = vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c-finish".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+        // One observable edit before the claim — the leg-3 precondition
+        // rejects `finish(done)` on an unchanged tree, and this trial runs in
+        // a real git work tree. Zero usage, so the token assertions hold.
+        let turns = vec![
+            scratch_edit_turn(),
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
             },
-        }];
+        ];
         let backend = MockBackend::from_turns(turns);
 
         let state_root = tempdir().expect("state root");
@@ -4943,21 +5227,27 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
         task.agent_gate_command = Some("true".to_string());
 
-        let turns = vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c-finish".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+        // One observable edit before the claim — the leg-3 precondition
+        // rejects `finish(done)` on an unchanged tree, and this trial runs in
+        // a real git work tree. Zero usage, so the token assertions hold.
+        let turns = vec![
+            scratch_edit_turn(),
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
             },
-        }];
+        ];
         let backend = MockBackend::from_turns(turns);
 
         let state_root = tempdir().expect("state root");
@@ -5008,21 +5298,27 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let (_workroot, task_dir, mut task, statement) = agent_gate_task_fixture();
         task.agent_gate_command = Some("true # AGENT_GATE_SENTINEL".to_string());
 
-        let turns = vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c-finish".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+        // One observable edit before the claim — the leg-3 precondition
+        // rejects `finish(done)` on an unchanged tree, and this trial runs in
+        // a real git work tree. Zero usage, so the token assertions hold.
+        let turns = vec![
+            scratch_edit_turn(),
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
             },
-        }];
+        ];
         let backend = MockBackend::from_turns(turns);
 
         let state_root = tempdir().expect("state root");
@@ -5048,7 +5344,9 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(trial.nudges_fired, 0);
         assert_eq!(trial.claimed_disposition, CLAIMED_DONE);
         assert_eq!(trial.score, TrialScore::Resolved);
-        assert_eq!(backend.calls(), 1);
+        // Two draws: the scratch edit that satisfies the leg-3 precondition,
+        // then the claim.
+        assert_eq!(backend.calls(), 2);
         // AgentGateMode::Off never runs the post-run gate: NOT-RUN, not
         // "ran and passed".
         assert_eq!(trial.agent_gate_post, None);
@@ -5654,21 +5952,27 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             path: "dest.py".to_string(),
         }];
 
-        let backend = MockBackend::from_turns(vec![AssistantTurn {
-            content: vec![ContentBlock::ToolCall(ToolCallRequest {
-                id: "c-finish".to_string(),
-                name: FINISH_TOOL_NAME.to_string(),
-                input: serde_json::json!({"disposition": "done", "summary": "ok"}),
-            })],
-            stop_reason: StopReason::ToolUse,
-            usage: Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+        // One observable edit before the claim — the leg-3 precondition
+        // rejects `finish(done)` on an unchanged tree, and this trial runs in
+        // a real git work tree.
+        let backend = MockBackend::from_turns(vec![
+            scratch_edit_turn(),
+            AssistantTurn {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "c-finish".to_string(),
+                    name: FINISH_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
             },
-        }]);
+        ]);
         let _ = FinishTool;
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");

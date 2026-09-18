@@ -417,17 +417,37 @@ mod tests {
             rendered.to_lowercase().contains("no checks"),
             "no-check variant must announce that no checks are configured; got:\n{rendered}"
         );
-        // With no checks configured, there is no rejection to threaten, and
-        // no `run_checks` invocation to gate `done` on — those phrases must
-        // NOT appear in the no-check variant.
-        assert!(
-            !rendered.contains("REJECTED") && !rendered.contains("rejected"),
-            "no-check variant must not talk about rejection; got:\n{rendered}"
-        );
+        // Re-scoped to the claim this test was actually protecting: with no
+        // checks configured there is no `run_checks` invocation to gate
+        // `done` on, and no CHECKS-based rejection to threaten. The
+        // check-INDEPENDENT rejection (an unchanged working tree) DOES apply
+        // on this branch and is deliberately admitted here.
         assert!(
             !rendered.contains("run_checks"),
             "no-check variant must not reference the run_checks tool; got:\n{rendered}"
         );
+        assert!(
+            !rendered.contains("the checks pass"),
+            "no-check variant must not promise a checks-based rejection; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("working tree is unchanged"),
+            "no-check variant must still state the unchanged-tree rejection; got:\n{rendered}"
+        );
+    }
+
+    /// The `already_satisfied` off-ramp must be advertised on BOTH branches of
+    /// the check-command match — the guidance section sits outside it, and the
+    /// leg-3 precondition applies with and without configured checks.
+    #[test]
+    fn system_prompt_advertises_already_satisfied_on_both_check_branches() {
+        for check in [Some("cargo nextest run"), None] {
+            let rendered = render_system_prompt(&[], check);
+            assert!(
+                rendered.contains("already_satisfied"),
+                "already_satisfied must render for checks={check:?}; got:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -972,6 +992,8 @@ mod tests {
         let rendered = render_nudge_prompt();
         let expected = "The quality gates are currently green. \
             If the acceptance criteria are met, call `finish(done)` now. \
+            If nothing needed changing because the task was already complete, \
+            call `finish(already_satisfied)` with a `reason`. \
             If they are not yet met, reply with a one-sentence status: \
             what remains, and why you are still working.";
         assert_eq!(

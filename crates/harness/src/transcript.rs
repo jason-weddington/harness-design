@@ -35,7 +35,10 @@
 //!   `label` (the [`TranscriptConfig::label`] verbatim), `run_id` (the
 //!   persisted run id, or `null` for the no-persistence [`crate::engine::run`]
 //!   path), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
-//!   [`crate::engine::ResumeMode::FreshContext`]), `system` (the exact
+//!   [`crate::engine::ResumeMode::FreshContext`]), `tree_baseline` (the
+//!   serialized [`crate::exec::TreeObservation`] the leg-3 precondition
+//!   compares against, with `porcelain` capped for rendering and its
+//!   untruncated `porcelain_chars` count alongside), `system` (the exact
 //!   rendered system prompt), `tools` (the exact tool-schema array), `messages`
 //!   (the full starting [`crate::model::Message`] history — for `Crash` this
 //!   is the reconciled history, for `FreshContext` the fresh task seed), and
@@ -47,6 +50,7 @@
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
 //!    "transcript_version":1,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1","resume":false,
+//!    "tree_baseline":{"Observed":{"porcelain":"","porcelain_chars":0,"head":"abc123"}},
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":32768,"checks":"cargo test",
@@ -105,11 +109,14 @@
 //!   (always present — the offload path display string for calls routed
 //!   through [`crate::tool::ToolRegistry::invoke`], `null` for finish-routed
 //!   calls), `duration_ms`. ONLY for a call routed through the harness's
-//!   finish-acceptance path does it ALSO carry `finish_accepted` and
+//!   finish-acceptance path does it ALSO carry `finish_accepted`,
 //!   `finish_verification` (the [`crate::exec::CheckReport`], or `null` when
-//!   no checks ran) — both keys are absent on every other `tool_result`,
-//!   including a second `finish` in the same batch (which executes as a plain
-//!   tool call).
+//!   no checks ran), `finish_change` (the
+//!   [`crate::exec::ChangeEvidence`], or `null` when the call returned before
+//!   observing the tree) and `tree_current` (the
+//!   [`crate::exec::TreeObservation`] that evidence was classified from, or
+//!   `null`) — those keys are absent on every other `tool_result`, including a
+//!   second `finish` in the same batch (which executes as a plain tool call).
 //!
 //!   ```json
 //!   {"event":"tool_result","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
@@ -119,7 +126,8 @@
 //!    "iteration":2,"call_id":"c2","tool_name":"finish","is_error":true,
 //!    "content":"finish(done) rejected: verification failed","offload_path":null,
 //!    "duration_ms":12,"finish_accepted":false,
-//!    "finish_verification":{"passed":false,"excerpt":"FAIL_DETAIL","exit_code":3,"offload_path":null}}
+//!    "finish_verification":{"passed":false,"excerpt":"FAIL_DETAIL","exit_code":3,"offload_path":null},
+//!    "finish_change":null,"tree_current":null}
 //!   ```
 //!
 //! - **`harness_message`** — emitted for every finish-recovery nudge
@@ -167,7 +175,9 @@
 //!   `cache_read_tokens`, `cache_write_tokens`, `gates_green_at_exit`,
 //!   `nudges_fired`, `tree_dirty`, `iters_since_tree_change_at_exit`,
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
-//!   `edit_file_calls_ok`). `wall_clock` is intentionally omitted — the
+//!   `edit_file_calls_ok`, `no_change_rejections`,
+//!   `already_satisfied_check_rejections`, `tree_baseline_unobservable`).
+//!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
 //!   AFTER `run_loop_impl` (and therefore this event) returns.
 //!
@@ -177,14 +187,23 @@
 //!   ```json
 //!   {"event":"run_end","ts":"2026-09-15T02:00:10Z","elapsed_ms":10000,
 //!    "outcome":"Finished",
-//!    "disposition":{"Done":{"summary":"ok","verification":"NoChecksConfigured"}},
+//!    "disposition":{"Done":{"summary":"ok","verification":"NoChecksConfigured",
+//!                            "change":"TreeChanged"}},
 //!    "detail":null,
 //!    "stats":{"iterations":1,"input_tokens":0,"output_tokens":0,
 //!             "cache_read_tokens":0,"cache_write_tokens":0,"gates_green_at_exit":false,
 //!             "nudges_fired":0,"tree_dirty":false,"iters_since_tree_change_at_exit":0,
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
-//!             "edit_file_calls_ok":0}}
+//!             "edit_file_calls_ok":0,"no_change_rejections":0,
+//!             "already_satisfied_check_rejections":0,"tree_baseline_unobservable":false}}
 //!   ```
+//!
+//! - **`contract_violation`** — emitted from the same choke point as
+//!   `run_end`, and ONLY when the leg-3 invariant was broken: a
+//!   `Disposition::Done` reached the terminal carrying
+//!   [`crate::exec::ChangeEvidence::TreeUnchanged`]. Fields: `kind`
+//!   (`"done_with_unchanged_tree"` today), `run_id` (or `null`), `change`. A
+//!   correct run never emits it.
 //!
 //! ## Nested shapes (externally tagged serde)
 //!
@@ -193,9 +212,13 @@
 //!   `{"ToolCall":{"id":"..","name":"..","input":{}}}`.
 //! - `messages`: `{"User":{"content":[{"ToolResult":{"call_id":"..","content":"..","is_error":false}}]}}`
 //!   or `{"Assistant":{"content":[...]}}`.
-//! - `disposition`: `{"Done":{"summary":"..","verification":"NoChecksConfigured"}}`
-//!   or `{..,"Checks":{"passed":true,"excerpt":"..","exit_code":0,
-//!   "offload_path":null,"duration":{"secs":1,"nanos":0}}}`.
+//! - `disposition`: `{"Done":{"summary":"..","verification":"NoChecksConfigured",
+//!   "change":"TreeChanged"}}` or `{..,"Checks":{"passed":true,"excerpt":"..",
+//!   "exit_code":0,"offload_path":null,"duration":{"secs":1,"nanos":0}}}`;
+//!   `{"AlreadySatisfied":{"reason":"..","verification":"NoChecksConfigured",
+//!   "change":"TreeUnchanged"}}`.
+//! - `change`: `"TreeChanged"` / `"TreeUnchanged"` (unit variants) or
+//!   `{"Unobservable":{"reason":".."}}`.
 //!
 //! Object key order within a line is unspecified.
 //!

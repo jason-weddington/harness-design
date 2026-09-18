@@ -12,6 +12,12 @@
 //! "agent claims, harness verifies" mechanism enforced by the
 //! [`CriterionStatus::Verified`] variant requiring [`Evidence`].
 //!
+//! The completion contract has three legs: **the agent claimed**, **the checks
+//! verified** ([`Verification`]), and **work demonstrably happened**
+//! ([`ChangeEvidence`]). [`Disposition::Done`] carries both evidence types;
+//! [`Disposition::AlreadySatisfied`] is its peer for a task that turned out to
+//! need no change at all — same evidence discipline, never pushable.
+//!
 //! ## Determinism
 //!
 //! Maps use [`BTreeMap`], never [`std::collections::HashMap`]. Serialized JSON
@@ -22,7 +28,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::exec::CheckReport;
+use crate::exec::{ChangeEvidence, CheckReport};
 use crate::model::Message;
 
 /// Current run-record schema version. Bump deliberately when the on-disk
@@ -262,7 +268,9 @@ pub struct GateOutcome {
 // ===== Verification ====================================================
 
 /// The evidence attached to a [`Disposition::Done`] — the justification for
-/// accepting the agent's claim that the task is complete.
+/// accepting the agent's claim that the task is complete. Leg 2 of the
+/// completion contract (the agent claimed, **the checks verified**, and work
+/// demonstrably happened); leg 3 is [`ChangeEvidence`].
 ///
 /// The loop is the ONLY constructor of [`Disposition::Done`] and it only
 /// constructs it after a green harness-run verification (or explicitly records
@@ -286,17 +294,40 @@ pub enum Verification {
 
 /// Terminal status of a run. The discriminator is "does running the same
 /// thing again have any chance of working?" — `Blocked` no, `Failed` maybe,
-/// `Done` already worked.
+/// `Done` already worked, and `AlreadySatisfied` was never work in the first
+/// place.
 ///
 /// `Eq` is NOT derived because [`Verification::Checks`] wraps a
 /// [`CheckReport`] that is `PartialEq`-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Disposition {
     /// Gates green and every criterion `Verified`. Carries the outcome
-    /// summary and the verification evidence that justifies the claim.
+    /// summary, the verification evidence, and the leg-3
+    /// [`ChangeEvidence`] that justify the claim.
     Done {
         summary: String,
         verification: Verification,
+        /// Leg 3 of the completion contract: work demonstrably happened.
+        /// `#[serde(default)]` so records written before this field existed
+        /// still deserialize — the same additive-on-the-wire convention
+        /// [`BudgetLimits::wall_clock_secs`] uses, hence no `SCHEMA_VERSION`
+        /// bump and no migration.
+        #[serde(default)]
+        change: ChangeEvidence,
+    },
+    /// The task turned out to be **already satisfied**: the gates were green,
+    /// nothing needed changing, and the agent said so deliberately. Held to
+    /// the same evidence discipline as [`Disposition::Done`] — it carries both
+    /// the verification and the change evidence — but the run is **never**
+    /// pushable, because no work happened to push.
+    AlreadySatisfied {
+        /// What the agent checked and why the task was already complete.
+        reason: String,
+        verification: Verification,
+        /// The tree observation as observed. `AlreadySatisfied` imposes no
+        /// tree constraint, so a `TreeChanged` value here is recorded, not
+        /// rejected.
+        change: ChangeEvidence,
     },
     /// The spec or environment is the problem; retrying unchanged cannot
     /// help (ambiguous AC, missing access, out-of-scope ask).
@@ -345,8 +376,8 @@ pub struct DispositionReport {
 /// static-tree spin nudges exhausted, OR green gates + model stopped producing
 /// tool calls nudges exhausted) OR the wall-clock
 /// [`FailureMode::BudgetExhausted`]-on-timeout terminal — all build it from the
-/// same loop-locals. `None` on every other outcome: `Done`, `Blocked`,
-/// `BackendError`. A GREEN-static `MaxIterations` (gates green, tree static,
+/// same loop-locals. `None` on every other outcome: `Done`, `AlreadySatisfied`,
+/// `Blocked`, `BackendError`. A GREEN-static `MaxIterations` (gates green, tree static,
 /// model never called finish — and finish-recovery disabled via `max_nudges == 0`
 /// OR the `FinishDiscipline` terminal simply did not trip before the cap) also
 /// captures recovery facts, so the WIP the recovery feature exists to preserve
@@ -455,6 +486,7 @@ mod tests {
         GateResult, Phase, ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task,
         Verification,
     };
+    use crate::exec::ChangeEvidence;
     use crate::exec::{CheckCommand, ChecksRunner};
     use crate::model::{ContentBlock, Message, ToolCallRequest, UserBlock};
     use std::collections::BTreeMap;
@@ -674,6 +706,7 @@ mod tests {
         round_trip(&Disposition::Done {
             summary: "task complete".to_string(),
             verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::default(),
         });
 
         // Done — Checks (real CheckReport from a trivially-green runner)
@@ -689,6 +722,15 @@ mod tests {
         round_trip(&Disposition::Done {
             summary: "checks green".to_string(),
             verification: Verification::Checks(report),
+            change: ChangeEvidence::default(),
+        });
+
+        // AlreadySatisfied — a PEER of Done, held to the same evidence
+        // discipline (verification + change), never pushable.
+        round_trip(&Disposition::AlreadySatisfied {
+            reason: "the flag was already set".to_string(),
+            verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::TreeUnchanged,
         });
 
         round_trip(&Disposition::Blocked {
@@ -763,6 +805,7 @@ mod tests {
                 disposition: Disposition::Done {
                     summary: "task complete".to_string(),
                     verification: Verification::NoChecksConfigured,
+                    change: ChangeEvidence::default(),
                 },
             },
         ];
@@ -949,6 +992,22 @@ mod tests {
             ),
             "parsed Done should carry NoChecksConfigured; got {parsed:?}"
         );
+    }
+
+    /// `change` is additive on the wire: a record written before leg-3
+    /// existed still deserializes, landing on [`ChangeEvidence::default()`]
+    /// — the same `#[serde(default)]` convention `BudgetLimits::wall_clock_secs`
+    /// uses, hence no `SCHEMA_VERSION` bump and no migration.
+    #[test]
+    fn done_without_change_key_deserializes_to_default() {
+        let legacy = r#"{"Done":{"summary":"x","verification":"NoChecksConfigured"}}"#;
+        let parsed: Disposition = serde_json::from_str(legacy).expect("legacy Done deserializes");
+        match parsed {
+            Disposition::Done { change, .. } => {
+                assert_eq!(change, ChangeEvidence::default());
+            }
+            other => panic!("expected Done; got {other:?}"),
+        }
     }
 
     #[test]

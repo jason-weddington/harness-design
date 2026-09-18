@@ -481,6 +481,9 @@ fn outcome_one_liner(outcome: &LoopOutcome) -> String {
             verification: Verification::NoChecksConfigured,
             ..
         }) => "Done — NO CHECKS (unverified)".to_string(),
+        LoopOutcome::Finished(Disposition::AlreadySatisfied { reason, .. }) => {
+            format!("AlreadySatisfied — {reason}")
+        }
         LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
             format!("Blocked — {decision_needed}")
         }

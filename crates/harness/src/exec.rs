@@ -17,7 +17,7 @@
 //!
 //! Linux-only by design (tests use `/bin/sh`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -197,7 +197,7 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
 
 /// The last `cap` characters of `text` (the whole thing if it is shorter),
 /// counted by `char` so a multi-byte boundary is never split.
-fn tail(text: &str, cap: usize) -> String {
+pub(crate) fn tail(text: &str, cap: usize) -> String {
     let total = text.chars().count();
     if total <= cap {
         return text.to_string();
@@ -257,6 +257,192 @@ pub struct CheckReport {
     pub offload_path: Option<PathBuf>,
     /// Wall-clock time the checks took.
     pub duration: Duration,
+}
+
+/// Leg 3 of the completion contract: **the agent claimed**, **the checks
+/// verified**, and **work demonstrably happened**. This type carries the third
+/// leg — whether the workspace actually moved between the start of the run and
+/// the moment the claim was made.
+///
+/// `Unobservable` mirrors [`crate::run_record::Verification::NoChecksConfigured`]:
+/// the loop could not observe the workspace, so the claim was accepted on
+/// trust rather than on evidence.
+///
+/// Standing rule: **no code may synthesize leg-3 evidence it did not actually
+/// observe.** Any constructor that did not itself call [`observe_tree`] and
+/// [`classify_change`] MUST use `Unobservable { reason }` — an external-harness
+/// adapter that wrote `TreeChanged` would make the invariant false at exactly
+/// the surface that mirrors the production path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeEvidence {
+    /// The workspace is not in the state this run started from.
+    TreeChanged,
+    /// The workspace is byte-for-byte in the state this run started from.
+    TreeUnchanged,
+    /// The workspace could not be observed; the claim was accepted on trust.
+    Unobservable {
+        /// Why the observation could not be made.
+        reason: String,
+    },
+}
+
+impl Default for ChangeEvidence {
+    // Hand-written rather than `#[derive(Default)]` + `#[default]`: that
+    // attribute cannot sit on a variant with fields.
+    fn default() -> Self {
+        Self::Unobservable {
+            reason: "not recorded (record predates change evidence)".to_string(),
+        }
+    }
+}
+
+/// Wall-clock bound on a single [`observe_tree`] call from the engine's finish
+/// precondition. `ralph` passes its own, longer `GIT_TIMEOUT` instead.
+pub const TREE_OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on the `reason` text of [`TreeObservation::Unobservable`], in
+/// characters.
+const TREE_REASON_CAP: usize = 200;
+
+/// A single observation of a git work tree: what `git status --porcelain`
+/// reported, plus where `HEAD` pointed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeObservation {
+    /// The work tree was observed.
+    Observed {
+        /// `git status --porcelain` stdout, trimmed. Stored **verbatim and
+        /// uncapped** — comparison correctness beats memory; only the
+        /// transcript rendering is capped.
+        porcelain: String,
+        /// `git rev-parse HEAD`, trimmed, when it exited 0; `None` otherwise.
+        head: Option<String>,
+    },
+    /// The work tree could not be observed (not a work tree, `git` missing,
+    /// or the status call timed out).
+    Unobservable {
+        /// Why the observation failed, capped at 200 characters.
+        reason: String,
+    },
+}
+
+/// Observe the git work tree rooted at `root`, bounded by `timeout`.
+///
+/// The result is `Unobservable` **iff** the `git status --porcelain`
+/// invocation did not exit 0 (non-zero, spawn failure, or timeout).
+///
+/// `head` is `None` for **both** an unborn `HEAD` and a failed or timed-out
+/// `git rev-parse HEAD` — deliberately indistinguishable, because the
+/// resulting `None` ↔ `Some` transition reads as
+/// [`ChangeEvidence::TreeChanged`] in [`classify_change`] and therefore fails
+/// **open** rather than producing a spurious rejection.
+///
+/// `timeout` is a parameter rather than a read of [`TREE_OBSERVE_TIMEOUT`] so
+/// `ralph` can keep its own, longer git bound while sharing this primitive.
+/// Build the [`TreeObservation::Unobservable`] reason for a failed
+/// `git status --porcelain`, truncated to [`TREE_REASON_CAP`] characters.
+///
+/// Pure and separated from [`observe_tree`] deliberately: driving the
+/// timed-out branch through a real `git` invocation is a race —
+/// `tokio::time::timeout` polls the inner future before checking the
+/// deadline, so even a zero duration returns the completed child whenever
+/// the process happens to be ready on the first poll. Testing the formatting
+/// against a synthetic [`ExecOutcome`] covers both branches deterministically.
+fn unobservable_reason(status: &ExecOutcome, timeout: Duration) -> String {
+    let reason = if status.timed_out {
+        format!(
+            "git status --porcelain timed out after {}s",
+            timeout.as_secs()
+        )
+    } else {
+        format!(
+            "git status --porcelain exited {:?}: {}",
+            status.exit_code,
+            status.stderr.trim()
+        )
+    };
+    reason.chars().take(TREE_REASON_CAP).collect()
+}
+
+pub async fn observe_tree(root: &Path, timeout: Duration) -> TreeObservation {
+    let status = run(&ExecSpec {
+        program: "git".to_string(),
+        args: vec!["status".to_string(), "--porcelain".to_string()],
+        cwd: root.to_path_buf(),
+        timeout,
+        extra_env: Vec::new(),
+    })
+    .await;
+
+    if status.exit_code != Some(0) {
+        return TreeObservation::Unobservable {
+            reason: unobservable_reason(&status, timeout),
+        };
+    }
+
+    let head_outcome = run(&ExecSpec {
+        program: "git".to_string(),
+        args: vec!["rev-parse".to_string(), "HEAD".to_string()],
+        cwd: root.to_path_buf(),
+        timeout,
+        extra_env: Vec::new(),
+    })
+    .await;
+    let head = if head_outcome.exit_code == Some(0) {
+        Some(head_outcome.stdout.trim().to_string())
+    } else {
+        None
+    };
+
+    TreeObservation::Observed {
+        porcelain: status.stdout.trim().to_string(),
+        head,
+    }
+}
+
+/// Classify a pair of observations into [`ChangeEvidence`]: *the workspace is
+/// not in the state this run started from*.
+///
+/// The comparison is **baseline-relative**, never a bare `current`-dirtiness
+/// test. A pre-existing dirty entry (e.g. the untracked
+/// `<run-id>-attachments/` directory the dispatch worker stages inside the
+/// clone root before launching the agent) appears in **both** observations and
+/// cancels; any agent edit changes the text.
+///
+/// Either side being `Unobservable` fails **open** — the loop could not
+/// establish what the run started from or ended at, so the claim is accepted
+/// on trust.
+///
+/// Two accepted holes: a workspace mutated by something other than the agent
+/// between the two observations reads as changed, and an agent that edits a
+/// file and reverts it byte-for-byte reads as unchanged.
+///
+/// This is **not** [`crate::engine::RunStats::tree_dirty`], which a single
+/// read-only `bash` call latches and which any agent could therefore defeat.
+#[must_use]
+pub fn classify_change(baseline: &TreeObservation, current: &TreeObservation) -> ChangeEvidence {
+    match (baseline, current) {
+        // Fail open, preferring `current`'s reason when both are unobservable.
+        (_, TreeObservation::Unobservable { reason })
+        | (TreeObservation::Unobservable { reason }, _) => ChangeEvidence::Unobservable {
+            reason: reason.clone(),
+        },
+        (
+            TreeObservation::Observed {
+                porcelain: base_porcelain,
+                head: base_head,
+            },
+            TreeObservation::Observed {
+                porcelain: cur_porcelain,
+                head: cur_head,
+            },
+        ) => {
+            if base_porcelain == cur_porcelain && base_head == cur_head {
+                ChangeEvidence::TreeUnchanged
+            } else {
+                ChangeEvidence::TreeChanged
+            }
+        }
+    }
 }
 
 /// Runs a [`CheckCommand`] in the workspace and produces a [`CheckReport`].
@@ -361,8 +547,9 @@ pub fn shell_checks_runner(
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckCommand, CheckReport, ChecksRunner, ExecSpec, format_duration, run,
-        shell_checks_runner, tail,
+        ChangeEvidence, CheckCommand, CheckReport, ChecksRunner, ExecOutcome, ExecSpec,
+        TreeObservation, classify_change, format_duration, observe_tree, run, shell_checks_runner,
+        tail,
     };
     use crate::tool::ToolCtx;
     use crate::workspace::{DiskOffloadSink, Workspace};
@@ -704,5 +891,175 @@ mod tests {
             vec!["-c".to_string(), "a && b".to_string()]
         );
         assert_eq!(runner.command_display(), "/bin/sh -c a && b");
+    }
+
+    /// Run `git` with `args` in `dir`, asserting it succeeded.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn observe_tree_non_work_tree_is_unobservable() {
+        let dir = tempdir().expect("tempdir");
+        let obs = observe_tree(dir.path(), Duration::from_secs(30)).await;
+        match obs {
+            TreeObservation::Unobservable { reason } => {
+                assert!(reason.contains("git status"), "reason was {reason}");
+                assert!(reason.contains("exited"), "reason was {reason}");
+            }
+            other @ TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_tree_untracked_file_is_observed_dirty() {
+        let dir = tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "hi").expect("write");
+        match observe_tree(dir.path(), Duration::from_secs(30)).await {
+            TreeObservation::Observed { porcelain, .. } => {
+                assert!(!porcelain.is_empty(), "porcelain was empty");
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_tree_clean_committed_tree_has_head_and_empty_porcelain() {
+        let dir = tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "hi").expect("write");
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "init"]);
+        match observe_tree(dir.path(), Duration::from_secs(30)).await {
+            TreeObservation::Observed { porcelain, head } => {
+                assert!(porcelain.is_empty(), "porcelain was {porcelain:?}");
+                assert!(head.is_some(), "head was None");
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+    }
+
+    /// Drives the timed-out reason branch against a synthetic
+    /// [`ExecOutcome`] rather than a real `git` invocation. The previous
+    /// version of this test passed `Duration::from_millis(0)` to
+    /// `observe_tree` and asserted the timeout fired; that is a race —
+    /// `tokio::time::timeout` polls the inner future before checking the
+    /// deadline, so a `git status` that is ready on the first poll returns
+    /// `Observed` and the test fails intermittently. It failed a pre-commit
+    /// run on 2026-09-18 having passed the identical suite moments earlier.
+    #[test]
+    fn unobservable_reason_timed_out_branch_says_timed_out() {
+        let reason = super::unobservable_reason(
+            &ExecOutcome {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration: Duration::from_secs(30),
+                timed_out: true,
+            },
+            Duration::from_secs(30),
+        );
+        assert!(reason.contains("timed out"), "reason was {reason}");
+        assert!(reason.contains("git status"), "reason was {reason}");
+        assert!(reason.contains("30s"), "reason was {reason}");
+    }
+
+    fn observed(porcelain: &str, head: Option<&str>) -> TreeObservation {
+        TreeObservation::Observed {
+            porcelain: porcelain.to_string(),
+            head: head.map(ToString::to_string),
+        }
+    }
+
+    fn unobservable(reason: &str) -> TreeObservation {
+        TreeObservation::Unobservable {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_change_current_unobservable_fails_open_with_current_reason() {
+        let evidence = classify_change(&observed("", Some("a")), &unobservable("cur"));
+        assert_eq!(
+            evidence,
+            ChangeEvidence::Unobservable {
+                reason: "cur".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_change_baseline_unobservable_fails_open_not_changed() {
+        let evidence = classify_change(&unobservable("base"), &observed("?? x", Some("a")));
+        assert_eq!(
+            evidence,
+            ChangeEvidence::Unobservable {
+                reason: "base".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_change_both_unobservable_prefers_current_reason() {
+        let evidence = classify_change(&unobservable("base"), &unobservable("cur"));
+        assert_eq!(
+            evidence,
+            ChangeEvidence::Unobservable {
+                reason: "cur".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_change_identical_dirty_observations_are_unchanged() {
+        let evidence = classify_change(
+            &observed("?? run-1-attachments/", Some("a")),
+            &observed("?? run-1-attachments/", Some("a")),
+        );
+        assert_eq!(evidence, ChangeEvidence::TreeUnchanged);
+    }
+
+    #[test]
+    fn classify_change_differing_porcelain_is_changed() {
+        let evidence = classify_change(&observed("", Some("a")), &observed("?? x", Some("a")));
+        assert_eq!(evidence, ChangeEvidence::TreeChanged);
+    }
+
+    #[test]
+    fn classify_change_differing_head_is_changed() {
+        assert_eq!(
+            classify_change(&observed("", Some("a")), &observed("", Some("b"))),
+            ChangeEvidence::TreeChanged
+        );
+        assert_eq!(
+            classify_change(&observed("", None), &observed("", Some("b"))),
+            ChangeEvidence::TreeChanged
+        );
+    }
+
+    #[test]
+    fn change_evidence_default_is_unobservable() {
+        match ChangeEvidence::default() {
+            ChangeEvidence::Unobservable { reason } => {
+                assert!(reason.contains("predates"), "reason was {reason}");
+            }
+            other => panic!("expected Unobservable, got {other:?}"),
+        }
     }
 }

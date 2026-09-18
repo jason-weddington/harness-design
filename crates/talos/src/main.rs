@@ -8,6 +8,7 @@
 //! | 0    | Task verified Done |
 //! | 10   | Task Blocked |
 //! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` |
+//! | 30   | Task was already satisfied — gates green, nothing changed; NOT pushable |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
 //!
 //! The code is read from [`harness::engine::LoopOutcome`], **not** from the
@@ -430,10 +431,16 @@ impl ModelBackend for Backend {
 /// | `StoppedWithoutFinish` | 20 |
 /// | `MaxIterations` | 20 |
 /// | `BudgetExhausted` | 20 |
+/// | `Finished(AlreadySatisfied{..})` | 30 |
 /// | `BackendError(_)` | 1 |
+///
+/// 30 exists as its own code because at 20 the dispatch worker cannot tell an
+/// already-satisfied run from a real failure, and at 0 it would be pushed as
+/// a Done — and an already-satisfied run has nothing to push.
 fn exit_code(outcome: &LoopOutcome) -> i32 {
     match outcome {
         LoopOutcome::Finished(Disposition::Done { .. }) => 0,
+        LoopOutcome::Finished(Disposition::AlreadySatisfied { .. }) => 30,
         LoopOutcome::Finished(Disposition::Blocked { .. }) => 10,
         LoopOutcome::Finished(Disposition::Failed { .. })
         | LoopOutcome::StoppedWithoutFinish
@@ -1446,6 +1453,7 @@ mod tests {
         resolve_transcript_path, touch_dir_mtime, transcript_label, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
+    use harness::exec::ChangeEvidence;
     use harness::model::{BackendError, TerminalKind, TransientKind};
     use harness::prompt::render_task_prompt_from_spec;
     use harness::ralph::RalphTerminal;
@@ -1461,8 +1469,43 @@ mod tests {
         let outcome = LoopOutcome::Finished(Disposition::Done {
             summary: "ok".into(),
             verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::default(),
         });
         assert_eq!(exit_code(&outcome), 0);
+    }
+
+    #[test]
+    fn exit_code_already_satisfied_is_30() {
+        let outcome = LoopOutcome::Finished(Disposition::AlreadySatisfied {
+            reason: "nothing needed changing".into(),
+            verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::TreeUnchanged,
+        });
+        assert_eq!(
+            exit_code(&outcome),
+            30,
+            "an already-satisfied run is neither a Done to push (0) nor a failure (20)"
+        );
+    }
+
+    /// `RunSummary` embeds the `Disposition` and derives `Serialize`, so the
+    /// new variant and its leg-3 evidence reach stdout with no new field.
+    #[test]
+    fn run_summary_serializes_already_satisfied_with_its_change_evidence() {
+        let summary = build_run_summary(
+            "Finished",
+            Disposition::AlreadySatisfied {
+                reason: "already complete".into(),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            },
+            "t:1".to_string(),
+            "/tmp/run.sqlite".to_string(),
+            1,
+        );
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains("AlreadySatisfied"), "got {json}");
+        assert!(json.contains("TreeUnchanged"), "got {json}");
     }
 
     #[test]
@@ -1520,6 +1563,7 @@ mod tests {
             outcome_str(&LoopOutcome::Finished(Disposition::Done {
                 summary: String::new(),
                 verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::default(),
             })),
             "Finished"
         );
@@ -1910,6 +1954,7 @@ mod tests {
                 LoopOutcome::Finished(Disposition::Done {
                     summary: String::new(),
                     verification: Verification::NoChecksConfigured,
+                    change: ChangeEvidence::default(),
                 }),
             ),
             ("StoppedWithoutFinish", LoopOutcome::StoppedWithoutFinish),
@@ -1942,6 +1987,7 @@ mod tests {
             Disposition::Done {
                 summary: "all green".into(),
                 verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::default(),
             },
             "task:1".into(),
             "/state/run.sqlite".into(),
