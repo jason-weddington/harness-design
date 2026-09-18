@@ -44,7 +44,7 @@ cargo test --doc --workspace       # doctests (nextest skips these)
 - `OLLAMA_MODEL` — required for ollama.
 - `OLLAMA_BASE_URL` — optional; default `http://localhost:11434`.
 - `OLLAMA_API_KEY` — optional bearer token.
-- `OLLAMA_NUM_CTX` — optional `u32`; defaults to 32 768 for localhost.
+- `OLLAMA_NUM_CTX` — optional. A non-empty `u32` is used verbatim and NO probe is made; empty/whitespace is treated as unset. When unset and `OLLAMA_BASE_URL` is a localhost/`127.0.0.1` URL, talos probes the daemon's `POST /api/show` and pins the model's own advertised context length — a probe failure exits `1` with a JSON error on stderr rather than falling back to a constant. When unset and the base URL is non-localhost (Ollama Cloud, a LAN host), no `num_ctx` is set (Ollama's own default applies), so set this variable explicitly for those topologies.
 - `OLLAMA_THINK` — `off|on|low|medium|high|max`.
 - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based retention talos applies to its own XDG state dir (`run.sqlite`, `offload/`, transcripts) on every `talos run` start; precedence is `--state-retention-days` flag > this env var > the compiled default of `30`, `0` disables pruning entirely, the env fallback does NOT survive dispatch's sudo boundary (only `TALOS_BACKEND` is kept), and the result is recorded per host in `<state-root>/talos/prune-last.json`.
 - `--transcript` — opt-in JSONL run transcript, off by default; a bare `--transcript` defaults to `transcript.jsonl` in the run's state dir next to `run.sqlite`, while `--transcript <path>` uses that path verbatim (no env fallback — see `RunArgs::transcript` in `crates/talos/src/main.rs`).

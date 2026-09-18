@@ -153,6 +153,10 @@ async fn backend_error_via_refused_port_writes_store_record() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
+        // port must fail the FIRST TURN (BackendError at run time), not
+        // backend construction (which would exit 1 before any artifacts).
+        .env("OLLAMA_NUM_CTX", "32768")
         // Isolate this run's implicit prune pass from the real
         // `$HOME/.local/state/talos` — without this, an unmodified nextest
         // run would point `remove_dir_all` at the developer's or the
@@ -263,7 +267,7 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("TALOS_BEDROCK")
         // Isolate the implicit prune pass from the real state root — see the
         // comment in `backend_error_via_refused_port_writes_store_record`.
@@ -305,8 +309,8 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
     // Line 1: run_start.
     assert_eq!(lines[0]["event"], "run_start");
     assert_eq!(
-        lines[0]["label"], "ollama:x think=unset num_ctx=unset",
-        "OLLAMA_THINK/OLLAMA_NUM_CTX are unset in the child env"
+        lines[0]["label"], "ollama:x think=unset num_ctx=32768",
+        "OLLAMA_THINK unset; OLLAMA_NUM_CTX pinned to keep the probe off"
     );
     assert_eq!(
         lines[0]["run_id"],
@@ -394,7 +398,7 @@ async fn no_transcript_flag_writes_no_jsonl_and_is_silent() {
         .env("OLLAMA_MODEL", "x")
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("TALOS_BEDROCK")
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", dir.path())
@@ -465,7 +469,7 @@ async fn bare_transcript_flag_defaults_into_state_dir() {
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("TALOS_BEDROCK")
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", dir.path())
@@ -557,7 +561,7 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("TALOS_BEDROCK")
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", dir.path())
@@ -732,6 +736,10 @@ fn valid_spec_via_file_input_backend_error_via_refused_port() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
+        // port must fail the FIRST TURN (BackendError at run time), not
+        // backend construction (which would exit 1 before any artifacts).
+        .env("OLLAMA_NUM_CTX", "32768")
         // Isolate the implicit prune pass from the real state root — see the
         // comment in `backend_error_via_refused_port_writes_store_record`.
         .env("XDG_STATE_HOME", dir.path().join("state-home"))
@@ -1038,6 +1046,10 @@ fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
+        // port must fail the FIRST TURN (BackendError at run time), not
+        // backend construction (which would exit 1 before any artifacts).
+        .env("OLLAMA_NUM_CTX", "32768")
         // `ralph` self-touches its own `talos-ralph` state dir (AC-19); point
         // it at an isolated state root rather than the real
         // `$HOME/.local/state/talos`.
@@ -1187,7 +1199,7 @@ fn spawn_prune_run(
     // Port 1 on loopback is reserved; connections are always refused.
     .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
     .env_remove("OLLAMA_THINK")
-    .env_remove("OLLAMA_NUM_CTX")
+    .env("OLLAMA_NUM_CTX", "32768")
     .env_remove("TALOS_BEDROCK")
     .env("XDG_STATE_HOME", &fx.state_home)
     .env("HOME", &fx.home)
@@ -1706,7 +1718,7 @@ async fn answer_mode_end_to_end_wires_the_read_only_run() {
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("TALOS_BEDROCK")
         .env("XDG_STATE_HOME", dir.path().join("state-home"))
         .env("HOME", dir.path())

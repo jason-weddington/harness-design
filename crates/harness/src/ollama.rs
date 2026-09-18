@@ -10,15 +10,18 @@
 //! response, and translates Ollama's native chat shape into the normalized
 //! types in [`crate::model`]. Streaming/SSE, structured outputs (`format`),
 //! the OpenAI-compat `/v1` path, and capability discovery via `/api/tags` and
-//! `/api/ps` are out of scope here. Context-length resolution via
-//! `POST /api/show` (`resolve_context_length`) IS in scope: it lets eval
-//! runners probe a model's advertised context window before constructing a
-//! backend, so the window is set from the model's own metadata rather than a
-//! hardcoded fallback.
+//! `/api/ps` are out of scope here. Context-length resolution IS in scope:
+//! the shared [`resolve_num_ctx`] (built on the `POST /api/show` probe
+//! [`resolve_context_length`]) is used by talos (`crates/talos/src/main.rs`)
+//! AND both eval runners (`examples/coding_eval.rs`,
+//! `examples/mined_eval.rs`) — one implementation, so the `num_ctx`
+//! precedence cannot drift between the shipped lane and the measured lane,
+//! and a local model's window is set from the model's own advertised
+//! `{arch}.context_length` rather than a hardcoded fallback.
 //!
 //! Note: a non-localhost, non-cloud Ollama daemon (e.g. `http://jason-desktop:11434`,
-//! a LAN address) is neither matched by `is_local` nor probed by the eval
-//! runners — it receives no `num_ctx` and therefore inherits Ollama's own low
+//! a LAN address) is not matched by [`is_local_ollama_url`] and is therefore
+//! never probed — it receives no `num_ctx` and inherits Ollama's own low
 //! default (documented as 2048 with silent oldest-message dropping). Setting
 //! `OLLAMA_NUM_CTX` is the operator's remedy for that topology.
 //!
@@ -418,6 +421,166 @@ pub async fn resolve_context_length(
         architecture: arch.to_string(),
         key: ctx_key,
     })
+}
+
+/// Audit floor for a resolved `num_ctx`. This is **not** a default or
+/// fallback — [`resolve_num_ctx`] never assigns it as the value. It is used
+/// only to flag a probe result that sits below it (a `warning` line and the
+/// `BELOW-FLOOR` provenance variant in the `desc`); the run still proceeds
+/// with the verbatim advertised value.
+pub const MIN_EXPECTED_NUM_CTX: u32 = 32_768;
+
+/// Whether `base_url` names a local Ollama daemon — the URL contains
+/// `localhost` or `127.0.0.1`. The single gate used by [`resolve_num_ctx`]
+/// to decide whether the `POST /api/show` probe fires; non-local URLs
+/// (cloud, LAN hostnames) get no `num_ctx` and inherit Ollama's own
+/// default.
+pub fn is_local_ollama_url(base_url: &str) -> bool {
+    base_url.contains("localhost") || base_url.contains("127.0.0.1")
+}
+
+/// How a [`NumCtxResolution`] was produced — the provenance of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumCtxSource {
+    /// `OLLAMA_NUM_CTX` was set to a non-empty value that parses as `u32` —
+    /// used verbatim, no HTTP request.
+    Explicit,
+    /// The value came from a `POST /api/show` probe of a local daemon.
+    Probe,
+    /// No env value and a non-local base URL — the backend gets no `num_ctx`
+    /// (Ollama's own default applies), no HTTP request.
+    Default,
+}
+
+impl NumCtxSource {
+    /// The stable string form used in structured stderr / run records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Probe => "probe",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// The outcome of [`resolve_num_ctx`]: the value to pin (if any), its
+/// provenance, a provenance description for run headers / records, and an
+/// optional warning line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumCtxResolution {
+    /// The `num_ctx` to pin via [`OllamaBackend::with_num_ctx`], or `None`
+    /// (leave `num_ctx` unset — Ollama's own default applies).
+    pub value: Option<u32>,
+    /// How `value` was obtained.
+    pub source: NumCtxSource,
+    /// Human-readable provenance, e.g.
+    /// `num_ctx=262144 (resolved: arch=qwen35moe key=qwen35moe.context_length)`.
+    pub desc: String,
+    /// A pre-formatted warning line (below-floor probe result). The library
+    /// only RETURNS this string — printing is the caller's job.
+    pub warning: Option<String>,
+}
+
+/// Resolve the `num_ctx` to pin for an Ollama backend — the SINGLE
+/// implementation of the `OLLAMA_NUM_CTX` precedence shared by talos and
+/// both eval runners (one function, so the shipped lane and the measured
+/// lane cannot drift).
+///
+/// Five branches, in exactly this order:
+/// 0. `raw_env` is `Some(s)` and `s.trim()` is empty → treated as UNSET
+///    (falls through to 3/4/5).
+/// 1. `raw_env` is `Some(s)`, `s.trim()` non-empty, parses as `u32` →
+///    [`NumCtxSource::Explicit`]; NO HTTP request is made.
+/// 2. `raw_env` is `Some(s)`, `s.trim()` non-empty, does NOT parse as `u32`
+///    → `Err` naming `OLLAMA_NUM_CTX` and the untrimmed raw string; NO HTTP
+///    request is made.
+/// 3. unset/empty AND [`is_local_ollama_url`] → probe via
+///    [`resolve_context_length`]; on `Ok` with a value at or above
+///    [`MIN_EXPECTED_NUM_CTX`] → [`NumCtxSource::Probe`], no warning.
+/// 4. same as 3 but the value is below the floor →
+///    [`NumCtxSource::Probe`] with a `warning` (BELOW-FLOOR); the run still
+///    proceeds with the verbatim advertised value.
+/// 5. unset/empty AND NOT local → [`NumCtxSource::Default`], `value: None`,
+///    NO HTTP request is made.
+///
+/// # Errors
+///
+/// Branch 2 always fails. In branches 3/4 a probe failure is propagated
+/// verbatim as `resolve_context_length`'s error string (which names both
+/// the model id and the `{base_url}/api/show` url) — NEVER a constant, a
+/// default, or `None`.
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let r = harness::ollama::resolve_num_ctx(
+///     "http://localhost:11434",
+///     "qwen3.6:35b",
+///     None,
+///     None,
+/// ).await?;
+/// println!("{} (source={})", r.desc, r.source.as_str());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn resolve_num_ctx(
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    raw_env: Option<&str>,
+) -> Result<NumCtxResolution, String> {
+    // Branches 0/1/2: an env value, when present and non-blank after trim,
+    // is decisive — a parse error fails loudly BEFORE any HTTP request.
+    // An empty/whitespace-only value (branch 0) falls through as UNSET.
+    if let Some(s) = raw_env
+        && !s.trim().is_empty()
+    {
+        return match s.parse::<u32>() {
+            Ok(n) => Ok(NumCtxResolution {
+                value: Some(n),
+                source: NumCtxSource::Explicit,
+                desc: format!("num_ctx={n} (explicit OLLAMA_NUM_CTX)"),
+                warning: None,
+            }),
+            Err(_) => Err(format!("OLLAMA_NUM_CTX must be a valid u32, got `{s}`")),
+        };
+    }
+
+    // Branches 3/4: local daemon → probe; fail-loud, never a fallback.
+    if is_local_ollama_url(base_url) {
+        let resolved = resolve_context_length(base_url, model, api_key)
+            .await
+            .map_err(|e| e.to_string())?;
+        let v = resolved.value;
+        let a = resolved.architecture;
+        let k = resolved.key;
+        if v >= MIN_EXPECTED_NUM_CTX {
+            Ok(NumCtxResolution {
+                value: Some(v),
+                source: NumCtxSource::Probe,
+                desc: format!("num_ctx={v} (resolved: arch={a} key={k})"),
+                warning: None,
+            })
+        } else {
+            Ok(NumCtxResolution {
+                value: Some(v),
+                source: NumCtxSource::Probe,
+                desc: format!("num_ctx={v} (resolved, BELOW-FLOOR: arch={a} key={k})"),
+                warning: Some(format!(
+                    "WARNING: resolved num_ctx={v} for `{model}` (arch={a}, key={k}) is \
+                     BELOW the {MIN_EXPECTED_NUM_CTX} sanity floor; the run may be \
+                     truncation-invalid — set OLLAMA_NUM_CTX to override"
+                )),
+            })
+        }
+    } else {
+        // Branch 5: non-local, no env value → no `num_ctx`, no HTTP request.
+        Ok(NumCtxResolution {
+            value: None,
+            source: NumCtxSource::Default,
+            desc: "num_ctx=default".to_string(),
+            warning: None,
+        })
+    }
 }
 
 // ============================================================================
@@ -1729,7 +1892,10 @@ mod tests {
 
     // ---- (h) context-length resolution ------------------------------------
 
-    use super::{ContextLengthErrorKind, resolve_context_length};
+    use super::{
+        ContextLengthErrorKind, MIN_EXPECTED_NUM_CTX, NumCtxResolution, NumCtxSource,
+        is_local_ollama_url, resolve_context_length, resolve_num_ctx,
+    };
 
     /// Mount a successful `/api/show` response with the given `model_info` payload.
     async fn mount_show(server: &MockServer, model_info: Value) {
@@ -2151,5 +2317,146 @@ mod tests {
         assert_eq!(r.value, 8192);
         assert_eq!(r.architecture, "qwen3");
         assert_eq!(r.key, "qwen3.context_length");
+    }
+
+    // ---- resolve_num_ctx: the shared five-branch precedence --------------
+
+    // (0) set-but-empty / whitespace-only is UNSET, not a parse error.
+    #[tokio::test]
+    async fn num_ctx_empty_env_is_unset_not_parse_error() {
+        for raw in ["", "   "] {
+            let r = resolve_num_ctx("https://ollama.com", "m", None, Some(raw))
+                .await
+                .expect("empty env value must fall through, not Err");
+            assert_eq!(r.value, None);
+            assert_eq!(r.source, NumCtxSource::Default);
+            assert_eq!(r.desc, "num_ctx=default");
+            assert!(r.warning.is_none());
+        }
+    }
+
+    // (1) explicit valid u32 is used verbatim. No mock is mounted: an
+    // accidental probe would 404 and yield Err, so Ok proves no probe fired.
+    #[tokio::test]
+    async fn num_ctx_explicit_value_is_used_without_probe() {
+        let server = MockServer::start().await;
+        let r = resolve_num_ctx(&server.uri(), "m", None, Some("65536"))
+            .await
+            .expect("explicit value must succeed without a probe");
+        assert_eq!(r.value, Some(65_536));
+        assert_eq!(r.source, NumCtxSource::Explicit);
+        assert_eq!(r.desc, "num_ctx=65536 (explicit OLLAMA_NUM_CTX)");
+        assert!(r.warning.is_none());
+    }
+
+    // (2) non-u32 env value is a parse error naming the UNTRIMMED string.
+    #[tokio::test]
+    async fn num_ctx_bad_env_is_parse_error_with_untrimmed_raw() {
+        for raw in ["not-a-number", " 12x "] {
+            let err = resolve_num_ctx("https://ollama.com", "m", None, Some(raw))
+                .await
+                .expect_err("non-u32 env value must be Err");
+            assert!(
+                err.contains(raw),
+                "error must name the raw string `{raw}`: {err}"
+            );
+            assert!(
+                err.contains("OLLAMA_NUM_CTX"),
+                "error must name the var: {err}"
+            );
+        }
+    }
+
+    // (3) unset + local + probe >= floor -> Probe, no warning.
+    #[tokio::test]
+    async fn num_ctx_local_probe_above_floor_is_probe() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({"general.architecture": "qwen35moe", "qwen35moe.context_length": 262_144_u32}),
+        )
+        .await;
+        let r = resolve_num_ctx(&server.uri(), "qwen3.6:35b", None, None)
+            .await
+            .expect("probe must resolve");
+        assert_eq!(r.value, Some(262_144));
+        assert_eq!(r.source, NumCtxSource::Probe);
+        assert!(r.desc.contains("resolved: arch="), "desc: {}", r.desc);
+        assert!(r.desc.contains("key="), "desc: {}", r.desc);
+        assert!(r.warning.is_none());
+    }
+
+    // (4) unset + local + probe < floor -> Probe + warning.
+    #[tokio::test]
+    async fn num_ctx_local_probe_below_floor_warns() {
+        let server = MockServer::start().await;
+        mount_show(
+            &server,
+            json!({"general.architecture": "qwen3", "qwen3.context_length": 8_192_u32}),
+        )
+        .await;
+        let r = resolve_num_ctx(&server.uri(), "qwen3:1b", None, None)
+            .await
+            .expect("below floor is data, not a failure");
+        assert_eq!(r.value, Some(8_192));
+        assert_eq!(r.source, NumCtxSource::Probe);
+        assert!(r.desc.contains("BELOW-FLOOR"), "desc: {}", r.desc);
+        let w = r.warning.expect("below-floor must carry a warning");
+        assert!(
+            w.contains(&format!("BELOW the {MIN_EXPECTED_NUM_CTX} sanity floor")),
+            "warning: {w}"
+        );
+        assert!(w.contains("set OLLAMA_NUM_CTX to override"), "warning: {w}");
+    }
+
+    // (5) unset + non-local -> Default, no probe, no HTTP.
+    #[tokio::test]
+    async fn num_ctx_non_local_unset_is_default() {
+        let r = resolve_num_ctx("https://ollama.com", "m", None, None)
+            .await
+            .expect("non-local unset must succeed");
+        assert_eq!(r.value, None);
+        assert_eq!(r.source, NumCtxSource::Default);
+        assert_eq!(r.desc, "num_ctx=default");
+        assert!(r.warning.is_none());
+    }
+
+    // err: probe failure propagates as Err naming BOTH the model and the url.
+    #[tokio::test]
+    async fn num_ctx_probe_failure_is_err_naming_model_and_url() {
+        let server = MockServer::start().await;
+        mount_show_error(&server, 404, "{}").await;
+        let err = resolve_num_ctx(&server.uri(), "m", None, None)
+            .await
+            .expect_err("probe failure must be Err, never a fallback");
+        assert!(err.contains('m'), "must name the model: {err}");
+        assert!(
+            err.contains(&server.uri()),
+            "must name the server uri: {err}"
+        );
+    }
+
+    // is_local_ollama_url: the single probe gate.
+    #[test]
+    fn is_local_ollama_url_gate() {
+        assert!(is_local_ollama_url("http://localhost:11434"));
+        assert!(is_local_ollama_url("http://127.0.0.1:11434"));
+        assert!(!is_local_ollama_url("https://ollama.com"));
+        assert!(!is_local_ollama_url("http://jason-desktop:11434"));
+    }
+
+    // NumCtxSource::as_str: the stable string mapping.
+    #[test]
+    fn num_ctx_source_as_str_mapping() {
+        assert_eq!(NumCtxSource::Explicit.as_str(), "explicit");
+        assert_eq!(NumCtxSource::Probe.as_str(), "probe");
+        assert_eq!(NumCtxSource::Default.as_str(), "default");
+        let r = NumCtxResolution {
+            value: Some(1),
+            source: NumCtxSource::Default,
+            desc: "num_ctx=default".to_string(),
+            warning: None,
+        };
+        assert_eq!(r.source.as_str(), "default");
     }
 }
