@@ -41,7 +41,7 @@ pub fn standard_registry(checks: Option<ChecksRunner>) -> ToolRegistry {
     registry.register("list_files", Arc::new(ListFilesTool));
     registry.register("edit_file", Arc::new(EditFileTool));
     registry.register("bash", Arc::new(BashTool));
-    registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+    registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
     if let Some(runner) = checks {
         registry.register("run_checks", Arc::new(RunChecksTool::new(runner)));
     }

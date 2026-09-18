@@ -43,8 +43,10 @@
 //!   (the full starting [`crate::model::Message`] history — for `Crash` this
 //!   is the reconciled history, for `FreshContext` the fresh task seed), and
 //!   `config` (an object with exactly `max_iterations`, `max_tokens`, `checks`
-//!   — the check command display string, or `null` — `wall_clock_secs`,
-//!   `static_tree_k`, `max_nudges`, `max_retries`).
+//!   — the check command display string, or `null` — `answer_schema` (the
+//!   compiled answer-mode result schema VERBATIM, so a reader can re-verify
+//!   any `finish(answer)` verdict off the record; `null` in build mode),
+//!   `wall_clock_secs`, `static_tree_k`, `max_nudges`, `max_retries`).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
@@ -54,6 +56,7 @@
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":32768,"checks":"cargo test",
+//!              "answer_schema":null,
 //!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
 //!   ```
 //!
@@ -113,10 +116,21 @@
 //!   `finish_verification` (the [`crate::exec::CheckReport`], or `null` when
 //!   no checks ran), `finish_change` (the
 //!   [`crate::exec::ChangeEvidence`], or `null` when the call returned before
-//!   observing the tree) and `tree_current` (the
+//!   observing the tree), `tree_current` (the
 //!   [`crate::exec::TreeObservation`] that evidence was classified from, or
-//!   `null`) — those keys are absent on every other `tool_result`, including a
+//!   `null`) and `finish_answer` (answer mode's branch discriminator) — those
+//!   keys are absent on every other `tool_result`, including a
 //!   second `finish` in the same batch (which executes as a plain tool call).
+//!
+//!   `finish_answer` is `null` for every non-`answer` claim — INCLUDING a
+//!   build-mode `finish(answer)`, which parses as an unrecognized disposition
+//!   and never reaches the answer path. On an `answer` claim it is
+//!   `{"branch": ..., "errors": [..]}`, where `branch` is one of
+//!   `"missing_result"` (no `result` key was supplied), `"invalid"` (a
+//!   `result` was supplied and failed schema validation) or `"valid"` (it
+//!   validated and the claim was accepted). `errors` holds the SAME bounded
+//!   error list the model was shown and is empty on every branch but
+//!   `"invalid"`.
 //!
 //!   ```json
 //!   {"event":"tool_result","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
@@ -127,7 +141,7 @@
 //!    "content":"finish(done) rejected: verification failed","offload_path":null,
 //!    "duration_ms":12,"finish_accepted":false,
 //!    "finish_verification":{"passed":false,"excerpt":"FAIL_DETAIL","exit_code":3,"offload_path":null},
-//!    "finish_change":null,"tree_current":null}
+//!    "finish_change":null,"tree_current":null,"finish_answer":null}
 //!   ```
 //!
 //! - **`harness_message`** — emitted for every finish-recovery nudge
@@ -176,7 +190,8 @@
 //!   `nudges_fired`, `tree_dirty`, `iters_since_tree_change_at_exit`,
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
 //!   `edit_file_calls_ok`, `no_change_rejections`,
-//!   `already_satisfied_check_rejections`, `tree_baseline_unobservable`).
+//!   `already_satisfied_check_rejections`, `answer_schema_rejections`,
+//!   `tree_baseline_unobservable`).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
 //!   AFTER `run_loop_impl` (and therefore this event) returns.
@@ -195,15 +210,26 @@
 //!             "nudges_fired":0,"tree_dirty":false,"iters_since_tree_change_at_exit":0,
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
 //!             "edit_file_calls_ok":0,"no_change_rejections":0,
-//!             "already_satisfied_check_rejections":0,"tree_baseline_unobservable":false}}
+//!             "already_satisfied_check_rejections":0,"answer_schema_rejections":0,
+//!             "tree_baseline_unobservable":false}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
-//!   `run_end`, and ONLY when the leg-3 invariant was broken: a
-//!   `Disposition::Done` reached the terminal carrying
-//!   [`crate::exec::ChangeEvidence::TreeUnchanged`]. Fields: `kind`
-//!   (`"done_with_unchanged_tree"` today), `run_id` (or `null`), `change`. A
-//!   correct run never emits it.
+//!   `run_end`, and ONLY when a terminal invariant the type system cannot
+//!   enforce was broken. A correct run never emits it. Fields: `kind`,
+//!   `run_id` (or `null`), plus the kind-specific evidence field. The three
+//!   `kind` values:
+//!
+//!   - `"done_with_unchanged_tree"` — the leg-3 invariant: a
+//!     `Disposition::Done` reached the terminal carrying
+//!     [`crate::exec::ChangeEvidence::TreeUnchanged`]. Carries `change`.
+//!   - `"answer_without_schema"` — a `Disposition::Answer` reached the
+//!     terminal on a run with NO answer schema configured, so nothing could
+//!     have validated its `result`. Carries an empty `errors` array.
+//!   - `"answer_result_fails_schema"` — a `Disposition::Answer` reached the
+//!     terminal carrying a `result` that does not validate against the run's
+//!     configured schema. Carries the non-empty `errors` array from
+//!     re-running that validation at the choke point.
 //!
 //! ## Nested shapes (externally tagged serde)
 //!

@@ -529,7 +529,7 @@ mod tests {
     fn tool_lines_extracts_from_the_registered_schemas() {
         let mut registry = ToolRegistry::new();
         registry.register("echo", Arc::new(EchoTool));
-        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let lines = tool_lines(&registry);
         // BTreeMap iteration order → alphabetical by registered name.
@@ -631,7 +631,7 @@ mod tests {
     fn tool_lines_feeds_render_system_prompt_end_to_end() {
         let mut registry = ToolRegistry::new();
         registry.register("echo", Arc::new(EchoTool));
-        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let lines = tool_lines(&registry);
         let rendered = render_system_prompt(&lines, Some("cargo nextest run"));

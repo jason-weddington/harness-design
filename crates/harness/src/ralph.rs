@@ -496,6 +496,21 @@ pub async fn run_ralph(
             result.outcome,
             LoopOutcome::Finished(Disposition::AlreadySatisfied { .. })
         );
+        // Answer mode, decided explicitly rather than inherited from the
+        // `matches!` above: ralph's completion authority is the external
+        // `--stop-when` oracle, for which an inner `answer` claim has no
+        // meaning at all — a schema-validated payload is not a step toward a
+        // green stop command. So an `Answer` iteration is NOT green, commits
+        // nothing, and counts as a DO-OVER via the existing `(!is_green &&
+        // !is_backend_error)` arm, bounded by
+        // `RalphTerminal::DoOversExhausted`. Any incidental dirty file it
+        // left is reverted by the existing `made_changes && (!is_green ||
+        // commit_failed)` condition. `RalphTerminal`'s variant set is
+        // deliberately unchanged.
+        let is_answer = matches!(
+            result.outcome,
+            LoopOutcome::Finished(Disposition::Answer { .. })
+        );
 
         // (5) Detect changes via the FULL `git status --porcelain` (INCLUDING
         // the notes file — the journal commits even on a notes-only pass),
@@ -747,6 +762,10 @@ pub async fn run_ralph(
             !is_already_satisfied || (!is_green && !is_backend_error),
             "an AlreadySatisfied iteration must take the do-over arm"
         );
+        debug_assert!(
+            !is_answer || (!is_green && !is_backend_error),
+            "an Answer iteration must take the do-over arm"
+        );
         if is_green && committed {
             do_over_counter = 0;
         } else if (is_green && commit_failed) || (!is_green && !is_backend_error) {
@@ -843,12 +862,13 @@ mod tests {
         DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph,
     };
     use crate::engine::{FINISH_TOOL_NAME, LoopOutcome};
+    use crate::exec::ChangeEvidence;
     use crate::exec::{CheckCommand, ChecksRunner, ExecSpec, run as exec_run};
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason, TerminalKind,
         ToolCallRequest, TurnRequest, Usage,
     };
-    use crate::run_record::Disposition;
+    use crate::run_record::{Disposition, Verification};
     use crate::test_support::MockBackend;
     use crate::time::FakeClock;
     use crate::tool::ToolCtx;
@@ -1272,6 +1292,97 @@ mod tests {
             );
             assert!(!it.committed, "an AlreadySatisfied pass never commits");
         }
+    }
+
+    /// Answer mode's ralph decision, pinned.
+    ///
+    /// Ralph builds its own inner [`crate::engine::RunConfig`] and
+    /// deliberately wires NO `answer_schema` — its completion authority is
+    /// the external `--stop-when` oracle, for which an inner `answer` claim
+    /// has no meaning — so `Finished(Answer{..})` is not reachable through
+    /// `run_ralph` today. Both halves of the decision are therefore pinned
+    /// directly:
+    ///
+    /// 1. **the predicates** — an `Answer` outcome is neither `is_green` nor
+    ///    `is_backend_error`, so it lands in the existing `(!is_green &&
+    ///    !is_backend_error)` do-over arm by construction. This is exactly
+    ///    what the loop's `debug_assert!` asserts at runtime; and
+    /// 2. **the machinery** — a pass whose agent claims `answer` inside
+    ///    ralph's build-mode inner loop is non-green, so the incidental file
+    ///    it wrote is reverted, nothing commits, and the do-over counter
+    ///    advances.
+    #[tokio::test]
+    async fn answer_iterations_are_non_green_do_overs_that_revert_incidental_changes() {
+        // (1) the predicates.
+        let answer = LoopOutcome::Finished(Disposition::Answer {
+            result: serde_json::json!({ "verdict": "ok" }),
+            verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::TreeUnchanged,
+        });
+        assert!(
+            !matches!(answer, LoopOutcome::Finished(Disposition::Done { .. })),
+            "an Answer iteration is NOT green — ralph commits nothing for it"
+        );
+        assert!(
+            !matches!(answer, LoopOutcome::BackendError(_)),
+            "an Answer iteration is not backend-error-exempt either, so it \
+             takes the do-over arm"
+        );
+
+        // (2) the machinery.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@l",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&root_path)
+            .output()
+            .expect("initial commit");
+        let ctx = ctx_for(&root_path);
+
+        let backend = MockBackend::from_turns(vec![
+            edit_create_call("e0", "incidental.txt", "scratch\n"),
+            finish_call(
+                "a0",
+                serde_json::json!({
+                    "disposition": "answer",
+                    "summary": "ok",
+                    "result": { "verdict": "ok" },
+                }),
+            ),
+        ]);
+        let config = RalphConfig::new("answer-objective", stop_never(), 1, 4);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert_eq!(
+            report.terminal,
+            RalphTerminal::MaxIterationsExhausted,
+            "one do-over below the cap bottoms out on MaxIterations; got {:?}",
+            report.terminal
+        );
+        assert_eq!(report.outer_iterations(), 1);
+        assert!(
+            !report.iterations[0].committed,
+            "an answer pass commits nothing"
+        );
+        assert_eq!(
+            commit_count(&root_path).await,
+            Some(1),
+            "only the init commit must exist"
+        );
+        assert!(
+            !root_path.join("incidental.txt").exists(),
+            "the incidental file must be reverted by `git clean -fd`"
+        );
     }
 
     #[tokio::test]

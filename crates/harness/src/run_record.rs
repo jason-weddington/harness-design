@@ -278,12 +278,24 @@ pub struct GateOutcome {
 /// makes the "Done carries evidence" property a type-system invariant, not a
 /// documentation convention.
 ///
+/// **Scope of that invariant: [`Disposition::Done`] and
+/// [`Disposition::AlreadySatisfied`] only.** [`Disposition::Answer`] also
+/// carries a `Verification`, but there it is pure telemetry: answer mode's
+/// mechanical verifier is the *result schema*, not the gate, so an accepted
+/// `Answer` may carry a RED [`Self::Checks`] report. A red gate on an answer
+/// run describes the WORKSPACE, which the answering agent did not author —
+/// recorded as inherited state, never as the justification for acceptance.
+///
 /// `Eq` is NOT derived because [`CheckReport`] derives `PartialEq` but not
 /// `Eq` — keeping the door open for a future field that isn't `Eq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Verification {
-    /// The harness re-ran the configured checks and they passed. The full
-    /// [`CheckReport`] is attached as the evidence.
+    /// The harness re-ran the configured checks and they passed — on
+    /// [`Disposition::Done`] / [`Disposition::AlreadySatisfied`], where a red
+    /// report is a rejection and never reaches a disposition. On
+    /// [`Disposition::Answer`] this variant records whatever the gate
+    /// reported, green or red, as telemetry about the workspace; see the
+    /// type-level doc above.
     Checks(CheckReport),
     /// No checks were configured for this run — there was nothing to verify
     /// against, so the loop accepted the `done` claim on trust.
@@ -295,7 +307,9 @@ pub enum Verification {
 /// Terminal status of a run. The discriminator is "does running the same
 /// thing again have any chance of working?" — `Blocked` no, `Failed` maybe,
 /// `Done` already worked, and `AlreadySatisfied` was never work in the first
-/// place.
+/// place. [`Self::Answer`] sits outside that axis entirely: the run produced a
+/// schema-validated *deliverable* rather than a change, so there is nothing to
+/// re-run and nothing to push.
 ///
 /// `Eq` is NOT derived because [`Verification::Checks`] wraps a
 /// [`CheckReport`] that is `PartialEq`-only.
@@ -327,6 +341,28 @@ pub enum Disposition {
         /// The tree observation as observed. `AlreadySatisfied` imposes no
         /// tree constraint, so a `TreeChanged` value here is recorded, not
         /// rejected.
+        change: ChangeEvidence,
+    },
+    /// The run's deliverable was a **schema-validated payload**, not a change
+    /// to the workspace — answer mode's terminal. The agent claimed
+    /// (`finish(answer)`), the configured result schema verified, and the
+    /// validated `result` IS the evidence (leg 3 for answer mode is the
+    /// payload, not the diff). Never pushable: nothing changed to push.
+    ///
+    /// `change` deliberately has NO `#[serde(default)]`, unlike
+    /// [`Self::Done`]'s — that attribute exists only for backward
+    /// compatibility with pre-leg-3 records, and there are no legacy `Answer`
+    /// records to be compatible with.
+    Answer {
+        /// The payload the model supplied, after it validated against the
+        /// run's configured result schema.
+        result: serde_json::Value,
+        /// Recorded telemetry about the workspace's gate, NOT the
+        /// justification for acceptance — answer mode's verifier is the
+        /// schema. May be a RED [`Verification::Checks`] report.
+        verification: Verification,
+        /// The tree observation as observed. This variant RECORDS change
+        /// evidence; it imposes no constraint of its own.
         change: ChangeEvidence,
     },
     /// The spec or environment is the problem; retrying unchanged cannot
@@ -733,6 +769,17 @@ mod tests {
             change: ChangeEvidence::TreeUnchanged,
         });
 
+        // Answer — the schema-validated payload rides along verbatim.
+        round_trip(&Disposition::Answer {
+            result: serde_json::json!({
+                "verdict": "ok",
+                "findings": ["a", "b"],
+                "score": 3,
+            }),
+            verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::TreeUnchanged,
+        });
+
         round_trip(&Disposition::Blocked {
             decision_needed: "Which API version?".to_string(),
         });
@@ -991,6 +1038,43 @@ mod tests {
                 }
             ),
             "parsed Done should carry NoChecksConfigured; got {parsed:?}"
+        );
+    }
+
+    /// `Answer` requires BOTH `verification` and `change` on the wire —
+    /// neither is `#[serde(default)]`, because there are no legacy `Answer`
+    /// records to stay compatible with. Mirrors
+    /// [`done_missing_verification_fails_to_deserialize`].
+    #[test]
+    fn answer_missing_evidence_fails_to_deserialize() {
+        let missing_verification = r#"{"Answer":{"result":{},"change":"TreeUnchanged"}}"#;
+        let res: Result<Disposition, _> = serde_json::from_str(missing_verification);
+        assert!(
+            res.is_err(),
+            "Answer without `verification` must fail to deserialize, got Ok({:?})",
+            res.ok()
+        );
+
+        let missing_change = r#"{"Answer":{"result":{},"verification":"NoChecksConfigured"}}"#;
+        let res: Result<Disposition, _> = serde_json::from_str(missing_change);
+        assert!(
+            res.is_err(),
+            "Answer without `change` must fail to deserialize, got Ok({:?})",
+            res.ok()
+        );
+
+        let valid = r#"{"Answer":{"result":{},"verification":"NoChecksConfigured","change":"TreeUnchanged"}}"#;
+        let parsed: Disposition = serde_json::from_str(valid).expect("valid Answer deserializes");
+        assert!(
+            matches!(
+                parsed,
+                Disposition::Answer {
+                    verification: Verification::NoChecksConfigured,
+                    change: ChangeEvidence::TreeUnchanged,
+                    ..
+                }
+            ),
+            "parsed Answer should carry its evidence; got {parsed:?}"
         );
     }
 

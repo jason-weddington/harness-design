@@ -44,6 +44,19 @@
 //! result and never terminates the loop. So is an `already_satisfied` claim
 //! with no `reason`.
 //!
+//! ## Answer mode — a second deliverable shape
+//!
+//! When [`RunConfig::answer_schema`] is set, `finish` additionally accepts
+//! `answer`: the run's deliverable is a **schema-validated payload** rather
+//! than a changed workspace. The same three legs apply — the agent claims
+//! (`finish(answer)`), something mechanical verifies (the
+//! [`AnswerSchema`]), and the deliverable demonstrably exists (the validated
+//! `result` itself). A missing or schema-invalid `result` is fed back as an
+//! `is_error=true` tool result exactly like a red gate, and the loop
+//! continues. With NO schema configured, `answer` is not advertised and is
+//! rejected as an unrecognized disposition — build mode is byte-identical to
+//! what it was.
+//!
 //! ## What lives here
 //!
 //! - [`RunConfig`] — the shape a caller hands to [`run`]: task, iteration cap,
@@ -52,7 +65,9 @@
 //! - [`LoopOutcome`] — the four ways the loop can end.
 //! - [`FinishTool`] — the tool the model calls to end the run. Its schema is
 //!   what the model sees; the loop is what parses the input and (for `done`)
-//!   verifies it.
+//!   verifies it. The `answer_mode` flag gates whether the `answer`
+//!   disposition and its `result` property appear in that schema at all; with
+//!   it `false` (the default) the schema is byte-identical to build mode's.
 //! - [`LoopOutcome::into_disposition`] — converts a terminal outcome to a
 //!   [`crate::run_record::Disposition`] for storage.
 //!
@@ -115,6 +130,74 @@ use crate::transcript::{TranscriptConfig, TranscriptWriter};
 /// The registered name of the finish tool — the loop recognizes termination by
 /// matching an executed call's name against this.
 pub const FINISH_TOOL_NAME: &str = "finish";
+
+/// A compiled JSON Schema every `finish(answer)` payload is validated
+/// against — answer mode's mechanical verifier, playing the role a green gate
+/// plays for `finish(done)`.
+///
+/// Holds BOTH the compiled `jsonschema::Validator` and the
+/// [`serde_json::Value`] it was compiled from, so the transcript can record
+/// the schema itself and a reader can re-verify the harness's verdict off the
+/// record. `jsonschema::Validator` is `Debug + Clone + Send + Sync +
+/// 'static`, so no `Arc` and no hand-written `Debug` impl are needed and
+/// [`RunConfig`]'s `#[derive(Debug, Clone)]` survives.
+#[derive(Debug, Clone)]
+pub struct AnswerSchema {
+    validator: jsonschema::Validator,
+    source: Value,
+}
+
+/// A result schema that would not compile — the caller handed [`AnswerSchema::compile`]
+/// something that is not a valid JSON Schema (e.g. `{"type": 12345}`).
+#[derive(Debug, thiserror::Error)]
+#[error("invalid answer result schema: {message}")]
+pub struct AnswerSchemaError {
+    /// The underlying compile failure as `jsonschema` reported it.
+    pub message: String,
+}
+
+impl AnswerSchema {
+    /// Compile `schema` into a reusable validator.
+    ///
+    /// Built on `jsonschema::validator_for`, so anything that crate rejects
+    /// as a schema — a non-object, a `"type"` that is not a string or array
+    /// of strings, an unresolvable `$ref` — yields
+    /// [`AnswerSchemaError`] rather than a validator that silently accepts
+    /// everything.
+    pub fn compile(schema: &Value) -> Result<Self, AnswerSchemaError> {
+        let validator = jsonschema::validator_for(schema).map_err(|e| AnswerSchemaError {
+            message: e.to_string(),
+        })?;
+        Ok(Self {
+            validator,
+            source: schema.clone(),
+        })
+    }
+
+    /// The schema value this validator was compiled from — recorded on the
+    /// transcript's `run_start` so a reviewer can re-check any verdict.
+    pub fn source(&self) -> &Value {
+        &self.source
+    }
+
+    /// Validate `instance`, returning an EMPTY vec when it conforms and one
+    /// `"<path>: <message>"` string per error otherwise.
+    ///
+    /// `jsonschema` renders the instance path of a ROOT-level error as the
+    /// empty string, which would produce a leading-colon line like
+    /// `": 1 is not of type \"object\""`. That is normalized here to `/`, so
+    /// every line the model sees names a JSON pointer.
+    pub fn validation_errors(&self, instance: &Value) -> Vec<String> {
+        self.validator
+            .iter_errors(instance)
+            .map(|err| {
+                let path = err.instance_path().to_string();
+                let path = if path.is_empty() { "/" } else { path.as_str() };
+                format!("{path}: {err}")
+            })
+            .collect()
+    }
+}
 
 /// Configuration for one call to [`run`].
 ///
@@ -193,6 +276,14 @@ pub struct RunConfig {
     /// written and the loop does zero transcript-related filesystem I/O or
     /// event-payload construction. Set via [`RunConfig::with_transcript`].
     pub transcript: Option<TranscriptConfig>,
+    /// The result schema that turns on **answer mode**. `None` (the default
+    /// set by [`RunConfig::new`]) means the `answer` disposition is neither
+    /// advertised in [`FinishTool`]'s schema nor accepted by the parser — a
+    /// `finish(answer)` is rejected as an unrecognized disposition, exactly
+    /// as it is today. `Some` advertises `answer` and makes the schema the
+    /// mechanical verifier for its `result`. Set via
+    /// [`RunConfig::with_answer_schema`].
+    pub answer_schema: Option<AnswerSchema>,
 }
 
 /// The default per-turn output cap. Sized for reasoning models: a model whose
@@ -251,6 +342,7 @@ impl RunConfig {
             wall_clock_secs: 0,
             clock: Arc::new(SystemClock),
             transcript: None,
+            answer_schema: None,
         }
     }
 
@@ -259,6 +351,15 @@ impl RunConfig {
     #[must_use]
     pub fn with_checks(mut self, checks: ChecksRunner) -> Self {
         self.checks = Some(checks);
+        self
+    }
+
+    /// Turn on **answer mode**: advertise the `answer` disposition and
+    /// validate every `finish(answer)` payload against `schema`. Off
+    /// (`None`) by default — see [`RunConfig::answer_schema`].
+    #[must_use]
+    pub fn with_answer_schema(mut self, schema: AnswerSchema) -> Self {
+        self.answer_schema = Some(schema);
         self
     }
 
@@ -452,7 +553,11 @@ struct RunPersist {
 /// the loop then decides whether to accept it as a [`Disposition`]. Kept
 /// internal because callers should only ever see the post-verification
 /// [`Disposition`].
-#[derive(Debug, PartialEq, Eq)]
+///
+/// `Eq` is NOT derived: [`Self::Answer`] carries a [`serde_json::Value`],
+/// which is `PartialEq` but not `Eq`. Every existing use compares with
+/// `assert_eq!`, which needs only `PartialEq`.
+#[derive(Debug, PartialEq)]
 enum FinishClaim {
     Done {
         summary: String,
@@ -468,6 +573,16 @@ enum FinishClaim {
     },
     Failed {
         summary: String,
+    },
+    /// Answer mode's claim: the deliverable is the `result` payload, which
+    /// the loop validates against the run's configured [`AnswerSchema`].
+    /// Selected ONLY when answer mode is enabled; with no schema configured a
+    /// `disposition` of `answer` falls through to [`Self::Invalid`] like any
+    /// other unrecognized value. `result` is `None` when the key is absent
+    /// and `Some` for ANY present JSON value (including `null`); any
+    /// `summary` on this branch is deliberately discarded.
+    Answer {
+        result: Option<Value>,
     },
     /// The model's `disposition` was missing, non-string, or unrecognized;
     /// `raw` is its JSON serialization, or `<missing>` when the key is
@@ -498,10 +613,21 @@ impl FinishClaim {
     /// `reason` is the human-readable text. A missing, non-string, or
     /// blank-after-trimming `reason` yields [`Self::MissingReason`].
     ///
+    /// `answer_enabled` is the answer-mode gate — `true` exactly when the run
+    /// has an [`AnswerSchema`] configured. Only then does a `disposition` of
+    /// `answer` (after the same trim + ASCII-lowercase) select
+    /// [`Self::Answer`], reading `result` as `input.get("result").cloned()`
+    /// (present-but-any-JSON-type is `Some`, absent is `None`). With
+    /// `answer_enabled == false` the value falls through to the ordinary
+    /// [`Self::Invalid`] arm, so the rejection wording, the
+    /// `invalid_finish_calls` bump and the recorded `raw` are inherited
+    /// byte-for-byte. Like `already_satisfied`, the `answer` branch DISCARDS
+    /// any supplied `summary` — [`Self::Answer`] carries only `result`.
+    ///
     /// No other normalization is performed: no Unicode case folding, no
     /// synonyms. `"complete"`, `"success"`, and `"finished"` are all
     /// [`Self::Invalid`].
-    fn from_input(input: &Value) -> Self {
+    fn from_input(input: &Value, answer_enabled: bool) -> Self {
         let field = |key: &str| {
             input
                 .get(key)
@@ -531,6 +657,9 @@ impl FinishClaim {
             },
             Some(s) if s == "failed" => Self::Failed {
                 summary: field("summary"),
+            },
+            Some(s) if answer_enabled && s == "answer" => Self::Answer {
+                result: input.get("result").cloned(),
             },
             _ => Self::Invalid {
                 raw: disposition.to_string(),
@@ -615,6 +744,11 @@ impl FinishClaim {
 ///   since THIS loop invocation — a resumed run starts from zero.
 /// - `already_satisfied_check_rejections`: count of
 ///   `finish(already_satisfied)` claims rejected by a red gate. Counted
+///   since THIS loop invocation — a resumed run starts from zero.
+/// - `answer_schema_rejections`: count of `finish(answer)` claims rejected
+///   because the supplied `result` did not validate against the configured
+///   [`AnswerSchema`]. A missing `result` is NOT counted here — that is a
+///   malformed finish call and lands in `invalid_finish_calls`. Counted
 ///   since THIS loop invocation — a resumed run starts from zero.
 /// - `tree_baseline_unobservable`: whether the run-start tree observation
 ///   failed, which makes the leg-3 precondition INERT for the whole run (it
@@ -729,6 +863,13 @@ pub struct RunStats {
     /// Counted since THIS loop invocation — a resumed run (`resume`,
     /// engine.rs:1808) starts from zero.
     pub already_satisfied_check_rejections: u32,
+    /// Count of `finish(answer)` claims rejected because the supplied
+    /// `result` failed to validate against the configured [`AnswerSchema`].
+    /// A missing `result` is NOT counted here — it is a malformed finish call
+    /// and bumps [`Self::invalid_finish_calls`] instead. Counted since THIS
+    /// loop invocation — a resumed run (`resume`, engine.rs:1808) starts from
+    /// zero.
+    pub answer_schema_rejections: u32,
     /// Whether the run-start tree observation failed, making the leg-3
     /// precondition INERT for this run (it fails open). The inert-detector:
     /// a precondition that silently disabled itself in production would
@@ -841,6 +982,16 @@ impl LoopOutcome {
 /// Its input is `{ disposition: "done" | "blocked" | "failed", summary:
 /// string, decision_needed?: string }`.
 ///
+/// `answer_mode` gates the answer-mode surface: with it `false` (the
+/// [`Default`], and every build-mode run) [`Tool::schema`] returns exactly
+/// the schema it always has — the string `answer` appears nowhere in it. With
+/// it `true` the `disposition` enum gains `answer` (LAST, so the existing
+/// members keep their order), a `result` property is advertised, and the
+/// prose describes both. `"required"` is `["disposition", "summary"]` in BOTH
+/// modes: `result`'s presence is enforced by the harness's pinned
+/// missing-result rejection, exactly the way `reason` is enforced for
+/// `already_satisfied` today.
+///
 /// [`Tool::run`] here just returns an ok acknowledgment; the LOOP is what
 /// recognizes the name, parses the input, verifies a `done` claim against
 /// the configured [`ChecksRunner`], and (when the claim is accepted) builds
@@ -854,7 +1005,12 @@ impl LoopOutcome {
 ///
 /// [`ChecksRunner`]: crate::exec::ChecksRunner
 #[derive(Debug, Default, Clone, Copy)]
-pub struct FinishTool;
+pub struct FinishTool {
+    /// Whether to advertise the `answer` disposition and its `result`
+    /// property. `false` (the [`Default`]) yields the byte-identical
+    /// build-mode schema.
+    pub answer_mode: bool,
+}
 
 #[async_trait]
 impl Tool for FinishTool {
@@ -865,7 +1021,68 @@ impl Tool for FinishTool {
         FINISH_TOOL_NAME
     }
 
+    #[allow(clippy::too_many_lines)]
     fn schema(&self) -> Value {
+        if self.answer_mode {
+            return json!({
+                "name": FINISH_TOOL_NAME,
+                "description": "End the run. Call it when the task is complete, \
+                                already satisfied, answered, blocked on a decision, or has \
+                                failed. A `done` claim is verified by the harness re-running \
+                                the configured checks AND requiring that the working tree \
+                                changed since the run started; an `answer` claim is verified \
+                                by the harness validating your `result` against the run's \
+                                configured result schema. An unchanged tree, a failed \
+                                verification, an absent or schema-invalid `result`, or a \
+                                disposition other than \
+                                done/already_satisfied/answer/blocked/failed is fed back as \
+                                a tool-result error you can react to, not a termination.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "disposition": {
+                            "type": "string",
+                            "enum": ["done", "blocked", "failed", "already_satisfied", "answer"],
+                            "description": "done = task complete and you changed something \
+                                            (harness verifies via checks AND requires a changed \
+                                            working tree); already_satisfied = the task was \
+                                            already complete and nothing needed changing \
+                                            (requires `reason`; harness still verifies via \
+                                            checks); answer = the deliverable is data, not a \
+                                            change: supply `result` conforming to the run's \
+                                            configured result schema (an absent or \
+                                            schema-invalid `result` is fed back as a \
+                                            tool-result error, not a termination); blocked = \
+                                            needs a decision before retrying; failed = you \
+                                            could not complete the task in this attempt and a \
+                                            fresh attempt might succeed."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "A short summary of the outcome."
+                        },
+                        "decision_needed": {
+                            "type": "string",
+                            "description": "Required when blocked: the decision a human must make."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Required when the disposition is already_satisfied: \
+                                            what you checked and why the task was already \
+                                            complete."
+                        },
+                        "result": {
+                            "description": "Required when the disposition is answer: the \
+                                            deliverable payload. It MUST conform to the run's \
+                                            configured result schema; the harness validates it \
+                                            and feeds any validation errors back to you as a \
+                                            tool-result error rather than terminating the run."
+                        }
+                    },
+                    "required": ["disposition", "summary"]
+                }
+            });
+        }
         json!({
             "name": FINISH_TOOL_NAME,
             "description": "End the run. Call it when the task is complete, \
@@ -973,11 +1190,72 @@ fn missing_reason_rejection_content() -> String {
         .to_string()
 }
 
+/// The `is_error=true` fed-back content for a `finish(answer)` that supplied
+/// no `result` at all. The sibling of [`missing_reason_rejection_content`]:
+/// answer mode's `result` is enforced by the harness, not by the tool schema's
+/// `required` list, so the model needs wording that names both ways forward.
+fn missing_result_rejection_content() -> String {
+    "finish rejected: answer requires a `result` that conforms to the configured result \
+     schema. Call finish again with disposition `answer` and a `result`, or with a different \
+     disposition."
+        .to_string()
+}
+
+/// Character cap on the rendered schema-error block fed back to the model.
+/// Mirrors `exec::CHECK_EXCERPT_CAP` (also `4_000`), the precedent for
+/// model-facing bounded text: a pathological schema can produce megabytes of
+/// errors, and an unbounded feed-back would blow the context window the
+/// rejection exists to steer.
+const ANSWER_SCHEMA_ERRORS_CAP: usize = 4_000;
+
+/// Cap on how many individual schema-error LINES are rendered before an
+/// `…and N more` tail. A line cap as well as a character cap so a few
+/// enormous messages cannot crowd out the count of how many problems there
+/// actually are.
+const ANSWER_SCHEMA_ERRORS_MAX_LINES: usize = 20;
+
+/// The `is_error=true` fed-back content for a `finish(answer)` whose `result`
+/// did not validate: the pinned header line plus the (bounded) error lines,
+/// one per line.
+///
+/// Bounded twice — at most [`ANSWER_SCHEMA_ERRORS_MAX_LINES`] error lines
+/// (then an `…and N more` line), and the whole rendered string truncated to
+/// [`ANSWER_SCHEMA_ERRORS_CAP`] characters with an interpolated marker so the
+/// marker cannot drift from the constant.
+fn answer_schema_rejection_content(errors: &[String]) -> String {
+    let mut content =
+        "finish(answer) rejected: result does not conform to the configured schema:".to_string();
+    for err in errors.iter().take(ANSWER_SCHEMA_ERRORS_MAX_LINES) {
+        content.push('\n');
+        content.push_str(err);
+    }
+    if errors.len() > ANSWER_SCHEMA_ERRORS_MAX_LINES {
+        use std::fmt::Write as _;
+        // `write!` into a String is infallible (its `write_str` cannot fail),
+        // so `.expect` here is a lint-satisfying no-op, not a real recovery
+        // path — the same idiom `rejection_content` uses.
+        write!(
+            content,
+            "\n…and {} more",
+            errors.len() - ANSWER_SCHEMA_ERRORS_MAX_LINES
+        )
+        .expect("write! into String is infallible");
+    }
+    if content.chars().count() > ANSWER_SCHEMA_ERRORS_CAP {
+        let head: String = content.chars().take(ANSWER_SCHEMA_ERRORS_CAP).collect();
+        content = format!("{head}…[truncated at {ANSWER_SCHEMA_ERRORS_CAP} chars]");
+    }
+    content
+}
+
 /// Which rejection a well-formed-but-unaccepted `finish` call produced. Read
 /// by the loop to increment the matching [`RunStats`] counter — the same
 /// discriminator-on-[`FinishOutcome`] shape `invalid_raw` already uses. A
 /// checks-rejected `done` has no variant here: it is the pre-existing
-/// rejection and has never been counted.
+/// rejection and has never been counted. Neither does a `finish(answer)` with
+/// no `result` at all — that is a MALFORMED call, counted through
+/// `invalid_raw` like every other malformed finish; only a `result` that was
+/// supplied and FAILED validation lands on [`Self::AnswerSchema`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinishRejection {
     /// A `done` claim whose checks were green but whose working tree was
@@ -985,6 +1263,24 @@ enum FinishRejection {
     NoChange,
     /// An `already_satisfied` claim rejected by a red gate.
     AlreadySatisfiedChecks,
+    /// An `answer` claim whose `result` failed to validate against the
+    /// configured [`AnswerSchema`]. A `finish(answer)` with NO `result` is
+    /// not here — it is a malformed finish call and bumps
+    /// `invalid_finish_calls`.
+    AnswerSchema,
+}
+
+/// Which branch of the answer-mode gate a `finish(answer)` call took —
+/// recorded on the transcript so a reader can tell "the model never supplied
+/// a result" from "the model supplied one and it failed validation" from
+/// "accepted", rather than only validity-vs-not.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AnswerVerdict {
+    /// `"missing_result"`, `"invalid"`, or `"valid"`.
+    branch: &'static str,
+    /// The SAME bounded error list the model was shown — empty on every
+    /// branch except `"invalid"`.
+    errors: Vec<String>,
 }
 
 /// One dispatched `finish` call's outcome from the loop's point of view: the
@@ -1000,27 +1296,36 @@ struct FinishOutcome {
     /// `None` on every other arm (including a checks-rejected `done`).
     invalid_raw: Option<String>,
     /// The [`CheckReport`] `handle_finish_call` ran against `config.checks`,
-    /// when it ran one — `Some` on the five arms that ran the checks:
+    /// when it ran one — `Some` on the six arms that ran the checks:
     /// accepted-`Done`-with-checks, checks-rejected-`done`,
     /// tree-unchanged-rejected-`done`-with-checks,
-    /// accepted-`AlreadySatisfied`-with-checks, and
-    /// checks-rejected-`already_satisfied`. `None` on every no-checks path,
-    /// on `blocked`/`failed`, on `Invalid`, and on `MissingReason`.
+    /// accepted-`AlreadySatisfied`-with-checks,
+    /// checks-rejected-`already_satisfied`, and accepted-`Answer`-with-checks
+    /// (which records a RED report too — see [`Verification`]). `None` on
+    /// every no-checks path, on `blocked`/`failed`, on `Invalid`, on
+    /// `MissingReason`, and on both rejected `Answer` arms, which return
+    /// before running anything.
     /// Transcript-only: the `tool_result` event's `finish_verification` field
     /// is derived from this, never from `FinishClaim` internals.
     report: Option<CheckReport>,
     /// The leg-3 [`ChangeEvidence`] this call computed, when it observed the
     /// tree at all — `Some` on exactly the arms that reached the observation
     /// (accepted `Done`, tree-unchanged-rejected `done`, accepted
-    /// `AlreadySatisfied`), `None` on `blocked`/`failed`/`Invalid`/
-    /// `MissingReason` and on a checks-rejected claim, which returns before
-    /// observing. Transcript-only.
+    /// `AlreadySatisfied`, accepted `Answer`), `None` on
+    /// `blocked`/`failed`/`Invalid`/`MissingReason`, on a checks-rejected
+    /// claim, and on a missing-result / schema-invalid `Answer` — all of
+    /// which return before observing. Transcript-only.
     change: Option<ChangeEvidence>,
     /// The [`TreeObservation`] taken at the moment of the claim, paired with
     /// `change`. `Some` on exactly the same arms. Transcript-only.
     current_tree: Option<TreeObservation>,
     /// Which [`RunStats`] rejection counter this call should bump, if any.
     rejection: Option<FinishRejection>,
+    /// Which answer-mode branch this call took — `Some` on exactly the three
+    /// [`FinishClaim::Answer`] arms (missing-result, schema-invalid,
+    /// accepted), `None` on every other claim INCLUDING a build-mode `answer`
+    /// that parsed as [`FinishClaim::Invalid`]. Transcript-only.
+    answer: Option<AnswerVerdict>,
 }
 
 impl FinishOutcome {
@@ -1035,6 +1340,7 @@ impl FinishOutcome {
             change: None,
             current_tree: None,
             rejection: None,
+            answer: None,
         }
     }
 
@@ -1059,6 +1365,7 @@ impl FinishOutcome {
             change: None,
             current_tree: None,
             rejection,
+            answer: None,
         }
     }
 }
@@ -1116,6 +1423,7 @@ fn checks_rejected(
         change: None,
         current_tree: None,
         rejection,
+        answer: None,
     }
 }
 
@@ -1130,17 +1438,28 @@ fn checks_rejected(
 /// an `is_error=true` tool result — `finish = None`, no checks run — and the
 /// loop continues.
 ///
+/// `answer_schema` is the answer-mode gate: `Some` advertises and accepts the
+/// `answer` disposition, whose `result` must validate against it; `None`
+/// (build mode) makes `answer` an unrecognized disposition handled entirely
+/// by the pre-existing [`FinishClaim::Invalid`] arm. An accepted `answer`
+/// validates FIRST (so an invalid answer never pays for a gate run), then
+/// runs the checks — recording BOTH verdicts as [`Verification`] telemetry
+/// without ever rejecting on a red one — then observes the tree and records
+/// the change evidence.
+///
 /// Returns the fed-back [`UserBlock::ToolResult`] plus, when the loop should
 /// terminate, the accepted [`Disposition`]. A rejected `done` returns
 /// `finish = None`, an `is_error=true` result, and the loop continues.
+#[allow(clippy::too_many_lines)]
 async fn handle_finish_call(
     call_id: &str,
     input: &Value,
     checks: Option<&ChecksRunner>,
+    answer_schema: Option<&AnswerSchema>,
     baseline: &TreeObservation,
     ctx: &ToolCtx,
 ) -> FinishOutcome {
-    match FinishClaim::from_input(input) {
+    match FinishClaim::from_input(input, answer_schema.is_some()) {
         FinishClaim::Done { summary } => {
             // Ordering is load-bearing and unchanged: the checks run FIRST,
             // and a red report still returns exactly the rejection it always
@@ -1185,6 +1504,7 @@ async fn handle_finish_call(
                 change: Some(change),
                 current_tree: Some(current),
                 rejection: (!accepted).then_some(FinishRejection::NoChange),
+                answer: None,
             }
         }
         FinishClaim::AlreadySatisfied { reason } => {
@@ -1221,6 +1541,96 @@ async fn handle_finish_call(
                 change: Some(change),
                 current_tree: Some(current),
                 rejection: None,
+                answer: None,
+            }
+        }
+        FinishClaim::Answer { result } => {
+            // `answer_enabled` was `answer_schema.is_some()`, so this arm is
+            // unreachable without a schema — but express it as a `let else`
+            // rather than an `expect`, so a future parser change degrades to
+            // the inherited invalid-disposition rejection instead of panicking.
+            let Some(schema) = answer_schema else {
+                return FinishOutcome::rejected(
+                    call_id,
+                    missing_result_rejection_content(),
+                    Some("answer without result".to_string()),
+                    None,
+                );
+            };
+            let Some(result) = result else {
+                let mut outcome = FinishOutcome::rejected(
+                    call_id,
+                    missing_result_rejection_content(),
+                    Some("answer without result".to_string()),
+                    None,
+                );
+                outcome.answer = Some(AnswerVerdict {
+                    branch: "missing_result",
+                    errors: Vec::new(),
+                });
+                return outcome;
+            };
+            // Ordering is load-bearing: the SCHEMA is answer mode's
+            // mechanical verifier, so it runs first and an invalid answer
+            // never pays for a gate run.
+            let errors = schema.validation_errors(&result);
+            if !errors.is_empty() {
+                let shown: Vec<String> = errors
+                    .iter()
+                    .take(ANSWER_SCHEMA_ERRORS_MAX_LINES)
+                    .cloned()
+                    .collect();
+                let mut outcome = FinishOutcome::rejected(
+                    call_id,
+                    answer_schema_rejection_content(&errors),
+                    None,
+                    Some(FinishRejection::AnswerSchema),
+                );
+                outcome.answer = Some(AnswerVerdict {
+                    branch: "invalid",
+                    errors: shown,
+                });
+                return outcome;
+            }
+            // Checks in answer mode: RUN if configured, NEVER reject. For
+            // `Answer` the mechanical verifier is the SCHEMA, not the gate
+            // (docs/design/06-answer-mode-and-workflows.md:23 — "for answer
+            // mode leg 3 is the payload"). The gate describes the WORKSPACE,
+            // which an answering agent did not author, so a red gate is
+            // inherited state, not evidence against the answer — and
+            // rejecting on it would trap an answer agent in an unfixable loop
+            // to the iteration cap. Both verdicts therefore map to a
+            // `Verification` that is RECORDED; `checks_rejected` is never
+            // called here.
+            let (report, verification) = match verify_against_checks(checks, ctx).await {
+                ChecksVerdict::Green {
+                    report,
+                    verification,
+                } => (report, verification),
+                ChecksVerdict::Red(report) => (Some(report.clone()), Verification::Checks(report)),
+            };
+            // Change evidence is RECORDED, not enforced: `TreeChanged`,
+            // `TreeUnchanged` and `Unobservable` are all accepted here. The
+            // inverted precondition (an answer agent must not have modified
+            // the workspace) belongs to answer mode's CLI half.
+            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let change = exec::classify_change(baseline, &current);
+            FinishOutcome {
+                result: ack(call_id),
+                finish: Some(Disposition::Answer {
+                    result,
+                    verification,
+                    change: change.clone(),
+                }),
+                invalid_raw: None,
+                report,
+                change: Some(change),
+                current_tree: Some(current),
+                rejection: None,
+                answer: Some(AnswerVerdict {
+                    branch: "valid",
+                    errors: Vec::new(),
+                }),
             }
         }
         FinishClaim::Blocked { decision_needed } => {
@@ -1253,8 +1663,9 @@ async fn handle_finish_call(
 
 /// The standard `finish acknowledged` fed-back [`UserBlock::ToolResult`] the
 /// loop hands the model for an accepted `finish` — for an accepted
-/// done/blocked/failed claim (or a `done` with no checks configured). Kept
-/// factored so the wording matches exactly across the four accepted paths.
+/// `done` / `already_satisfied` / `answer` / `blocked` / `failed` claim (or a
+/// `done` with no checks configured). Kept factored so the wording matches
+/// exactly across the five accepted paths.
 fn ack(call_id: &str) -> UserBlock {
     UserBlock::ToolResult {
         call_id: call_id.to_string(),
@@ -1344,6 +1755,7 @@ pub async fn run(
         first_invalid_finish_raw: None,
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
+        answer_schema_rejections: 0,
         tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
@@ -1416,6 +1828,7 @@ pub async fn run_persisted(
         first_invalid_finish_raw: None,
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
+        answer_schema_rejections: 0,
         tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
@@ -1507,7 +1920,13 @@ async fn run_loop_impl(
         &mut writer,
     )
     .await;
-    emit_run_end(&mut writer, &result, stats, run_id_hint.as_deref());
+    emit_run_end(
+        &mut writer,
+        &result,
+        stats,
+        run_id_hint.as_deref(),
+        config.answer_schema.as_ref(),
+    );
     result
 }
 
@@ -1520,6 +1939,7 @@ fn emit_run_end(
     result: &Result<LoopOutcome, StoreError>,
     stats: &RunStats,
     run_id: Option<&str>,
+    answer_schema: Option<&AnswerSchema>,
 ) {
     // The cheap runtime audit of the leg-3 invariant. Unlike `Verification`,
     // `Disposition::Done` is a public struct variant with a public `change`
@@ -1545,6 +1965,50 @@ fn emit_run_end(
                 "change": serde_json::to_value(change).unwrap_or(Value::Null),
             }),
         );
+    }
+    // The `Answer` counterpart of the same tripwire. `Disposition::Answer` is
+    // a public struct variant with a public `result` field constructible
+    // anywhere, so "an Answer only reaches the terminal when a schema was
+    // configured AND its result validated" is enforced by one code path plus
+    // convention. Re-check it at the single choke point every terminal
+    // passes through.
+    if let Ok(LoopOutcome::Finished(Disposition::Answer { result, .. })) = result {
+        match answer_schema {
+            None => {
+                eprintln!(
+                    "warning: contract violation — an Answer disposition reached the terminal \
+                     on a run with no answer schema configured; the schema-validated-result \
+                     precondition did not hold"
+                );
+                writer.emit(
+                    "contract_violation",
+                    json!({
+                        "kind": "answer_without_schema",
+                        "run_id": run_id,
+                        "errors": Vec::<String>::new(),
+                    }),
+                );
+            }
+            Some(schema) => {
+                let errors = schema.validation_errors(result);
+                if !errors.is_empty() {
+                    eprintln!(
+                        "warning: contract violation — an Answer disposition reached the \
+                         terminal carrying a result that does not validate against the \
+                         configured schema; the schema-validated-result precondition did not \
+                         hold"
+                    );
+                    writer.emit(
+                        "contract_violation",
+                        json!({
+                            "kind": "answer_result_fails_schema",
+                            "run_id": run_id,
+                            "errors": errors,
+                        }),
+                    );
+                }
+            }
+        }
     }
     if !writer.is_enabled() {
         return;
@@ -1585,6 +2049,7 @@ fn emit_run_end(
                 "edit_file_calls_ok": stats.edit_file_calls_ok,
                 "no_change_rejections": stats.no_change_rejections,
                 "already_satisfied_check_rejections": stats.already_satisfied_check_rejections,
+                "answer_schema_rejections": stats.answer_schema_rejections,
                 "tree_baseline_unobservable": stats.tree_baseline_unobservable,
             },
         }),
@@ -1734,6 +2199,7 @@ async fn run_loop_body(
                     "max_iterations": config.max_iterations,
                     "max_tokens": config.max_tokens,
                     "checks": config.checks.as_ref().map(ChecksRunner::command_display),
+                    "answer_schema": config.answer_schema.as_ref().map(AnswerSchema::source),
                     "wall_clock_secs": config.wall_clock_secs,
                     "static_tree_k": config.static_tree_k,
                     "max_nudges": config.max_nudges,
@@ -2100,6 +2566,7 @@ async fn run_loop_body(
                     &call.id,
                     &call.input,
                     config.checks.as_ref(),
+                    config.answer_schema.as_ref(),
                     &tree_baseline,
                     ctx,
                 )
@@ -2138,6 +2605,10 @@ async fn run_loop_body(
                                 .current_tree
                                 .as_ref()
                                 .map(render_tree_observation),
+                            "finish_answer": outcome
+                                .answer
+                                .as_ref()
+                                .map(|a| serde_json::to_value(a).unwrap_or(Value::Null)),
                         }),
                     );
                 }
@@ -2148,6 +2619,7 @@ async fn run_loop_body(
                     Some(FinishRejection::AlreadySatisfiedChecks) => {
                         stats.already_satisfied_check_rejections += 1;
                     }
+                    Some(FinishRejection::AnswerSchema) => stats.answer_schema_rejections += 1,
                     None => {}
                 }
                 results.push(outcome.result);
@@ -2269,10 +2741,17 @@ async fn run_loop_body(
         // turn) captured text and clear.
         if nudge_awaiting_status {
             // An accepted `already_satisfied` after a nudge is a clean
-            // success on the newly-advertised off-ramp, not a failed nudge.
+            // success on the newly-advertised off-ramp, not a failed nudge —
+            // and, decided here rather than inherited, so is an accepted
+            // `answer`: it is a clean success on answer mode's off-ramp, not
+            // a nudge the model failed to act on.
             let is_done = matches!(
                 finish,
-                Some(Disposition::Done { .. } | Disposition::AlreadySatisfied { .. })
+                Some(
+                    Disposition::Done { .. }
+                        | Disposition::AlreadySatisfied { .. }
+                        | Disposition::Answer { .. }
+                )
             );
             if !is_done {
                 nudge_statuses.push(turn_text);
@@ -2767,6 +3246,7 @@ pub async fn resume(
         first_invalid_finish_raw: None,
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
+        answer_schema_rejections: 0,
         tree_baseline_unobservable: false,
     };
 
@@ -2878,8 +3358,10 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TOOL_NAME, FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError,
-        ResumeMode, RunConfig, RunResult, RunStats, emit_run_end, missing_reason_rejection_content,
+        ANSWER_SCHEMA_ERRORS_CAP, ANSWER_SCHEMA_ERRORS_MAX_LINES, AnswerSchema, FINISH_TOOL_NAME,
+        FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError, ResumeMode, RunConfig,
+        RunResult, RunStats, answer_schema_rejection_content, emit_run_end,
+        missing_reason_rejection_content, missing_result_rejection_content,
         no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
         run, run_id, run_persisted,
     };
@@ -3119,7 +3601,7 @@ mod tests {
     fn registry_with_finish_and_echo() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register("echo", Arc::new(EchoTool));
-        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
         registry
     }
 
@@ -3613,7 +4095,7 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         tools.register("edit_file", Arc::new(EditFileTool));
-        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let backend = MockBackend::from_turns(vec![
             // 1: claim done — flag doesn't exist, should be rejected.
@@ -3979,162 +4461,230 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn from_input_classifies_every_disposition_shape() {
-        let cases: Vec<(serde_json::Value, FinishClaim)> = vec![
+        // Built by a closure rather than a `let` binding so the SAME table of
+        // pre-existing rows can be materialized twice — once per
+        // `answer_enabled` value. `FinishClaim` is deliberately not `Clone`
+        // (see its derive), so the rows cannot simply be reused.
+        let shared_cases = || -> Vec<(serde_json::Value, FinishClaim)> {
+            vec![
+                (
+                    serde_json::json!({ "disposition": "done", "summary": "s" }),
+                    FinishClaim::Done {
+                        summary: "s".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "blocked", "decision_needed": "d" }),
+                    FinishClaim::Blocked {
+                        decision_needed: "d".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "failed", "summary": "s" }),
+                    FinishClaim::Failed {
+                        summary: "s".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": " Done \n" }),
+                    FinishClaim::Done {
+                        summary: String::new(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "FAILED" }),
+                    FinishClaim::Failed {
+                        summary: String::new(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "done", "summary": 5 }),
+                    FinishClaim::Done {
+                        summary: String::new(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "blocked" }),
+                    FinishClaim::Blocked {
+                        decision_needed: String::new(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "already_satisfied", "reason": "r" }),
+                    FinishClaim::AlreadySatisfied {
+                        reason: "r".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": " Already_Satisfied ", "reason": "r" }),
+                    FinishClaim::AlreadySatisfied {
+                        reason: "r".to_string(),
+                    },
+                ),
+                (
+                    // The schema still requires `summary`, so a conforming
+                    // already_satisfied call supplies one — it is DISCARDED, never
+                    // smuggled into `reason`.
+                    serde_json::json!({
+                        "disposition": "already_satisfied",
+                        "summary": "s",
+                        "reason": "r",
+                    }),
+                    FinishClaim::AlreadySatisfied {
+                        reason: "r".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "already_satisfied" }),
+                    FinishClaim::MissingReason,
+                ),
+                (
+                    serde_json::json!({ "disposition": "already_satisfied", "reason": "" }),
+                    FinishClaim::MissingReason,
+                ),
+                (
+                    serde_json::json!({ "disposition": "already_satisfied", "reason": "  \t " }),
+                    FinishClaim::MissingReason,
+                ),
+                (
+                    serde_json::json!({ "disposition": "already_satisfied", "reason": 7 }),
+                    FinishClaim::MissingReason,
+                ),
+                (
+                    serde_json::json!({ "disposition": "complete" }),
+                    FinishClaim::Invalid {
+                        raw: "\"complete\"".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "success" }),
+                    FinishClaim::Invalid {
+                        raw: "\"success\"".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": "" }),
+                    FinishClaim::Invalid {
+                        raw: "\"\"".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": 1 }),
+                    FinishClaim::Invalid {
+                        raw: "1".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": true }),
+                    FinishClaim::Invalid {
+                        raw: "true".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": null }),
+                    FinishClaim::Invalid {
+                        raw: "null".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "disposition": ["done"] }),
+                    FinishClaim::Invalid {
+                        raw: "[\"done\"]".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!({ "summary": "x" }),
+                    FinishClaim::Invalid {
+                        raw: "<missing>".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!("done"),
+                    FinishClaim::Invalid {
+                        raw: "<missing>".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!(null),
+                    FinishClaim::Invalid {
+                        raw: "<missing>".to_string(),
+                    },
+                ),
+                (
+                    serde_json::json!(["done"]),
+                    FinishClaim::Invalid {
+                        raw: "<missing>".to_string(),
+                    },
+                ),
+            ]
+        };
+        // Every pre-existing row must classify identically in BOTH modes —
+        // turning answer mode on changes nothing about the other five shapes.
+        for answer_enabled in [true, false] {
+            for (input, expected) in shared_cases() {
+                assert_eq!(
+                    FinishClaim::from_input(&input, answer_enabled),
+                    expected,
+                    "input: {input:?} (answer_enabled: {answer_enabled})"
+                );
+            }
+        }
+
+        // The answer-mode rows, where `answer_enabled` IS the discriminator.
+        let answer_cases: Vec<(serde_json::Value, bool, FinishClaim)> = vec![
             (
-                serde_json::json!({ "disposition": "done", "summary": "s" }),
-                FinishClaim::Done {
-                    summary: "s".to_string(),
+                serde_json::json!({ "disposition": "answer", "result": { "v": 1 } }),
+                true,
+                FinishClaim::Answer {
+                    result: Some(serde_json::json!({ "v": 1 })),
                 },
             ),
             (
-                serde_json::json!({ "disposition": "blocked", "decision_needed": "d" }),
-                FinishClaim::Blocked {
-                    decision_needed: "d".to_string(),
+                serde_json::json!({ "disposition": " ANSWER " }),
+                true,
+                FinishClaim::Answer { result: None },
+            ),
+            (
+                serde_json::json!({ "disposition": "answer", "result": null }),
+                true,
+                FinishClaim::Answer {
+                    result: Some(serde_json::Value::Null),
                 },
             ),
             (
-                serde_json::json!({ "disposition": "failed", "summary": "s" }),
-                FinishClaim::Failed {
-                    summary: "s".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": " Done \n" }),
-                FinishClaim::Done {
-                    summary: String::new(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "FAILED" }),
-                FinishClaim::Failed {
-                    summary: String::new(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "done", "summary": 5 }),
-                FinishClaim::Done {
-                    summary: String::new(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "blocked" }),
-                FinishClaim::Blocked {
-                    decision_needed: String::new(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "already_satisfied", "reason": "r" }),
-                FinishClaim::AlreadySatisfied {
-                    reason: "r".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": " Already_Satisfied ", "reason": "r" }),
-                FinishClaim::AlreadySatisfied {
-                    reason: "r".to_string(),
-                },
-            ),
-            (
-                // The schema still requires `summary`, so a conforming
-                // already_satisfied call supplies one — it is DISCARDED, never
-                // smuggled into `reason`.
                 serde_json::json!({
-                    "disposition": "already_satisfied",
-                    "summary": "s",
-                    "reason": "r",
+                    "disposition": "answer",
+                    "summary": "ignored",
+                    "result": {}
                 }),
-                FinishClaim::AlreadySatisfied {
-                    reason: "r".to_string(),
+                true,
+                FinishClaim::Answer {
+                    result: Some(serde_json::json!({})),
+                },
+            ),
+            // With answer mode OFF the value falls through the pre-existing
+            // `Invalid` arm, so `raw` is the UNTRIMMED original JSON — not a
+            // synthesized literal.
+            (
+                serde_json::json!({ "disposition": " ANSWER " }),
+                false,
+                FinishClaim::Invalid {
+                    raw: "\" ANSWER \"".to_string(),
                 },
             ),
             (
-                serde_json::json!({ "disposition": "already_satisfied" }),
-                FinishClaim::MissingReason,
-            ),
-            (
-                serde_json::json!({ "disposition": "already_satisfied", "reason": "" }),
-                FinishClaim::MissingReason,
-            ),
-            (
-                serde_json::json!({ "disposition": "already_satisfied", "reason": "  \t " }),
-                FinishClaim::MissingReason,
-            ),
-            (
-                serde_json::json!({ "disposition": "already_satisfied", "reason": 7 }),
-                FinishClaim::MissingReason,
-            ),
-            (
-                serde_json::json!({ "disposition": "complete" }),
+                serde_json::json!({ "disposition": "answer" }),
+                false,
                 FinishClaim::Invalid {
-                    raw: "\"complete\"".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "success" }),
-                FinishClaim::Invalid {
-                    raw: "\"success\"".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": "" }),
-                FinishClaim::Invalid {
-                    raw: "\"\"".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": 1 }),
-                FinishClaim::Invalid {
-                    raw: "1".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": true }),
-                FinishClaim::Invalid {
-                    raw: "true".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": null }),
-                FinishClaim::Invalid {
-                    raw: "null".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "disposition": ["done"] }),
-                FinishClaim::Invalid {
-                    raw: "[\"done\"]".to_string(),
-                },
-            ),
-            (
-                serde_json::json!({ "summary": "x" }),
-                FinishClaim::Invalid {
-                    raw: "<missing>".to_string(),
-                },
-            ),
-            (
-                serde_json::json!("done"),
-                FinishClaim::Invalid {
-                    raw: "<missing>".to_string(),
-                },
-            ),
-            (
-                serde_json::json!(null),
-                FinishClaim::Invalid {
-                    raw: "<missing>".to_string(),
-                },
-            ),
-            (
-                serde_json::json!(["done"]),
-                FinishClaim::Invalid {
-                    raw: "<missing>".to_string(),
+                    raw: "\"answer\"".to_string(),
                 },
             ),
         ];
-        for (input, expected) in cases {
+        for (input, answer_enabled, expected) in answer_cases {
             assert_eq!(
-                FinishClaim::from_input(&input),
+                FinishClaim::from_input(&input, answer_enabled),
                 expected,
-                "input: {input:?}"
+                "input: {input:?} (answer_enabled: {answer_enabled})"
             );
         }
     }
@@ -4189,7 +4739,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_tool_metadata_and_run() {
-        let tool = FinishTool;
+        let tool = FinishTool::default();
         assert_eq!(tool.name(), FINISH_TOOL_NAME);
         let schema = tool.schema();
         assert_eq!(schema["name"], FINISH_TOOL_NAME);
@@ -4208,7 +4758,7 @@ mod tests {
 
     #[test]
     fn finish_schema_disposition_description_is_pinned() {
-        let schema = FinishTool.schema();
+        let schema = FinishTool::default().schema();
         assert_eq!(
             schema["description"],
             "End the run. Call it when the task is complete, already satisfied, blocked \
@@ -4376,6 +4926,7 @@ mod tests {
             first_invalid_finish_raw: None,
             no_change_rejections: 0,
             already_satisfied_check_rejections: 0,
+            answer_schema_rejections: 0,
             tree_baseline_unobservable: false,
         };
         let printed = format!("{a:?}");
@@ -5717,7 +6268,7 @@ mod tests {
         });
         let mut tools = ToolRegistry::new();
         tools.register("count", counter.clone());
-        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         // Build the interrupted record: task seed + assistant(call1, call2).
         let task_seed = Message::User {
@@ -6374,7 +6925,7 @@ mod tests {
                     counter: counter_for_spawn,
                 }),
             );
-            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
             let ctx = ToolCtx::stub();
             let config = RunConfig::new("do the task", 10).with_checks(passing_runner());
             let store: Arc<dyn RunStore> =
@@ -6459,7 +7010,7 @@ mod tests {
                 counter: side_effect_counter.clone(),
             }),
         );
-        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let ctx_leg2 = ToolCtx::stub();
         let config_leg2 = RunConfig::new("do the task", 10).with_checks(passing_runner());
@@ -6782,7 +7333,7 @@ mod tests {
                     counter: counter_for_spawn,
                 }),
             );
-            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+            tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
             let ctx = ToolCtx::stub();
             let config = RunConfig::new("do the task", 10).with_checks(passing_runner());
             let store: Arc<dyn RunStore> =
@@ -6863,7 +7414,7 @@ mod tests {
                 counter: panicky_counter.clone(),
             }),
         );
-        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools_leg2.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let ctx_leg2 = ToolCtx::stub();
         let config_leg2 = RunConfig::new("do the task", 10).with_checks(passing_runner());
@@ -9496,6 +10047,7 @@ mod tests {
             first_invalid_finish_raw: None,
             no_change_rejections: 0,
             already_satisfied_check_rejections: 0,
+            answer_schema_rejections: 0,
             tree_baseline_unobservable: false,
         }
     }
@@ -9530,7 +10082,7 @@ mod tests {
     fn registry_with_finish_and_edit() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register("edit_file", Arc::new(EditFileTool));
-        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
         registry
     }
 
@@ -9730,7 +10282,7 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         tools.register("bash", Arc::new(crate::tools::bash::BashTool));
-        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         // The agent commits its own change: the tree is CLEAN at finish time
         // but HEAD moved. No template instructs a commit, but `bash` permits
@@ -9939,8 +10491,23 @@ mod tests {
              you checked and why the task was already complete. Call finish again with a \
              reason, or with a different disposition."
         );
+        assert_eq!(
+            missing_result_rejection_content(),
+            "finish rejected: answer requires a `result` that conforms to the configured \
+             result schema. Call finish again with disposition `answer` and a `result`, or \
+             with a different disposition."
+        );
         assert!(no_change_rejection_content().contains("rejected"));
         assert!(missing_reason_rejection_content().contains("rejected"));
+        assert!(missing_result_rejection_content().contains("rejected"));
+        let answer_errors = answer_schema_rejection_content(&["/verdict: bad".to_string()]);
+        assert!(
+            answer_errors.starts_with(
+                "finish(answer) rejected: result does not conform to the configured schema:"
+            ),
+            "got {answer_errors}"
+        );
+        assert!(answer_errors.contains("rejected"));
         let report = CheckReport {
             passed: false,
             exit_code: Some(1),
@@ -10075,7 +10642,7 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         tools.register("bash", Arc::new(crate::tools::bash::BashTool));
-        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        tools.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
 
         let transcript = root_path.join("t.jsonl");
         let backend = MockBackend::from_turns(vec![
@@ -10157,7 +10724,7 @@ mod tests {
                 verification: Verification::NoChecksConfigured,
                 change: ChangeEvidence::TreeUnchanged,
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"));
+        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"), None);
         drop(writer);
 
         let lines = read_transcript_lines(&path);
@@ -10184,7 +10751,612 @@ mod tests {
                 verification: Verification::NoChecksConfigured,
                 change: ChangeEvidence::TreeChanged,
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), None);
+        emit_run_end(&mut writer, &result, &zero_stats(), None, None);
+        drop(writer);
+
+        let lines = read_transcript_lines(&path);
+        assert!(lines.iter().all(|l| l["event"] != "contract_violation"));
+    }
+
+    // ---- answer mode ----------------------------------------------------
+
+    /// A schema that accepts `{"verdict": "ok"|"bad"}` objects and nothing
+    /// else — small enough to reason about, strict enough to produce a
+    /// predictable error message.
+    fn verdict_schema() -> AnswerSchema {
+        AnswerSchema::compile(&serde_json::json!({
+            "type": "object",
+            "properties": { "verdict": { "enum": ["ok", "bad"] } },
+            "required": ["verdict"],
+        }))
+        .expect("the verdict schema compiles")
+    }
+
+    #[test]
+    fn answer_schema_compile_rejects_a_non_schema() {
+        let err = AnswerSchema::compile(&serde_json::json!({ "type": 12345 }))
+            .expect_err("`{\"type\": 12345}` is not a valid JSON Schema");
+        assert!(
+            !err.message.is_empty(),
+            "the compile failure must carry a message"
+        );
+    }
+
+    #[test]
+    fn answer_schema_source_round_trips_the_value_it_compiled() {
+        let schema = serde_json::json!({ "type": "object" });
+        let compiled = AnswerSchema::compile(&schema).expect("compiles");
+        assert_eq!(compiled.source(), &schema);
+    }
+
+    #[test]
+    fn validation_errors_normalizes_a_root_path_to_slash() {
+        let compiled =
+            AnswerSchema::compile(&serde_json::json!({ "type": "object" })).expect("compiles");
+        let errors = compiled.validation_errors(&serde_json::json!(1));
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(
+            errors[0].starts_with("/: "),
+            "a ROOT-level error renders its empty instance path as `/`; got {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validation_errors_names_the_failing_property_and_is_empty_when_valid() {
+        let compiled = AnswerSchema::compile(&serde_json::json!({
+            "type": "object",
+            "properties": { "verdict": { "enum": ["ok"] } },
+        }))
+        .expect("compiles");
+        let errors = compiled.validation_errors(&serde_json::json!({ "verdict": "nope" }));
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(errors[0].starts_with("/verdict: "), "got {:?}", errors[0]);
+        assert!(
+            compiled
+                .validation_errors(&serde_json::json!({ "verdict": "ok" }))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn run_config_answer_schema_defaults_to_none_and_the_builder_sets_it() {
+        let config = RunConfig::new("t", 1);
+        assert!(config.answer_schema.is_none());
+        let config = config.with_answer_schema(verdict_schema());
+        assert!(config.answer_schema.is_some());
+    }
+
+    #[test]
+    fn answer_schema_rejection_content_caps_lines_and_reports_the_remainder() {
+        let errors: Vec<String> = (0..25).map(|i| format!("/f{i}: bad")).collect();
+        let content = answer_schema_rejection_content(&errors);
+        let lines: Vec<&str> = content.lines().collect();
+        // header + MAX_LINES error lines + the "…and N more" line
+        assert_eq!(lines.len(), ANSWER_SCHEMA_ERRORS_MAX_LINES + 2);
+        assert_eq!(
+            lines[0],
+            "finish(answer) rejected: result does not conform to the configured schema:"
+        );
+        assert_eq!(
+            lines[ANSWER_SCHEMA_ERRORS_MAX_LINES + 1],
+            format!("…and {} more", 25 - ANSWER_SCHEMA_ERRORS_MAX_LINES)
+        );
+    }
+
+    #[test]
+    fn answer_schema_rejection_content_truncates_one_enormous_error() {
+        let errors = vec!["x".repeat(10_000)];
+        let content = answer_schema_rejection_content(&errors);
+        let marker = format!("…[truncated at {ANSWER_SCHEMA_ERRORS_CAP} chars]");
+        assert!(content.ends_with(&marker), "expected the truncation marker");
+        let body = content
+            .strip_suffix(&marker)
+            .expect("the marker was just asserted");
+        assert!(
+            body.chars().count() <= ANSWER_SCHEMA_ERRORS_CAP,
+            "pre-marker body was {} chars",
+            body.chars().count()
+        );
+    }
+
+    /// Build mode is byte-identical: the `answer` disposition is not
+    /// advertised, so a `finish(answer)` is rejected by the pre-existing
+    /// invalid-disposition path with the pre-existing wording and counters.
+    #[tokio::test]
+    async fn answer_without_a_configured_schema_is_the_inherited_invalid_rejection() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        // A second, non-finish turn so the fed-back rejection reaches the
+        // backend and can be inspected via `last_messages`.
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-answer",
+                serde_json::json!({ "disposition": "answer", "result": {} }),
+            ),
+            turn_with(
+                vec![ContentBlock::Text("hm".to_string())],
+                StopReason::EndTurn,
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 3);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "an un-advertised answer must NOT terminate the loop as Finished; got {outcome:?}"
+        );
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert_eq!(
+            stats.first_invalid_finish_raw.as_deref(),
+            Some("\"answer\"")
+        );
+        assert_eq!(stats.answer_schema_rejections, 0);
+
+        let fed_back = backend.last_messages();
+        assert!(
+            fed_back.iter().any(|m| matches!(
+                m,
+                Message::User { content }
+                    if content.iter().any(|b| matches!(
+                        b,
+                        UserBlock::ToolResult { content, is_error, .. }
+                            if *is_error && content == "finish rejected: disposition must be \
+                                one of: done, blocked, failed, already_satisfied; got \
+                                \"answer\". Call finish again with one of those values."
+                    ))
+            )),
+            "the inherited invalid-disposition wording must be reused byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_without_a_result_is_a_malformed_finish_call() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call("c-answer", serde_json::json!({ "disposition": "answer" })),
+            turn_with(
+                vec![ContentBlock::Text("hm".to_string())],
+                StopReason::EndTurn,
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 3).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert_eq!(
+            stats.first_invalid_finish_raw.as_deref(),
+            Some("answer without result")
+        );
+        assert_eq!(stats.answer_schema_rejections, 0);
+
+        let fed_back = backend.last_messages();
+        assert!(fed_back.iter().any(|m| matches!(
+            m,
+            Message::User { content }
+                if content.iter().any(|b| matches!(
+                    b,
+                    UserBlock::ToolResult { content, is_error, .. }
+                        if *is_error && *content == missing_result_rejection_content()
+                ))
+        )));
+    }
+
+    #[tokio::test]
+    async fn schema_invalid_answers_are_counted_then_a_valid_one_terminates() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("answer.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-a1",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            ),
+            finish_call(
+                "c-a2",
+                serde_json::json!({ "disposition": "answer", "result": 7 }),
+            ),
+            finish_call(
+                "c-a3",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 4)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "answer");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { ref result, .. }) => {
+                assert_eq!(result, &serde_json::json!({ "verdict": "ok" }));
+            }
+            other => panic!("expected Finished(Answer); got {other:?}"),
+        }
+        assert_eq!(stats.answer_schema_rejections, 2);
+        assert_eq!(stats.invalid_finish_calls, 0);
+        assert_eq!(stats.no_change_rejections, 0);
+        assert_eq!(stats.already_satisfied_check_rejections, 0);
+
+        // The counter must reach the DURABLE record, not just RunStats.
+        let lines = read_transcript_lines(&transcript);
+        let run_end = lines
+            .iter()
+            .rfind(|l| l["event"] == "run_end")
+            .expect("a run_end line");
+        assert_eq!(run_end["stats"]["answer_schema_rejections"], 2);
+    }
+
+    /// The transcript's `finish_answer` key discriminates the BRANCH, not
+    /// merely validity — and is absent entirely on a non-finish call.
+    #[tokio::test]
+    async fn finish_answer_records_each_branch_on_the_transcript() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("branches.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "x\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call("c-miss", serde_json::json!({ "disposition": "answer" })),
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            ),
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 5)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "branches");
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(
+            outcome,
+            LoopOutcome::Finished(Disposition::Answer { .. })
+        ));
+
+        let lines = read_transcript_lines(&transcript);
+        let by_call = |id: &str| -> serde_json::Value {
+            lines
+                .iter()
+                .find(|l| l["event"] == "tool_result" && l["call_id"] == id)
+                .unwrap_or_else(|| panic!("a tool_result for {id}"))
+                .clone()
+        };
+
+        // A non-finish call carries NO `finish_answer` key at all.
+        assert!(by_call("c-edit").get("finish_answer").is_none());
+
+        let missing = by_call("c-miss");
+        assert_eq!(missing["finish_answer"]["branch"], "missing_result");
+        assert_eq!(
+            missing["finish_answer"]["errors"],
+            serde_json::json!([]),
+            "the missing-result branch shows no schema errors"
+        );
+        assert_eq!(missing["finish_accepted"], serde_json::json!(false));
+
+        let invalid = by_call("c-bad");
+        assert_eq!(invalid["finish_answer"]["branch"], "invalid");
+        assert!(
+            !invalid["finish_answer"]["errors"]
+                .as_array()
+                .expect("an errors array")
+                .is_empty()
+        );
+        assert_eq!(invalid["finish_accepted"], serde_json::json!(false));
+
+        let valid = by_call("c-ok");
+        assert_eq!(valid["finish_answer"]["branch"], "valid");
+        assert_eq!(valid["finish_answer"]["errors"], serde_json::json!([]));
+        assert_eq!(valid["finish_accepted"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn finish_answer_is_null_for_a_done_claim() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("done.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "f.txt",
+                        "old_string": "",
+                        "new_string": "work\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "did it" }),
+            ),
+        ]);
+        let config = RunConfig::new("work", 3)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "done");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let lines = read_transcript_lines(&transcript);
+        let finish = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result" && l["call_id"] == "c-done")
+            .expect("a finish tool_result");
+        assert_eq!(finish["finish_answer"], serde_json::Value::Null);
+    }
+
+    /// The schema itself is recorded on `run_start` so a reviewer can
+    /// re-verify any verdict off the record; build mode records `null`.
+    #[tokio::test]
+    async fn run_start_records_the_answer_schema_and_null_in_build_mode() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let schema_value = serde_json::json!({ "type": "object" });
+        let answer_t = root_path.join("answer_start.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-ok",
+            serde_json::json!({ "disposition": "answer", "result": {} }),
+        )]);
+        let config = RunConfig::new("t", 1)
+            .with_answer_schema(AnswerSchema::compile(&schema_value).expect("compiles"))
+            .with_transcript(answer_t.clone(), "answer");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&answer_t);
+        assert_eq!(lines[0]["config"]["answer_schema"], schema_value);
+
+        let build_t = root_path.join("build_start.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config = RunConfig::new("t", 1).with_transcript(build_t.clone(), "build");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&build_t);
+        assert_eq!(lines[0]["config"]["answer_schema"], serde_json::Value::Null);
+    }
+
+    /// Checks in answer mode RUN if configured but NEVER reject: answer
+    /// mode's verifier is the schema, and a red gate describes a workspace
+    /// the answering agent did not author.
+    #[tokio::test]
+    async fn a_red_gate_is_recorded_on_an_accepted_answer_not_rejected() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 1".to_string()],
+            },
+            root_path.clone(),
+            Duration::from_secs(10),
+        );
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-ok",
+            serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+        )]);
+        let config = RunConfig::new("answer me", 2)
+            .with_answer_schema(verdict_schema())
+            .with_checks(runner);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { verification, .. }) => match verification {
+                Verification::Checks(report) => assert!(
+                    !report.passed,
+                    "the RED report must be recorded as telemetry, not suppressed"
+                ),
+                other @ Verification::NoChecksConfigured => {
+                    panic!("expected Verification::Checks; got {other:?}")
+                }
+            },
+            other => panic!("a red gate must NOT reject an answer; got {other:?}"),
+        }
+        assert_eq!(stats.answer_schema_rejections, 0);
+    }
+
+    /// Change evidence is RECORDED, not enforced — the inverted precondition
+    /// belongs to answer mode's CLI half.
+    #[tokio::test]
+    async fn an_answer_in_a_mutated_workspace_is_still_accepted() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "incidental\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 3).with_answer_schema(verdict_schema());
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Answer); got {other:?}"),
+        }
+    }
+
+    // ---- answer mode: the FinishTool schema gate -------------------------
+
+    #[test]
+    fn build_mode_finish_schema_disposition_enum_is_unchanged() {
+        let schema = FinishTool::default().schema();
+        assert_eq!(
+            schema["input_schema"]["properties"]["disposition"]["enum"],
+            serde_json::json!(["done", "blocked", "failed", "already_satisfied"]),
+        );
+    }
+
+    #[test]
+    fn build_mode_finish_schema_never_mentions_answer() {
+        let rendered = serde_json::to_string(&FinishTool::default().schema())
+            .expect("the finish schema serializes")
+            .to_lowercase();
+        assert!(
+            !rendered.contains("answer"),
+            "build mode must not advertise answer mode; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn build_mode_system_prompt_never_mentions_answer() {
+        let rendered = prompt::render_system_prompt(
+            &prompt::tool_lines(&crate::tools::standard_registry(None)),
+            None,
+        )
+        .to_lowercase();
+        assert!(
+            !rendered.contains("answer"),
+            "the build-mode prompt must stay untouched by answer mode"
+        );
+    }
+
+    #[test]
+    fn answer_mode_finish_schema_advertises_answer_last_without_requiring_result() {
+        let schema = FinishTool { answer_mode: true }.schema();
+        assert_eq!(
+            schema["input_schema"]["properties"]["disposition"]["enum"],
+            serde_json::json!(["done", "blocked", "failed", "already_satisfied", "answer"]),
+        );
+        assert_eq!(
+            schema["input_schema"]["required"],
+            serde_json::json!(["disposition", "summary"]),
+            "`result` is enforced by the harness's pinned rejection, not the schema"
+        );
+        assert!(!schema["input_schema"]["properties"]["result"].is_null());
+    }
+
+    // ---- answer mode: the runtime audit ---------------------------------
+
+    #[test]
+    fn emit_run_end_audits_an_answer_that_reached_the_terminal_with_no_schema() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("no_schema.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "audit".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Answer {
+                result: serde_json::json!({ "verdict": "ok" }),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            }));
+        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"), None);
+        drop(writer);
+
+        let violation = read_transcript_lines(&path)
+            .into_iter()
+            .find(|l| l["event"] == "contract_violation")
+            .expect("a contract_violation event");
+        assert_eq!(violation["kind"], "answer_without_schema");
+        assert_eq!(violation["run_id"], "task:1");
+    }
+
+    #[test]
+    fn emit_run_end_audits_an_answer_whose_result_violates_the_schema() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("bad_result.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "audit".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Answer {
+                result: serde_json::json!({ "verdict": "nope" }),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            }));
+        let schema = verdict_schema();
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            Some("task:1"),
+            Some(&schema),
+        );
+        drop(writer);
+
+        let violation = read_transcript_lines(&path)
+            .into_iter()
+            .find(|l| l["event"] == "contract_violation")
+            .expect("a contract_violation event");
+        assert_eq!(violation["kind"], "answer_result_fails_schema");
+        assert!(
+            !violation["errors"]
+                .as_array()
+                .expect("an errors array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn emit_run_end_does_not_audit_an_honest_answer() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("honest.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "audit".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Answer {
+                result: serde_json::json!({ "verdict": "ok" }),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            }));
+        let schema = verdict_schema();
+        emit_run_end(&mut writer, &result, &zero_stats(), None, Some(&schema));
         drop(writer);
 
         let lines = read_transcript_lines(&path);

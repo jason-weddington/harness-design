@@ -128,6 +128,18 @@ exceptions = [
     # Each entry is the crate and version constraint, and its specific allow
     # list
     #{ allow = ["Zlib"], crate = "adler32" },
+    # borrow-or-share: MIT-0 — MIT without the attribution clause, i.e. strictly
+    # more permissive than a license already on the allow list, and non-copyleft.
+    # Reached only via `jsonschema` -> `referencing` -> `fluent-uri` ->
+    # `borrow-or-share` (answer mode's schema validator). Scoped as a per-crate
+    # exception rather than widening `allow`, so a future MIT-0 crate still
+    # arrives as a deliberate decision.
+    { allow = ["MIT-0"], crate = "borrow-or-share" },
+    # foldhash: Zlib — OSI-approved, permissive, non-copyleft (no attribution
+    # requirement beyond not misrepresenting origin). Reached only via
+    # `jsonschema` -> `referencing` -> `hashbrown` -> `foldhash`. Same reasoning
+    # as above: scoped to this crate, not admitted project-wide.
+    { allow = ["Zlib"], crate = "foldhash" },
 ]
 
 # Some crates don't have (easily) machine readable licensing information,

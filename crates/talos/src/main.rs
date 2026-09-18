@@ -9,6 +9,7 @@
 //! | 10   | Task Blocked |
 //! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` |
 //! | 30   | Task was already satisfied — gates green, nothing changed; NOT pushable |
+//! | 40   | Task produced a schema-validated Answer; NOT pushable |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
 //!
 //! The code is read from [`harness::engine::LoopOutcome`], **not** from the
@@ -432,15 +433,25 @@ impl ModelBackend for Backend {
 /// | `MaxIterations` | 20 |
 /// | `BudgetExhausted` | 20 |
 /// | `Finished(AlreadySatisfied{..})` | 30 |
+/// | `Finished(Answer{..})` | 40 |
 /// | `BackendError(_)` | 1 |
 ///
 /// 30 exists as its own code because at 20 the dispatch worker cannot tell an
 /// already-satisfied run from a real failure, and at 0 it would be pushed as
 /// a Done — and an already-satisfied run has nothing to push.
+///
+/// 40 exists for exactly the same reason, applied to answer mode. Exit 0 is
+/// the ONE thing the dispatch worker (`agent-gtd-dispatch`
+/// `talos.py::map_talos_result`) relies on to mean "push the branch", and an
+/// answer run has nothing to push — its deliverable is the JSON payload on
+/// stdout. 20 would misread a successful answer as a task failure. An unknown
+/// code falls to that worker's engine-error catch-all, which fails safe —
+/// which is the right landing spot until the worker grows an arm for it.
 fn exit_code(outcome: &LoopOutcome) -> i32 {
     match outcome {
         LoopOutcome::Finished(Disposition::Done { .. }) => 0,
         LoopOutcome::Finished(Disposition::AlreadySatisfied { .. }) => 30,
+        LoopOutcome::Finished(Disposition::Answer { .. }) => 40,
         LoopOutcome::Finished(Disposition::Blocked { .. }) => 10,
         LoopOutcome::Finished(Disposition::Failed { .. })
         | LoopOutcome::StoppedWithoutFinish
@@ -1506,6 +1517,40 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize");
         assert!(json.contains("AlreadySatisfied"), "got {json}");
         assert!(json.contains("TreeUnchanged"), "got {json}");
+    }
+
+    #[test]
+    fn exit_code_answer_is_40() {
+        let outcome = LoopOutcome::Finished(Disposition::Answer {
+            result: serde_json::json!({"verdict": "ok"}),
+            verification: Verification::NoChecksConfigured,
+            change: ChangeEvidence::TreeUnchanged,
+        });
+        assert_eq!(
+            exit_code(&outcome),
+            40,
+            "an answer run is neither a pushable Done (0) nor a failure (20)"
+        );
+    }
+
+    /// The validated payload reaches stdout transitively through the embedded
+    /// `Disposition` — `RunSummary` gains no top-level `result` field.
+    #[test]
+    fn run_summary_serializes_answer_with_its_result() {
+        let summary = build_run_summary(
+            "Finished",
+            Disposition::Answer {
+                result: serde_json::json!({"verdict": "ok"}),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            },
+            "t:1".to_string(),
+            "/tmp/run.sqlite".to_string(),
+            1,
+        );
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains("Answer"), "got {json}");
+        assert!(json.contains("verdict"), "got {json}");
     }
 
     #[test]

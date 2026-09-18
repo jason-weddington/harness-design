@@ -41,6 +41,13 @@ aws-smithy-runtime-api = "1.13.0"
 aws-smithy-types = "1.6.1"
 # clap: command-line argument parsing with derive macros. MIT OR Apache-2.0.
 clap = { version = "4", features = ["derive"] }
+# jsonschema: JSON Schema validation. Answer mode compiles a caller-supplied
+# schema once and validates every `finish(answer)` payload against it — the
+# mechanical verifier that plays the role a green gate plays in build mode.
+# `default-features = false` drops the optional `resolve-http`/`resolve-file`
+# remote-reference resolvers and the CLI; we only ever validate against an
+# in-memory schema value. MIT.
+jsonschema = { version = "0.56", default-features = false }
 # reqwest pinned to the rustls (ring) TLS backend — no system OpenSSL, no
 # native-tls. `default-features = false` drops the native-tls baseline; we
 # only opt back into the bits we actually need (`json` for body

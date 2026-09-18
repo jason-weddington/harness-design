@@ -484,6 +484,9 @@ fn outcome_one_liner(outcome: &LoopOutcome) -> String {
         LoopOutcome::Finished(Disposition::AlreadySatisfied { reason, .. }) => {
             format!("AlreadySatisfied — {reason}")
         }
+        LoopOutcome::Finished(Disposition::Answer { result, .. }) => {
+            format!("Answer — {} bytes of result", result.to_string().len())
+        }
         LoopOutcome::Finished(Disposition::Blocked { decision_needed }) => {
             format!("Blocked — {decision_needed}")
         }

@@ -1918,6 +1918,10 @@ pub const CLAIMED_FAILED: &str = "Failed";
 /// Label used for an `AlreadySatisfied` disposition — the agent's deliberate
 /// "nothing needed changing" off-ramp.
 pub const CLAIMED_ALREADY_SATISFIED: &str = "AlreadySatisfied";
+/// Label used for an `Answer` disposition — answer mode's schema-validated
+/// payload terminal. Never produced by a tier-2 mined trial (which runs in
+/// build mode), but the match over [`Disposition`] is exhaustive.
+pub const CLAIMED_ANSWER: &str = "Answer";
 
 /// Render a terminal [`LoopOutcome`] as the compact string stored on
 /// [`MinedTrialResult::claimed_disposition`].
@@ -1928,6 +1932,7 @@ pub fn claimed_disposition_label(outcome: &LoopOutcome) -> String {
         LoopOutcome::Finished(Disposition::AlreadySatisfied { .. }) => {
             CLAIMED_ALREADY_SATISFIED.to_string()
         }
+        LoopOutcome::Finished(Disposition::Answer { .. }) => CLAIMED_ANSWER.to_string(),
         LoopOutcome::Finished(Disposition::Blocked { .. }) => CLAIMED_BLOCKED.to_string(),
         LoopOutcome::Finished(Disposition::Failed { .. }) => CLAIMED_FAILED.to_string(),
         LoopOutcome::StoppedWithoutFinish => "StoppedWithoutFinish".to_string(),
@@ -3862,6 +3867,14 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             CLAIMED_DONE,
         );
         assert_eq!(
+            claimed_disposition_label(&LoopOutcome::Finished(Disposition::Answer {
+                result: serde_json::json!({"verdict": "ok"}),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            })),
+            super::CLAIMED_ANSWER,
+        );
+        assert_eq!(
             claimed_disposition_label(&LoopOutcome::Finished(Disposition::Blocked {
                 decision_needed: "?".to_string(),
             })),
@@ -4572,7 +4585,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             transcripts: false,
         };
         // Silence FinishTool's `use` warning across the impl surface.
-        let _ = FinishTool;
+        let _ = FinishTool::default();
         let mut on_trial_calls = 0u32;
         let mut on_trial = |_t: &MinedTrialResult| {
             on_trial_calls += 1;
@@ -4689,7 +4702,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             wall_clock_secs: 0,
             transcripts: true,
         };
-        let _ = FinishTool;
+        let _ = FinishTool::default();
         let mut on_trial = |_t: &MinedTrialResult| {};
         let report = run_mined_task(&backend, &PytestParser, &config, &mut on_trial).await;
 
@@ -5973,7 +5986,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
                 },
             },
         ]);
-        let _ = FinishTool;
+        let _ = FinishTool::default();
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {

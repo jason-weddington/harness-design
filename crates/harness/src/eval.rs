@@ -936,7 +936,7 @@ mod tests {
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::new();
         r.register("echo", Arc::new(EchoTool));
-        r.register(FINISH_TOOL_NAME, Arc::new(FinishTool));
+        r.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
         r
     }
 
@@ -1453,6 +1453,7 @@ mod tests {
                 first_invalid_finish_raw: None,
                 no_change_rejections: 0,
                 already_satisfied_check_rejections: 0,
+                answer_schema_rejections: 0,
                 tree_baseline_unobservable: false,
             },
             transcript_path: None,
@@ -1935,6 +1936,7 @@ mod tests {
                 first_invalid_finish_raw: None,
                 no_change_rejections: 0,
                 already_satisfied_check_rejections: 0,
+                answer_schema_rejections: 0,
                 tree_baseline_unobservable: false,
             },
             transcript_path: None,
