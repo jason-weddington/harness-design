@@ -1,6 +1,13 @@
 //! `talos run` — accept a [`TaskSpec`] JSON (stdin or `--file`), execute
 //! it with full persistence, and exit with a disposition-mapped code.
 //!
+//! `talos run --mode answer --schema <path>` — the READ-ONLY variant: the
+//! input is a free-text question instead of a `TaskSpec`, the tool registry
+//! omits `edit_file`, no gate and no nudges are wired, and the run terminates
+//! with a `finish(answer)` whose `result` validated against `--schema` AND
+//! whose working tree is UNCHANGED since the run started. See the `--mode`
+//! answer section below.
+//!
 //! ## Exit code contract (locked)
 //!
 //! | Code | Meaning |
@@ -12,6 +19,17 @@
 //! | 40   | Task produced a schema-validated Answer; NOT pushable |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
 //!
+//! Why 40 and not 0/20/30 (the dispatch-worker contract, re-verified against
+//! `agent-gtd-dispatch` at the cited lines): `talos.py::map_talos_result`
+//! (talos.py:285-306) sets `push=True` only on exit 0 with parseable stdout,
+//! and a validated answer has NOTHING to push — its deliverable is the JSON
+//! payload on stdout — so it must not be 0. It is not an already-satisfied
+//! build run either, so it must not be 30; keeping 40 distinct from 30 lets a
+//! future mapper arm tell answer-with-payload from already-satisfied. Today
+//! BOTH 30 and 40 fall to that mapper's unknown-exit-code catch-all
+//! (talos.py:342-346), which fails safe (status `failed`, `push=False`) —
+//! the right landing spot until the worker grows an arm for it.
+//!
 //! The code is read from [`harness::engine::LoopOutcome`], **not** from the
 //! disposition — because `BackendError`'s `into_disposition` also yields
 //! `Failed`, which would collapse engine-broke (must be 1) into task-Failed
@@ -22,6 +40,48 @@
 //! tool result — default OFF, flag only (no env fallback); a bare
 //! `--transcript` defaults to `transcript.jsonl` in the run's state dir.
 //! `talos ralph` has no transcript support.
+//!
+//! ## `talos run --mode answer` flags
+//!
+//! - `--mode <build|answer>` (default `build`) — `build` is today's path,
+//!   byte-for-byte. `answer` REQUIRES `--schema`; `build` REJECTS it. Both
+//!   shape errors are checked BEFORE stdin is read, so a wrongly flagged
+//!   invocation fails immediately instead of blocking on a pipe.
+//! - `--schema <PathBuf>` (required with `--mode answer`, forbidden without
+//!   it) — a JSON Schema file the answer's `result` must conform to. Used
+//!   verbatim as supplied: resolved against the process CWD, NOT canonicalized
+//!   and NOT confined to `--workspace`, exactly like `--file`. Its RAW bytes
+//!   are shown to the model (key order and formatting survive) and separately
+//!   compiled into the validator the harness enforces.
+//! - `--file` / stdin — in answer mode this is the free-text QUESTION, never
+//!   a `TaskSpec`; it is never handed to `serde_json`. A whitespace-only
+//!   question is rejected before the store is opened.
+//! - Everything else applies identically (`--task-id`, `--attempt`,
+//!   `--max-iterations`, `--wall-clock-secs`, `--transcript`,
+//!   `--state-retention-days`, `--offload-dir`, `--run-store`).
+//!   `--gate-timeout-secs` is accepted and INERT — answer mode wires no gate
+//!   this cut.
+//!
+//! CONCURRENCY: several answer agents on one host MUST each pass a distinct
+//! `--task-id` (or distinct `--run-store` + `--offload-dir`) — the default
+//! `talos-run` state dir and run id (`talos-run:1`) collide.
+//!
+//! ## Auditing an answer run's transcript
+//!
+//! Both queries must return ZERO rows on an answer run; any hit means the
+//! read-only guard regressed:
+//!
+//! ```text
+//! jq -c 'select(.event=="tool_result" and .finish_accepted==true and .finish_change=="TreeChanged")' t.jsonl
+//! jq -c 'select(.event=="run_end" and .stats.edit_file_calls_ok>0)' t.jsonl
+//! ```
+//!
+//! The first would mean the harness accepted an answer from a workspace the
+//! agent modified; the second, that an `edit_file` succeeded in a registry
+//! that does not register it. Note that `tree_dirty` and `mutating_iters` are
+//! NOT the read-only oracle — in answer mode they count successful `bash`
+//! calls, not observed tree changes. The authoritative evidence is
+//! `Disposition::Answer.change`.
 //!
 //! `talos ralph` — a thin CLI over [`harness::ralph::run_ralph`]: drive the
 //! Ralph outer loop toward a plain-objective `--stop-when` command oracle
@@ -137,11 +197,11 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use harness::anthropic::AnthropicBackend;
 use harness::bedrock::BedrockBackend;
-use harness::engine::{LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
+use harness::engine::{AnswerSchema, LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
 use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel};
-use harness::prompt::render_task_prompt_from_spec;
+use harness::prompt::{render_answer_prompt, render_task_prompt_from_spec};
 use harness::ralph::{
     DEFAULT_MAX_BACKEND_ERRORS, DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport,
     RalphTerminal, run_ralph,
@@ -150,7 +210,7 @@ use harness::run_record::Disposition;
 use harness::store::{RunStore, SqliteRunStore};
 use harness::task_spec::TaskSpec;
 use harness::tool::{OffloadSink, ToolCtx};
-use harness::tools::standard_registry;
+use harness::tools::{answer_registry, standard_registry};
 use harness::workspace::{DiskOffloadSink, Workspace};
 use serde::Serialize;
 
@@ -199,6 +259,32 @@ enum Command {
     Ralph(RalphArgs),
 }
 
+/// What `talos run` is being asked to do.
+///
+/// The engine has no `RunMode` — answer mode there IS
+/// `RunConfig::answer_schema.is_some()`. This flag's only jobs are CLI-side:
+/// REQUIRE `--schema` (and forbid it in build mode), select the read-only
+/// `answer_registry` over `standard_registry`, select `render_answer_prompt`
+/// over the task-spec renderer, and — through the schema it forces you to
+/// supply — turn on the engine's inverted tree precondition.
+/// The two variants deliberately carry `//` comments rather than `///` doc
+/// comments: clap turns a variant doc comment into per-variant long help,
+/// which replaces the compact `[possible values: build, answer]` line that
+/// `crates/talos/tests/cli.rs` pins. The prose lives here instead.
+///
+/// - `build` — execute a groomed [`TaskSpec`] and change the workspace. The
+///   default, and what every existing caller gets.
+/// - `answer` — answer a free-text question about the workspace WITHOUT
+///   changing it. Requires `--schema`; the deliverable is the validated JSON
+///   payload on stdout, and the exit code is 40.
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+enum RunMode {
+    // Execute a groomed `TaskSpec` and change the workspace.
+    Build,
+    // Answer a question about the workspace without changing it.
+    Answer,
+}
+
 /// Arguments for `talos run`.
 #[derive(clap::Args)]
 struct RunArgs {
@@ -206,9 +292,30 @@ struct RunArgs {
     #[arg(long)]
     workspace: PathBuf,
 
-    /// Path to `TaskSpec` JSON file (reads stdin when omitted).
+    /// Path to the run input — a `TaskSpec` JSON in build mode, the free-text
+    /// prompt in answer mode (reads stdin when omitted).
     #[arg(long)]
     file: Option<PathBuf>,
+
+    /// What this run is: `build` (execute a `TaskSpec`, the default) or
+    /// `answer` (answer a question about the workspace without changing it).
+    ///
+    /// `answer` REQUIRES `--schema`; `build` REJECTS it. Both shape errors are
+    /// checked before stdin is read, so a wrongly flagged invocation fails
+    /// immediately instead of blocking on a pipe.
+    #[arg(long, value_enum, default_value_t = RunMode::Build)]
+    mode: RunMode,
+
+    /// Path to a JSON Schema file the answer's `result` must conform to.
+    /// Valid ONLY with `--mode answer`, where it is required.
+    ///
+    /// Used verbatim as supplied — resolved against the process CWD, NOT
+    /// canonicalized and NOT confined to `--workspace`, exactly like
+    /// `--file`. The raw file bytes are shown to the model (so key order and
+    /// formatting survive) and separately compiled into the validator the
+    /// harness checks `finish(answer)` against.
+    #[arg(long)]
+    schema: Option<PathBuf>,
 
     /// `SQLite` store path for the run record.
     /// Defaults to `${XDG_STATE_HOME:-~/.local/state}/talos/<task-id>/run.sqlite`.
@@ -222,6 +329,12 @@ struct RunArgs {
 
     /// Task identifier — becomes `Persistence.task_id` and seeds the run id.
     /// `TaskSpec` has no `task_id` field; this must come from the CLI.
+    ///
+    /// CONCURRENCY (answer mode): several answer agents sharing one checkout
+    /// MUST each pass a DISTINCT `--task-id` (or distinct `--run-store` +
+    /// `--offload-dir`). The default `talos-run` resolves to one state dir and
+    /// one run id (`talos-run:1`), so concurrent runs would collide on the
+    /// same `run.sqlite` and the same run record.
     #[arg(long, default_value = "talos-run")]
     task_id: String,
 
@@ -1100,8 +1213,12 @@ fn prune_report_json(
     .to_string()
 }
 
-/// Read the raw spec JSON from `--file <path>` or stdin.
-fn read_spec_json(args: &RunArgs) -> Result<String, String> {
+/// Read the raw run input from `--file <path>` or stdin.
+///
+/// Returns the bytes VERBATIM; how to interpret them depends on the mode. In
+/// build mode they are parsed as a [`TaskSpec`] JSON; in answer mode they are
+/// the free-text question and are NEVER handed to `serde_json`.
+fn read_run_input(args: &RunArgs) -> Result<String, String> {
     if let Some(path) = &args.file {
         std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read spec file `{}`: {e}", path.display()))
@@ -1112,6 +1229,40 @@ fn read_spec_json(args: &RunArgs) -> Result<String, String> {
             .map_err(|e| format!("failed to read spec from stdin: {e}"))?;
         Ok(buf)
     }
+}
+
+/// Validate the answer-mode flag SHAPE: `--schema` is required with
+/// `--mode answer` and rejected without it.
+///
+/// Pure and separately unit-tested, and called BEFORE [`read_run_input`] —
+/// mirroring the `--stop-when` guard in `run_ralph_cmd`. A wrongly flagged
+/// invocation must fail immediately rather than block on a pipe that will
+/// never be written.
+fn validate_mode_flags(mode: RunMode, schema: Option<&Path>) -> Result<(), String> {
+    match (mode, schema) {
+        (RunMode::Answer, None) => Err("--schema is required with --mode answer".to_string()),
+        (RunMode::Build, Some(_)) => Err("--schema is only valid with --mode answer".to_string()),
+        (RunMode::Answer, Some(_)) | (RunMode::Build, None) => Ok(()),
+    }
+}
+
+/// Read, parse and compile `--schema`, returning the RAW file text alongside
+/// the compiled validator.
+///
+/// The raw text is what the model is shown (see
+/// [`harness::prompt::render_answer_prompt`]) — re-serializing it through
+/// `serde_json` first would silently reorder object keys, so the schema in the
+/// prompt would stop matching the schema on disk. Runs BEFORE the run store is
+/// opened, so a bad schema never touches the filesystem, exactly like a
+/// malformed `TaskSpec`.
+fn load_answer_schema(path: &Path) -> Result<(String, AnswerSchema), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --schema `{}`: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("--schema `{}` is not valid JSON: {e}", path.display()))?;
+    let compiled = AnswerSchema::compile(&value)
+        .map_err(|e| format!("invalid --schema `{}`: {e}", path.display()))?;
+    Ok((text, compiled))
 }
 
 // ============================================================================
@@ -1148,26 +1299,74 @@ async fn main() {
     }
 }
 
-/// Execute a [`TaskSpec`] JSON and report outcome + exit code (the `run`
-/// subcommand handler). Full persistence: a `SQLite` store record is written
-/// on every terminal path. See the module doc for the exit-code contract.
+/// Execute a run and report outcome + exit code (the `run` subcommand
+/// handler). Full persistence: a `SQLite` store record is written on every
+/// terminal path. See the module doc for the exit-code contract.
+///
+/// Two modes, selected by `--mode`. BUILD mode is the pre-existing path,
+/// byte-for-byte: parse the input as a [`TaskSpec`], build a `ChecksRunner`
+/// from its `gate_command`, wire `standard_registry`, seed with
+/// `render_task_prompt_from_spec`. ANSWER mode never parses a `TaskSpec` at
+/// all: the input IS the question, `--schema` supplies the result contract,
+/// the registry is read-only, and no gate and no nudges are wired.
+///
+/// The answer-mode step ORDER is load-bearing and pinned by
+/// `crates/talos/tests/cli.rs`: (1) flag-shape validation, (2) schema read +
+/// parse + compile, (3) read the run input, (4) the non-empty guard, and only
+/// then (5) today's backend/store/workspace sequence. (1) and (2) precede the
+/// stdin read deliberately — a wrongly flagged or unreadable-schema invocation
+/// must fail immediately rather than block on a pipe nobody will write.
 #[allow(clippy::too_many_lines)]
 async fn run_cmd(args: RunArgs) {
-    // 2. Read and parse spec — must happen BEFORE the store is opened, so a
+    // 1. Flag shape, BEFORE stdin — mirrors `run_ralph_cmd`'s `--stop-when`
+    //    guard.
+    if let Err(e) = validate_mode_flags(args.mode, args.schema.as_deref()) {
+        stderr_json_error(&e);
+        std::process::exit(1);
+    }
+
+    // 2. `--schema`, BEFORE stdin and before the store is opened. Keeps the
+    //    raw text (what the model is shown) next to the compiled validator
+    //    (what the harness enforces), both from the same bytes.
+    let answer_schema = match args.schema.as_deref() {
+        Some(path) => match load_answer_schema(path) {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                stderr_json_error(&e);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // 3. Read the run input — must happen BEFORE the store is opened, so a
     //    bad spec never touches the filesystem.
-    let spec_json = match read_spec_json(&args) {
+    let run_input = match read_run_input(&args) {
         Ok(s) => s,
         Err(e) => {
             stderr_json_error(&e);
             std::process::exit(1);
         }
     };
-    let spec: TaskSpec = match serde_json::from_str(&spec_json) {
-        Ok(s) => s,
-        Err(e) => {
-            stderr_json_error(&format!("invalid TaskSpec: {e}"));
-            std::process::exit(1);
+
+    // 4. Interpret the input per mode. In answer mode it is free text and is
+    //    NEVER handed to `serde_json` — only emptiness is checked, because an
+    //    empty question would send the agent off to answer nothing.
+    let spec: Option<TaskSpec> = match args.mode {
+        RunMode::Answer => {
+            if run_input.trim().is_empty() {
+                stderr_json_error("answer prompt must be non-empty");
+                std::process::exit(1);
+            }
+            None
         }
+        RunMode::Build => match serde_json::from_str(&run_input) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                stderr_json_error(&format!("invalid TaskSpec: {e}"));
+                std::process::exit(1);
+            }
+        },
     };
 
     // 3. Select model backend from environment.
@@ -1264,16 +1463,6 @@ async fn run_cmd(args: RunArgs) {
     };
     let store: Arc<dyn RunStore> = Arc::new(store);
 
-    // 9. Build the optional ChecksRunner from spec.gate_command, wiring it to
-    //    BOTH the tool registry (so the agent can call `run_checks`) AND the
-    //    RunConfig (so finish(done) is harness-verified).
-    let checks = build_checks_runner(&spec.gate_command, workspace_root, args.gate_timeout_secs);
-    let tools = standard_registry(checks.clone());
-
-    // 10. Render the seed prompt — byte-for-byte from the renderer, never
-    //     hand-formatted.
-    let seed = make_run_seed(&spec);
-
     // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env > 0 (unbounded).
     // The `env` clap feature is NOT enabled (Cargo.toml features=['derive'] only),
     // so the env fallback is resolved here via the env_accessor closure.
@@ -1282,12 +1471,54 @@ async fn run_cmd(args: RunArgs) {
         .or_else(|| env_accessor("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(0);
 
-    let mut config = if let Some(runner) = checks {
-        RunConfig::new(seed, args.max_iterations)
-            .with_checks(runner)
-            .with_wall_clock_secs(wall_clock_secs)
-    } else {
-        RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
+    // 9/10. Registry + seed prompt + RunConfig, per mode. The seed is always
+    //       byte-for-byte from a renderer, never hand-formatted.
+    let (tools, mut config) = match (answer_schema, spec) {
+        (Some((schema_text, compiled)), _) => {
+            // ANSWER mode wires NO gate and NO nudges this cut. There is no
+            // TaskSpec, hence no `gate_command`, hence no `ChecksRunner` — so
+            // `run_checks` is absent from the registry and an accepted
+            // `Disposition::Answer` carries `Verification::NoChecksConfigured`.
+            // `max_nudges(0)` structurally disables finish-recovery, whose
+            // `nudge_prompt.md` steers toward `finish(done)` /
+            // `finish(already_satisfied)` — both rejected in answer mode, which
+            // would otherwise loop to `FailureMode::FinishDiscipline`.
+            //
+            // `--gate-timeout-secs` is accepted and inert here; there is
+            // nothing for it to time out.
+            let seed = render_answer_prompt(&run_input, &schema_text);
+            let config = RunConfig::new(seed, args.max_iterations)
+                .with_answer_schema(compiled)
+                .with_wall_clock_secs(wall_clock_secs)
+                .with_max_nudges(0);
+            (answer_registry(None), config)
+        }
+        (None, Some(spec)) => {
+            // BUILD mode — unchanged. The optional ChecksRunner from
+            // spec.gate_command wires to BOTH the tool registry (so the agent
+            // can call `run_checks`) AND the RunConfig (so finish(done) is
+            // harness-verified).
+            let checks =
+                build_checks_runner(&spec.gate_command, workspace_root, args.gate_timeout_secs);
+            let tools = standard_registry(checks.clone());
+            let seed = make_run_seed(&spec);
+            let config = if let Some(runner) = checks {
+                RunConfig::new(seed, args.max_iterations)
+                    .with_checks(runner)
+                    .with_wall_clock_secs(wall_clock_secs)
+            } else {
+                RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
+            };
+            (tools, config)
+        }
+        // Unreachable: `validate_mode_flags` guarantees a schema iff
+        // `--mode answer`, and the mode match above builds a `TaskSpec` for
+        // exactly the other case. Expressed as an arm rather than an
+        // `unwrap` so a future flag change degrades to a JSON error.
+        (None, None) => {
+            stderr_json_error("internal error: no TaskSpec and no --schema after validation");
+            std::process::exit(1);
+        }
     };
     // Label is computed from `model_label` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
@@ -1457,11 +1688,12 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunSummary, SECS_PER_DAY,
+        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunMode, RunSummary, SECS_PER_DAY,
         backend_from_env, build_checks_runner, build_ralph_summary, build_run_summary, exit_code,
-        make_run_seed, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
-        ralph_terminal_str, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
-        resolve_transcript_path, touch_dir_mtime, transcript_label, write_ralph_error_detail,
+        load_answer_schema, make_run_seed, outcome_str, prune_report_json, prune_state_root,
+        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
+        resolve_state_retention_days, resolve_transcript_path, touch_dir_mtime, transcript_label,
+        validate_mode_flags, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::exec::ChangeEvidence;
@@ -1551,6 +1783,122 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize");
         assert!(json.contains("Answer"), "got {json}");
         assert!(json.contains("verdict"), "got {json}");
+    }
+
+    /// The ORCHESTRATOR contract `RunSummary` has to carry that item 1's
+    /// positive test does not: the change evidence.
+    ///
+    /// `RunSummary` gains no field for it — the payload reaches stdout
+    /// transitively through the embedded `Disposition`, which is externally
+    /// tagged — so `["disposition"]["Answer"]["change"]` is the read path.
+    /// A caller needs it to tell a VERIFIED read-only answer (`TreeUnchanged`,
+    /// the precondition actually held) from an UNVERIFIABLE one
+    /// (`Unobservable`, the precondition failed open), which is the only
+    /// difference between an answer you can trust was read-only and one you
+    /// cannot.
+    #[test]
+    fn run_summary_exposes_an_unobservable_answer_s_change_evidence() {
+        let summary = build_run_summary(
+            "Finished",
+            Disposition::Answer {
+                result: serde_json::json!({"verdict": "ok"}),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::Unobservable {
+                    reason: "no git".to_string(),
+                },
+            },
+            "t:1".to_string(),
+            "/tmp/run.sqlite".to_string(),
+            1,
+        );
+        let value = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(
+            value["disposition"]["Answer"]["change"]["Unobservable"]["reason"], "no git",
+            "the fail-open reason must be visible to the orchestrator; got {value}"
+        );
+        // And the verified case is distinguishable from it.
+        let verified = build_run_summary(
+            "Finished",
+            Disposition::Answer {
+                result: serde_json::json!({"verdict": "ok"}),
+                verification: Verification::NoChecksConfigured,
+                change: ChangeEvidence::TreeUnchanged,
+            },
+            "t:1".to_string(),
+            "/tmp/run.sqlite".to_string(),
+            1,
+        );
+        let verified = serde_json::to_value(&verified).expect("serialize");
+        assert_eq!(verified["disposition"]["Answer"]["change"], "TreeUnchanged");
+    }
+
+    // ---- answer-mode flag shape ----------------------------------------
+
+    /// `--schema` is required with `--mode answer` and rejected without it;
+    /// the two legal shapes pass. Pins the exact wording the CLI tests assert
+    /// on stderr.
+    #[test]
+    fn validate_mode_flags_requires_schema_iff_answer_mode() {
+        let path = PathBuf::from("/tmp/schema.json");
+
+        assert_eq!(
+            validate_mode_flags(RunMode::Answer, None),
+            Err("--schema is required with --mode answer".to_string())
+        );
+        assert_eq!(
+            validate_mode_flags(RunMode::Build, Some(&path)),
+            Err("--schema is only valid with --mode answer".to_string())
+        );
+        assert_eq!(validate_mode_flags(RunMode::Answer, Some(&path)), Ok(()));
+        assert_eq!(validate_mode_flags(RunMode::Build, None), Ok(()));
+    }
+
+    /// `load_answer_schema` returns the RAW file text next to the compiled
+    /// validator — never a re-serialization, which would reorder keys and
+    /// desynchronize the schema in the prompt from the schema on disk.
+    #[test]
+    fn load_answer_schema_returns_the_raw_text_and_a_working_validator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schema.json");
+        // Deliberately NON-alphabetical key order and non-canonical spacing.
+        let raw = "{ \"title\": \"t\", \"type\": \"object\",\n  \"required\": [\"a\"] }";
+        std::fs::write(&path, raw).expect("write");
+
+        let (text, compiled) = load_answer_schema(&path).expect("compiles");
+        assert_eq!(text, raw, "the raw bytes must survive verbatim");
+        assert!(
+            compiled
+                .validation_errors(&serde_json::json!({ "a": 1 }))
+                .is_empty()
+        );
+        assert!(
+            !compiled
+                .validation_errors(&serde_json::json!({}))
+                .is_empty(),
+            "the compiled validator must actually enforce `required`"
+        );
+    }
+
+    /// The three ways `--schema` can be bad, each with its own message.
+    #[test]
+    fn load_answer_schema_reports_each_failure_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let missing = dir.path().join("missing.json");
+        let err = load_answer_schema(&missing).expect_err("a missing file fails");
+        assert!(err.contains("--schema"), "got {err}");
+        assert!(err.contains("missing.json"), "got {err}");
+
+        let not_json = dir.path().join("not-json.txt");
+        std::fs::write(&not_json, "nope").expect("write");
+        let err = load_answer_schema(&not_json).expect_err("non-JSON fails");
+        assert!(err.contains("--schema"), "got {err}");
+        assert!(err.contains("JSON"), "got {err}");
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, r#"{"type":"not-a-type"}"#).expect("write");
+        let err = load_answer_schema(&bad).expect_err("an uncompilable schema fails");
+        assert!(err.contains("invalid --schema"), "got {err}");
     }
 
     #[test]

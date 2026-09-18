@@ -34,6 +34,14 @@
 //! - [`render_task_prompt`] — render the task-framing prompt.
 //! - [`render_task_prompt_from_spec`] — render the task prompt from a groomed
 //!   [`crate::task_spec::TaskSpec`], producing the `{{ task }}` slot content.
+//! - [`render_answer_prompt`] — render ANSWER mode's task-framing content
+//!   (the question plus the result schema, verbatim) into the `{{ task }}`
+//!   slot.
+//! - [`render_answer_system_prompt`] — render ANSWER mode's system prompt: a
+//!   read-only analyst frame whose only terminal dispositions are `answer`,
+//!   `blocked` and `failed`. A DISTINCT template from
+//!   [`render_system_prompt`], deliberately — the build-mode prompt is the
+//!   eval-parity surface and must stay byte-identical.
 
 use askama::Template;
 use serde_json::Value;
@@ -169,6 +177,33 @@ struct RalphPromptTemplate<'a> {
 #[derive(Template)]
 #[template(path = "nudge_prompt.md", escape = "none")]
 struct NudgePromptTemplate;
+
+/// Answer mode's task-framing template: the question, the result schema
+/// verbatim inside a fenced `json` block, and the three rules the frame states.
+/// Renders the content of the `{{ task }}` slot — the engine wraps it under
+/// `# Task` via [`render_task_prompt`], so every heading here is `##` or
+/// lower. `escape = "none"` is pinned so a schema containing `"`, `<`, `>`,
+/// or `&` reaches the model byte-for-byte as supplied; a schema the model
+/// sees in escaped form is a schema it cannot conform to.
+#[derive(Template)]
+#[template(path = "answer_prompt.md", escape = "none")]
+struct AnswerPromptTemplate<'a> {
+    question: &'a str,
+    schema_text: &'a str,
+}
+
+/// Answer mode's system prompt template — a DISTINCT file from
+/// `system_prompt.md`, not a branch inside it. Keeping them separate is the
+/// point: `system_prompt.md` is the build-mode surface the tier-1/tier-2
+/// evals measure, and answer mode must be able to change its own frame
+/// without touching a byte of it. Takes no `check_command`: there is no
+/// verification section in answer mode, because the mechanical verifier is
+/// the result schema, not a gate.
+#[derive(Template)]
+#[template(path = "answer_system_prompt.md", escape = "none")]
+struct AnswerSystemPromptTemplate<'a> {
+    tools: &'a [ToolLine],
+}
 
 /// Render the system prompt.
 ///
@@ -342,10 +377,57 @@ pub fn render_verification_section(gate_command: &str) -> String {
         )
 }
 
+/// Render answer mode's task-framing content: the `question` verbatim, the
+/// result schema verbatim inside a fenced `json` block, and the read-only rules.
+///
+/// `schema_text` is the RAW text of the schema as the operator supplied it —
+/// the caller must NOT re-serialize it through `serde_json` first. Key order,
+/// comments-as-whitespace and formatting are all part of what the model is
+/// asked to conform to, and a round-trip through `Value` silently reorders
+/// object keys.
+///
+/// The output is the content of the inner [`crate::engine::RunConfig::task`]
+/// slot — the engine wraps it under `# Task` via [`render_task_prompt`], so
+/// it must NOT itself begin with a top-level `# ` heading (all headings are
+/// `##` or lower). The render is a pure function of its inputs and is
+/// byte-deterministic.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_answer_prompt(question: &str, schema_text: &str) -> String {
+    AnswerPromptTemplate {
+        question,
+        schema_text,
+    }
+    .render()
+    .expect("answer_prompt.md is a static template that renders infallibly for owned inputs")
+}
+
+/// Render answer mode's system prompt: the read-only analyst frame plus the
+/// tool listing.
+///
+/// Deliberately NOT a variant of [`render_system_prompt`] — it renders its
+/// own template file, takes no `check_command`, and names only `answer` /
+/// `blocked` / `failed` as terminals. `system_prompt.md` stays byte-identical
+/// so the tier-1/tier-2 eval-parity rule gains no new surface.
+///
+/// The render is a pure function of `tools` and is byte-deterministic.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_answer_system_prompt(tools: &[ToolLine]) -> String {
+    AnswerSystemPromptTemplate { tools }.render().expect(
+        "answer_system_prompt.md is a static template that renders infallibly for owned inputs",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        NudgePromptTemplate, RalphPromptTemplate, ToolLine, render_nudge_prompt,
+        AnswerPromptTemplate, AnswerSystemPromptTemplate, NudgePromptTemplate, RalphPromptTemplate,
+        ToolLine, render_answer_prompt, render_answer_system_prompt, render_nudge_prompt,
         render_ralph_prompt, render_system_prompt, render_task_prompt,
         render_task_prompt_from_spec, render_task_prompt_from_spec_with,
         render_test_first_approach, render_verification_section, tool_lines,
@@ -357,6 +439,125 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::sync::Arc;
+
+    /// The golden bytes of `answer_system_prompt.md` rendered for
+    /// [`two_tools`]. Pinned in full by
+    /// `render_answer_system_prompt_production_byte_identity`.
+    const ANSWER_SYSTEM_PROMPT_GOLDEN: &str = concat!(
+        "# Role
+",
+        "
+",
+        "You are an autonomous read-only analyst operating inside a confined
+",
+        "workspace. Every path you emit or resolve is workspace-relative — the
+",
+        "workspace root is your world, and there is no filesystem outside it that you
+",
+        "should touch. Your deliverable is DATA, not a change: you investigate the
+",
+        "workspace and report a structured result.
+",
+        "
+",
+        "# Tools available
+",
+        "
+",
+        "- foo — does the foo thing
+",
+        "- bar — does the bar thing
+",
+        "
+",
+        "# Read-only contract
+",
+        "
+",
+        "This run must not modify the workspace. The harness observed the working tree
+",
+        "before your first turn and observes it again when you finish: an accepted
+",
+        "answer REQUIRES the tree to be unchanged since the run started. A modified
+",
+        "tree is rejected and fed back to you — revert your edits (restore tracked
+",
+        "files, delete files you created) and finish again.
+",
+        "
+",
+        "That constraint is on the WORKSPACE, not on your thinking. Read, list, search
+",
+        "and run read-only shell commands freely. Do not write, move, or delete files,
+",
+        "and do not run commands that mutate the tree or its git state.
+",
+        "
+",
+        "# Workflow
+",
+        "
+",
+        "Orient before you conclude. List and read enough of the workspace to ground
+",
+        "the answer in what is actually there, and prefer citing a file and line you
+",
+        "read over recalling something you did not. Then assemble the result payload
+",
+        "the task's result schema describes, and finish.
+",
+        "
+",
+        "# Steering semantics
+",
+        "
+",
+        "Tool results that come back with `is_error: true` are recoverable guidance,
+",
+        "not fatal errors. Read the message carefully, adjust your approach, and try
+",
+        "again. Do not give up because a single tool call returned an error.
+",
+        "
+",
+        "Long tool outputs are truncated in your view. When a result advertises a
+",
+        "full-output path (for example, \"full output at <path>\"), you can read the
+",
+        "untruncated contents via `read_file` on that path when the inline slice is
+",
+        "not enough.
+",
+        "
+",
+        "# Disposition guidance
+",
+        "
+",
+        "This run accepts exactly three terminal dispositions:
+",
+        "
+",
+        "- `answer` — you investigated the question and have the deliverable. Supply a
+",
+        "  `result` that conforms to the run's configured result schema; the harness
+",
+        "  validates it and feeds any validation errors back to you rather than
+",
+        "  terminating the run. The working tree must be unchanged since the run
+",
+        "  started.
+",
+        "- `blocked` — the question or the environment is the problem: retrying the
+",
+        "  same run unchanged is guaranteed not to produce an answer until a human
+",
+        "  makes a decision. State exactly what decision is needed.
+",
+        "- `failed` — the attempt is the problem: something in how *this* run went
+",
+        "  wrong, and a fresh attempt might succeed. Summarize what went wrong.",
+    );
 
     fn two_tools() -> Vec<ToolLine> {
         vec![
@@ -1109,5 +1310,245 @@ mod tests {
         .expect("ralph template renders infallibly");
         let via_fn = render_ralph_prompt("obj", "notes", "PROGRESS.md");
         assert_eq!(via_struct, via_fn);
+    }
+
+    // =====================================================================
+    // Answer mode — `render_answer_prompt`
+    // =====================================================================
+
+    /// A schema text whose keys are in NON-alphabetical source order and
+    /// which carries `"`, `<`, `>` and `&`. Used to prove both that the
+    /// schema reaches the model byte-for-byte (AC-17) and that escaping is
+    /// off (AC-14b) — a `serde_json` round-trip would reorder these keys.
+    fn gnarly_schema_text() -> &'static str {
+        "{\"title\":\"q & a <v1>\",\"type\":\"object\",\"required\":[\"answer\"],\
+         \"properties\":{\"answer\":{\"type\":\"string\"}},\"additionalProperties\":false}"
+    }
+
+    /// AC-14(a): both arguments appear verbatim in the rendered output.
+    #[test]
+    fn render_answer_prompt_carries_question_and_schema_verbatim() {
+        let question = "What does exit code 30 mean in this repo?";
+        let rendered = render_answer_prompt(question, gnarly_schema_text());
+        assert!(
+            rendered.contains(question),
+            "the question must appear verbatim; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(gnarly_schema_text()),
+            "the schema text must appear verbatim; got:\n{rendered}"
+        );
+    }
+
+    /// AC-14(b): `"`, `<`, `>`, `&` in EITHER argument pass through
+    /// unescaped. Mirrors `render_task_prompt_from_spec_unescaped_passthrough`.
+    #[test]
+    fn render_answer_prompt_unescaped_passthrough() {
+        let question = r#"why does "x" & <y> differ?"#;
+        let rendered = render_answer_prompt(question, gnarly_schema_text());
+
+        assert!(rendered.contains(r#""x""#), "double quotes pass through");
+        assert!(rendered.contains("<y>"), "angle brackets pass through");
+        assert!(rendered.contains(" & "), "ampersand passes through");
+        assert!(!rendered.contains("&quot;"), "must not HTML-escape quotes");
+        assert!(!rendered.contains("&lt;"), "must not HTML-escape <");
+        assert!(!rendered.contains("&gt;"), "must not HTML-escape >");
+        assert!(!rendered.contains("&amp;"), "must not HTML-escape &");
+    }
+
+    /// AC-14(c): the render is a pure function — same inputs, identical bytes
+    /// (the prompt-cache correctness invariant).
+    #[test]
+    fn render_answer_prompt_is_byte_deterministic() {
+        let a = render_answer_prompt("q?", gnarly_schema_text());
+        let b = render_answer_prompt("q?", gnarly_schema_text());
+        assert_eq!(a, b, "re-rendering identical inputs must be byte-identical");
+    }
+
+    /// AC-15: the skeleton is pinned — `## Question`, the question,
+    /// `## Result schema`, a fenced `json` block wrapping the schema text,
+    /// then `## Rules`, in that order.
+    #[test]
+    fn render_answer_prompt_skeleton_is_pinned() {
+        let question = "SENTINEL-QUESTION";
+        let schema = "SENTINEL-SCHEMA";
+        let rendered = render_answer_prompt(question, schema);
+
+        let idx = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in:\n{rendered}"))
+        };
+        let q_heading = idx("## Question");
+        let q_text = idx(question);
+        let s_heading = idx("## Result schema");
+        let fence_open = idx("```json\n");
+        let s_text = idx(schema);
+        let rules = idx("## Rules");
+
+        assert!(q_heading < q_text, "the question follows `## Question`");
+        assert!(
+            q_text < s_heading,
+            "`## Result schema` follows the question"
+        );
+        assert!(
+            s_heading < fence_open,
+            "the fence follows `## Result schema`"
+        );
+        assert!(fence_open < s_text, "the schema sits inside the fence");
+        assert!(
+            rendered[s_text..].contains("\n```"),
+            "the json fence must be closed after the schema; got:\n{rendered}"
+        );
+        assert!(s_text < rules, "`## Rules` follows the schema fence");
+    }
+
+    /// AC-15: the engine wraps this slot under `# Task`, so the rendered
+    /// output must contain no top-level `# ` heading. Mirrors
+    /// `render_task_prompt_from_spec_no_top_level_heading`.
+    #[test]
+    fn render_answer_prompt_no_top_level_heading() {
+        let rendered = render_answer_prompt("q?", gnarly_schema_text());
+        for line in rendered.lines() {
+            assert!(
+                !line.starts_with("# "),
+                "rendered slot content must not contain a top-level '# ' heading; \
+                 offending line: {line:?}; full output:\n{rendered}"
+            );
+        }
+    }
+
+    /// AC-16: the answer frame states three things, each pinned.
+    #[test]
+    fn render_answer_prompt_frame_states_the_three_rules() {
+        let rendered = render_answer_prompt("q?", gnarly_schema_text());
+        assert!(
+            rendered.contains("answering a question about the workspace"),
+            "(a) the agent is answering a question about the workspace; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("must not modify"),
+            "(b) it must not modify the workspace; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("makes the answer unacceptable"),
+            "(b) a modified tree makes the answer unacceptable; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("finish(answer)"),
+            "(c) it must end the run with finish(answer); got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("`result` that matches the schema"),
+            "(c) supplying a result that matches the schema shown; got:\n{rendered}"
+        );
+    }
+
+    /// AC-17: the schema is shown VERBATIM — non-alphabetical key order and
+    /// special characters survive byte-for-byte. A `serde_json` round-trip
+    /// before rendering would silently reorder the object keys and fail here.
+    #[test]
+    fn render_answer_prompt_shows_the_schema_byte_for_byte() {
+        let rendered = render_answer_prompt("q?", gnarly_schema_text());
+        assert!(
+            rendered.contains(gnarly_schema_text()),
+            "the schema must appear byte-for-byte as supplied; got:\n{rendered}"
+        );
+        // Key order is the discriminator: `title` precedes `type`, which a
+        // re-serialization through `serde_json::Value` would invert.
+        let t = rendered.find("\"title\"").expect("title key present");
+        let ty = rendered.find("\"type\"").expect("type key present");
+        assert!(t < ty, "source key order must survive; got:\n{rendered}");
+    }
+
+    /// `AnswerPromptTemplate`'s derive-render must agree with the free
+    /// function — the wrapper adds nothing.
+    #[test]
+    fn answer_prompt_template_struct_matches_the_free_function() {
+        let via_struct = AnswerPromptTemplate {
+            question: "q?",
+            schema_text: gnarly_schema_text(),
+        }
+        .render()
+        .expect("renders");
+        assert_eq!(via_struct, render_answer_prompt("q?", gnarly_schema_text()));
+    }
+
+    // =====================================================================
+    // Answer mode — `render_answer_system_prompt`
+    // =====================================================================
+
+    /// AC-18(a): the FULL rendered bytes for a fixed `ToolLine` list, pinned
+    /// against a golden. Mirrors
+    /// `render_task_prompt_from_spec_production_byte_identity` — a wording
+    /// pass has to update this deliberately.
+    #[test]
+    fn render_answer_system_prompt_production_byte_identity() {
+        const GOLDEN: &str = ANSWER_SYSTEM_PROMPT_GOLDEN;
+        assert_eq!(render_answer_system_prompt(&two_tools()), GOLDEN);
+    }
+
+    /// AC-18(b): every supplied tool name and description appears.
+    #[test]
+    fn answer_system_prompt_lists_every_supplied_tool_name_and_description() {
+        let tools = two_tools();
+        let rendered = render_answer_system_prompt(&tools);
+        for tool in &tools {
+            assert!(
+                rendered.contains(&tool.name),
+                "rendered prompt must contain tool name `{}`",
+                tool.name
+            );
+            assert!(
+                rendered.contains(&tool.description),
+                "rendered prompt must contain description `{}`",
+                tool.description
+            );
+        }
+    }
+
+    /// AC-18(c): the NEGATIVE test. With an EMPTY tool list no tool
+    /// description can leak a disposition name in, so what remains is the
+    /// frame's own wording: it names `answer`, `blocked` and `failed`, and
+    /// names neither `already_satisfied` nor the backticked `` `done` ``.
+    #[test]
+    fn answer_system_prompt_names_only_the_three_answer_mode_terminals() {
+        let rendered = render_answer_system_prompt(&[]);
+        assert!(rendered.contains("answer"), "must name `answer`");
+        assert!(rendered.contains("blocked"), "must name `blocked`");
+        assert!(rendered.contains("failed"), "must name `failed`");
+        assert!(
+            !rendered.contains("already_satisfied"),
+            "answer mode must not advertise already_satisfied; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("`done`"),
+            "answer mode must not advertise `done`; got:\n{rendered}"
+        );
+    }
+
+    /// The build-mode system prompt is a DIFFERENT document — the two
+    /// renderers must not collapse into one. `system_prompt.md` is the
+    /// eval-parity surface; this is the guard that a refactor did not point
+    /// both functions at the same template.
+    #[test]
+    fn answer_and_build_system_prompts_are_distinct_documents() {
+        let tools = two_tools();
+        assert_ne!(
+            render_answer_system_prompt(&tools),
+            render_system_prompt(&tools, None),
+            "answer mode must render its own system prompt"
+        );
+    }
+
+    /// `AnswerSystemPromptTemplate`'s derive-render must agree with the free
+    /// function.
+    #[test]
+    fn answer_system_prompt_template_struct_matches_the_free_function() {
+        let tools = two_tools();
+        let via_struct = AnswerSystemPromptTemplate { tools: &tools }
+            .render()
+            .expect("renders");
+        assert_eq!(via_struct, render_answer_system_prompt(&tools));
     }
 }

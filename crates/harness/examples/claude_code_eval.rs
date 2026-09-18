@@ -521,6 +521,7 @@ async fn main() {
                 no_change_rejections: 0,
                 already_satisfied_check_rejections: 0,
                 answer_schema_rejections: 0,
+                modified_workspace_rejections: 0,
                 tree_baseline_unobservable: false,
             };
 

@@ -616,6 +616,22 @@ fn help_flag_exits_0_with_plain_help() {
         stdout_str.contains("--workspace"),
         "help text must be on stdout; got: {stdout_str:?}"
     );
+    // Answer mode's two flags are part of the advertised surface. The
+    // compact possible-values line is pinned too: `RunMode`'s variants carry
+    // `//` comments rather than `///` doc comments precisely so clap renders
+    // this one-liner instead of a per-variant help block.
+    assert!(
+        stdout_str.contains("--mode"),
+        "help must advertise --mode; got: {stdout_str:?}"
+    );
+    assert!(
+        stdout_str.contains("--schema"),
+        "help must advertise --schema; got: {stdout_str:?}"
+    );
+    assert!(
+        stdout_str.contains("possible values: build, answer"),
+        "help must list the RunMode values compactly; got: {stdout_str:?}"
+    );
     assert!(
         !stdout_str.trim_start().starts_with('{'),
         "help must be plain text, not a JSON error object"
@@ -1370,4 +1386,435 @@ fn prune_pass_produces_byte_identical_stderr_whether_or_not_it_prunes() {
             "stderr must never mention pruning; got: {text:?}"
         );
     }
+}
+
+// ============================================================================
+// (g) Answer mode — `talos run --mode answer --schema <path>`
+// ============================================================================
+
+/// A minimal JSON Schema for an answer `result`.
+fn answer_schema_json() -> &'static str {
+    r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#
+}
+
+/// The shared assertion for every answer-mode flag-shape rejection: exit 1,
+/// empty stdout, exactly one line of stderr parsing as a JSON object whose
+/// `error` contains `needle`, and NO run store written.
+///
+/// The `--run-store` non-existence check mirrors
+/// `malformed_spec_stdin_exits_1_with_json_error_no_record`: it is what pins
+/// the ORDERING, proving the rejection happened before the store was opened.
+fn assert_answer_mode_rejection(args: &[&str], store_path: &std::path::Path, needle: &str) {
+    let output = Command::new(TALOS_BIN)
+        .args(args)
+        // Null stdin is load-bearing: these checks must precede the input
+        // read, so a wrong ordering surfaces a DIFFERENT error (or hangs on a
+        // pipe) instead of the pinned substring.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a flag-shape rejection must exit 1 (args: {args:?})"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may reach stdout; got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr_str.trim_end().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stderr must be ONE line; got: {stderr_str:?}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(lines[0])
+        .unwrap_or_else(|_| panic!("stderr must be valid JSON; got: {stderr_str:?}"));
+    let message = parsed
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("stderr JSON must have a string `error`; got: {parsed}"));
+    assert!(
+        message.contains(needle),
+        "error must contain {needle:?}; got: {message:?}"
+    );
+
+    assert!(
+        !store_path.exists(),
+        "no store may be opened when the invocation is rejected"
+    );
+}
+
+/// AC-4: `--mode answer` without `--schema` is rejected before stdin is read.
+#[test]
+fn answer_mode_without_schema_exits_1_with_json_error_no_record() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let store_path = dir.path().join("run.sqlite");
+
+    assert_answer_mode_rejection(
+        &[
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--mode",
+            "answer",
+        ],
+        &store_path,
+        "--schema is required with --mode answer",
+    );
+}
+
+/// AC-5: `--schema` in build mode is rejected — with the mode defaulted AND
+/// with it named explicitly, so neither spelling slips through.
+#[test]
+fn schema_in_build_mode_exits_1_with_json_error_no_record() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let store_path = dir.path().join("run.sqlite");
+    let schema_path = dir.path().join("schema.json");
+    std::fs::write(&schema_path, answer_schema_json()).unwrap();
+
+    let base: Vec<String> = vec![
+        "run".to_string(),
+        "--workspace".to_string(),
+        dir.path().to_str().unwrap().to_string(),
+        "--run-store".to_string(),
+        store_path.to_str().unwrap().to_string(),
+        "--schema".to_string(),
+        schema_path.to_str().unwrap().to_string(),
+    ];
+
+    // (a) mode defaulted.
+    let defaulted: Vec<&str> = base.iter().map(String::as_str).collect();
+    assert_answer_mode_rejection(
+        &defaulted,
+        &store_path,
+        "--schema is only valid with --mode answer",
+    );
+
+    // (b) mode named explicitly.
+    let mut explicit = base.clone();
+    explicit.push("--mode".to_string());
+    explicit.push("build".to_string());
+    let explicit: Vec<&str> = explicit.iter().map(String::as_str).collect();
+    assert_answer_mode_rejection(
+        &explicit,
+        &store_path,
+        "--schema is only valid with --mode answer",
+    );
+}
+
+/// AC-8: a whitespace-only answer prompt is rejected — an empty question
+/// would send the agent off to answer nothing.
+#[test]
+fn whitespace_only_answer_prompt_exits_1_with_json_error_no_record() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let store_path = dir.path().join("run.sqlite");
+    let schema_path = dir.path().join("schema.json");
+    std::fs::write(&schema_path, answer_schema_json()).unwrap();
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--mode",
+            "answer",
+            "--schema",
+            schema_path.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"   \n\t\n  ")
+        .unwrap();
+    let output = child.wait_with_output().expect("wait for talos");
+
+    assert_eq!(output.status.code(), Some(1), "an empty prompt must exit 1");
+    assert!(output.stdout.is_empty(), "nothing may reach stdout");
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr_str.trim_end().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stderr must be ONE line; got: {stderr_str:?}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("stderr must be valid JSON");
+    let message = parsed["error"].as_str().expect("a string `error`");
+    assert!(
+        message.contains("answer prompt must be non-empty"),
+        "got: {message:?}"
+    );
+    assert!(!store_path.exists(), "no store may be opened");
+}
+
+/// AC-9: a bad `--schema` is rejected before the store is opened, in all
+/// three ways it can be bad.
+#[test]
+fn bad_schema_exits_1_before_the_store_is_opened() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+
+    // (a) the path does not exist.
+    let store_a = dir.path().join("a.sqlite");
+    let missing = dir.path().join("no-such-schema.json");
+    let missing_str = missing.to_str().unwrap().to_string();
+    assert_answer_mode_rejection(
+        &[
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--run-store",
+            store_a.to_str().unwrap(),
+            "--mode",
+            "answer",
+            "--schema",
+            &missing_str,
+        ],
+        &store_a,
+        "--schema",
+    );
+    // The error must name the supplied path, not just the flag.
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--run-store",
+            store_a.to_str().unwrap(),
+            "--mode",
+            "answer",
+            "--schema",
+            &missing_str,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn talos");
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr_str.contains(&missing_str),
+        "the error must name the supplied path; got: {stderr_str:?}"
+    );
+
+    // (b) the file is not JSON.
+    let store_b = dir.path().join("b.sqlite");
+    let not_json = dir.path().join("not-json.txt");
+    std::fs::write(&not_json, "this is not json at all").unwrap();
+    for needle in ["--schema", "JSON"] {
+        assert_answer_mode_rejection(
+            &[
+                "run",
+                "--workspace",
+                dir.path().to_str().unwrap(),
+                "--run-store",
+                store_b.to_str().unwrap(),
+                "--mode",
+                "answer",
+                "--schema",
+                not_json.to_str().unwrap(),
+            ],
+            &store_b,
+            needle,
+        );
+    }
+
+    // (c) valid JSON, invalid JSON Schema — parses, then fails to compile.
+    let store_c = dir.path().join("c.sqlite");
+    let bad_schema = dir.path().join("bad-schema.json");
+    std::fs::write(&bad_schema, r#"{"type":"not-a-type"}"#).unwrap();
+    assert_answer_mode_rejection(
+        &[
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--run-store",
+            store_c.to_str().unwrap(),
+            "--mode",
+            "answer",
+            "--schema",
+            bad_schema.to_str().unwrap(),
+        ],
+        &store_c,
+        "invalid --schema",
+    );
+}
+
+/// AC-29: the whole answer branch of `run_cmd` after flag validation, proven
+/// end-to-end WITHOUT a model.
+///
+/// Mirrors `transcript_flag_writes_pinned_seven_lines_on_backend_error` — the
+/// same refused-port Ollama setup, so the run reaches the first backend call
+/// and dies there deterministically. Everything the answer branch does
+/// happens BEFORE that call, so `run_start` (emitted before the first turn)
+/// is a complete record of the wiring: the read-only registry, the answer
+/// system prompt, the seeded question + schema, no checks, no nudges.
+#[tokio::test(flavor = "current_thread")]
+async fn answer_mode_end_to_end_wires_the_read_only_run() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("t").join("run.jsonl");
+    let schema_path = dir.path().join("schema.json");
+    std::fs::write(&schema_path, answer_schema_json()).unwrap();
+
+    let question = "What does exit code 30 mean in this repo?";
+
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--run-store",
+            store_path.to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            "cli-test-answer",
+            "--attempt",
+            "1",
+            "--mode",
+            "answer",
+            "--schema",
+            schema_path.to_str().unwrap(),
+            "--transcript",
+            transcript_path.to_str().unwrap(),
+            "--state-retention-days",
+            "0",
+        ])
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("OLLAMA_NUM_CTX")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    // Plain, non-JSON text: in answer mode the input is the question and is
+    // NEVER parsed as a `TaskSpec`.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(question.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(output.status.code(), Some(1), "BackendError must exit 1");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let summary: serde_json::Value = serde_json::from_str(stdout_str.trim())
+        .unwrap_or_else(|_| panic!("stdout must be valid JSON summary; got: {stdout_str:?}"));
+    assert_eq!(summary["outcome"], "BackendError");
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr_str.contains("invalid TaskSpec"),
+        "the free-text question must never reach the TaskSpec parser; got: {stderr_str:?}"
+    );
+
+    // The store EXISTS — input read, schema parse + compile, and store open
+    // all succeeded before the backend failed.
+    assert!(
+        store_path.exists(),
+        "the run store must be opened once the answer wiring succeeds"
+    );
+
+    let contents = std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each transcript line is valid JSON"))
+        .collect();
+    assert_answer_run_start(&lines[0], question);
+}
+
+/// Everything answer mode wired, read off the `run_start` line: the
+/// read-only registry, the answer system prompt, the seeded question +
+/// schema, no gate, no nudges, and the recorded mode.
+///
+/// Factored out of `answer_mode_end_to_end_wires_the_read_only_run` so each
+/// function stays under the workspace's `too_many_lines` clippy bound.
+fn assert_answer_run_start(run_start: &serde_json::Value, question: &str) {
+    assert_eq!(run_start["event"], "run_start");
+
+    // The READ-ONLY registry: no `edit_file`, no `run_checks`.
+    let tool_names: Vec<&str> = run_start["tools"]
+        .as_array()
+        .expect("tools is an array")
+        .iter()
+        .map(|t| t["name"].as_str().expect("each tool has a name"))
+        .collect();
+    assert_eq!(
+        tool_names,
+        vec!["bash", "finish", "list_files", "read_file"]
+    );
+
+    // The ANSWER system prompt, byte-for-byte from the harness renderer.
+    let tool_lines: Vec<harness::prompt::ToolLine> = run_start["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| harness::prompt::ToolLine {
+            name: t["name"].as_str().unwrap().to_string(),
+            description: t["description"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        run_start["system"],
+        serde_json::Value::String(harness::prompt::render_answer_system_prompt(&tool_lines)),
+        "answer mode must send the answer system prompt"
+    );
+
+    // The seed: the engine's `# Task` wrapper, then the question and the
+    // schema file's bytes verbatim.
+    let first_text = run_start["messages"][0]["User"]["content"][0]["Text"]
+        .as_str()
+        .expect("the first message's first block is text");
+    assert!(
+        first_text.starts_with("# Task"),
+        "the seed must be wrapped under `# Task`; got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains(question),
+        "the question must reach the model verbatim; got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains(answer_schema_json()),
+        "the schema file's bytes must reach the model verbatim; got: {first_text:?}"
+    );
+
+    // No gate, no nudges, and the mode recorded for auditing.
+    assert!(
+        run_start["config"]["checks"].is_null(),
+        "answer mode wires no gate this cut"
+    );
+    assert_eq!(run_start["config"]["max_nudges"], 0);
+    assert_eq!(run_start["config"]["mode"], "answer");
 }

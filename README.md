@@ -49,6 +49,32 @@ cargo test --doc --workspace       # doctests (nextest skips these)
 - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based retention talos applies to its own XDG state dir (`run.sqlite`, `offload/`, transcripts) on every `talos run` start; precedence is `--state-retention-days` flag > this env var > the compiled default of `30`, `0` disables pruning entirely, the env fallback does NOT survive dispatch's sudo boundary (only `TALOS_BACKEND` is kept), and the result is recorded per host in `<state-root>/talos/prune-last.json`.
 - `--transcript` — opt-in JSONL run transcript, off by default; a bare `--transcript` defaults to `transcript.jsonl` in the run's state dir next to `run.sqlite`, while `--transcript <path>` uses that path verbatim (no env fallback — see `RunArgs::transcript` in `crates/talos/src/main.rs`).
 
+## Answer mode (`talos run --mode answer`)
+
+**Answer mode** turns talos into a sub-agent that returns *data* instead of a diff: `talos run --mode answer --schema result.json` reads a free-text question (stdin or `--file`), investigates the workspace, and terminates with a `finish(answer)` whose `result` payload conforms to the JSON Schema you supplied. It is the talos-side half of the "talos as the sub-agent of a dynamic workflow" design — see `docs/design/06-answer-mode-and-workflows.md`.
+
+```bash
+echo 'Which crates depend on the exec module, and why?' | \
+talos run \
+  --workspace /path/to/repo \
+  --mode answer \
+  --schema /path/to/result-schema.json \
+  --task-id answer-exec-deps
+# exit 40; stdout carries the validated payload at .disposition.Answer.result
+```
+
+- **`--mode <build|answer>`** (default `build`) — `build` is the pre-existing `TaskSpec` path, unchanged. `answer` REQUIRES `--schema`; `build` REJECTS it. Both shape errors are checked *before* stdin is read, so a wrongly flagged invocation fails immediately instead of blocking on a pipe.
+- **`--schema <path>`** — the JSON Schema the answer's `result` must satisfy. Its raw bytes are shown to the model (key order and formatting survive verbatim) and separately compiled into the validator the harness enforces; a schema-invalid `result` is fed back as a tool-result error, not a termination. The path is used exactly as supplied — resolved against the process CWD, not canonicalized, not confined to `--workspace`, the same as `--file`.
+- **Read-only tool registry.** An answer run gets `read_file`, `list_files`, `bash` and `finish` — no `edit_file`, and no `run_checks` (there is no `TaskSpec`, hence no gate command, this cut). Dropping `edit_file` is the convenience, not the enforcement: it keeps many answer agents sharing one checkout off each other's toes and stops the prompt advertising a capability the run would then reject.
+- **The tree-UNCHANGED precondition (the enforcement).** Build mode requires evidence that work *happened* before it accepts `finish(done)`. Answer mode inverts it: an accepted `finish(answer)` requires the working tree to be **unchanged** relative to the run-start baseline. A changed tree is rejected with the changed paths as evidence and the loop continues, so an agent that wrote a scratch file can revert and finish. The rule holds no matter which tool did the mutating — `bash` included. An *unobservable* workspace (not a git work tree, `git` missing, the status call timed out) fails **open** and is recorded: the accepted `Disposition::Answer` carries `change: Unobservable{reason}` and `RunStats::tree_baseline_unobservable` is `true`, so you can always tell a verified read-only answer from an unverifiable one. Symmetrically, `finish(done)` and `finish(already_satisfied)` are rejected in answer mode with steering toward `answer`.
+- **Exit 40**, not 0, 20 or 30. `agent-gtd-dispatch`'s `talos.py::map_talos_result` sets `push=True` only on exit 0 with parseable stdout (talos.py:285-306) — and a validated answer has nothing to push, so 0 would be wrong. It is not a task failure, so 20 would be wrong. It is not an already-satisfied build run, so 30 would be wrong; keeping 40 distinct from 30 lets a future mapper arm tell answer-with-payload from already-satisfied. Today both 30 and 40 fall to that mapper's unknown-exit-code catch-all (talos.py:342-346), which fails safe (status `failed`, `push=False`) — the right landing spot until the worker grows an arm for answer mode. Answer mode is deliberately unreachable from dispatch in this cut.
+- **Reading the result.** `RunSummary` gains no field: the payload rides out on stdout through the embedded, externally-tagged `Disposition`, so the orchestrator's read path is `.disposition.Answer.result`, with `.disposition.Answer.change` as the read-only evidence.
+
+Two operator notes:
+
+1. **Concurrent answer agents on one host MUST each pass a distinct `--task-id`** (or a distinct `--run-store` plus `--offload-dir`). The default `talos-run` resolves to one state dir and one run id (`talos-run:1`), so parallel runs would collide on the same `run.sqlite` and the same run record.
+2. **`tree_dirty` and `mutating_iters` are not the read-only oracle.** In answer mode they count *successful `bash` calls*, not observed tree changes, so a run that only grepped will still report them set. The authoritative read-only evidence is `Disposition::Answer.change` (and, on a transcript, the `run_end` stats `edit_file_calls_ok` and any `finish_rejection: "modified_workspace"` rows).
+
 ## Ralph mode (`talos ralph`)
 
 The **Ralph loop** drives an agent toward an objective by re-invoking the inner engine with a **fresh context every outer iteration** — durable state lives *outside* the context window (the code on disk, the git history, and a notes file the agent reads-then-appends), so each pass starts cold and still makes forward progress. Each iteration does exactly one unit of work; the **harness owns a git commit per iteration** (a deliberate ralph-only exception to the worker-owns-git rule). Distinct from finish-recovery (which nudges the *same* context when a gate is red) — Ralph *restarts* the context. Core: `crates/harness/src/ralph.rs`.

@@ -750,6 +750,13 @@ impl FinishClaim {
 ///   [`AnswerSchema`]. A missing `result` is NOT counted here — that is a
 ///   malformed finish call and lands in `invalid_finish_calls`. Counted
 ///   since THIS loop invocation — a resumed run starts from zero.
+/// - `modified_workspace_rejections`: count of `finish(answer)` claims
+///   rejected because the working tree CHANGED since the run started (answer
+///   mode's INVERTED leg 3 — an answer run must not modify the workspace).
+///   A wrong-mode `done` / `already_satisfied` claim on an answer run is NOT
+///   counted here (or anywhere): it is a steering rejection, not evidence
+///   about the workspace. Counted since THIS loop invocation — a resumed run
+///   starts from zero.
 /// - `tree_baseline_unobservable`: whether the run-start tree observation
 ///   failed, which makes the leg-3 precondition INERT for the whole run (it
 ///   fails open). The inert-detector: without it, a precondition that
@@ -870,6 +877,12 @@ pub struct RunStats {
     /// loop invocation — a resumed run (`resume`, engine.rs:1808) starts from
     /// zero.
     pub answer_schema_rejections: u32,
+    /// Count of `finish(answer)` claims rejected because the working tree
+    /// CHANGED since the run started — answer mode's INVERTED leg-3
+    /// precondition. A wrong-mode `done` / `already_satisfied` claim on an
+    /// answer run bumps NOTHING; it is steering, not evidence. Counted since
+    /// THIS loop invocation — a resumed run (`resume`) starts from zero.
+    pub modified_workspace_rejections: u32,
     /// Whether the run-start tree observation failed, making the leg-3
     /// precondition INERT for this run (it fails open). The inert-detector:
     /// a precondition that silently disabled itself in production would
@@ -1201,6 +1214,58 @@ fn missing_result_rejection_content() -> String {
         .to_string()
 }
 
+/// The `is_error=true` fed-back content for a `finish(answer)` whose `result`
+/// validated but whose working tree CHANGED since the run started — answer
+/// mode's INVERTED leg-3 precondition.
+///
+/// Build mode requires evidence that work happened; answer mode requires
+/// evidence that it did NOT. The wording therefore has to do two jobs: say
+/// why the claim bounced, and tell the model concretely how to get back to an
+/// acceptable state (revert, then finish again). The changed paths are
+/// appended as evidence — `git status --porcelain` of the CURRENT observation,
+/// capped at [`TREE_PORCELAIN_RENDER_CAP`] characters like every other
+/// model-facing tree rendering.
+///
+/// An observation with an EMPTY porcelain that still classified as
+/// `TreeChanged` means `HEAD` moved (a commit, a checkout, a reset) with a
+/// clean tree, so there are no paths to list; the lead-in says that instead.
+fn modified_workspace_rejection_content(current: &TreeObservation) -> String {
+    let evidence = match current {
+        TreeObservation::Observed { porcelain, .. } if porcelain.trim().is_empty() => {
+            "HEAD moved".to_string()
+        }
+        TreeObservation::Observed { porcelain, .. } => format!(
+            "changed paths:\n{}",
+            exec::tail(porcelain, TREE_PORCELAIN_RENDER_CAP)
+        ),
+        // Unreachable in practice — `TreeChanged` requires BOTH observations
+        // to be `Observed`. Expressed as an arm rather than an `expect` so a
+        // future classifier change degrades to a bare rejection, not a panic.
+        TreeObservation::Unobservable { .. } => "changed paths:".to_string(),
+    };
+    format!(
+        "finish(answer) rejected: the working tree changed since this run started — an \
+         answer run must not modify the workspace. Revert your edits (restore tracked files \
+         and delete files you created) and call finish(answer) again.\n{evidence}"
+    )
+}
+
+/// The `is_error=true` fed-back content for a build-mode terminal disposition
+/// (`done` / `already_satisfied`) claimed on an ANSWER-mode run.
+///
+/// `claim` is the disposition as the model named it, so the rejection opens
+/// with the same `finish(<claim>) rejected:` shape every other rejection uses.
+/// Returned BEFORE any checks run and before the tree is observed — a
+/// wrong-mode claim costs nothing to diagnose, and running a gate for it would
+/// be pure waste.
+fn wrong_mode_rejection_content(claim: &str) -> String {
+    format!(
+        "finish({claim}) rejected: this run is in answer mode — the only accepted terminal \
+         dispositions are answer, blocked, failed. End it with disposition `answer` and a \
+         `result` matching the schema in the task."
+    )
+}
+
 /// Character cap on the rendered schema-error block fed back to the model.
 /// Mirrors `exec::CHECK_EXCERPT_CAP` (also `4_000`), the precedent for
 /// model-facing bounded text: a pathological schema can produce megabytes of
@@ -1268,6 +1333,33 @@ enum FinishRejection {
     /// not here — it is a malformed finish call and bumps
     /// `invalid_finish_calls`.
     AnswerSchema,
+    /// A `finish(answer)` claim whose `result` validated but whose working
+    /// tree changed since the run started — answer mode's INVERTED leg-3
+    /// precondition. Counted by `RunStats::modified_workspace_rejections`.
+    ModifiedWorkspace,
+    /// A build-mode terminal disposition (`done` / `already_satisfied`)
+    /// claimed on an answer-mode run. Bumps no counter — it is a steering
+    /// rejection, not evidence about the workspace — but it IS surfaced on
+    /// the transcript via [`Self::as_str`].
+    WrongModeDisposition,
+}
+
+impl FinishRejection {
+    /// The stable transcript label for this rejection — the value of the
+    /// `tool_result` event's `finish_rejection` field.
+    ///
+    /// Hand-written rather than derived so the wire strings are pinned
+    /// independently of the Rust variant names; a rename must not silently
+    /// change a transcript key a jq audit query greps for.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoChange => "no_change",
+            Self::AlreadySatisfiedChecks => "already_satisfied_checks",
+            Self::AnswerSchema => "schema_invalid",
+            Self::ModifiedWorkspace => "modified_workspace",
+            Self::WrongModeDisposition => "wrong_mode_disposition",
+        }
+    }
 }
 
 /// Which branch of the answer-mode gate a `finish(answer)` call took —
@@ -1296,14 +1388,16 @@ struct FinishOutcome {
     /// `None` on every other arm (including a checks-rejected `done`).
     invalid_raw: Option<String>,
     /// The [`CheckReport`] `handle_finish_call` ran against `config.checks`,
-    /// when it ran one — `Some` on the six arms that ran the checks:
+    /// when it ran one — `Some` on the seven arms that ran the checks:
     /// accepted-`Done`-with-checks, checks-rejected-`done`,
     /// tree-unchanged-rejected-`done`-with-checks,
     /// accepted-`AlreadySatisfied`-with-checks,
-    /// checks-rejected-`already_satisfied`, and accepted-`Answer`-with-checks
-    /// (which records a RED report too — see [`Verification`]). `None` on
-    /// every no-checks path, on `blocked`/`failed`, on `Invalid`, on
-    /// `MissingReason`, and on both rejected `Answer` arms, which return
+    /// checks-rejected-`already_satisfied`, accepted-`Answer`-with-checks and
+    /// modified-workspace-rejected-`Answer`-with-checks (both of which record
+    /// a RED report too — see [`Verification`]). `None` on every no-checks
+    /// path, on `blocked`/`failed`, on `Invalid`, on `MissingReason`, on both
+    /// wrong-mode arms (an answer-mode `done` / `already_satisfied`), and on
+    /// the missing-result / schema-invalid `Answer` arms — all of which return
     /// before running anything.
     /// Transcript-only: the `tool_result` event's `finish_verification` field
     /// is derived from this, never from `FinishClaim` internals.
@@ -1311,20 +1405,26 @@ struct FinishOutcome {
     /// The leg-3 [`ChangeEvidence`] this call computed, when it observed the
     /// tree at all — `Some` on exactly the arms that reached the observation
     /// (accepted `Done`, tree-unchanged-rejected `done`, accepted
-    /// `AlreadySatisfied`, accepted `Answer`), `None` on
+    /// `AlreadySatisfied`, accepted `Answer`, and
+    /// modified-workspace-rejected `Answer`), `None` on
     /// `blocked`/`failed`/`Invalid`/`MissingReason`, on a checks-rejected
-    /// claim, and on a missing-result / schema-invalid `Answer` — all of
-    /// which return before observing. Transcript-only.
+    /// claim, on a wrong-mode `done` / `already_satisfied`, and on a
+    /// missing-result / schema-invalid `Answer` — all of which return before
+    /// observing. Transcript-only.
     change: Option<ChangeEvidence>,
     /// The [`TreeObservation`] taken at the moment of the claim, paired with
     /// `change`. `Some` on exactly the same arms. Transcript-only.
     current_tree: Option<TreeObservation>,
     /// Which [`RunStats`] rejection counter this call should bump, if any.
     rejection: Option<FinishRejection>,
-    /// Which answer-mode branch this call took — `Some` on exactly the three
+    /// Which answer-mode branch this call took — `Some` on exactly the four
     /// [`FinishClaim::Answer`] arms (missing-result, schema-invalid,
-    /// accepted), `None` on every other claim INCLUDING a build-mode `answer`
-    /// that parsed as [`FinishClaim::Invalid`]. Transcript-only.
+    /// modified-workspace-rejected, accepted), `None` on every other claim
+    /// INCLUDING a build-mode `answer` that parsed as
+    /// [`FinishClaim::Invalid`]. `branch` describes the SCHEMA verdict only,
+    /// so a modified-workspace rejection still reports `"valid"` — read
+    /// `rejection` (the transcript's `finish_rejection`) to see why an
+    /// otherwise-valid answer was not accepted. Transcript-only.
     answer: Option<AnswerVerdict>,
 }
 
@@ -1444,8 +1544,18 @@ fn checks_rejected(
 /// by the pre-existing [`FinishClaim::Invalid`] arm. An accepted `answer`
 /// validates FIRST (so an invalid answer never pays for a gate run), then
 /// runs the checks — recording BOTH verdicts as [`Verification`] telemetry
-/// without ever rejecting on a red one — then observes the tree and records
-/// the change evidence.
+/// without ever rejecting on a red one — then observes the tree and applies
+/// the INVERTED leg-3 precondition.
+///
+/// **Answer mode inverts leg 3.** Build mode requires evidence that the
+/// workspace MOVED; answer mode requires evidence that it did not. A
+/// `finish(answer)` whose `result` validated but whose tree is
+/// [`ChangeEvidence::TreeChanged`] is REJECTED (with the changed paths as
+/// evidence) and the loop continues; `TreeUnchanged` is accepted;
+/// `Unobservable` fails OPEN and is recorded. Symmetrically, `answer_schema
+/// == Some` makes the BUILD-mode terminals (`done`, `already_satisfied`)
+/// wrong-mode claims: both are rejected up front, before any checks run and
+/// before the tree is observed, with steering toward `answer`.
 ///
 /// Returns the fed-back [`UserBlock::ToolResult`] plus, when the loop should
 /// terminate, the accepted [`Disposition`]. A rejected `done` returns
@@ -1461,6 +1571,19 @@ async fn handle_finish_call(
 ) -> FinishOutcome {
     match FinishClaim::from_input(input, answer_schema.is_some()) {
         FinishClaim::Done { summary } => {
+            // Answer mode rejects the build-mode terminals BEFORE anything
+            // else: no checks are run, the tree is not observed, no counter
+            // moves. `done` means "I changed the workspace", which is exactly
+            // what an answer run must not have done — accepting it would
+            // invert the guarantee the inverted precondition exists to make.
+            if answer_schema.is_some() {
+                return FinishOutcome::rejected(
+                    call_id,
+                    wrong_mode_rejection_content("done"),
+                    None,
+                    Some(FinishRejection::WrongModeDisposition),
+                );
+            }
             // Ordering is load-bearing and unchanged: the checks run FIRST,
             // and a red report still returns exactly the rejection it always
             // did. Only a green verdict — including the
@@ -1508,6 +1631,17 @@ async fn handle_finish_call(
             }
         }
         FinishClaim::AlreadySatisfied { reason } => {
+            // Same wrong-mode guard as `done` — see that arm. An answer run's
+            // deliverable is the payload, so "nothing needed changing" is not
+            // a terminal it can reach.
+            if answer_schema.is_some() {
+                return FinishOutcome::rejected(
+                    call_id,
+                    wrong_mode_rejection_content("already_satisfied"),
+                    None,
+                    Some(FinishRejection::WrongModeDisposition),
+                );
+            }
             // A no-op claim on a red repo is never legitimate, so the checks
             // still gate it. The tree does NOT: a `TreeChanged` observation
             // is RECORDED, not rejected — rejecting it would trap an agent
@@ -1609,12 +1743,44 @@ async fn handle_finish_call(
                 } => (report, verification),
                 ChecksVerdict::Red(report) => (Some(report.clone()), Verification::Checks(report)),
             };
-            // Change evidence is RECORDED, not enforced: `TreeChanged`,
-            // `TreeUnchanged` and `Unobservable` are all accepted here. The
-            // inverted precondition (an answer agent must not have modified
-            // the workspace) belongs to answer mode's CLI half.
+            // The INVERTED leg-3 precondition, and the LAST gate in the
+            // arm: schema first (item 1), then checks (item 1), then this.
+            // The ordering matters — an invalid `result` on a changed tree
+            // gets the schema rejection, which is the more actionable of the
+            // two, and never pays for a tree observation.
+            //
+            // Build mode requires evidence that work HAPPENED; answer mode
+            // requires evidence that it did NOT. `TreeChanged` is therefore
+            // rejected and the loop continues. `Unobservable` fails OPEN —
+            // deliberately, and for the same reason build mode does: a
+            // workspace the harness cannot observe is no evidence that the
+            // agent modified it, and every non-git temp workspace in the test
+            // suite would otherwise become unanswerable. The fail-open is
+            // RECORDED (`RunStats::tree_baseline_unobservable`, and the
+            // `Unobservable` evidence on the accepted `Disposition::Answer`
+            // itself) so a caller can tell a verified read-only answer from
+            // an unverifiable one.
             let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
             let change = exec::classify_change(baseline, &current);
+            if change == ChangeEvidence::TreeChanged {
+                return FinishOutcome {
+                    result: UserBlock::ToolResult {
+                        call_id: call_id.to_string(),
+                        content: modified_workspace_rejection_content(&current),
+                        is_error: true,
+                    },
+                    finish: None,
+                    invalid_raw: None,
+                    report,
+                    change: Some(change),
+                    current_tree: Some(current),
+                    rejection: Some(FinishRejection::ModifiedWorkspace),
+                    answer: Some(AnswerVerdict {
+                        branch: "valid",
+                        errors: Vec::new(),
+                    }),
+                };
+            }
             FinishOutcome {
                 result: ack(call_id),
                 finish: Some(Disposition::Answer {
@@ -1697,6 +1863,25 @@ fn render_tree_observation(obs: &TreeObservation) -> Value {
     }
 }
 
+/// The tripwire text appended to the run-start "tree observation unavailable"
+/// warning, naming the precondition that just went INERT.
+///
+/// Mode-aware because the two modes enforce OPPOSITE invariants off the same
+/// observation: build mode requires the tree to have CHANGED before it will
+/// accept a `done`, answer mode requires it to be UNCHANGED before it will
+/// accept an `answer`. A warning that named the wrong one would send the next
+/// reader of the log hunting the wrong invariant.
+///
+/// Pure and `&'static str`-returning so both branches are unit-testable
+/// without capturing stderr.
+fn inert_precondition_warning(answer_mode: bool) -> &'static str {
+    if answer_mode {
+        "the answer-requires-unchanged-tree precondition is INERT for this run"
+    } else {
+        "the done-requires-change precondition is INERT for this run"
+    }
+}
+
 /// Drive `backend` + `tools` through a conversation until the agent finishes
 /// or `config.max_iterations` is hit.
 ///
@@ -1756,6 +1941,7 @@ pub async fn run(
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
+        modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
@@ -1829,6 +2015,7 @@ pub async fn run_persisted(
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
+        modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
     };
     let task_message = prompt::render_task_prompt(&config.task);
@@ -2033,27 +2220,38 @@ fn emit_run_end(
             "outcome": outcome_str,
             "disposition": disposition,
             "detail": detail,
-            "stats": {
-                "iterations": stats.iterations,
-                "input_tokens": stats.input_tokens,
-                "output_tokens": stats.output_tokens,
-                "cache_read_tokens": stats.cache_read_tokens,
-                "cache_write_tokens": stats.cache_write_tokens,
-                "gates_green_at_exit": stats.gates_green_at_exit,
-                "nudges_fired": stats.nudges_fired,
-                "tree_dirty": stats.tree_dirty,
-                "iters_since_tree_change_at_exit": stats.iters_since_tree_change_at_exit,
-                "peak_iters_since_tree_change": stats.peak_iters_since_tree_change,
-                "mutating_iters": stats.mutating_iters,
-                "bash_calls_ok": stats.bash_calls_ok,
-                "edit_file_calls_ok": stats.edit_file_calls_ok,
-                "no_change_rejections": stats.no_change_rejections,
-                "already_satisfied_check_rejections": stats.already_satisfied_check_rejections,
-                "answer_schema_rejections": stats.answer_schema_rejections,
-                "tree_baseline_unobservable": stats.tree_baseline_unobservable,
-            },
+            "stats": render_run_end_stats(stats),
         }),
     );
+}
+
+/// Serialize [`RunStats`] for the `run_end` event.
+///
+/// `wall_clock` is intentionally omitted — the caller
+/// (`run`/`run_persisted`/`resume`) sets it only AFTER `run_loop_impl` (and
+/// therefore this event) returns, so it would always be zero here. Every
+/// other field is emitted, and the transcript module doc enumerates them.
+fn render_run_end_stats(stats: &RunStats) -> Value {
+    json!({
+        "iterations": stats.iterations,
+        "input_tokens": stats.input_tokens,
+        "output_tokens": stats.output_tokens,
+        "cache_read_tokens": stats.cache_read_tokens,
+        "cache_write_tokens": stats.cache_write_tokens,
+        "gates_green_at_exit": stats.gates_green_at_exit,
+        "nudges_fired": stats.nudges_fired,
+        "tree_dirty": stats.tree_dirty,
+        "iters_since_tree_change_at_exit": stats.iters_since_tree_change_at_exit,
+        "peak_iters_since_tree_change": stats.peak_iters_since_tree_change,
+        "mutating_iters": stats.mutating_iters,
+        "bash_calls_ok": stats.bash_calls_ok,
+        "edit_file_calls_ok": stats.edit_file_calls_ok,
+        "no_change_rejections": stats.no_change_rejections,
+        "already_satisfied_check_rejections": stats.already_satisfied_check_rejections,
+        "answer_schema_rejections": stats.answer_schema_rejections,
+        "modified_workspace_rejections": stats.modified_workspace_rejections,
+        "tree_baseline_unobservable": stats.tree_baseline_unobservable,
+    })
 }
 
 /// The engine loop body proper — the renamed former `run_loop_impl`, now
@@ -2081,16 +2279,28 @@ async fn run_loop_body(
     // directly — so tests can drive time with a FakeClock.
     let loop_start = config.clock.now();
 
+    // Answer mode IS `config.answer_schema.is_some()` — there is deliberately
+    // no second mode field to drift out of sync with it.
+    let answer_mode = config.answer_schema.is_some();
+
     // Render the system prompt ONCE and reuse verbatim every iteration —
-    // the prompt-cache correctness invariant (D9).
-    let system = prompt::render_system_prompt(
-        &prompt::tool_lines(tools),
-        config
-            .checks
-            .as_ref()
-            .map(ChecksRunner::command_display)
-            .as_deref(),
-    );
+    // the prompt-cache correctness invariant (D9). Answer mode renders its
+    // OWN template (`answer_system_prompt.md`): a read-only analyst frame
+    // with no verification section and only `answer`/`blocked`/`failed` as
+    // terminals. `system_prompt.md` is left byte-identical, so the
+    // tier-1/tier-2 eval-parity rule gains no new surface.
+    let system = if answer_mode {
+        prompt::render_answer_system_prompt(&prompt::tool_lines(tools))
+    } else {
+        prompt::render_system_prompt(
+            &prompt::tool_lines(tools),
+            config
+                .checks
+                .as_ref()
+                .map(ChecksRunner::command_display)
+                .as_deref(),
+        )
+    };
 
     let mut messages = initial_messages;
     let tool_schemas = tools.list();
@@ -2174,8 +2384,8 @@ async fn run_loop_body(
     if let TreeObservation::Unobservable { reason } = &tree_baseline {
         stats.tree_baseline_unobservable = true;
         eprintln!(
-            "warning: tree observation unavailable ({reason}) — the done-requires-change \
-             precondition is INERT for this run"
+            "warning: tree observation unavailable ({reason}) — {}",
+            inert_precondition_warning(answer_mode)
         );
     }
 
@@ -2198,6 +2408,7 @@ async fn run_loop_body(
                 "config": {
                     "max_iterations": config.max_iterations,
                     "max_tokens": config.max_tokens,
+                    "mode": if answer_mode { "answer" } else { "build" },
                     "checks": config.checks.as_ref().map(ChecksRunner::command_display),
                     "answer_schema": config.answer_schema.as_ref().map(AnswerSchema::source),
                     "wall_clock_secs": config.wall_clock_secs,
@@ -2609,6 +2820,9 @@ async fn run_loop_body(
                                 .answer
                                 .as_ref()
                                 .map(|a| serde_json::to_value(a).unwrap_or(Value::Null)),
+                            "finish_rejection": outcome
+                                .rejection
+                                .map(FinishRejection::as_str),
                         }),
                     );
                 }
@@ -2620,7 +2834,11 @@ async fn run_loop_body(
                         stats.already_satisfied_check_rejections += 1;
                     }
                     Some(FinishRejection::AnswerSchema) => stats.answer_schema_rejections += 1,
-                    None => {}
+                    Some(FinishRejection::ModifiedWorkspace) => {
+                        stats.modified_workspace_rejections += 1;
+                    }
+                    // Steering, not evidence — deliberately uncounted.
+                    Some(FinishRejection::WrongModeDisposition) | None => {}
                 }
                 results.push(outcome.result);
                 finish = outcome.finish;
@@ -3247,6 +3465,7 @@ pub async fn resume(
         no_change_rejections: 0,
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
+        modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
     };
 
@@ -3359,11 +3578,11 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 mod tests {
     use super::{
         ANSWER_SCHEMA_ERRORS_CAP, ANSWER_SCHEMA_ERRORS_MAX_LINES, AnswerSchema, FINISH_TOOL_NAME,
-        FinishClaim, FinishTool, LoopOutcome, Persistence, ResumeError, ResumeMode, RunConfig,
-        RunResult, RunStats, answer_schema_rejection_content, emit_run_end,
-        missing_reason_rejection_content, missing_result_rejection_content,
-        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
-        run, run_id, run_persisted,
+        FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence, ResumeError,
+        ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content, emit_run_end,
+        inert_precondition_warning, missing_reason_rejection_content,
+        missing_result_rejection_content, no_change_rejection_content, rejection_content,
+        render_tool_result, resume, retry_delay, run, run_id, run_persisted,
     };
     use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -4927,6 +5146,7 @@ mod tests {
             no_change_rejections: 0,
             already_satisfied_check_rejections: 0,
             answer_schema_rejections: 0,
+            modified_workspace_rejections: 0,
             tree_baseline_unobservable: false,
         };
         let printed = format!("{a:?}");
@@ -10048,6 +10268,7 @@ mod tests {
             no_change_rejections: 0,
             already_satisfied_check_rejections: 0,
             answer_schema_rejections: 0,
+            modified_workspace_rejections: 0,
             tree_baseline_unobservable: false,
         }
     }
@@ -11004,20 +11225,18 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canonicalize");
         let ctx = git_ctx(&root_path);
-        let tools = registry_with_finish_and_edit();
+        // A NON-mutating first call: answer mode's inverted precondition
+        // rejects a `finish(answer)` on a changed tree, so the accepted
+        // branch this test needs is only reachable from a clean workspace.
+        // `echo` gives the same thing the call was here for — a non-finish
+        // `tool_result` to prove `finish_answer` is absent on one.
+        let mut tools = registry_with_finish_and_edit();
+        tools.register("echo", Arc::new(EchoTool));
         let transcript = root_path.join("branches.jsonl");
 
         let backend = MockBackend::from_turns(vec![
             turn_with(
-                vec![tool_call(
-                    "c-edit",
-                    "edit_file",
-                    serde_json::json!({
-                        "path": "scratch.txt",
-                        "old_string": "",
-                        "new_string": "x\n",
-                    }),
-                )],
+                vec![tool_call("c-edit", "echo", serde_json::json!({ "i": 1 }))],
                 StopReason::ToolUse,
             ),
             finish_call("c-miss", serde_json::json!({ "disposition": "answer" })),
@@ -11190,10 +11409,17 @@ mod tests {
         assert_eq!(stats.answer_schema_rejections, 0);
     }
 
-    /// Change evidence is RECORDED, not enforced — the inverted precondition
-    /// belongs to answer mode's CLI half.
+    /// SUPERSEDED BY THE INVERTED PRECONDITION. When the library half
+    /// (`bce155b`) landed, change evidence on an `answer` claim was RECORDED
+    /// but not enforced, and this test pinned that — the enforcement was
+    /// explicitly deferred to answer mode's CLI half. That half is now here:
+    /// a `finish(answer)` on a mutated workspace is REJECTED. The test keeps
+    /// its subject (an answer claim in a workspace the agent modified) and
+    /// flips its expectation, which is the whole behavioural delta of this
+    /// item; the rejection's wording and evidence are pinned separately by
+    /// `answer_on_a_changed_tree_is_rejected_with_the_changed_paths`.
     #[tokio::test]
-    async fn an_answer_in_a_mutated_workspace_is_still_accepted() {
+    async fn an_answer_in_a_mutated_workspace_is_rejected() {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canonicalize");
         let ctx = git_ctx(&root_path);
@@ -11217,14 +11443,13 @@ mod tests {
                 serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
             ),
         ]);
-        let config = RunConfig::new("answer me", 3).with_answer_schema(verdict_schema());
-        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
-        match outcome {
-            LoopOutcome::Finished(Disposition::Answer { change, .. }) => {
-                assert_eq!(change, ChangeEvidence::TreeChanged);
-            }
-            other => panic!("expected Finished(Answer); got {other:?}"),
-        }
+        let config = RunConfig::new("answer me", 2).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a mutated workspace must NOT terminate as Finished(Answer); got {outcome:?}"
+        );
+        assert_eq!(stats.modified_workspace_rejections, 1);
     }
 
     // ---- answer mode: the FinishTool schema gate -------------------------
@@ -11361,5 +11586,555 @@ mod tests {
 
         let lines = read_transcript_lines(&path);
         assert!(lines.iter().all(|l| l["event"] != "contract_violation"));
+    }
+
+    // =====================================================================
+    // Answer mode — the INVERTED leg-3 precondition (item 2)
+    // =====================================================================
+
+    /// The fixture schema every answer-mode engine test in this item uses.
+    fn answer_schema_fixture() -> AnswerSchema {
+        AnswerSchema::compile(&serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+            "additionalProperties": false,
+        }))
+        .expect("the fixture schema compiles")
+    }
+
+    /// The fixture claim: schema-valid, so every test that bounces bounces on
+    /// something OTHER than validation.
+    fn valid_answer_claim() -> serde_json::Value {
+        serde_json::json!({
+            "disposition": "answer",
+            "summary": "s",
+            "result": { "answer": "42" },
+        })
+    }
+
+    /// True when any fed-back tool result matched `pred`.
+    fn any_tool_result(messages: &[Message], pred: impl Fn(&str, bool) -> bool) -> bool {
+        messages.iter().any(|m| match m {
+            Message::User { content } => content.iter().any(|b| match b {
+                UserBlock::ToolResult {
+                    content, is_error, ..
+                } => pred(content, *is_error),
+                UserBlock::Text(_) => false,
+            }),
+            Message::Assistant { .. } => false,
+        })
+    }
+
+    /// AC-20. A `finish(answer)` whose `result` VALIDATES but whose working
+    /// tree changed is REJECTED — answer mode's inverted precondition — and
+    /// the loop continues to the iteration cap.
+    ///
+    /// Deliberately uses the EDIT-CAPABLE registry: registry composition is
+    /// enforced at the CLI (`answer_registry` has no `edit_file`), and the
+    /// precondition must hold regardless of which tool mutated the tree.
+    #[tokio::test]
+    async fn answer_on_a_changed_tree_is_rejected_with_the_changed_paths() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        // The transcript lives OUTSIDE the workspace — writing it inside
+        // would itself dirty the tree and confound the assertion.
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "oops\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call("c-answer", valid_answer_claim()),
+            // A third draw so the rejection from the second is visible in the
+            // messages the loop SENT — `last_messages` is the last request,
+            // and a rejection on the final iteration is never sent.
+            finish_call("c-answer-2", valid_answer_claim()),
+        ]);
+        let config = RunConfig::new("answer the question", 3)
+            .with_answer_schema(answer_schema_fixture())
+            .with_transcript(transcript.clone(), "answer");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a modified tree must NOT terminate as Finished(Answer); got {outcome:?}"
+        );
+        assert_eq!(stats.modified_workspace_rejections, 2);
+        assert_eq!(stats.no_change_rejections, 0);
+
+        let fed_back = backend.last_messages();
+        assert!(
+            any_tool_result(&fed_back, |content, is_error| {
+                is_error
+                    && content.starts_with(
+                        "finish(answer) rejected: the working tree changed since this run \
+                         started — an answer run must not modify the workspace. Revert your \
+                         edits (restore tracked files and delete files you created) and call \
+                         finish(answer) again.\nchanged paths:",
+                    )
+                    && content.contains("scratch.txt")
+            }),
+            "the rejection must carry the pinned sentence and name the changed path; \
+             got: {fed_back:?}"
+        );
+
+        let lines = read_transcript_lines(&transcript);
+        let tool_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a finish tool_result");
+        assert_eq!(tool_result["finish_accepted"], false);
+        assert_eq!(tool_result["finish_rejection"], "modified_workspace");
+        assert_eq!(
+            tool_result["finish_change"],
+            serde_json::json!("TreeChanged")
+        );
+        assert!(
+            tool_result["tree_current"]["Observed"].is_object(),
+            "the rejection must record the observation it classified: {tool_result}"
+        );
+        let run_end = lines
+            .iter()
+            .rfind(|l| l["event"] == "run_end")
+            .expect("a run_end event");
+        assert_eq!(run_end["stats"]["modified_workspace_rejections"], 2);
+    }
+
+    /// AC-21. The mirror case: an untouched tree ACCEPTS the same claim.
+    #[tokio::test]
+    async fn answer_on_an_unchanged_tree_is_accepted_with_tree_unchanged_evidence() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![finish_call("c-answer", valid_answer_claim())]);
+        let config = RunConfig::new("answer the question", 2)
+            .with_answer_schema(answer_schema_fixture())
+            .with_transcript(transcript.clone(), "answer");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer {
+                result,
+                change,
+                verification,
+            }) => {
+                assert_eq!(result, serde_json::json!({ "answer": "42" }));
+                assert_eq!(change, ChangeEvidence::TreeUnchanged);
+                assert_eq!(verification, Verification::NoChecksConfigured);
+            }
+            other => panic!("expected Finished(Answer{{TreeUnchanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.modified_workspace_rejections, 0);
+        assert_eq!(stats.edit_file_calls_ok, 0);
+
+        // The fed-back result is the non-error ack. An accepted finish ENDS
+        // the run, so that result is never part of a subsequent request —
+        // the transcript is where it is observable.
+        let lines = read_transcript_lines(&transcript);
+        let tool_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a finish tool_result");
+        assert_eq!(tool_result["is_error"], false);
+        assert_eq!(tool_result["content"], "finish acknowledged");
+        assert_eq!(tool_result["finish_accepted"], true);
+    }
+
+    /// AC-22. Unobservable fails OPEN — accepted, with the unobservability
+    /// RECORDED on both the disposition and the stats, so a caller can tell a
+    /// verified read-only answer from an unverifiable one.
+    #[tokio::test]
+    async fn answer_in_a_non_git_workspace_fails_open_and_records_it() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let probe = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&root_path)
+            .output()
+            .expect("git runs");
+        assert!(
+            !probe.status.success(),
+            "the fail-open assumption requires a non-git workspace root"
+        );
+
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+        let tools = registry_with_finish_and_edit();
+        let backend = MockBackend::from_turns(vec![finish_call("c-answer", valid_answer_claim())]);
+        let config =
+            RunConfig::new("answer the question", 2).with_answer_schema(answer_schema_fixture());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { change, .. }) => {
+                assert!(
+                    matches!(change, ChangeEvidence::Unobservable { .. }),
+                    "an unobservable workspace must fail OPEN; got {change:?}"
+                );
+            }
+            other => panic!("expected Finished(Answer{{Unobservable}}); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+        assert_eq!(stats.modified_workspace_rejections, 0);
+    }
+
+    /// AC-22. The tripwire names the invariant that actually went inert —
+    /// the two modes enforce OPPOSITE things off the same observation.
+    #[test]
+    fn inert_precondition_warning_names_the_mode_s_invariant() {
+        assert_eq!(
+            inert_precondition_warning(false),
+            "the done-requires-change precondition is INERT for this run",
+            "build mode's wording is load-bearing and must not drift"
+        );
+        assert!(
+            inert_precondition_warning(true)
+                .contains("the answer-requires-unchanged-tree precondition is INERT"),
+            "answer mode's tripwire must name the INVERTED precondition; got {}",
+            inert_precondition_warning(true)
+        );
+    }
+
+    /// AC-24. The inverted rule is scoped to answer mode ONLY: a build-mode
+    /// run that edits a file and claims `done` is still accepted.
+    #[tokio::test]
+    async fn build_mode_still_accepts_a_changed_tree_and_bumps_no_answer_counter() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "work.txt",
+                        "old_string": "",
+                        "new_string": "done\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "edited" }),
+            ),
+        ]);
+        // No `with_answer_schema` — `config.answer_schema` is None, so this
+        // is a build-mode run.
+        let config = RunConfig::new("do the work", 5);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.modified_workspace_rejections, 0);
+    }
+
+    /// AC-25. `done` and `already_satisfied` are wrong-mode claims on an
+    /// answer run: rejected with steering, before any checks run and before
+    /// the tree is observed, bumping no counter.
+    #[tokio::test]
+    async fn answer_mode_rejects_the_build_mode_terminals() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+            finish_call(
+                "c-as",
+                serde_json::json!({
+                    "disposition": "already_satisfied",
+                    "reason": "nothing to do",
+                }),
+            ),
+            // A third draw so BOTH rejections appear in the messages the loop
+            // sent — a rejection on the final iteration is never sent.
+            finish_call(
+                "c-done-2",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ]);
+        let config = RunConfig::new("answer the question", 3)
+            .with_answer_schema(answer_schema_fixture())
+            .with_transcript(transcript.clone(), "answer");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a build-mode terminal must not end an answer run; got {outcome:?}"
+        );
+        assert_eq!(
+            stats.invalid_finish_calls, 0,
+            "a wrong-mode claim is well-formed, not malformed"
+        );
+        assert_eq!(stats.modified_workspace_rejections, 0);
+        assert_eq!(stats.no_change_rejections, 0);
+        assert_eq!(stats.already_satisfied_check_rejections, 0);
+
+        let fed_back = backend.last_messages();
+        for claim in ["done", "already_satisfied"] {
+            let expected = format!(
+                "finish({claim}) rejected: this run is in answer mode — the only accepted \
+                 terminal dispositions are answer, blocked, failed. End it with disposition \
+                 `answer` and a `result` matching the schema in the task."
+            );
+            assert!(
+                any_tool_result(&fed_back, |content, is_error| is_error
+                    && content == expected),
+                "the {claim} rejection must be the pinned wrong-mode text; got: {fed_back:?}"
+            );
+        }
+        assert!(
+            any_tool_result(&fed_back, |content, _| content.contains("answer mode")),
+            "the rejection must name the mode; got: {fed_back:?}"
+        );
+
+        let lines = read_transcript_lines(&transcript);
+        let finishes: Vec<_> = lines
+            .iter()
+            .filter(|l| l["event"] == "tool_result")
+            .collect();
+        assert_eq!(finishes.len(), 3, "every finish call is recorded");
+        for line in finishes {
+            assert_eq!(line["finish_accepted"], false);
+            assert_eq!(line["finish_rejection"], "wrong_mode_disposition");
+            assert!(
+                line["finish_verification"].is_null(),
+                "no checks ran for a wrong-mode claim: {line}"
+            );
+            assert!(
+                line["finish_change"].is_null(),
+                "the tree is not observed for a wrong-mode claim: {line}"
+            );
+        }
+    }
+
+    /// Ordering guard: schema validation runs BEFORE the tree precondition,
+    /// so an invalid `result` on a CHANGED tree gets the schema rejection —
+    /// the more actionable of the two — and never pays for a tree
+    /// observation.
+    #[tokio::test]
+    async fn an_invalid_result_on_a_changed_tree_gets_the_schema_rejection() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "oops\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-answer",
+                serde_json::json!({
+                    "disposition": "answer",
+                    "summary": "s",
+                    "result": { "answer": 42 },
+                }),
+            ),
+            finish_call(
+                "c-answer-2",
+                serde_json::json!({
+                    "disposition": "answer",
+                    "summary": "s",
+                    "result": { "answer": 42 },
+                }),
+            ),
+        ]);
+        let config =
+            RunConfig::new("answer the question", 3).with_answer_schema(answer_schema_fixture());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(matches!(outcome, LoopOutcome::MaxIterations));
+        assert_eq!(stats.answer_schema_rejections, 2);
+        assert_eq!(
+            stats.modified_workspace_rejections, 0,
+            "the schema verdict wins; the tree is never observed"
+        );
+        let fed_back = backend.last_messages();
+        assert!(
+            any_tool_result(&fed_back, |content, is_error| {
+                is_error
+                    && content.starts_with(
+                        "finish(answer) rejected: result does not conform to the configured \
+                         schema:",
+                    )
+            }),
+            "expected the schema rejection; got: {fed_back:?}"
+        );
+    }
+
+    /// AC-28(b). Every `FinishRejection` variant has a pinned wire label —
+    /// the value jq audit queries grep for.
+    #[test]
+    fn finish_rejection_wire_labels_are_pinned() {
+        assert_eq!(FinishRejection::NoChange.as_str(), "no_change");
+        assert_eq!(
+            FinishRejection::AlreadySatisfiedChecks.as_str(),
+            "already_satisfied_checks"
+        );
+        assert_eq!(FinishRejection::AnswerSchema.as_str(), "schema_invalid");
+        assert_eq!(
+            FinishRejection::ModifiedWorkspace.as_str(),
+            "modified_workspace"
+        );
+        assert_eq!(
+            FinishRejection::WrongModeDisposition.as_str(),
+            "wrong_mode_disposition"
+        );
+    }
+
+    /// An accepted claim carries `finish_rejection: null` — the field is
+    /// present and explicitly empty, not absent, so an audit query can treat
+    /// it as a closed discriminator.
+    #[tokio::test]
+    async fn an_accepted_finish_records_a_null_finish_rejection() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![finish_call("c-answer", valid_answer_claim())]);
+        let config = RunConfig::new("answer the question", 2)
+            .with_answer_schema(answer_schema_fixture())
+            .with_transcript(transcript.clone(), "answer");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let lines = read_transcript_lines(&transcript);
+        let tool_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a finish tool_result");
+        assert_eq!(tool_result["finish_accepted"], true);
+        assert!(
+            tool_result.get("finish_rejection").is_some()
+                && tool_result["finish_rejection"].is_null(),
+            "an accepted claim carries an explicit null: {tool_result}"
+        );
+    }
+
+    // =====================================================================
+    // AC-19 / AC-28(a): the engine selects the mode's system prompt, and
+    // `run_start.config` records which mode it is in.
+    // =====================================================================
+
+    /// AC-19 + AC-28(a), answer mode: the system string equals
+    /// `render_answer_system_prompt`, and `run_start.config` says so.
+    #[tokio::test]
+    async fn answer_mode_run_renders_the_answer_system_prompt() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![finish_call("c-answer", valid_answer_claim())]);
+        let schema = answer_schema_fixture();
+        let schema_source = schema.source().clone();
+        let config = RunConfig::new("answer the question", 2)
+            .with_answer_schema(schema)
+            .with_transcript(transcript.clone(), "answer");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let expected = prompt::render_answer_system_prompt(&prompt::tool_lines(&tools));
+        let systems = backend.systems_seen();
+        assert!(!systems.is_empty(), "at least one turn drawn");
+        for (i, entry) in systems.iter().enumerate() {
+            assert_eq!(
+                entry.as_deref(),
+                Some(expected.as_str()),
+                "turn {i} must send the ANSWER system prompt"
+            );
+        }
+        assert_ne!(
+            expected,
+            prompt::render_system_prompt(&prompt::tool_lines(&tools), None),
+            "the answer system prompt must not be the build one"
+        );
+
+        let lines = read_transcript_lines(&transcript);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["config"]["mode"], "answer");
+        assert_eq!(lines[0]["config"]["answer_schema"], schema_source);
+        assert_eq!(lines[0]["system"], expected);
+    }
+
+    /// AC-19 + AC-28(a), build mode: unchanged — the system string equals
+    /// `render_system_prompt`, `mode` is `"build"`, `answer_schema` is null.
+    #[tokio::test]
+    async fn build_mode_run_still_renders_the_build_system_prompt() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        )]);
+        let config = RunConfig::new("do the work", 1).with_transcript(transcript.clone(), "build");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let expected = prompt::render_system_prompt(&prompt::tool_lines(&tools), None);
+        let systems = backend.systems_seen();
+        assert!(!systems.is_empty(), "at least one turn drawn");
+        for (i, entry) in systems.iter().enumerate() {
+            assert_eq!(
+                entry.as_deref(),
+                Some(expected.as_str()),
+                "turn {i} must send the BUILD system prompt"
+            );
+        }
+
+        let lines = read_transcript_lines(&transcript);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["config"]["mode"], "build");
+        assert!(lines[0]["config"]["answer_schema"].is_null());
+        assert_eq!(lines[0]["system"], expected);
     }
 }

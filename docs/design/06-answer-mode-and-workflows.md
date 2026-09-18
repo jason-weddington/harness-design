@@ -1,6 +1,6 @@
 # 06 — Answer mode: talos as the sub-agent of a dynamic workflow
 
-Status: **PROPOSED (2026-09-18).** Design thoughts captured before grooming, at Jason's request, as the next area of inquiry for the learning project. The talos-side pieces are groomed as GTD items on the harness-design board; the Python client and the first ported workflow follow once those land. Principle of record for the completion contract this extends: `kb-03300`. The leg-3 change it builds on: `1ec37b2` (tree-change precondition, `AlreadySatisfied`, exit 30).
+Status: **BOTH HALVES SHIPPED (2026-09-18 — library `bce155b`, CLI: GTD 118fa92c).** Answer mode is live in `talos run --mode answer --schema`; the Python client and the first ported workflow remain open.
 
 ## The question
 

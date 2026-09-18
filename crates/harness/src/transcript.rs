@@ -42,11 +42,14 @@
 //!   rendered system prompt), `tools` (the exact tool-schema array), `messages`
 //!   (the full starting [`crate::model::Message`] history — for `Crash` this
 //!   is the reconciled history, for `FreshContext` the fresh task seed), and
-//!   `config` (an object with exactly `max_iterations`, `max_tokens`, `checks`
-//!   — the check command display string, or `null` — `answer_schema` (the
-//!   compiled answer-mode result schema VERBATIM, so a reader can re-verify
-//!   any `finish(answer)` verdict off the record; `null` in build mode),
-//!   `wall_clock_secs`, `static_tree_k`, `max_nudges`, `max_retries`).
+//!   `config` (an object with exactly `max_iterations`, `max_tokens`, `mode`
+//!   — `"answer"` when the run has an answer schema configured, `"build"`
+//!   otherwise, so an audit can select answer runs without inspecting the
+//!   schema — `checks` — the check command display string, or `null` —
+//!   `answer_schema` (the compiled answer-mode result schema VERBATIM, so a
+//!   reader can re-verify any `finish(answer)` verdict off the record; `null`
+//!   in build mode), `wall_clock_secs`, `static_tree_k`, `max_nudges`,
+//!   `max_retries`).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
@@ -55,8 +58,8 @@
 //!    "tree_baseline":{"Observed":{"porcelain":"","porcelain_chars":0,"head":"abc123"}},
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
-//!    "config":{"max_iterations":10,"max_tokens":32768,"checks":"cargo test",
-//!              "answer_schema":null,
+//!    "config":{"max_iterations":10,"max_tokens":32768,"mode":"build",
+//!              "checks":"cargo test","answer_schema":null,
 //!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
 //!   ```
 //!
@@ -118,9 +121,23 @@
 //!   [`crate::exec::ChangeEvidence`], or `null` when the call returned before
 //!   observing the tree), `tree_current` (the
 //!   [`crate::exec::TreeObservation`] that evidence was classified from, or
-//!   `null`) and `finish_answer` (answer mode's branch discriminator) — those
+//!   `null`), `finish_answer` (answer mode's branch discriminator) and
+//!   `finish_rejection` (WHY a well-formed claim was not accepted) — those
 //!   keys are absent on every other `tool_result`, including a
 //!   second `finish` in the same batch (which executes as a plain tool call).
+//!
+//!   `finish_rejection` is `null` when the claim was accepted (and on a
+//!   MALFORMED claim, which is reported through `finish_accepted: false`
+//!   plus the fed-back content instead). Otherwise it is exactly one of
+//!   `"no_change"` (a `done` on an unchanged tree), `"already_satisfied_checks"`
+//!   (an `already_satisfied` on a red gate), `"schema_invalid"` (a
+//!   `finish(answer)` whose `result` failed schema validation),
+//!   `"modified_workspace"` (a `finish(answer)` whose `result` validated but
+//!   whose tree CHANGED since the run started — answer mode's inverted leg-3
+//!   precondition) or `"wrong_mode_disposition"` (a build-mode `done` /
+//!   `already_satisfied` claimed on an answer-mode run). It pairs with
+//!   `finish_accepted: false`, and two zero-row audit queries on an answer
+//!   run depend on it — see the `crates/talos/src/main.rs` module doc.
 //!
 //!   `finish_answer` is `null` for every non-`answer` claim — INCLUDING a
 //!   build-mode `finish(answer)`, which parses as an unrecognized disposition
@@ -128,9 +145,11 @@
 //!   `{"branch": ..., "errors": [..]}`, where `branch` is one of
 //!   `"missing_result"` (no `result` key was supplied), `"invalid"` (a
 //!   `result` was supplied and failed schema validation) or `"valid"` (it
-//!   validated and the claim was accepted). `errors` holds the SAME bounded
-//!   error list the model was shown and is empty on every branch but
-//!   `"invalid"`.
+//!   validated). `branch` reports the SCHEMA verdict ONLY: a `"valid"` claim
+//!   can still have been rejected by the inverted tree precondition, in which
+//!   case `finish_accepted` is `false` and `finish_rejection` is
+//!   `"modified_workspace"`. `errors` holds the SAME bounded error list the
+//!   model was shown and is empty on every branch but `"invalid"`.
 //!
 //!   ```json
 //!   {"event":"tool_result","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
@@ -191,7 +210,7 @@
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
 //!   `edit_file_calls_ok`, `no_change_rejections`,
 //!   `already_satisfied_check_rejections`, `answer_schema_rejections`,
-//!   `tree_baseline_unobservable`).
+//!   `modified_workspace_rejections`, `tree_baseline_unobservable`).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
 //!   AFTER `run_loop_impl` (and therefore this event) returns.
@@ -211,7 +230,7 @@
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
 //!             "edit_file_calls_ok":0,"no_change_rejections":0,
 //!             "already_satisfied_check_rejections":0,"answer_schema_rejections":0,
-//!             "tree_baseline_unobservable":false}}
+//!             "modified_workspace_rejections":0,"tree_baseline_unobservable":false}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
