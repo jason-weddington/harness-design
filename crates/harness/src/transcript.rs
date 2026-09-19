@@ -36,8 +36,11 @@
 //!   persisted run id, or `null` for the no-persistence [`crate::engine::run`]
 //!   path), `backend_settings` (the SAME structured
 //!   [`crate::run_record::BackendSettings`] value stamped on the record —
-//!   `kind`, `model`, `think`, `num_ctx`, `num_ctx_source` of the backend
-//!   the run was CONSTRUCTED with; `null` for the no-persistence
+//!   `kind`, `model`, `think`, `num_ctx`, `num_ctx_source`, `max_tokens`,
+//!   `max_tokens_source` of the backend the run was CONSTRUCTED with, where
+//!   `max_tokens`/`max_tokens_source` are the turn-1 output-cap resolution
+//!   and its provenance (`"explicit"`/`"table"`/`"derived"`/`"fallback"`);
+//!   `null` for the no-persistence
 //!   [`crate::engine::run`] path — additive on the v1 wire, so
 //!   [`TRANSCRIPT_VERSION`] stays 1), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
 //!   [`crate::engine::ResumeMode::FreshContext`]), `tree_baseline` (the
@@ -47,7 +50,14 @@
 //!   rendered system prompt), `tools` (the exact tool-schema array), `messages`
 //!   (the full starting [`crate::model::Message`] history — for `Crash` this
 //!   is the reconciled history, for `FreshContext` the fresh task seed), and
-//!   `config` (an object with exactly `max_iterations`, `max_tokens`, `mode`
+//!   `config` (an object with exactly `max_iterations`, `max_tokens` (the
+//!   EFFECTIVE turn-1 cap: the `--max-tokens` override verbatim when one was
+//!   flagged, else the backend's construction-time
+//!   [`crate::model::ModelBackend::output_cap`] resolution — identical to
+//!   iteration 1's cap by construction; the per-iteration value rides each
+//!   `model_request`), `max_tokens_source` (`"explicit"` when overridden,
+//!   else the [`crate::model::MaxTokensSource::as_str`] of that same
+//!   resolution), `mode`
 //!   — `"answer"` when the run has an answer schema configured, `"build"`
 //!   otherwise, so an audit can select answer runs without inspecting the
 //!   schema — `checks` — the check command display string, or `null` —
@@ -60,12 +70,12 @@
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
 //!    "transcript_version":1,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
-//!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null},
+//!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
 //!    "tree_baseline":{"Observed":{"porcelain":"","porcelain_chars":0,"head":"abc123"}},
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
-//!    "config":{"max_iterations":10,"max_tokens":32768,"mode":"build",
+//!    "config":{"max_iterations":10,"max_tokens":128000,"max_tokens_source":"table","mode":"build",
 //!              "checks":"cargo test","answer_schema":null,
 //!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
 //!   ```
@@ -74,12 +84,15 @@
 //!   `stats.iterations` is incremented and before the retry loop; NOT
 //!   re-emitted per retry. Fields: `iteration` (1-based), `message_count`
 //!   (`messages.len()` at send time), `block_count` (total content blocks
-//!   summed across those messages). Deliberately lean — it does not re-dump
-//!   history; a reader reconstructs it (see "Reconstruction" below).
+//!   summed across those messages), `max_tokens` (the EXACT
+//!   `req.params.max_tokens` sent that iteration — the per-turn cap, which
+//!   on the derived lane moves as the prompt grows). Deliberately lean — it
+//!   does not re-dump history; a reader reconstructs it (see
+//!   "Reconstruction" below).
 //!
 //!   ```json
 //!   {"event":"model_request","ts":"2026-09-15T02:00:00Z","elapsed_ms":1,
-//!    "iteration":1,"message_count":1,"block_count":1}
+//!    "iteration":1,"message_count":1,"block_count":1,"max_tokens":128000}
 //!   ```
 //!
 //! - **`backend_error`** — emitted for EVERY failed `backend.turn` inside the

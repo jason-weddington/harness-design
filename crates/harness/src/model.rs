@@ -333,6 +333,66 @@ impl BackendError {
     }
 }
 
+// ===== Output cap =====================================================
+
+/// The per-turn output cap used when NOTHING better is known — the
+/// documented **fallback**, not a default. Resolution lives in the engine
+/// loop ([`ModelBackend::output_cap`]); this value is what a backend that
+/// knows neither a published per-model limit nor a context budget returns
+/// (see design 08, `docs/design/08-context-budget.md`). It stays at the
+/// historical 32768 so a backend/model pair with no table entry and no
+/// pinned window behaves exactly as it did before the cap became resolved.
+pub const DEFAULT_MAX_TOKENS: u32 = 32768;
+
+/// How a resolved per-turn output cap was produced — the provenance that
+/// rides beside [`OutputCapResolution::max_tokens`] onto the transcript
+/// wire and into run records (as `max_tokens_source`, via [`Self::as_str`]).
+///
+/// Not serde on purpose: the persisted form is `Option<u32>` +
+/// `Option<String>` on [`crate::run_record::BackendSettings`], built from
+/// `max_tokens` and `source.as_str()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensSource {
+    /// An operator override (`--max-tokens` / [`crate::engine::RunConfig::with_max_tokens`])
+    /// — used verbatim; the backend accessor is never consulted.
+    Explicit,
+    /// A published per-model provider limit (the Anthropic/Bedrock tables).
+    Table,
+    /// Derived from the context budget (Ollama: `num_ctx` minus the
+    /// previous turn's prompt minus the output margin).
+    Derived,
+    /// Nothing backend-specific was known — [`DEFAULT_MAX_TOKENS`].
+    Fallback,
+}
+
+impl MaxTokensSource {
+    /// The stable string form used on the transcript wire and in run
+    /// records: exactly `"explicit"` / `"table"` / `"derived"` /
+    /// `"fallback"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Table => "table",
+            Self::Derived => "derived",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// A resolved per-turn output cap plus its provenance — what
+/// [`ModelBackend::output_cap`] returns.
+///
+/// Plain struct with public fields (deliberately not serde — see
+/// [`MaxTokensSource`] for the persisted shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputCapResolution {
+    /// The cap, in output tokens.
+    pub max_tokens: u32,
+    /// How the cap was produced.
+    pub source: MaxTokensSource,
+}
+
 // ===== Trait ==========================================================
 
 /// The anti-corruption boundary between the agent loop and any specific
@@ -360,6 +420,32 @@ pub trait ModelBackend: Send + Sync {
     /// every wire-format translation; the loop only sees the normalized
     /// types defined in this module.
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError>;
+
+    /// Resolve this backend/model pair's per-turn output cap — the value the
+    /// loop threads into [`SamplingParams::max_tokens`] each iteration
+    /// unless the operator overrode it.
+    ///
+    /// `prompt_tokens` is the total prompt size of the **previous** turn —
+    /// `usage.input_tokens + usage.cache_read_tokens.unwrap_or(0)` — or
+    /// `None` when no turn has completed yet (turn 1). It is the input the
+    /// deriving backends need: the only exact measurement of "how full the
+    /// window already is". `usage.cache_write_tokens` is deliberately
+    /// EXCLUDED from the formula — it is exact for Ollama (the only
+    /// deriving backend, which never reports cache writes) and unused by
+    /// the table backends.
+    ///
+    /// SYNC default method (no `async`), so the trait stays object-safe
+    /// alongside the [`mod@async_trait`] `turn`. The default is the
+    /// documented fallback: a backend that knows neither a published
+    /// per-model limit (Anthropic/Bedrock tables) nor a context budget
+    /// (Ollama `num_ctx`) resolves to
+    /// `{ max_tokens: `[`DEFAULT_MAX_TOKENS`]`, source: `[`MaxTokensSource::Fallback`]` }`.
+    fn output_cap(&self, _prompt_tokens: Option<u32>) -> OutputCapResolution {
+        OutputCapResolution {
+            max_tokens: DEFAULT_MAX_TOKENS,
+            source: MaxTokensSource::Fallback,
+        }
+    }
 }
 
 // =======================================================================
@@ -369,12 +455,14 @@ pub trait ModelBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, SamplingParams,
-        StopReason, TerminalKind, ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
+        AssistantTurn, BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message,
+        ModelBackend, OutputCapResolution, SamplingParams, StopReason, TerminalKind,
+        ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
     };
     use async_trait::async_trait;
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn round_trip<T>(value: &T)
@@ -799,5 +887,74 @@ mod tests {
         // And the From impl appends to history without per-variant remap.
         let msg: Message = turn.into();
         assert!(matches!(msg, Message::Assistant { .. }));
+    }
+    // ---- output_cap: the documented fallback + dyn-safety ----
+
+    /// A mock overriding ONLY `turn` — the whole surface a backend had
+    /// before `output_cap` existed — so the default resolution is what it
+    /// must inherit.
+    struct TurnOnlyBackend;
+
+    #[async_trait]
+    impl ModelBackend for TurnOnlyBackend {
+        async fn turn(&self, _req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
+            Ok(AssistantTurn {
+                content: vec![ContentBlock::Text("ok".to_string())],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+        }
+    }
+
+    /// The default `output_cap` is the documented fallback, reachable
+    /// through an `Arc<dyn ModelBackend>` — the routing shape the loop
+    /// uses, and the assertion that the new sync default method did not
+    /// break object safety.
+    #[tokio::test]
+    async fn output_cap_default_is_the_fallback_through_dyn() {
+        let backend: Arc<dyn ModelBackend> = Arc::new(TurnOnlyBackend);
+        assert_eq!(
+            backend.output_cap(Some(1000)),
+            OutputCapResolution {
+                max_tokens: DEFAULT_MAX_TOKENS,
+                source: MaxTokensSource::Fallback,
+            },
+            "a backend overriding only `turn` must inherit the fallback resolution"
+        );
+        assert_eq!(DEFAULT_MAX_TOKENS, 32768);
+        // And the mock still turns — the default method changed nothing.
+        let messages = vec![Message::User {
+            content: vec![UserBlock::Text("ping".to_string())],
+        }];
+        let tools: Vec<Value> = vec![];
+        let params = SamplingParams {
+            max_tokens: 16,
+            temperature: None,
+            stop_sequences: vec![],
+        };
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &params,
+        };
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(turn.text(), "ok");
+    }
+
+    /// `as_str` returns exactly the four pinned strings — the wire/record
+    /// spelling is load-bearing (transcripts, run records, stderr).
+    #[test]
+    fn max_tokens_source_as_str_is_pinned() {
+        assert_eq!(MaxTokensSource::Explicit.as_str(), "explicit");
+        assert_eq!(MaxTokensSource::Table.as_str(), "table");
+        assert_eq!(MaxTokensSource::Derived.as_str(), "derived");
+        assert_eq!(MaxTokensSource::Fallback.as_str(), "fallback");
     }
 }

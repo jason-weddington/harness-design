@@ -203,13 +203,13 @@ impl AnswerSchema {
 /// Configuration for one call to [`run`].
 ///
 /// Bundles the task text, iteration cap, optional [`ChecksRunner`], and the
-/// per-turn `max_tokens` cap into one struct so the [`run`] signature stays
-/// tight and adding a knob later doesn't force every caller to change. When
-/// `checks` is `Some`, `finish(done)` is verified against the runner before
-/// being honored (see the module docs).
+/// per-turn output-cap override into one struct so the [`run`] signature
+/// stays tight and adding a knob later doesn't force every caller to change.
+/// When `checks` is `Some`, `finish(done)` is verified against the runner
+/// before being honored (see the module docs).
 ///
-/// Build via [`RunConfig::new`] (which sets the [`DEFAULT_MAX_TOKENS`] default)
-/// and layer optional knobs with [`RunConfig::with_checks`] /
+/// Build via [`RunConfig::new`] (which resolves the output cap per backend
+/// unless overridden) and layer optional knobs with [`RunConfig::with_checks`] /
 /// [`RunConfig::with_max_tokens`].
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -223,7 +223,14 @@ pub struct RunConfig {
     /// [`crate::run_record::Verification::NoChecksConfigured`].
     pub checks: Option<ChecksRunner>,
     /// Per-turn output cap threaded into [`SamplingParams::max_tokens`].
-    pub max_tokens: u32,
+    ///
+    /// `None` (the default) = **resolve per backend, per iteration**: each
+    /// loop pass asks the backend via [`model::ModelBackend::output_cap`]
+    /// (Ollama derives from the context budget, Anthropic/Bedrock read their
+    /// published per-model tables, and a backend that knows nothing falls
+    /// back to [`DEFAULT_MAX_TOKENS`]). `Some(n)` = an operator override
+    /// that wins verbatim; the backend accessor is never consulted.
+    pub max_tokens: Option<u32>,
     /// Static-tree threshold K for finish-recovery: how many consecutive
     /// non-mutating iterations must accumulate AFTER a green `run_checks`
     /// before the harness considers the run "done-but-unclaimed" and injects
@@ -287,16 +294,18 @@ pub struct RunConfig {
     pub answer_schema: Option<AnswerSchema>,
 }
 
-/// The default per-turn output cap. Sized for reasoning models: a model whose
-/// thinking counts toward completion tokens (glm-5.2, qwen) can exceed a small
-/// cap mid-turn and get truncated *before* it emits a tool call, which the loop
-/// then sees as a no-tool-call turn and reports as `StoppedWithoutFinish` (a
-/// silent, misdiagnosed stall — see kb-03104). 32768 is safe across every
-/// backend: it is half of Claude Haiku 4.5's 64K output ceiling (Sonnet/Opus
-/// allow 128K) and well within Ollama's `num_predict`; there is no cost
-/// downside since billing is on actual output, not the cap. Override per-run
-/// with [`RunConfig::with_max_tokens`].
-pub const DEFAULT_MAX_TOKENS: u32 = 32768;
+/// The fallback per-turn output cap — re-exported from
+/// [`model::DEFAULT_MAX_TOKENS`] so the historical
+/// `harness::engine::DEFAULT_MAX_TOKENS` path keeps resolving. It is a
+/// **fallback, not a default**: the engine loop resolves the cap per backend
+/// via [`model::ModelBackend::output_cap`] each iteration, and this value is
+/// only what a backend/model pair that knows neither a published per-model
+/// limit nor a context budget resolves to. (The old "sized for reasoning
+/// models / safe across every backend" rationale is superseded: two dispatch
+/// runs died at exactly 32768 output tokens with ~98% of the context window
+/// free — see design 08, `docs/design/08-context-budget.md` — and a single
+/// raised constant would break the Haiku lane, which publishes 64,000.)
+pub use crate::model::DEFAULT_MAX_TOKENS;
 
 /// Default retry cap: how many ADDITIONAL attempts are made after the first
 /// try on a retryable [`model::BackendError::Transient`] failure. With the
@@ -326,8 +335,9 @@ pub const DEFAULT_MAX_NUDGES: u32 = 2;
 
 impl RunConfig {
     /// Build a config with the given `task` and iteration cap. Defaults
-    /// `checks` to `None`, `max_tokens` to [`DEFAULT_MAX_TOKENS`],
-    /// `max_retries` to [`DEFAULT_MAX_RETRIES`], and `retry_backoff_base` to
+    /// `checks` to `None`, `max_tokens` to `None` (resolve per backend per
+    /// iteration — see [`RunConfig::max_tokens`]), `max_retries` to
+    /// [`DEFAULT_MAX_RETRIES`], and `retry_backoff_base` to
     /// [`DEFAULT_RETRY_BACKOFF_BASE`].
     #[must_use]
     pub fn new(task: impl Into<String>, max_iterations: u32) -> Self {
@@ -335,7 +345,7 @@ impl RunConfig {
             task: task.into(),
             max_iterations,
             checks: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: None,
             static_tree_k: DEFAULT_STATIC_TREE_K,
             max_nudges: DEFAULT_MAX_NUDGES,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -364,10 +374,12 @@ impl RunConfig {
         self
     }
 
-    /// Override the per-turn output cap ([`DEFAULT_MAX_TOKENS`] by default).
+    /// Override the per-turn output cap: `Some(n)` wins verbatim on every
+    /// iteration and the backend's [`model::ModelBackend::output_cap`] is
+    /// never consulted. Unset, the cap resolves per backend per iteration.
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         self
     }
 
@@ -2358,10 +2370,20 @@ async fn run_loop_body(
 
     let mut messages = initial_messages;
     let tool_schemas = tools.list();
-    let params = SamplingParams {
-        max_tokens: config.max_tokens,
-        temperature: None,
-        stop_sequences: Vec::new(),
+
+    // The turn-1 output-cap resolution, computed ONCE for the `run_start`
+    // `config` object: the operator override verbatim when `config.max_tokens`
+    // is `Some`, else the backend's construction-time `output_cap(None)`. The
+    // loop below re-resolves each iteration with the previous turn's prompt
+    // size; on iteration 1 (`last_prompt_tokens == None`) it is identical to
+    // this value by construction, so the recorded cap is the cap the first
+    // request actually sent.
+    let turn1_cap_resolution = match config.max_tokens {
+        Some(max_tokens) => model::OutputCapResolution {
+            max_tokens,
+            source: model::MaxTokensSource::Explicit,
+        },
+        None => backend.output_cap(None),
     };
 
     // Captured before `override_persist` is moved into the match below —
@@ -2468,7 +2490,8 @@ async fn run_loop_body(
                 "messages": serde_json::to_value(&messages).unwrap_or(Value::Null),
                 "config": {
                     "max_iterations": config.max_iterations,
-                    "max_tokens": config.max_tokens,
+                    "max_tokens": turn1_cap_resolution.max_tokens,
+                    "max_tokens_source": turn1_cap_resolution.source.as_str(),
                     "mode": if answer_mode { "answer" } else { "build" },
                     "checks": config.checks.as_ref().map(ChecksRunner::command_display),
                     "answer_schema": config.answer_schema.as_ref().map(AnswerSchema::source),
@@ -2501,7 +2524,29 @@ async fn run_loop_body(
     let mut nudge_awaiting_status: bool = false;
     let mut nudge_statuses: Vec<String> = Vec::new();
 
+    // Total prompt tokens of the PREVIOUS turn
+    // (`usage.input_tokens + usage.cache_read_tokens.unwrap_or(0)`), or `None`
+    // before the first turn completes — the input the backend's
+    // `output_cap` derivation needs. `cache_write_tokens` is deliberately
+    // excluded (exact for Ollama, the only deriving backend, which never
+    // reports cache writes).
+    let mut last_prompt_tokens: Option<u32> = None;
+
     for _ in 0..config.max_iterations {
+        // Per-iteration output-cap resolution: the operator override verbatim
+        // when `config.max_tokens` is `Some` (the accessor is never
+        // consulted), else the backend's resolution against the previous
+        // turn's prompt size. Built INSIDE the loop because the derived cap
+        // moves with the context budget as the run grows.
+        let turn_cap = match config.max_tokens {
+            Some(max_tokens) => max_tokens,
+            None => backend.output_cap(last_prompt_tokens).max_tokens,
+        };
+        let params = SamplingParams {
+            max_tokens: turn_cap,
+            temperature: None,
+            stop_sequences: Vec::new(),
+        };
         let req = TurnRequest {
             system: Some(&system),
             messages: &messages,
@@ -2528,6 +2573,10 @@ async fn run_loop_body(
                     "iteration": stats.iterations,
                     "message_count": messages.len(),
                     "block_count": block_count,
+                    // The exact `req.params.max_tokens` sent THIS iteration —
+                    // additive on the v1 wire so the per-turn cap is auditable
+                    // on the derived lane, where it moves turn to turn.
+                    "max_tokens": turn_cap,
                 }),
             );
         }
@@ -2630,6 +2679,14 @@ async fn run_loop_body(
         let per_turn_cache_read = u64::from(turn.usage.cache_read_tokens.unwrap_or(0));
         let per_turn_cache_write = u64::from(turn.usage.cache_write_tokens.unwrap_or(0));
 
+        // The prompt-size input the NEXT iteration's `output_cap` resolution
+        // derives from. Captured before the turn is consumed below.
+        last_prompt_tokens = Some(
+            turn.usage
+                .input_tokens
+                .saturating_add(turn.usage.cache_read_tokens.unwrap_or(0)),
+        );
+
         // Accumulate into run totals. Per-turn u32 values sum into u64 so a
         // long run can't overflow.
         stats.input_tokens += per_turn_input;
@@ -2715,9 +2772,8 @@ async fn run_loop_body(
                 let disposition = Disposition::Failed {
                     mode: FailureMode::Truncated,
                     summary: format!(
-                        "turn truncated at max_tokens (produced {per_turn_output} of {} \
-                         output-token cap) before any tool call; raise --max-tokens",
-                        config.max_tokens
+                        "turn truncated at max_tokens (produced {per_turn_output} of {turn_cap} \
+                         output-token cap) before any tool call; raise --max-tokens"
                     ),
                 };
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
@@ -2847,12 +2903,11 @@ async fn run_loop_body(
                 // observable fingerprint of that masking class. At or above
                 // the cap the summary names it; below the cap the literal is
                 // byte-unchanged.
-                let summary = if per_turn_output >= u64::from(config.max_tokens) {
+                let summary = if per_turn_output >= u64::from(turn_cap) {
                     format!(
                         "agent stopped generating tool calls without calling finish \
-                             (output hit the {}-token cap: {per_turn_output} produced; \
-                             possible masked truncation)",
-                        config.max_tokens
+                             (output hit the {turn_cap}-token cap: {per_turn_output} produced; \
+                             possible masked truncation)"
                     )
                 } else {
                     "agent stopped generating tool calls without calling finish".to_string()
@@ -3714,8 +3769,8 @@ mod tests {
     };
     use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
-        AssistantTurn, BackendError, ContentBlock, Message, StopReason, TerminalKind,
-        ToolCallRequest, TransientKind, Usage, UserBlock,
+        AssistantTurn, BackendError, ContentBlock, MaxTokensSource, Message, OutputCapResolution,
+        StopReason, TerminalKind, ToolCallRequest, TransientKind, Usage, UserBlock,
     };
     use crate::prompt;
     use crate::run_record::{
@@ -5422,18 +5477,18 @@ mod tests {
 
     #[test]
     fn run_config_defaults_and_builders_compose() {
-        // new() sets checks=None and max_tokens=DEFAULT_MAX_TOKENS.
+        // new() sets checks=None and max_tokens=None (resolve per backend).
         let config = RunConfig::new("do a thing", 7);
         assert_eq!(config.task, "do a thing");
         assert_eq!(config.max_iterations, 7);
         assert!(config.checks.is_none());
-        assert_eq!(config.max_tokens, super::DEFAULT_MAX_TOKENS);
+        assert_eq!(config.max_tokens, None);
 
         // Builders layer on top.
         let with_checks = RunConfig::new("t", 1).with_checks(passing_runner());
         assert!(with_checks.checks.is_some());
         let with_mt = RunConfig::new("t", 1).with_max_tokens(1234);
-        assert_eq!(with_mt.max_tokens, 1234);
+        assert_eq!(with_mt.max_tokens, Some(1234));
 
         // wall_clock_secs defaults 0; with_wall_clock_secs overrides it.
         assert_eq!(RunConfig::new("t", 1).wall_clock_secs, 0);
@@ -5928,6 +5983,8 @@ mod tests {
             think: Some("on".to_string()),
             num_ctx: Some(32768),
             num_ctx_source: Some("explicit".to_string()),
+            max_tokens: None,
+            max_tokens_source: None,
         };
         let backend = MockBackend::from_turns(vec![finish_call(
             "c-fin",
@@ -6413,6 +6470,199 @@ mod tests {
             }
             other => panic!("expected Failed{{StoppedWithoutFinish}}; got {other:?}"),
         }
+    }
+
+    // ---- per-iteration output-cap resolution (design 08) ---------------------
+
+    /// The override closure every derived-lane test below shares: the cap is
+    /// `1000 + previous-prompt`, so a run's cap MOVES turn to turn.
+    fn shifting_cap_override() -> Box<dyn Fn(Option<u32>) -> OutputCapResolution + Send + Sync> {
+        Box::new(|prompt_tokens| OutputCapResolution {
+            max_tokens: 1000 + prompt_tokens.unwrap_or(0),
+            source: MaxTokensSource::Derived,
+        })
+    }
+
+    /// The loop re-resolves the cap each iteration from the PREVIOUS turn's
+    /// prompt size: request 1 gets the turn-1 cap (no prompt known), request
+    /// 2 gets `1000 + 200` after a turn whose usage reported 200 input
+    /// tokens.
+    #[tokio::test]
+    async fn output_cap_resolves_per_iteration_from_previous_prompt() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+                usage_with(200, 5),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ])
+        .with_output_cap_override(shifting_cap_override());
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected a clean finish; got {outcome:?}"
+        );
+        assert_eq!(
+            backend.params_seen(),
+            vec![1000, 1200],
+            "iteration 2's cap must derive from turn 1's reported prompt size"
+        );
+    }
+
+    /// Transcript variant of the per-iteration resolution: each
+    /// `model_request` event carries the EXACT cap that iteration sent, and
+    /// `run_start.config` carries the turn-1 cap plus its source.
+    #[tokio::test]
+    async fn transcript_records_the_per_iteration_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("caps.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+                usage_with(200, 5),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ])
+        .with_output_cap_override(shifting_cap_override());
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(outcome, LoopOutcome::Finished(_)));
+
+        let lines = read_transcript_lines(&path);
+        let requests: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "model_request")
+            .collect();
+        assert_eq!(requests.len(), 2, "two model_request events");
+        assert_eq!(requests[0]["max_tokens"], 1000, "turn-1 cap on iteration 1");
+        assert_eq!(
+            requests[1]["max_tokens"], 1200,
+            "turn-2 cap derives from turn 1's prompt"
+        );
+        // And run_start.config names the turn-1 cap and its provenance —
+        // identical to iteration 1's cap by construction.
+        let run_start = lines
+            .iter()
+            .find(|l| l["event"] == "run_start")
+            .expect("run_start line");
+        assert_eq!(run_start["config"]["max_tokens"], 1000);
+        assert_eq!(run_start["config"]["max_tokens_source"], "derived");
+    }
+
+    /// A flagged cap wins verbatim on EVERY iteration and the backend
+    /// accessor is never consulted — not by the loop, not by the
+    /// `run_start` emit.
+    #[tokio::test]
+    async fn flagged_max_tokens_wins_verbatim_and_never_calls_the_accessor() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("explicit.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+                usage_with(200, 5),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ])
+        .with_output_cap_override(shifting_cap_override());
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5)
+            .with_max_tokens(1234)
+            .with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(matches!(outcome, LoopOutcome::Finished(_)));
+        assert_eq!(
+            backend.params_seen(),
+            vec![1234, 1234],
+            "the override is verbatim on every iteration"
+        );
+        assert_eq!(
+            backend.output_cap_calls(),
+            0,
+            "an explicit override must never consult the backend accessor"
+        );
+
+        let lines = read_transcript_lines(&path);
+        let run_start = lines
+            .iter()
+            .find(|l| l["event"] == "run_start")
+            .expect("run_start line");
+        assert_eq!(run_start["config"]["max_tokens"], 1234);
+        assert_eq!(run_start["config"]["max_tokens_source"], "explicit");
+    }
+
+    /// Masked truncation on the DERIVED lane: the comparison operand is the
+    /// iteration-local cap (1200, derived from turn 1's 200-token prompt),
+    /// not turn 1's cap (1000) and not the fallback 32768.
+    #[tokio::test]
+    async fn masked_truncation_uses_the_iteration_local_derived_cap() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+                usage_with(200, 5),
+            ),
+            turn_with_usage(
+                vec![ContentBlock::Text("silently cut off".to_string())],
+                StopReason::EndTurn,
+                usage_with(200, 1200),
+            ),
+        ])
+        .with_output_cap_override(shifting_cap_override());
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        match rec.disposition {
+            Some(Disposition::Failed { mode, ref summary }) => {
+                assert_eq!(mode, FailureMode::StoppedWithoutFinish);
+                assert_eq!(
+                    summary,
+                    "agent stopped generating tool calls without calling finish \
+                     (output hit the 1200-token cap: 1200 produced; possible \
+                     masked truncation)",
+                    "the cap in the tripwire is the iteration-local derived cap"
+                );
+            }
+            other => panic!("expected Failed{{StoppedWithoutFinish}}; got {other:?}"),
+        }
+        assert_eq!(
+            backend.params_seen(),
+            vec![1000, 1200],
+            "the run must have sent the derived per-iteration caps"
+        );
     }
 
     /// AC4 tripwire, sub-cap fixture: below the cap the `StoppedWithoutFinish`
@@ -7415,6 +7665,8 @@ mod tests {
             think: Some("on".to_string()),
             num_ctx: Some(32768),
             num_ctx_source: Some("explicit".to_string()),
+            max_tokens: None,
+            max_tokens_source: None,
         };
         let mut record = make_minimal_record("bs-fc-task", 1);
         record.backend_settings = Some(s.clone());
@@ -7494,6 +7746,8 @@ mod tests {
             think: Some("on".to_string()),
             num_ctx: Some(32768),
             num_ctx_source: Some("explicit".to_string()),
+            max_tokens: None,
+            max_tokens_source: None,
         };
         let mut record = make_minimal_record("bs-crash-task", 1);
         record.backend_settings = Some(s.clone());

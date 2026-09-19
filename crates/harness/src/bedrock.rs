@@ -150,8 +150,47 @@ impl BedrockBackend {
     }
 }
 
+/// Bedrock's per-model output cap — same shape as
+/// [`crate::anthropic::output_cap_for_model`], keyed on the CANONICAL model
+/// name (the field [`BedrockBackend`] retains), and covering EXACTLY the set
+/// [`map_model_id`] accepts. Construction rejects any other canonical name,
+/// so the `None` arm is unreachable-by-construction through
+/// [`BedrockBackend::new`] — the backend's fallback arm keeps it defensive
+/// anyway.
+///
+/// **Tripwire for a stale/wrong entry:** a table value above the provider's
+/// real limit surfaces as a first-turn validation 400 that
+/// [`classify_validation`] labels `Terminal(BadRequest)` — NOT
+/// `ContextLengthExceeded` (an over-cap `max_tokens` is a request-shape
+/// error, not a prompt-window phrasing). An auditor must grep the
+/// `backend_error` event's `error`/`error_debug` for the provider's
+/// `max_tokens`/validation wording, not the context-overflow phrase set.
+#[must_use]
+pub fn output_cap_for_model(canonical: &str) -> Option<u32> {
+    match canonical {
+        "claude-haiku-4-5" => Some(64_000),
+        "claude-sonnet-5" | "claude-opus-4-8" => Some(128_000),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl ModelBackend for BedrockBackend {
+    /// The published per-model table (see [`output_cap_for_model`]) — a
+    /// provider-published limit does not depend on the prompt size.
+    fn output_cap(&self, _prompt_tokens: Option<u32>) -> crate::model::OutputCapResolution {
+        match output_cap_for_model(&self.canonical) {
+            Some(max_tokens) => crate::model::OutputCapResolution {
+                max_tokens,
+                source: crate::model::MaxTokensSource::Table,
+            },
+            None => crate::model::OutputCapResolution {
+                max_tokens: crate::model::DEFAULT_MAX_TOKENS,
+                source: crate::model::MaxTokensSource::Fallback,
+            },
+        }
+    }
+
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         // Production path: the AWS default credential/region chain (SSO/IMDS
         // do async I/O) loads on first use. The test override pre-seeds the
@@ -291,9 +330,10 @@ fn map_assistant_block(b: &ContentBlock) -> Option<BedrockContentBlock> {
 }
 
 /// Build the `InferenceConfiguration`: `max_tokens` from `req.params` (read
-/// exactly like the anthropic adapter — no `DEFAULT_MAX_TOKENS` here; that
-/// lives in the engine and reaches the backend pre-defaulted), temperature
-/// only when `Some`, `stopSequences` only when non-empty.
+/// exactly like the anthropic adapter — the resolved/fallback cap lives in
+/// `crate::model::DEFAULT_MAX_TOKENS` and reaches the backend pre-resolved
+/// by the engine loop, which consults [`ModelBackend::output_cap`]),
+/// temperature only when `Some`, `stopSequences` only when non-empty.
 fn build_inference_config(req: &TurnRequest<'_>) -> InferenceConfiguration {
     InferenceConfiguration::builder()
         .max_tokens(i32::try_from(req.params.max_tokens).unwrap_or(i32::MAX))
@@ -594,11 +634,12 @@ fn document_to_value(doc: &Document) -> Value {
 mod tests {
     use super::{
         BedrockBackend, classify_validation, document_to_value, map_converse_error, map_model_id,
-        map_stop_reason, map_usage, value_to_document,
+        map_stop_reason, map_usage, output_cap_for_model, value_to_document,
     };
     use crate::model::{
-        BackendError, ContentBlock, Message, ModelBackend, SamplingParams, StopReason,
-        TerminalKind, ToolCallRequest, TransientKind, TurnRequest, UserBlock,
+        BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
+        OutputCapResolution, SamplingParams, StopReason, TerminalKind, ToolCallRequest,
+        TransientKind, TurnRequest, UserBlock,
     };
     use aws_sdk_bedrockruntime::error::SdkError;
     use aws_sdk_bedrockruntime::operation::converse::ConverseError;
@@ -607,6 +648,44 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    // ---- output cap: the per-model table -----------------------------------
+
+    /// Every table arm — the three models construction accepts, plus the
+    /// `None` arm the pure fn carries defensively (unreachable through
+    /// `BedrockBackend::new`, which rejects the unmapped names).
+    #[test]
+    fn output_cap_for_model_pins_every_arm() {
+        assert_eq!(output_cap_for_model("claude-haiku-4-5"), Some(64_000));
+        assert_eq!(output_cap_for_model("claude-sonnet-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-opus-4-8"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-opus-5"), None);
+    }
+
+    /// The backend resolves its canonical model's published cap with source
+    /// `Table`, exactly as the anthropic adapter does.
+    #[test]
+    fn bedrock_backend_output_cap_uses_the_table() {
+        for (canonical, cap) in [
+            ("claude-haiku-4-5", 64_000),
+            ("claude-sonnet-5", 128_000),
+            ("claude-opus-4-8", 128_000),
+        ] {
+            let backend = BedrockBackend::new(canonical).expect("mapped canonical model");
+            assert_eq!(
+                backend.output_cap(None),
+                OutputCapResolution {
+                    max_tokens: cap,
+                    source: MaxTokensSource::Table,
+                },
+                "{canonical} must resolve its published cap"
+            );
+        }
+        // The pure fn's fallback arm, pinned directly (construction cannot
+        // reach it — `map_model_id` rejects every other name).
+        assert_eq!(output_cap_for_model("claude-3-opus"), None);
+        assert_eq!(DEFAULT_MAX_TOKENS, 32768);
+    }
 
     // ---- small helpers -----------------------------------------------------
 

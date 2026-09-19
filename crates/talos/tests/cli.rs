@@ -248,6 +248,8 @@ fn assert_resolved_backend_settings(
             think: None,
             num_ctx: Some(32768),
             num_ctx_source: Some("explicit".into()),
+            max_tokens: Some(16384),
+            max_tokens_source: Some("derived".into()),
         }),
         "record.backend_settings must be the resolved construction settings"
     );
@@ -260,6 +262,10 @@ fn assert_resolved_backend_settings(
     );
     assert_eq!(summary["backend_settings"]["num_ctx"], 32768);
     assert_eq!(summary["backend_settings"]["num_ctx_source"], "explicit");
+    // The resolved per-turn output cap and its provenance — the turn-1
+    // derivation from the pinned num_ctx (32768 - 16384 margin).
+    assert_eq!(summary["backend_settings"]["max_tokens"], 16384);
+    assert_eq!(summary["backend_settings"]["max_tokens_source"], "derived");
 }
 
 // ============================================================================
@@ -399,7 +405,9 @@ fn assert_run_start_label_and_settings(run_start: &serde_json::Value) {
             "model": "x",
             "think": null,
             "num_ctx": 32768,
-            "num_ctx_source": "explicit"
+            "num_ctx_source": "explicit",
+            "max_tokens": 16384,
+            "max_tokens_source": "derived"
         }),
         "run_start.backend_settings must carry the resolved construction settings"
     );
@@ -667,11 +675,11 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
 /// Shared driver for the `--max-tokens` tests: spawn `talos run` with an
 /// explicit `--transcript` path (the refused-port Ollama path still writes a
 /// full transcript whose first line is `run_start`), an optional
-/// `--max-tokens` value, and return the parsed `run_start` line's
-/// `config.max_tokens`. The sqlite run record persists no cap
-/// (`BackendSettings` is deliberately closed), so the transcript's
-/// `run_start` event is the only external record of the cap.
-fn run_start_max_tokens(max_tokens_arg: Option<&str>) -> serde_json::Value {
+/// `--max-tokens` value, and return the parsed `run_start` line. The cap now
+/// lands in THREE places: `run_start.config` (`max_tokens` — the effective
+/// turn-1 cap — plus `max_tokens_source`), the run record's
+/// `backend_settings` (and the stdout summary's copy of it).
+fn run_start_line(max_tokens_arg: Option<&str>) -> serde_json::Value {
     let dir = tempfile::tempdir().expect("create temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -744,27 +752,53 @@ fn run_start_max_tokens(max_tokens_arg: Option<&str>) -> serde_json::Value {
         })
         .find(|l| l["event"] == "run_start")
         .expect("the transcript must carry a run_start line");
-    run_start["config"]["max_tokens"].clone()
+    run_start
 }
 
-/// No `--max-tokens` flag: the `run_start` event carries the harness default
-/// (`DEFAULT_MAX_TOKENS` = 32768).
+/// No `--max-tokens` flag: the cap RESOLVES from the backend. The fixture
+/// pins `OLLAMA_NUM_CTX=32768`, so the turn-1 derivation is
+/// `32768 - 16384 (OUTPUT_TOKEN_MARGIN) = 16384` with source `derived` — on
+/// BOTH `run_start.config` and `run_start.backend_settings`.
 #[tokio::test(flavor = "current_thread")]
-async fn run_start_defaults_max_tokens_to_32768() {
-    let max_tokens = run_start_max_tokens(None);
+async fn run_start_resolves_max_tokens_from_backend_when_unset() {
+    let run_start = run_start_line(None);
     assert_eq!(
-        max_tokens, 32768,
-        "run_start.config.max_tokens must carry the DEFAULT_MAX_TOKENS default"
+        run_start["config"]["max_tokens"], 16384,
+        "run_start.config.max_tokens must carry the backend-resolved turn-1 cap"
+    );
+    assert_eq!(
+        run_start["config"]["max_tokens_source"], "derived",
+        "run_start.config.max_tokens_source must name the derivation"
+    );
+    assert_eq!(
+        run_start["backend_settings"]["max_tokens"], 16384,
+        "backend_settings must carry the same resolved cap (one source)"
+    );
+    assert_eq!(
+        run_start["backend_settings"]["max_tokens_source"], "derived",
+        "backend_settings must carry the same provenance (one source)"
     );
 }
 
 /// `--max-tokens 4096`: the `run_start` event carries the flagged value.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_flagged_max_tokens() {
-    let max_tokens = run_start_max_tokens(Some("4096"));
+    let run_start = run_start_line(Some("4096"));
     assert_eq!(
-        max_tokens, 4096,
+        run_start["config"]["max_tokens"], 4096,
         "run_start.config.max_tokens must carry the --max-tokens flag value"
+    );
+    assert_eq!(
+        run_start["config"]["max_tokens_source"], "explicit",
+        "an override must be labelled explicit, never resolved"
+    );
+    assert_eq!(
+        run_start["backend_settings"]["max_tokens"], 4096,
+        "backend_settings must carry the flagged cap too (one source)"
+    );
+    assert_eq!(
+        run_start["backend_settings"]["max_tokens_source"],
+        "explicit"
     );
 }
 

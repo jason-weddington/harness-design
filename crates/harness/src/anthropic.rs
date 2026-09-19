@@ -99,8 +99,50 @@ impl AnthropicBackend {
     }
 }
 
+/// Anthropic's published per-model output cap — the static table, keyed
+/// EXACTLY on the model id [`AnthropicBackend`] was constructed with.
+/// Anthropic is the strict case design 08 calls out: exceeding the published
+/// `max_tokens` is a 400, and one raised constant shared across backends
+/// breaks the Haiku lane specifically (64,000 vs 128,000 for the rest).
+///
+/// The static table is the WHOLE mechanism — no `GET /v1/models` probe is
+/// made (design 08: the values are published, versioned per model id, and
+/// an HTTP probe would add a new mid-run failure mode for zero
+/// information).
+///
+/// **Tripwire for a stale/wrong entry:** a table value above the provider's
+/// real limit surfaces as a first-turn 400 that [`classify_bad_request`]
+/// labels `Terminal(BadRequest)` — NOT `ContextLengthExceeded` (an
+/// over-cap `max_tokens` is a request-shape error, not a prompt-window
+/// phrasing). An auditor must grep the `backend_error` event's `error` /
+/// `error_debug` for the provider's `max_tokens`/validation wording, not
+/// for the context-overflow phrase set.
+#[must_use]
+pub fn output_cap_for_model(model: &str) -> Option<u32> {
+    match model {
+        "claude-haiku-4-5" => Some(64_000),
+        "claude-sonnet-5" | "claude-opus-4-8" | "claude-opus-5" => Some(128_000),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl ModelBackend for AnthropicBackend {
+    /// The published per-model table (see [`output_cap_for_model`]) — the
+    /// prompt size plays no part in a provider-published limit.
+    fn output_cap(&self, _prompt_tokens: Option<u32>) -> crate::model::OutputCapResolution {
+        match output_cap_for_model(&self.model) {
+            Some(max_tokens) => crate::model::OutputCapResolution {
+                max_tokens,
+                source: crate::model::MaxTokensSource::Table,
+            },
+            None => crate::model::OutputCapResolution {
+                max_tokens: crate::model::DEFAULT_MAX_TOKENS,
+                source: crate::model::MaxTokensSource::Fallback,
+            },
+        }
+    }
+
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         let body = build_request_body(&self.model, req);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
@@ -564,16 +606,64 @@ fn parse_retry_after(header: Option<&reqwest::header::HeaderValue>) -> Option<Du
 
 #[cfg(test)]
 mod tests {
-    use super::{AnthropicBackend, classify_bad_request, map_stop_reason, parse_retry_after};
+    use super::{
+        AnthropicBackend, classify_bad_request, map_stop_reason, output_cap_for_model,
+        parse_retry_after,
+    };
     use crate::model::{
-        BackendError, ContentBlock, Message, ModelBackend, SamplingParams, StopReason,
-        TerminalKind, ToolCallRequest, TransientKind, TurnRequest, UserBlock,
+        BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
+        OutputCapResolution, SamplingParams, StopReason, TerminalKind, ToolCallRequest,
+        TransientKind, TurnRequest, UserBlock,
     };
     use reqwest::header::HeaderValue;
     use serde_json::{Value, json};
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    // ---- output cap: the published per-model table -------------------------
+
+    /// All five arms of the table, pinned — including the `None` arm an
+    /// unmapped model id falls into.
+    #[test]
+    fn output_cap_for_model_pins_every_arm() {
+        assert_eq!(output_cap_for_model("claude-haiku-4-5"), Some(64_000));
+        assert_eq!(output_cap_for_model("claude-sonnet-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-opus-4-8"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-opus-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-3-opus"), None);
+    }
+
+    /// The backend resolves from the table with source `Table`; an unknown
+    /// model id (constructible — Anthropic validates nothing at
+    /// construction) takes the fallback. The prompt size is ignored: a
+    /// published limit does not depend on it.
+    #[test]
+    fn anthropic_backend_output_cap_uses_the_table() {
+        for (model, cap) in [
+            ("claude-haiku-4-5", 64_000),
+            ("claude-sonnet-5", 128_000),
+            ("claude-opus-4-8", 128_000),
+            ("claude-opus-5", 128_000),
+        ] {
+            assert_eq!(
+                AnthropicBackend::new(model, "k").output_cap(Some(46_004)),
+                OutputCapResolution {
+                    max_tokens: cap,
+                    source: MaxTokensSource::Table,
+                },
+                "{model} must resolve its published cap, prompt size ignored"
+            );
+        }
+        assert_eq!(
+            AnthropicBackend::new("claude-3-opus", "k").output_cap(None),
+            OutputCapResolution {
+                max_tokens: DEFAULT_MAX_TOKENS,
+                source: MaxTokensSource::Fallback,
+            },
+            "an unmapped model id falls back, it does not guess"
+        );
+    }
 
     // ---- small helpers -----------------------------------------------------
 

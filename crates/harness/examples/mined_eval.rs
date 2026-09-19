@@ -108,7 +108,7 @@ use harness::mined_eval::{
     PytestParser, SpecLevel, TrialScore, load_statement, load_task, parse_agent_gate_mode,
     parse_test_first, parse_wall_clock_secs, resolve_agent_gate_command,
 };
-use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
+use harness::model::{AssistantTurn, BackendError, ModelBackend, OutputCapResolution, TurnRequest};
 use harness::ollama::{OllamaBackend, ThinkLevel, resolve_num_ctx};
 
 /// Default model id when `ANTHROPIC_MODEL` is not set.
@@ -139,6 +139,17 @@ impl ModelBackend for Backend {
         match self {
             Backend::Anthropic(b) => b.turn(req).await,
             Backend::Ollama(b) => b.turn(req).await,
+        }
+    }
+
+    /// Forward the per-backend output-cap resolution. Without this the eval
+    /// lane would inherit the trait fallback (32768/Fallback) while
+    /// `talos run` resolves per backend — the measured-vs-shipped drift
+    /// design 07 (`docs/design/07-num-ctx.md`) exists to prevent.
+    fn output_cap(&self, prompt_tokens: Option<u32>) -> OutputCapResolution {
+        match self {
+            Backend::Anthropic(b) => b.output_cap(prompt_tokens),
+            Backend::Ollama(b) => b.output_cap(prompt_tokens),
         }
     }
 }

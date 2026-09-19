@@ -221,8 +221,71 @@ impl OllamaBackend {
     }
 }
 
+/// WHY `16_384`: the derived cap must still cover a turn's full output growth
+/// even on iteration 1, where no previous-turn usage exists to approximate
+/// the current prompt. The dominant term is the seed prompt itself — the
+/// task spec alone measures 13,000-34,000 characters (design 08,
+/// `docs/design/08-context-budget.md` "What actually fills the context") —
+/// plus one turn's tool-result growth, since the current prompt is only
+/// approximated by the previous turn's exact usage. `16_384` (~4x the largest
+/// measured spec at chars/4) keeps the turn-1 cap from being consumed by the
+/// prompt the agent has not even built yet.
+pub const OUTPUT_TOKEN_MARGIN: u32 = 16_384;
+
+/// WHY `4_096`: the floor. A small pinned window (`OLLAMA_NUM_CTX=8192`, say)
+/// minus a large prompt would otherwise derive a cap too small for any
+/// model to emit a tool call in — the run would stall on every turn. The
+/// floor keeps a small pinned window usable; the pre-flight context guard
+/// (not this derivation) is what actually refuses a window that is already
+/// too full.
+pub const MIN_OUTPUT_CAP: u32 = 4_096;
+
+/// Pure derivation of the per-turn output cap from the context budget —
+/// the whole Ollama mechanism (Ollama advertises NO output limit of any
+/// kind, only `context_length`; `num_predict` is a client-side ceiling
+/// honoured exactly, per design 08).
+///
+/// - `num_ctx == None` (no context budget known — the non-local-unpinned
+///   cloud/local case) → the documented fallback
+///   ([`crate::model::DEFAULT_MAX_TOKENS`], source `Fallback`).
+/// - `Some(nc)` → `nc` minus the previous turn's prompt tokens (0 when
+///   none) minus [`OUTPUT_TOKEN_MARGIN`], floored at [`MIN_OUTPUT_CAP`],
+///   source `Derived`.
+///
+/// Ollama's own ceiling is therefore never the binding constraint before
+/// the context window is — and the context window is what the pre-flight
+/// guard (see [`estimate_prompt_tokens`]) refuses, unchanged.
+#[must_use]
+pub fn derive_max_tokens(
+    num_ctx: Option<u32>,
+    prompt_tokens: Option<u32>,
+) -> crate::model::OutputCapResolution {
+    match num_ctx {
+        None => crate::model::OutputCapResolution {
+            max_tokens: crate::model::DEFAULT_MAX_TOKENS,
+            source: crate::model::MaxTokensSource::Fallback,
+        },
+        Some(nc) => crate::model::OutputCapResolution {
+            max_tokens: nc
+                .saturating_sub(
+                    prompt_tokens
+                        .unwrap_or(0)
+                        .saturating_add(OUTPUT_TOKEN_MARGIN),
+                )
+                .max(MIN_OUTPUT_CAP),
+            source: crate::model::MaxTokensSource::Derived,
+        },
+    }
+}
+
 #[async_trait]
 impl ModelBackend for OllamaBackend {
+    /// Derived from the pinned `num_ctx` (see [`derive_max_tokens`]) — the
+    /// per-iteration prompt approximation is supplied by the loop.
+    fn output_cap(&self, prompt_tokens: Option<u32>) -> crate::model::OutputCapResolution {
+        derive_max_tokens(self.num_ctx, prompt_tokens)
+    }
+
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         // Build first: request assembly is fallible (an unresolvable
         // tool-result `call_id` is a Protocol error we must catch *before*
@@ -1209,16 +1272,89 @@ fn map_error_status(status: StatusCode, body_text: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::{
-        OllamaBackend, ThinkLevel, classify_transport_error, extract_error_message,
-        map_stop_reason, ollama_usage_inconsistency_warning,
+        MIN_OUTPUT_CAP, OUTPUT_TOKEN_MARGIN, OllamaBackend, ThinkLevel, classify_transport_error,
+        derive_max_tokens, extract_error_message, map_stop_reason,
+        ollama_usage_inconsistency_warning,
     };
     use crate::model::{
-        BackendError, ContentBlock, Message, ModelBackend, SamplingParams, StopReason,
-        TerminalKind, ToolCallRequest, TransientKind, TurnRequest, UserBlock,
+        BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
+        OutputCapResolution, SamplingParams, StopReason, TerminalKind, ToolCallRequest,
+        TransientKind, TurnRequest, UserBlock,
     };
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    // ---- output cap: the Ollama derivation ---------------------------------
+
+    /// The pinned derivation table — four arms, each a measured or
+    /// structural case from design 08.
+    #[test]
+    fn derive_max_tokens_pins_the_four_cases() {
+        // Turn 1 against a pinned 32768 window: no prompt known yet, so the
+        // whole margin comes off the top.
+        assert_eq!(
+            derive_max_tokens(Some(32_768), None),
+            OutputCapResolution {
+                max_tokens: 16_384,
+                source: MaxTokensSource::Derived,
+            }
+        );
+        // The PhotoQueue death prompt (46,004 tokens) against the glm pin
+        // (1,048,576) — the run design 08 records as killed by the old
+        // constant, now with ~986K of output headroom.
+        assert_eq!(
+            derive_max_tokens(Some(1_048_576), Some(46_004)),
+            OutputCapResolution {
+                max_tokens: 986_188,
+                source: MaxTokensSource::Derived,
+            }
+        );
+        // A prompt that already fills the window saturates to the floor.
+        assert_eq!(
+            derive_max_tokens(Some(32_768), Some(32_768)),
+            OutputCapResolution {
+                max_tokens: MIN_OUTPUT_CAP,
+                source: MaxTokensSource::Derived,
+            }
+        );
+        // No context budget known (non-local, unpinned) → the fallback, even
+        // with a prompt size in hand.
+        assert_eq!(
+            derive_max_tokens(None, Some(999_999)),
+            OutputCapResolution {
+                max_tokens: DEFAULT_MAX_TOKENS,
+                source: MaxTokensSource::Fallback,
+            }
+        );
+        // The margin and floor are the pinned constants, not magic numbers.
+        assert_eq!(OUTPUT_TOKEN_MARGIN, 16_384);
+        assert_eq!(MIN_OUTPUT_CAP, 4_096);
+    }
+
+    /// The backend delegates to [`derive_max_tokens`] over its pinned
+    /// `num_ctx` — same numbers as the pure fn, reached the way the loop
+    /// reaches them.
+    #[test]
+    fn ollama_backend_output_cap_derives_from_pinned_num_ctx() {
+        assert_eq!(
+            OllamaBackend::new("m", "http://localhost:11434")
+                .with_num_ctx(32_768)
+                .output_cap(None),
+            OutputCapResolution {
+                max_tokens: 16_384,
+                source: MaxTokensSource::Derived,
+            }
+        );
+        // Unpinned → fallback through the backend too.
+        assert_eq!(
+            OllamaBackend::new("m", "http://localhost:11434").output_cap(Some(1_000)),
+            OutputCapResolution {
+                max_tokens: DEFAULT_MAX_TOKENS,
+                source: MaxTokensSource::Fallback,
+            }
+        );
+    }
 
     // ---- small helpers -----------------------------------------------------
 

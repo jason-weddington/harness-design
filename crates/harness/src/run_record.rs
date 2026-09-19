@@ -56,15 +56,17 @@ pub enum BackendKind {
 /// Resolved backend construction settings, recorded on every [`RunRecord`].
 ///
 /// These are the settings the backend was CONSTRUCTED with — the model id,
-/// the think level, and the `num_ctx` the adapter was pinned with — NOT
+/// the think level, the `num_ctx` the adapter was pinned with, and the
+/// per-turn output cap resolved at construction time — NOT
 /// what any server reported back: no backend currently echoes the SERVED
 /// model (Ollama's `ResponseBody`, `ollama.rs:894-902`, does not
 /// deserialize the `model` field the server returns), so this field is NOT
 /// proof of served identity (the `kb-02979` "engine LABEL != IDENTITY"
 /// lesson). Deliberately closed: exactly `kind`, `model`, `think`,
-/// `num_ctx`, and `num_ctx_source` — no api key, base URL, or credential
-/// field may ever be added here (the record is a plaintext blob; the
-/// exact-key unit test pins that mechanically).
+/// `num_ctx`, `num_ctx_source`, `max_tokens`, and `max_tokens_source` — no
+/// api key, base URL, or credential field may ever be added here (the
+/// record is a plaintext blob; the exact-key unit test pins that
+/// mechanically).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSettings {
     /// Which provider family the backend was constructed as.
@@ -92,6 +94,22 @@ pub struct BackendSettings {
     /// across history.
     #[serde(default)]
     pub num_ctx_source: Option<String>,
+    /// The per-turn output cap resolved at construction time (the turn-1
+    /// rule): the `--max-tokens` override verbatim, else
+    /// [`crate::model::ModelBackend::output_cap`]` (None)`. Unlike
+    /// `num_ctx`, a run ALWAYS has a cap — so the `"fallback"` source DOES
+    /// reach records (it is not a "pins no value" case, unlike
+    /// `num_ctx_source`'s `Default` arm). `Some(max_tokens)` co-occurs with
+    /// `Some(max_tokens_source)` in every record this version writes;
+    /// `None` (a pre-cap record) serializes as explicit `null`.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// How [`Self::max_tokens`] was produced: `"explicit"`, `"table"`,
+    /// `"derived"`, or `"fallback"` (from
+    /// [`crate::model::MaxTokensSource::as_str`]). `None` serializes as
+    /// explicit `null`.
+    #[serde(default)]
+    pub max_tokens_source: Option<String>,
 }
 
 impl BackendSettings {
@@ -1262,17 +1280,19 @@ mod tests {
 
     // ---- backend_settings: exact key set, label, legacy deser, round-trip ----
 
-    /// The wire shape is EXACTLY these five keys — nothing more. This is the
+    /// The wire shape is EXACTLY these seven keys — nothing more. This is the
     /// mechanical guard that an api key, base URL, or AWS credential field is
     /// never added to a value that gets persisted as a plaintext blob.
     #[test]
-    fn backend_settings_serializes_to_exactly_five_keys() {
+    fn backend_settings_serializes_to_exactly_seven_keys() {
         let s = BackendSettings {
             kind: BackendKind::Anthropic,
             model: "m".to_string(),
             think: None,
             num_ctx: None,
             num_ctx_source: None,
+            max_tokens: None,
+            max_tokens_source: None,
         };
         let v: serde_json::Value = serde_json::to_value(&s).expect("serialize");
         let obj = v.as_object().expect("must be an object");
@@ -1280,7 +1300,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["kind", "model", "num_ctx", "num_ctx_source", "think"],
+            vec![
+                "kind",
+                "max_tokens",
+                "max_tokens_source",
+                "model",
+                "num_ctx",
+                "num_ctx_source",
+                "think"
+            ],
             "exact key set — a credential-bearing field must never be added"
         );
         // Externally tagged unit variant → the bare provider string.
@@ -1295,6 +1323,14 @@ mod tests {
             v["num_ctx_source"].is_null(),
             "unset num_ctx_source must be explicit null"
         );
+        assert!(
+            v["max_tokens"].is_null(),
+            "unset max_tokens must be explicit null (pre-cap record)"
+        );
+        assert!(
+            v["max_tokens_source"].is_null(),
+            "unset max_tokens_source must be explicit null (pre-cap record)"
+        );
     }
 
     /// `model_label` returns BYTE-IDENTICAL labels to the second tuple
@@ -1308,6 +1344,8 @@ mod tests {
                 think: None,
                 num_ctx: None,
                 num_ctx_source: None,
+                max_tokens: None,
+                max_tokens_source: None,
             }
         }
         assert_eq!(
@@ -1358,6 +1396,8 @@ mod tests {
             think: Some("high".to_string()),
             num_ctx: Some(131_072),
             num_ctx_source: Some("explicit".to_string()),
+            max_tokens: Some(986_188),
+            max_tokens_source: Some("derived".to_string()),
         });
         round_trip(&r);
     }

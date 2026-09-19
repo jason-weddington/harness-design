@@ -10,7 +10,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::model::{AssistantTurn, BackendError, Message, ModelBackend, TerminalKind, TurnRequest};
+use crate::model::{
+    AssistantTurn, BackendError, Message, ModelBackend, OutputCapResolution, TerminalKind,
+    TurnRequest,
+};
 
 /// A scripted [`ModelBackend`] for tests.
 ///
@@ -42,6 +45,15 @@ pub(crate) struct MockBackend {
     /// the messages the loop sent on the FIRST turn of a multi-turn script,
     /// which is the key assertion for crash-resume and fresh-context resume.
     messages_seen: Mutex<Vec<Vec<Message>>>,
+    /// One entry per `turn` call, in order, capturing the
+    /// `req.params.max_tokens` the loop sent that call — lets tests pin the
+    /// per-iteration output-cap resolution.
+    params_seen: Mutex<Vec<u32>>,
+    /// How many times [`ModelBackend::output_cap`] has been called.
+    output_cap_calls: Mutex<u32>,
+    /// Optional test override for [`ModelBackend::output_cap`]. `None`
+    /// (the default) inherits the trait fallback.
+    output_cap_override: Option<Box<dyn Fn(Option<u32>) -> OutputCapResolution + Send + Sync>>,
 }
 
 impl MockBackend {
@@ -54,6 +66,9 @@ impl MockBackend {
             last_messages: Mutex::new(Vec::new()),
             systems_seen: Mutex::new(Vec::new()),
             messages_seen: Mutex::new(Vec::new()),
+            params_seen: Mutex::new(Vec::new()),
+            output_cap_calls: Mutex::new(0),
+            output_cap_override: None,
         }
     }
 
@@ -98,12 +113,60 @@ impl MockBackend {
             .expect("messages_seen lock poisoned")
             .clone()
     }
+
+    /// One entry per `turn` call, in order: the `req.params.max_tokens` the
+    /// loop sent that call. Tests assert on this to pin the per-iteration
+    /// output-cap resolution (derived caps move turn to turn).
+    pub(crate) fn params_seen(&self) -> Vec<u32> {
+        self.params_seen
+            .lock()
+            .expect("params_seen lock poisoned")
+            .clone()
+    }
+
+    /// How many times [`ModelBackend::output_cap`] has been called on this
+    /// mock — zero proves the operator override short-circuits resolution.
+    pub(crate) fn output_cap_calls(&self) -> u32 {
+        *self
+            .output_cap_calls
+            .lock()
+            .expect("output_cap_calls lock poisoned")
+    }
+
+    /// Script [`ModelBackend::output_cap`] with a closure over the
+    /// `prompt_tokens` argument. Without this, the mock inherits the trait
+    /// fallback resolution.
+    pub(crate) fn with_output_cap_override(
+        mut self,
+        f: Box<dyn Fn(Option<u32>) -> OutputCapResolution + Send + Sync>,
+    ) -> Self {
+        self.output_cap_override = Some(f);
+        self
+    }
 }
 
 #[async_trait]
 impl ModelBackend for MockBackend {
+    fn output_cap(&self, prompt_tokens: Option<u32>) -> OutputCapResolution {
+        *self
+            .output_cap_calls
+            .lock()
+            .expect("output_cap_calls lock poisoned") += 1;
+        match &self.output_cap_override {
+            Some(f) => f(prompt_tokens),
+            None => crate::model::OutputCapResolution {
+                max_tokens: crate::model::DEFAULT_MAX_TOKENS,
+                source: crate::model::MaxTokensSource::Fallback,
+            },
+        }
+    }
+
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         *self.calls.lock().expect("calls lock poisoned") += 1;
+        self.params_seen
+            .lock()
+            .expect("params_seen lock poisoned")
+            .push(req.params.max_tokens);
         let msgs = req.messages.to_vec();
         *self
             .last_messages

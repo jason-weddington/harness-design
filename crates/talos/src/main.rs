@@ -208,7 +208,9 @@ use harness::anthropic::AnthropicBackend;
 use harness::bedrock::BedrockBackend;
 use harness::engine::{AnswerSchema, LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
-use harness::model::{AssistantTurn, BackendError, ModelBackend, TurnRequest};
+use harness::model::{
+    AssistantTurn, BackendError, MaxTokensSource, ModelBackend, OutputCapResolution, TurnRequest,
+};
 use harness::ollama::{OllamaBackend, ThinkLevel};
 use harness::prompt::{render_answer_prompt, render_task_prompt_from_spec};
 use harness::ralph::{
@@ -368,12 +370,24 @@ struct RunArgs {
     /// Per-turn output-token cap handed to the backend. A turn that hits the
     /// cap without emitting a tool call terminates the run as
     /// `Failed { mode: Truncated }` (exit 20) instead of masquerading as an
-    /// ordinary stop. Defaults to the harness's
-    /// [`harness::engine::DEFAULT_MAX_TOKENS`] (32768); the value is recorded
-    /// on the transcript's `run_start` `config.max_tokens` — the sqlite run
-    /// record persists no cap.
-    #[arg(long, default_value_t = harness::engine::DEFAULT_MAX_TOKENS)]
-    max_tokens: u32,
+    /// ordinary stop.
+    ///
+    /// UNSET means **resolve**: the harness asks the backend for its
+    /// per-model cap each iteration (Ollama derives it from the pinned
+    /// `num_ctx` and the previous turn's prompt size; Anthropic/Bedrock read
+    /// their published per-model tables; anything else falls back to
+    /// `harness::engine::DEFAULT_MAX_TOKENS`). SET means **override**: the
+    /// flagged value wins verbatim on every iteration and no backend
+    /// resolution happens — the same unset-vs-verbatim contract
+    /// `OLLAMA_NUM_CTX` holds for the context window.
+    ///
+    /// The resolved (or overridden) value and its provenance are recorded on
+    /// the run record's `backend_settings` (`max_tokens` +
+    /// `max_tokens_source`), on the transcript's `run_start`
+    /// `config.max_tokens` / `config.max_tokens_source`, and in the stdout
+    /// summary.
+    #[arg(long)]
+    max_tokens: Option<u32>,
 
     /// Timeout for the gate command, in seconds.
     #[arg(long, default_value_t = 300u64)]
@@ -540,11 +554,34 @@ impl ModelBackend for Backend {
             Self::Ollama(b) => b.turn(req).await,
         }
     }
+
+    /// Forward the per-backend output-cap resolution — the dispatch enum
+    /// must not silently flatten every lane to the trait fallback (the
+    /// measured-vs-shipped drift design 07 exists to prevent).
+    fn output_cap(&self, prompt_tokens: Option<u32>) -> OutputCapResolution {
+        match self {
+            Self::Anthropic(b) => b.output_cap(prompt_tokens),
+            Self::Bedrock(b) => b.output_cap(prompt_tokens),
+            Self::Ollama(b) => b.output_cap(prompt_tokens),
+        }
+    }
 }
 
 // ============================================================================
 // Pure, unit-testable helper functions
 // ============================================================================
+
+/// Apply the `--max-tokens` flag to a [`RunConfig`] — the ONE pinned
+/// mechanism, shared by every call site: `Some(n)` overrides the per-turn cap
+/// verbatim, `None` leaves the config alone so the engine loop resolves per
+/// backend per iteration. Keeps [`RunConfig::with_max_tokens`]'s `u32`
+/// signature intact (an unset flag is not a value).
+fn with_flagged_max_tokens(config: RunConfig, v: Option<u32>) -> RunConfig {
+    match v {
+        Some(n) => config.with_max_tokens(n),
+        None => config,
+    }
+}
 
 /// Map a [`LoopOutcome`] to the locked exit-code contract.
 ///
@@ -777,6 +814,29 @@ fn num_ctx_stderr_line(r: &harness::ollama::NumCtxResolution) -> String {
     obj.to_string()
 }
 
+/// Stamp the resolved per-turn output cap (and its provenance) onto a
+/// [`BackendSettings`] at construction time — the turn-1 rule. `flag` is the
+/// `--max-tokens` override: `Some(v)` wins verbatim and stamps `"explicit"`;
+/// `None` stamps the backend's `output_cap(None)` resolution, which the call
+/// site passes as `resolved` (the backend is not consulted here, keeping the
+/// helper pure and unit-testable).
+///
+/// Unlike `num_ctx`, a run ALWAYS has a cap, so both fields are `Some` on
+/// every record this version writes — including the `"fallback"` source.
+fn stamp_max_tokens(
+    mut settings: BackendSettings,
+    flag: Option<u32>,
+    resolved: OutputCapResolution,
+) -> BackendSettings {
+    let (max_tokens, source) = match flag {
+        Some(v) => (v, MaxTokensSource::Explicit),
+        None => (resolved.max_tokens, resolved.source),
+    };
+    settings.max_tokens = Some(max_tokens);
+    settings.max_tokens_source = Some(source.as_str().to_string());
+    settings
+}
+
 /// The `num_ctx_source` a run RECORD carries for a resolved `num_ctx`:
 /// `Some(as_str())` when a value was pinned, `None` when it was not —
 /// `NumCtxSource::Default` pins no value, so the string `"default"` never
@@ -806,8 +866,9 @@ struct RunSummary {
     /// Number of model turns the loop drew.
     iterations: u32,
     /// The resolved backend the run was CONSTRUCTED with (`kind`, `model`,
-    /// `think`, `num_ctx`, `num_ctx_source`) — the SAME value stamped on the
-    /// run record, so stdout and the store cannot disagree.
+    /// `think`, `num_ctx`, `num_ctx_source`, `max_tokens`,
+    /// `max_tokens_source`) — the SAME value stamped on the run record, so
+    /// stdout and the store cannot disagree.
     backend_settings: BackendSettings,
 }
 
@@ -933,6 +994,8 @@ fn build_anthropic_backend(
             think: None,
             num_ctx: None,
             num_ctx_source: None,
+            max_tokens: None,
+            max_tokens_source: None,
         },
     ))
 }
@@ -1022,6 +1085,8 @@ async fn build_ollama_backend(
         think: think.map(ThinkLevel::as_str).map(str::to_string),
         num_ctx: num_ctx.value,
         num_ctx_source: num_ctx_source_for_record(&num_ctx),
+        max_tokens: None,
+        max_tokens_source: None,
     };
     Ok((Backend::Ollama(ollama), settings))
 }
@@ -1051,6 +1116,8 @@ fn build_bedrock_backend(
             think: None,
             num_ctx: None,
             num_ctx_source: None,
+            max_tokens: None,
+            max_tokens_source: None,
         },
     ))
 }
@@ -1508,6 +1575,13 @@ async fn run_cmd(args: RunArgs) {
             std::process::exit(1);
         }
     };
+    // 3.5 Stamp the resolved per-turn output cap onto the settings — the ONE
+    //     construction-time resolution, so the record, the transcript's
+    //     `run_start.config`, and the stdout summary all carry the same cap
+    //     and provenance. `--max-tokens` wins verbatim (`explicit`); unset,
+    //     the backend's turn-1 rule resolves (Ollama with a pinned `num_ctx`
+    //     derives `num_ctx - OUTPUT_TOKEN_MARGIN`).
+    let settings = stamp_max_tokens(settings, args.max_tokens, backend.output_cap(None));
 
     // 4. Resolve run-artifact paths (default to XDG state dir outside the workspace).
     let state_dir = talos_state_dir(&args.task_id);
@@ -1617,11 +1691,13 @@ async fn run_cmd(args: RunArgs) {
             // `--gate-timeout-secs` is accepted and inert here; there is
             // nothing for it to time out.
             let seed = render_answer_prompt(&run_input, &schema_text);
-            let config = RunConfig::new(seed, args.max_iterations)
-                .with_answer_schema(compiled)
-                .with_wall_clock_secs(wall_clock_secs)
-                .with_max_tokens(args.max_tokens)
-                .with_max_nudges(0);
+            let config = with_flagged_max_tokens(
+                RunConfig::new(seed, args.max_iterations)
+                    .with_answer_schema(compiled)
+                    .with_wall_clock_secs(wall_clock_secs),
+                args.max_tokens,
+            )
+            .with_max_nudges(0);
             (answer_registry(None), config)
         }
         (None, Some(spec)) => {
@@ -1634,14 +1710,17 @@ async fn run_cmd(args: RunArgs) {
             let tools = standard_registry(checks.clone());
             let seed = make_run_seed(&spec);
             let config = if let Some(runner) = checks {
-                RunConfig::new(seed, args.max_iterations)
-                    .with_checks(runner)
-                    .with_wall_clock_secs(wall_clock_secs)
-                    .with_max_tokens(args.max_tokens)
+                with_flagged_max_tokens(
+                    RunConfig::new(seed, args.max_iterations)
+                        .with_checks(runner)
+                        .with_wall_clock_secs(wall_clock_secs),
+                    args.max_tokens,
+                )
             } else {
-                RunConfig::new(seed, args.max_iterations)
-                    .with_wall_clock_secs(wall_clock_secs)
-                    .with_max_tokens(args.max_tokens)
+                with_flagged_max_tokens(
+                    RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs),
+                    args.max_tokens,
+                )
             };
             (tools, config)
         }
@@ -1850,17 +1929,23 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunMode, RunSummary, SECS_PER_DAY,
-        backend_from_env, build_checks_runner, build_ralph_summary, build_run_summary, exit_code,
-        load_answer_schema, make_run_seed, num_ctx_source_for_record, num_ctx_stderr_line,
-        outcome_str, prune_report_json, prune_state_root, ralph_exit_code, ralph_terminal_str,
-        resolve_ralph_wall_clock_secs, resolve_state_retention_days, resolve_transcript_path,
-        touch_dir_mtime, transcript_label, validate_mode_flags, write_ralph_error_detail,
+        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunConfig, RunMode, RunSummary,
+        SECS_PER_DAY, backend_from_env, build_checks_runner, build_ralph_summary,
+        build_run_summary, exit_code, load_answer_schema, make_run_seed, num_ctx_source_for_record,
+        num_ctx_stderr_line, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
+        ralph_terminal_str, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
+        resolve_transcript_path, stamp_max_tokens, touch_dir_mtime, transcript_label,
+        validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
     };
+    use harness::anthropic::AnthropicBackend;
+    use harness::bedrock::BedrockBackend;
     use harness::engine::LoopOutcome;
     use harness::exec::ChangeEvidence;
-    use harness::model::{BackendError, TerminalKind, TransientKind};
-    use harness::ollama::ThinkLevel;
+    use harness::model::{
+        BackendError, MaxTokensSource, ModelBackend, OutputCapResolution, TerminalKind,
+        TransientKind,
+    };
+    use harness::ollama::{OllamaBackend, ThinkLevel};
     use harness::prompt::render_task_prompt_from_spec;
     use harness::ralph::RalphTerminal;
     use harness::run_record::{
@@ -1879,7 +1964,95 @@ mod tests {
             think: None,
             num_ctx: None,
             num_ctx_source: None,
+            max_tokens: None,
+            max_tokens_source: None,
         }
+    }
+
+    // ---- output cap: dispatch forward + flag + construction stamping ------
+
+    /// The `Backend` dispatch enum forwards `output_cap` to every variant —
+    /// lane parity with the engine's per-iteration resolution (a wrapper that
+    /// forgot the forward silently flattens its lane to the trait fallback).
+    #[test]
+    fn backend_dispatch_forwards_output_cap_to_each_variant() {
+        assert_eq!(
+            Backend::Anthropic(AnthropicBackend::new("claude-haiku-4-5", "k")).output_cap(None),
+            OutputCapResolution {
+                max_tokens: 64_000,
+                source: MaxTokensSource::Table,
+            }
+        );
+        assert_eq!(
+            Backend::Ollama(OllamaBackend::new("m", "http://localhost:11434").with_num_ctx(32_768))
+                .output_cap(None),
+            OutputCapResolution {
+                max_tokens: 16_384,
+                source: MaxTokensSource::Derived,
+            }
+        );
+        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5").expect("mapped"));
+        assert_eq!(
+            bedrock.output_cap(None),
+            OutputCapResolution {
+                max_tokens: 128_000,
+                source: MaxTokensSource::Table,
+            }
+        );
+    }
+
+    /// `with_flagged_max_tokens` is the ONE pinned mechanism the three
+    /// `RunConfig` call sites share: `Some` overrides verbatim, `None` leaves
+    /// the config's `max_tokens` at `None` (resolve per backend).
+    #[test]
+    fn with_flagged_max_tokens_applies_the_flag_conditionally() {
+        assert_eq!(
+            with_flagged_max_tokens(RunConfig::new("t", 1), Some(4096)).max_tokens,
+            Some(4096),
+            "a flagged value overrides the cap verbatim"
+        );
+        assert_eq!(
+            with_flagged_max_tokens(RunConfig::new("t", 1), None).max_tokens,
+            None,
+            "an unset flag must leave the config at resolve-per-backend"
+        );
+    }
+
+    /// Construction-time stamping: the flag wins as `"explicit"`; unset, the
+    /// backend's turn-1 resolution is recorded verbatim — the default
+    /// Anthropic lane's published table, and the Ollama-with-pinned-`num_ctx`
+    /// derivation.
+    #[test]
+    fn stamp_max_tokens_records_flag_and_backend_resolution() {
+        // Flagged → verbatim + "explicit".
+        let flagged = stamp_max_tokens(
+            default_settings(),
+            Some(4096),
+            OutputCapResolution {
+                max_tokens: 64_000,
+                source: MaxTokensSource::Table,
+            },
+        );
+        assert_eq!(flagged.max_tokens, Some(4096));
+        assert_eq!(flagged.max_tokens_source.as_deref(), Some("explicit"));
+
+        // Unset, default Anthropic (claude-haiku-4-5) → the published table.
+        let anthropic = stamp_max_tokens(default_settings(), None, {
+            let b = Backend::Anthropic(AnthropicBackend::new("claude-haiku-4-5", "k"));
+            b.output_cap(None)
+        });
+        assert_eq!(anthropic.max_tokens, Some(64_000));
+        assert_eq!(anthropic.max_tokens_source.as_deref(), Some("table"));
+
+        // Unset, Ollama with OLLAMA_NUM_CTX=32768 pinned → the derivation.
+        let ollama = stamp_max_tokens(default_settings(), None, {
+            let b = Backend::Ollama(
+                OllamaBackend::new("m", "http://localhost:11434").with_num_ctx(32_768),
+            );
+            b.output_cap(None)
+        });
+        assert_eq!(ollama.max_tokens, Some(16_384));
+        assert_eq!(ollama.max_tokens_source.as_deref(), Some("derived"));
     }
 
     // ---- exit_code: all 6 arms ----------------------------------------
@@ -2191,6 +2364,8 @@ mod tests {
             think: None,
             num_ctx: None,
             num_ctx_source: None,
+            max_tokens: None,
+            max_tokens_source: None,
         };
         assert_eq!(transcript_label(&anthropic), "claude-haiku-4-5");
 
@@ -2201,6 +2376,8 @@ mod tests {
                 think: think.map(str::to_string),
                 num_ctx,
                 num_ctx_source: num_ctx_source.map(str::to_string),
+                max_tokens: None,
+                max_tokens_source: None,
             }
         };
         assert_eq!(
@@ -2220,6 +2397,8 @@ mod tests {
             think: think.map(str::to_string),
             num_ctx,
             num_ctx_source: num_ctx.is_some().then(|| "explicit".to_string()),
+            max_tokens: None,
+            max_tokens_source: None,
         };
         assert_eq!(
             transcript_label(&ollama(None, None)),
@@ -2330,7 +2509,9 @@ mod tests {
                 model: "claude-haiku-4-5".to_string(),
                 think: None,
                 num_ctx: None,
-                num_ctx_source: None
+                num_ctx_source: None,
+                max_tokens: None,
+                max_tokens_source: None
             }
         );
     }
@@ -2986,6 +3167,8 @@ mod tests {
             think: Some("high".to_string()),
             num_ctx: Some(32768),
             num_ctx_source: Some("explicit".to_string()),
+            max_tokens: None,
+            max_tokens_source: None,
         };
         let summary = build_run_summary(
             "BackendError",
