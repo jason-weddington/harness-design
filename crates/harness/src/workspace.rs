@@ -28,7 +28,14 @@ use crate::tool::OffloadSink;
 /// Placeholder path returned by [`DiskOffloadSink`] when the full output cannot
 /// be persisted. Offloading is a best-effort safety net, so a failure surfaces
 /// as this marker rather than an error or a panic.
-const OFFLOAD_UNAVAILABLE: &str = "<offload-unavailable>";
+/// The sentinel path [`DiskOffloadSink`] returns when the offload write
+/// fails. [`crate::tool::OffloadSink`] is infallible by design because its
+/// original caller ([`crate::tool::ToolResult::with_detail`]) keeps a
+/// truncated inline copy, so a failed write costs only the full text. That
+/// contract does NOT transfer to compaction, whose tier-2 elision replaces
+/// the only remaining copy — so that caller must compare against this and
+/// skip rather than destroy. Public for exactly that check.
+pub const OFFLOAD_UNAVAILABLE: &str = "<offload-unavailable>";
 
 /// Failure to construct a [`Workspace`]: a root that does not exist or is not a
 /// directory. Raised only at construction time — once a `Workspace` exists its

@@ -54,6 +54,12 @@ pub(crate) struct MockBackend {
     /// Optional test override for [`ModelBackend::output_cap`]. `None`
     /// (the default) inherits the trait fallback.
     output_cap_override: Option<Box<dyn Fn(Option<u32>) -> OutputCapResolution + Send + Sync>>,
+    /// Optional test override for [`ModelBackend::context_limit`]. `None`
+    /// (the default) inherits the trait's `None` default — the same gate
+    /// that keeps compaction off for every real backend that advertises no
+    /// limit, so engine tests arm/disarm the compaction path without a live
+    /// daemon.
+    context_limit_override: Option<u32>,
 }
 
 impl MockBackend {
@@ -69,6 +75,7 @@ impl MockBackend {
             params_seen: Mutex::new(Vec::new()),
             output_cap_calls: Mutex::new(0),
             output_cap_override: None,
+            context_limit_override: None,
         }
     }
 
@@ -143,6 +150,15 @@ impl MockBackend {
         self.output_cap_override = Some(f);
         self
     }
+
+    /// Arm [`ModelBackend::context_limit`] with a pinned window — the
+    /// mocked equivalent of `OllamaBackend::with_num_ctx`. Without this, the
+    /// mock inherits the `None` default and the engine's compaction path is
+    /// off (exactly as it is for a real unpinned backend).
+    pub(crate) fn with_context_limit_override(mut self, limit: u32) -> Self {
+        self.context_limit_override = Some(limit);
+        self
+    }
 }
 
 #[async_trait]
@@ -159,6 +175,10 @@ impl ModelBackend for MockBackend {
                 source: crate::model::MaxTokensSource::Fallback,
             },
         }
+    }
+
+    fn context_limit(&self) -> Option<u32> {
+        self.context_limit_override
     }
 
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {

@@ -286,6 +286,17 @@ impl ModelBackend for OllamaBackend {
         derive_max_tokens(self.num_ctx, prompt_tokens)
     }
 
+    /// The pinned `num_ctx`, verbatim — the advertised context budget the
+    /// engine's compaction trigger compares the raw prompt against. This is
+    /// the ONLY backend override ([`crate::anthropic`] / [`crate::bedrock`]
+    /// inherit the `None` default, so compaction is off for them by
+    /// construction — design 08, "Compaction is Ollama-only"). Reads the same
+    /// private `num_ctx` field [`Self::output_cap`] already derives from, so
+    /// no state and no public getter are added.
+    fn context_limit(&self) -> Option<u32> {
+        self.num_ctx
+    }
+
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
         // Build first: request assembly is fallible (an unresolvable
         // tool-result `call_id` is a Protocol error we must catch *before*
@@ -1353,6 +1364,31 @@ mod tests {
                 max_tokens: DEFAULT_MAX_TOKENS,
                 source: MaxTokensSource::Fallback,
             }
+        );
+    }
+
+    /// The backend reports its pinned `num_ctx` as the advertised context
+    /// limit — `None` when unpinned, which is the compaction gate (design 08:
+    /// "no advertised limit means no compaction"). Ollama is the only
+    /// backend that holds a limit as a number, so compaction is Ollama-only
+    /// by construction, not by a `if kind == ollama` special case.
+    #[test]
+    fn ollama_backend_context_limit_reports_pinned_num_ctx() {
+        // Unpinned (OllamaBackend::new leaves num_ctx None) → None.
+        assert_eq!(
+            OllamaBackend::new("m", "http://localhost:11434").context_limit(),
+            None,
+            "an unpinned backend advertises no context budget"
+        );
+        // with_num_ctx(8192) → Some(8192) — the same private field
+        // `derive_max_tokens` already reads; the trait method is the only
+        // new exposure and adds no state.
+        assert_eq!(
+            OllamaBackend::new("m", "http://localhost:11434")
+                .with_num_ctx(8192)
+                .context_limit(),
+            Some(8192),
+            "a pinned window is advertised as the context limit"
         );
     }
 

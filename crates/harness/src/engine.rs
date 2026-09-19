@@ -70,12 +70,19 @@
 //!   it `false` (the default) the schema is byte-identical to build mode's.
 //! - [`LoopOutcome::into_disposition`] — converts a terminal outcome to a
 //!   [`crate::run_record::Disposition`] for storage.
+//! - [`COMPACT_THRESHOLD_PCT`] / [`COMPACT_RETENTION_ASSISTANT_MSGS`] /
+//!   [`COMPACT_REASONING_TAIL_CHARS`] / [`should_compact`] /
+//!   [`compact_history`] — in-run context compaction, Ollama-only by
+//!   construction: the trigger is gated on [`model::ModelBackend::context_limit`],
+//!   which only the Ollama backend overrides (design 08).
 //!
 //! What does **not** live here yet (tracked separately): token / cost budget
-//! enforcement, loop / no-progress detection, and context assembly /
-//! compaction. Wall-clock budget enforcement and persistence / checkpointing
-//! are implemented. The hard `max_iterations` cap and wall-clock cap are the
-//! two non-finish stopping conditions.
+//! enforcement and loop / no-progress detection. Wall-clock budget
+//! enforcement, persistence / checkpointing, and — as of design 08 — in-run
+//! context compaction (Ollama-only: gated on the backend advertising a
+//! context limit as a number, which only [`model::ModelBackend::context_limit`]
+//! on Ollama ever does) are implemented. The hard `max_iterations` cap and
+//! wall-clock cap are the two non-finish stopping conditions.
 //!
 //! ## Loop shape
 //!
@@ -99,13 +106,17 @@
 //! non-retryable error ([`model::BackendError::Terminal`],
 //! [`model::BackendError::Protocol`],
 //! [`model::BackendError::ContextLengthExceeded`]) is surfaced on first
-//! occurrence.
+//! occurrence — with ONE carve-out: a [`model::BackendError::ContextLengthExceeded`]
+//! on a backend that advertises a context limit is intercepted once per
+//! pass, compacted ([`compact_history`]), and retried once (see design 08,
+//! `docs/design/08-context-budget.md`).
 //!
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -119,9 +130,9 @@ use crate::exec::{
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
 use crate::run_record::{
-    BackendSettings, BudgetConsumed, BudgetLimits, Budgets, Disposition, DurableFacts, Event,
-    FailureMode, Phase, ProjectConfig, RecoveryFacts, RunRecord, SCHEMA_VERSION, Task,
-    Verification,
+    BackendSettings, BudgetConsumed, BudgetLimits, Budgets, CompactionFacts, Disposition,
+    DurableFacts, Event, FailureMode, Phase, ProjectConfig, RecoveryFacts, RunRecord,
+    SCHEMA_VERSION, Task, Verification,
 };
 use crate::store::{RunStore, StoreError};
 use crate::time::{Clock, SystemClock, format_rfc3339};
@@ -917,6 +928,76 @@ pub struct RunStats {
     /// engine.rs:1808) always reports `true`, since it supplies an
     /// unobservable baseline by construction.
     pub tree_baseline_unobservable: bool,
+    // ---- in-run compaction (design 08) ----
+    /// Compactions that CHANGED history this loop invocation. A tier-0
+    /// walk (nothing older than the retention window) is silent — no
+    /// event, no counter — so a run whose prompt stays over the trigger
+    /// threshold with nothing old enough to compact does not inflate this.
+    /// Counted since THIS loop invocation.
+    pub compactions: u32,
+    /// The highest tier any compaction reached: 0 = never compacted, 1 =
+    /// reasoning tail-truncated only, 2 = tool-result payloads elided.
+    /// Counted since THIS loop invocation.
+    pub highest_compaction_tier: u8,
+    /// Run-level sum of `prompt_before.saturating_sub(raw prompt of the
+    /// first post-compaction turn)` across every compaction. The clamp is
+    /// load-bearing: a compaction whose savings were immediately re-consumed
+    /// (the next turn grew past where the prompt was) reports 0, never a
+    /// negative. Per-occurrence reclaim is derivable only from the JSONL —
+    /// correlate the `model_response.usage` of the turn immediately after
+    /// each `compaction` event against that event's `prompt_tokens_before`.
+    /// Counted since THIS loop invocation.
+    pub compaction_tokens_reclaimed: u64,
+    /// `UserBlock::ToolResult` payloads replaced by a compaction stub this
+    /// loop invocation (tier 2). The blocks are RETAINED — only `content`
+    /// is elided, reversibly, to a fresh offload path. Counted since THIS
+    /// loop invocation.
+    pub tool_results_elided: u32,
+    /// Disorientation signal 1 (design 08): `read_file` calls aimed at an
+    /// offload path a compaction wrote — the agent re-reading an elided
+    /// payload, i.e. the agent telling us the elision was too aggressive.
+    /// Counted on the CALL, whether or not the read succeeds. Counted since
+    /// THIS loop invocation.
+    pub compaction_elided_rereads: u32,
+    /// Disorientation signal 2 (design 08): tool calls re-issued after the
+    /// first compaction whose `(tool_name, input)` hash was already seen
+    /// BEFORE that compaction — the agent having forgotten what it already
+    /// did. A duplicate of a call first made AFTER the compaction is
+    /// ordinary duplication and deliberately does not count. Counted since
+    /// THIS loop invocation.
+    pub compaction_repeated_calls: u32,
+    /// Runtime tripwire — [`UserBlock::ToolResult`] blocks seen during a
+    /// compaction walk whose `call_id` matches no `ContentBlock::ToolCall`
+    /// in history. Expected 0 forever: the pair-integrity invariant cannot
+    /// breach by construction ([`compact_history`] never removes a block),
+    /// but a future injection site or a resume-reconciled history could —
+    /// mirrors the `iteration_end` `last_gate_green` always-true tripwire
+    /// precedent. Counted since THIS loop invocation.
+    pub compaction_orphan_tool_results: u32,
+    /// Disorientation signal 3 (design 08, pre-drop half): summed CHARACTER
+    /// length of `ContentBlock::Reasoning` texts across the assistant turns
+    /// BEFORE the first compaction that dropped reasoning. Measured in
+    /// chars — NOT `usage.reasoning_tokens` — because Ollama, the only
+    /// backend that compacts, sets `reasoning_tokens: None` in every
+    /// `map_response` branch, so the design-08 token metric is constant zero
+    /// on the production compaction lane; char length is available on every
+    /// backend and comparable at chars/4 (a deliberate, grounded deviation
+    /// from design 08's "reasoning tokens" metric). Pairs with
+    /// [`Self::compaction_pre_reasoning_turns`] as an integer pair so the
+    /// pre-drop mean stays `Eq`-safe: mean = sum/turns.
+    pub compaction_pre_reasoning_chars_sum: u64,
+    /// The turn count denominator of
+    /// [`Self::compaction_pre_reasoning_chars_sum`] — one per successful
+    /// turn before the first reasoning-dropping compaction.
+    pub compaction_pre_reasoning_turns: u32,
+    /// Disorientation signal 3 (design 08, post-drop half): per-turn
+    /// reasoning CHARACTER length for every successful turn AFTER the first
+    /// compaction that dropped reasoning — per turn, not a single ratio,
+    /// because the SHAPE is the signal (one large turn is a re-plan, a
+    /// sustained rise is genuine disorientation). See
+    /// [`Self::compaction_pre_reasoning_chars_sum`] for the chars-not-tokens
+    /// deviation. Counted since THIS loop invocation.
+    pub post_compaction_reasoning_chars: Vec<u64>,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2009,6 +2090,16 @@ pub async fn run(
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
+        compactions: 0,
+        highest_compaction_tier: 0,
+        compaction_tokens_reclaimed: 0,
+        tool_results_elided: 0,
+        compaction_elided_rereads: 0,
+        compaction_repeated_calls: 0,
+        compaction_orphan_tool_results: 0,
+        compaction_pre_reasoning_chars_sum: 0,
+        compaction_pre_reasoning_turns: 0,
+        post_compaction_reasoning_chars: Vec::new(),
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2083,6 +2174,16 @@ pub async fn run_persisted(
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
+        compactions: 0,
+        highest_compaction_tier: 0,
+        compaction_tokens_reclaimed: 0,
+        tool_results_elided: 0,
+        compaction_elided_rereads: 0,
+        compaction_repeated_calls: 0,
+        compaction_orphan_tool_results: 0,
+        compaction_pre_reasoning_chars_sum: 0,
+        compaction_pre_reasoning_turns: 0,
+        post_compaction_reasoning_chars: Vec::new(),
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2317,7 +2418,578 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "answer_schema_rejections": stats.answer_schema_rejections,
         "modified_workspace_rejections": stats.modified_workspace_rejections,
         "tree_baseline_unobservable": stats.tree_baseline_unobservable,
+        "compactions": stats.compactions,
+        "highest_compaction_tier": stats.highest_compaction_tier,
+        "compaction_tokens_reclaimed": stats.compaction_tokens_reclaimed,
+        "tool_results_elided": stats.tool_results_elided,
+        "compaction_elided_rereads": stats.compaction_elided_rereads,
+        "compaction_repeated_calls": stats.compaction_repeated_calls,
+        "compaction_orphan_tool_results": stats.compaction_orphan_tool_results,
+        "compaction_pre_reasoning_chars_sum": stats.compaction_pre_reasoning_chars_sum,
+        "compaction_pre_reasoning_turns": stats.compaction_pre_reasoning_turns,
+        "post_compaction_reasoning_chars": stats.post_compaction_reasoning_chars,
     })
+}
+
+// ======================================================================
+// In-run context compaction (design 08, docs/design/08-context-budget.md)
+// ======================================================================
+
+/// Compaction trigger threshold, in PERCENT of the backend's advertised
+/// context limit ([`crate::model::ModelBackend::context_limit`]): the loop
+/// compacts at the top of a pass when the PREVIOUS turn's raw prompt tokens
+/// plus the next-turn reserve (`turn_cap`) reach this share of the limit.
+/// At or above 90% triggers — the boundary `raw + reserve == 90% of limit`
+/// TRIGGERS (see [`should_compact`]). WHY a percentage of the limit and not
+/// a fixed token count: the windows differ 4x across the fleet's lanes
+/// (262,144 against 1,048,576), so one fixed count is either uselessly
+/// conservative on the wide lane or too late on the narrow one (design 08,
+/// "Open questions").
+pub const COMPACT_THRESHOLD_PCT: u64 = 90;
+
+/// Tier-1 retention window, in ASSISTANT MESSAGES: reasoning blocks in
+/// Assistant messages older than the most recent
+/// [`COMPACT_RETENTION_ASSISTANT_MSGS`] are tail-truncated to
+/// [`COMPACT_REASONING_TAIL_CHARS`]. WHY a generous 10 (design 08 line 80):
+/// simulated against the only 164-iteration run the fleet has, the whole
+/// span from a 10-turn window down to 2 is worth 1.2 percentage points of
+/// peak prompt against a 26% total saving — the curve is flat because the
+/// mass is in the old reasoning — so the window is set by how much history
+/// the model needs to stay coherent, not by how much context it buys, and
+/// when those pull against each other coherence wins at almost no cost.
+pub const COMPACT_RETENTION_ASSISTANT_MSGS: usize = 10;
+
+/// Tier-1 retention per dropped reasoning BLOCK, in chars: a reasoning
+/// block outside the retention window keeps its LAST
+/// [`COMPACT_REASONING_TAIL_CHARS`] chars and loses the rest. WHY the tail
+/// and not deletion (design 08): the conclusion lives at the end — the fatal
+/// `PhotoQueue` block ended on "Let me write the file", i.e. the decision was
+/// in the final sentence and the preceding 106,000 characters were the
+/// derivation. Cheap insurance against the re-derivation risk; the
+/// re-derivation telemetry is what confirms or kills it.
+pub const COMPACT_REASONING_TAIL_CHARS: usize = 2_000;
+
+/// Tier-2 stub size bound for the rendered `args` of the retained tool
+/// call, in chars: `call.input.to_string()` truncated to its FIRST
+/// [`COMPACT_ARGS_CHARS`] chars (char-safe, never a byte slice) with the
+/// literal suffix `…(args truncated)` when longer. Together with the fixed
+/// stub prose this keeps the stub a bounded-size pointer that can never
+/// itself exceed [`crate::tool::DETAIL_CAP`] (25,000) — the stub REPLACES a
+/// tool result, so an unbounded args rendering would defeat the compaction.
+const COMPACT_ARGS_CHARS: usize = 1_000;
+
+/// The opening of a tier-2 compaction stub. Compaction walks are
+/// IDEMPOTENT on this prefix: a `UserBlock::ToolResult` whose content is
+/// already a stub is skipped, so re-running `compact_history` over an
+/// already-compacted history rewrites nothing (and therefore reports tier
+/// 0 — see [`CompactionOutcome::tier`]).
+const COMPACT_STUB_PREFIX: &str = "[compacted at iteration ";
+
+/// The pure compaction trigger predicate: true when the previous turn's
+/// raw prompt has reached [`COMPACT_THRESHOLD_PCT`] percent of the
+/// advertised `limit`. The boundary is INCLUSIVE — `raw == 90% of limit`
+/// triggers — so a run sailing into the wall at exactly the threshold still
+/// compacts. All math is `u64`/saturating: `raw_prompt_tokens` is a sum of
+/// three `u32` usage fields, and no real limit times 90 can overflow.
+///
+/// **NO next-turn reserve is added, deliberately, and this is load-bearing.**
+/// Design 08 originally said the reserve "is the same number the output cap
+/// resolves to, so trigger and cap share one budget". Implemented literally
+/// that is a tautology, because the derived Ollama cap IS
+/// `limit - prompt - OUTPUT_TOKEN_MARGIN`: adding it back to the prompt
+/// cancels the only pressure-sensitive term and leaves
+/// `limit - OUTPUT_TOKEN_MARGIN >= 90% of limit`, i.e. a constant true for
+/// every `limit >= 163_840`. Both fleet windows (`262_144` and `1_048_576`)
+/// clear that, so the trigger fired on EVERY pass from iteration 2 at ~1%
+/// window occupancy — an unconditional standing policy, which design 08
+/// explicitly forbids, paying the re-derivation risk and rewriting the
+/// cached prefix every turn. The design record is corrected alongside this.
+///
+/// A reserve is not merely harmful here, it is redundant: the per-iteration
+/// output cap already guarantees `prompt + output <= limit` on the derived
+/// lane, so overflow is the cap's job and pressure is this predicate's.
+#[must_use]
+pub fn should_compact(limit: u32, raw_prompt_tokens: u64) -> bool {
+    raw_prompt_tokens * 100 >= u64::from(limit) * COMPACT_THRESHOLD_PCT
+}
+
+/// One tier-2 elision — the reversible half of a compaction. The elided
+/// `ToolResult` content was written to `offload_path` (a FRESH offload via
+/// [`crate::tool::ToolCtx::offload`], never parsed out of rendered text),
+/// and the stub the model now sees names this `call_id` and `tool_name` so
+/// the record of WHAT ran survives with zero payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionElision {
+    /// The paired `ToolCallRequest.id` — the stub names it, and the
+    /// retained `ToolCall` keeps it, so the pair never breaks.
+    pub call_id: String,
+    /// The retained call's registered tool name.
+    pub tool_name: String,
+    /// Where the full, unelided `content` now lives.
+    pub offload_path: PathBuf,
+}
+
+/// What one [`compact_history`] walk did — the mechanical shape both the
+/// `compaction` transcript event and the `RunStats` counters are built
+/// from, so the emit site and unit tests are pure field reads. `iteration`,
+/// `limit`, `raw_prompt_tokens`, `reserve`, `threshold_pct`, and `trigger`
+/// are caller-supplied, NOT outcome fields: they describe WHEN and WHY the
+/// walk ran, not what it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    /// 0 = nothing changed, 1 = reasoning tail-truncated only,
+    /// 2 = at least one tool-result payload elided.
+    pub tier: u8,
+    /// Reasoning blocks whose text was tail-truncated (tier 1).
+    pub reasoning_blocks_truncated: u32,
+    /// Chars removed from reasoning blocks: summed `before − after` per
+    /// truncated block.
+    pub reasoning_chars_dropped: u64,
+    /// `UserBlock::ToolResult` payloads replaced by a compaction stub
+    /// (tier 2).
+    pub results_elided: u32,
+    /// One entry per elided result, in history order.
+    pub elided: Vec<CompactionElision>,
+    /// `ToolResult` blocks whose `call_id` matches NO `ToolCall` in
+    /// history — passed through untouched, tallied as the runtime
+    /// tripwire (0 expected).
+    pub orphan_tool_results: u32,
+    /// `ToolCall` blocks with no matching `ToolResult` in history —
+    /// pre-existing, passed through untouched, tallied for symmetry.
+    pub orphan_tool_calls: u32,
+    /// `messages.len()` before the walk.
+    pub message_count_before: usize,
+    /// `messages.len()` after — identical to `before`: compaction NEVER
+    /// removes a message, so the replayed history keeps its shape.
+    pub message_count_after: usize,
+    /// Total content blocks before the walk (the same per-message
+    /// content-length sum the `model_request` event uses).
+    pub block_count_before: usize,
+    /// Total content blocks after the walk — identical to `before`:
+    /// blocks are mutated in place or skipped, never removed.
+    pub block_count_after: usize,
+}
+
+/// The same per-message content-length sum the `model_request` transcript
+/// event records as `block_count` — one implementation so the compaction
+/// event's before/after counts are comparable with the reader-side replay
+/// invariant (transcript.rs, "Reconstruction contract").
+fn history_block_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| match m {
+            Message::User { content } => content.len(),
+            Message::Assistant { content } => content.len(),
+        })
+        .sum()
+}
+
+/// Render the retained call's `args` for a compaction stub:
+/// `call.input.to_string()` (`serde_json`'s compact rendering — `Value`
+/// implements no `Display`, so this is the only spelling that compiles)
+/// truncated to its first [`COMPACT_ARGS_CHARS`] chars, char-safe, with the
+/// literal `…(args truncated)` suffix when it was cut.
+fn compact_stub_args(input: &Value) -> String {
+    let raw = input.to_string();
+    if raw.chars().count() <= COMPACT_ARGS_CHARS {
+        return raw;
+    }
+    let head: String = raw.chars().take(COMPACT_ARGS_CHARS).collect();
+    format!("{head}…(args truncated)")
+}
+
+/// One in-run history compaction — the pure core of design 08's two-tier
+/// scheme (LLM summarization is explicitly NOT here; that is tier 3 and
+/// unbuilt). `messages[0]` (the task anchor) is NEVER modified.
+///
+/// **Tier 1** — every [`crate::model::ContentBlock::Reasoning`] in an
+/// Assistant message older than the most recent `tier1_retention` Assistant
+/// messages has its `text` replaced by its LAST `tail_chars` chars
+/// (char-boundary-safe slicing: never `&text[len - n..]`, which panics on
+/// multibyte UTF-8) and its `opaque` field dropped (`None` — the signature
+/// a provider needed for cache continuity no longer pairs with the full
+/// text). A block whose text already fits is left BYTE-IDENTICAL, and the
+/// block is RETAINED, never removed — the tool calls and their results
+/// (the record of what the agent DID) are untouched; only the record of why
+/// it decided to is trimmed.
+///
+/// **Tier 2** — every `UserBlock::ToolResult` whose matching
+/// `ContentBlock::ToolCall` (matched by `call_id`) sits in an Assistant
+/// message older than the window has its `content` replaced by the pinned
+/// stub `[compacted at iteration N: tool NAME result elided; call_id ID;
+/// args: ARGS; full output at PATH]`, where `PATH` is a FRESH
+/// `ctx.offload(&old_content)` write (reversible: `read_file` may re-read
+/// the offload root), `NAME`/`ARGS` come from the RETAINED matching
+/// `ToolCallRequest`, and `call_id`/`is_error` are untouched. The MOST
+/// RECENT `run_checks` pair is excluded — the done-oracle the agent is
+/// converging on must survive (design 08, `exclude_tools`). An orphan
+/// `ToolResult` (`call_id` matching no call) is passed through untouched and
+/// tallied; a second walk over an already-elided result is a no-op (the
+/// stub prefix is recognized), so repeated triggers do not rewrite history.
+///
+/// Takes `&ToolCtx` — NOT `&dyn OffloadSink` — because `ToolCtx`'s `sink`
+/// field is private and its only exposure is `ToolCtx::offload`, the same
+/// seam every tool already writes through.
+// `&mut Vec<Message>` is the pinned signature (the caller owns the loop's
+// history and compaction mutates it in place), and the two-tier walk reads
+// best as one function — splitting it would hide the tier ordering the
+// outcome's `tier` field depends on.
+#[allow(clippy::too_many_lines, clippy::ptr_arg)]
+fn compact_history(
+    messages: &mut Vec<Message>,
+    ctx: &ToolCtx,
+    tier1_retention: usize,
+    tail_chars: usize,
+    iteration: u32,
+) -> CompactionOutcome {
+    let message_count_before = messages.len();
+    let block_count_before = history_block_count(messages);
+
+    // Index the Assistant messages; the retention window is the LAST
+    // `tier1_retention` of them, so "old" is index-based, not turn-based
+    // (design 08: turn counts are the wrong unit only for the TRIGGER —
+    // the window itself is a message count, pinned at 10 by the flat
+    // saving curve).
+    let assistant_idx: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| matches!(m, Message::Assistant { .. }).then_some(i))
+        .collect();
+    let recent = assistant_idx.len().min(tier1_retention);
+    let old_assistant: HashSet<usize> = assistant_idx[..assistant_idx.len() - recent]
+        .iter()
+        .copied()
+        .collect();
+
+    // call_id → (the Assistant message holding the call, name, input) for
+    // EVERY call in history — the tier-2 walk matches a result to its call
+    // and classifies the pair by the CALL's age, then renders name/args
+    // from the retained call.
+    let mut call_sites: HashMap<String, (usize, String, Value)> = HashMap::new();
+    let mut most_recent_run_checks: Option<String> = None;
+    for (i, message) in messages.iter().enumerate() {
+        let Message::Assistant { content } = message else {
+            continue;
+        };
+        for block in content {
+            if let model::ContentBlock::ToolCall(call) = block {
+                call_sites.insert(call.id.clone(), (i, call.name.clone(), call.input.clone()));
+                if call.name == "run_checks" {
+                    // Last in history order wins — "the most recent".
+                    most_recent_run_checks = Some(call.id.clone());
+                }
+            }
+        }
+    }
+    // Every result call_id present in history — the denominator for the
+    // orphan-tool-call tripwire.
+    let result_ids: HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content } => Some(content.iter().filter_map(|b| match b {
+                UserBlock::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                UserBlock::Text(_) => None,
+            })),
+            Message::Assistant { .. } => None,
+        })
+        .flatten()
+        .collect();
+    let orphan_tool_calls = u32::try_from(
+        call_sites
+            .keys()
+            .filter(|id| !result_ids.contains(id.as_str()))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+
+    // ---- Tier 1: reasoning tail-truncation outside the window ----
+    let mut reasoning_blocks_truncated = 0u32;
+    let mut reasoning_chars_dropped = 0u64;
+    for &i in &old_assistant {
+        // ANCHOR GUARD, matching tier 2's. `messages[0]` carries the task
+        // spec and the acceptance criteria and is never compacted. It is a
+        // `User` message on every path that exists today (both seeds and
+        // resume build it that way), so this is unreachable — but design
+        // 08's anchor rule should hold unconditionally rather than by
+        // caller discipline, since a future seed shape is exactly the kind
+        // of change that would silently delete the spec.
+        if i == 0 {
+            continue;
+        }
+        let Message::Assistant { content } = &mut messages[i] else {
+            unreachable!("old_assistant holds Assistant-message indices only");
+        };
+        for block in content.iter_mut() {
+            let replacement = match block {
+                model::ContentBlock::Reasoning { text, .. }
+                    if text.chars().count() > tail_chars =>
+                {
+                    let before = text.chars().count();
+                    // LAST `tail_chars` chars, char-safe: skip the leading
+                    // `before - tail_chars` chars instead of slicing bytes
+                    // (`&text[before - tail_chars..]` panics mid-UTF-8).
+                    let tail: String = text.chars().skip(before - tail_chars).collect();
+                    reasoning_chars_dropped +=
+                        u64::try_from(before - tail_chars).unwrap_or(u64::MAX);
+                    reasoning_blocks_truncated += 1;
+                    Some(model::ContentBlock::Reasoning {
+                        text: tail,
+                        // The opaque signature paired with the FULL text;
+                        // echoing it beside a truncated tail is worse than
+                        // dropping it.
+                        opaque: None,
+                    })
+                }
+                // Fits the window already → byte-identical no-op (this arm
+                // also covers Text and ToolCall blocks).
+                _ => None,
+            };
+            if let Some(new_block) = replacement {
+                *block = new_block;
+            }
+        }
+    }
+
+    // ---- Tier 2: tool-result payload elision outside the window ----
+    let mut results_elided = 0u32;
+    let mut elided: Vec<CompactionElision> = Vec::new();
+    let mut orphan_tool_results = 0u32;
+    for (i, message) in messages.iter_mut().enumerate() {
+        // The anchor: the task seed message is never compacted (design 08
+        // — "losing it is losing the spec").
+        if i == 0 {
+            continue;
+        }
+        let Message::User { content } = message else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            let UserBlock::ToolResult {
+                call_id,
+                content: result_content,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            // The done-oracle pair always survives — the load-bearing
+            // signal the agent is converging on.
+            if most_recent_run_checks.as_deref() == Some(call_id.as_str()) {
+                continue;
+            }
+            let Some((call_msg_idx, name, input)) = call_sites.get(call_id.as_str()) else {
+                // Orphan: no call to pair with, nothing to elide against —
+                // passed through untouched, tallied as the tripwire.
+                orphan_tool_results += 1;
+                continue;
+            };
+            // The pair's age is the CALL's age, not the result's — a
+            // result never precedes its call, so classifying on the call
+            // keeps a pair either wholly inside or wholly outside the
+            // window (never cutting a pair: the Anthropic API rejects a
+            // `tool_result` whose `tool_use` is gone, design 08).
+            if !old_assistant.contains(call_msg_idx) {
+                continue;
+            }
+            // Idempotence: an already-elided result keeps its stub (and its
+            // offload path) — a second walk rewrites nothing, so a prompt
+            // that stays over the trigger reports tier 0, not one event per
+            // pass.
+            if result_content.starts_with(COMPACT_STUB_PREFIX) {
+                continue;
+            }
+            let offload_path = ctx.offload(result_content);
+            // VERIFY BEFORE DESTROYING. `OffloadSink` is infallible by
+            // design and `DiskOffloadSink` degrades a failed write to the
+            // `<offload-unavailable>` sentinel rather than erroring — fine
+            // for `with_detail`, which keeps a truncated inline copy, but
+            // fatal here: the stub below replaces the ONLY remaining copy
+            // of the payload, and `record.messages` persists the compacted
+            // history. On a full or unwritable disk this would destroy tool
+            // output irreversibly, silently, and report it as a healthy
+            // tier-2 elision. Skipping is always the safe side — an
+            // un-elided result costs context, a destroyed one costs the run.
+            if offload_path == std::path::Path::new(crate::workspace::OFFLOAD_UNAVAILABLE) {
+                continue;
+            }
+            let args = compact_stub_args(input);
+            let stub = format!(
+                "[compacted at iteration {iteration}: tool `{name}` result elided; \
+                 call_id {call_id}; args: {args}; full output at {path}]",
+                path = offload_path.display()
+            );
+            elided.push(CompactionElision {
+                call_id: call_id.clone(),
+                tool_name: name.clone(),
+                offload_path: offload_path.clone(),
+            });
+            results_elided += 1;
+            // Only `content` changes — `call_id` and `is_error` are the
+            // steering signals and pass through untouched.
+            *result_content = stub;
+        }
+    }
+
+    let tier: u8 = match (results_elided, reasoning_blocks_truncated) {
+        (1.., _) => 2,
+        (_, 1..) => 1,
+        _ => 0,
+    };
+    let message_count_after = messages.len();
+    let block_count_after = history_block_count(messages);
+    CompactionOutcome {
+        tier,
+        reasoning_blocks_truncated,
+        reasoning_chars_dropped,
+        results_elided,
+        elided,
+        orphan_tool_results,
+        orphan_tool_calls,
+        message_count_before,
+        message_count_after,
+        block_count_before,
+        block_count_after,
+    }
+}
+
+/// Loop-local compaction state, carried across passes so the disorientation
+/// telemetry (design 08) can compare post-compaction behaviour against what
+/// the run did before. All fields start empty: a run that never compacts
+/// touches none of them.
+#[derive(Default)]
+struct CompactionLoopState {
+    /// Every offload path tier 2 wrote — the elided-re-read signal matches
+    /// `read_file` calls against this set. It is the agent's escape hatch
+    /// that makes the signal measurable at all: tier 2 is reversible, so a
+    /// re-read is the agent telling us the elision was too aggressive.
+    elided_offload_paths: HashSet<PathBuf>,
+    /// Hash of EVERY dispatched tool call (`DefaultHasher` over
+    /// `(tool_name, input.to_string())`), accumulated from run start.
+    dispatched_call_hashes: HashSet<u64>,
+    /// The [`Self::dispatched_call_hashes`] snapshot taken at the FIRST
+    /// compaction that changed history; `None` until then. A post-compaction
+    /// call whose hash is in the SNAPSHOT is repeated work — the agent
+    /// re-issuing a call it had already made before the compaction. A
+    /// duplicate of a call first made AFTER the compaction is ordinary
+    /// duplication and deliberately does not count, which is exactly design
+    /// 08's definition — new hashes are inserted into the live set only,
+    /// never into the snapshot.
+    pre_compaction_call_snapshot: Option<HashSet<u64>>,
+    /// The raw prompt recorded with the most recent compaction — consumed by
+    /// the next successful turn to compute
+    /// [`RunStats::compaction_tokens_reclaimed`].
+    reclaim_prompt_before: Option<u64>,
+    /// Latch: a compaction has dropped reasoning. From the next successful
+    /// turn on, reasoning chars append to
+    /// [`RunStats::post_compaction_reasoning_chars`] instead of
+    /// accumulating the pre-drop pair
+    /// ([`RunStats::compaction_pre_reasoning_chars_sum`] /
+    /// [`RunStats::compaction_pre_reasoning_turns`]).
+    post_tier1_reasoning: bool,
+}
+
+/// Fold a compaction that CHANGED history (tier > 0) into the run's
+/// counters, the loop's compaction state, and the transcript, and emit the
+/// `compaction` event. Tier-0 outcomes never reach here — they are silent
+/// no-ops (no event, no counter) so a prompt that stays over the threshold
+/// with nothing old enough to compact neither emits a compaction event per
+/// pass nor inflates the counters; it merely re-walks a cheap pure function.
+///
+/// The event's before/after counts are recorded so the replayed history is
+/// auditable at the same points the `model_request` event pins its
+/// `message_count`/`block_count` — the transcript's reconstruction
+/// invariant (transcript.rs, "Reconstruction contract") would otherwise
+/// break on the first history mutation. The cache-rewrite measurement home
+/// (design 08, "What rolling history edits do to the prompt cache") is the
+/// JSONL: read the `model_response.usage.cache_read_tokens` of the turn
+/// immediately following each `compaction` event — a drop to ~0 is a full
+/// prefix rewrite, so the cost of a compaction is measurable off the record
+/// rather than modelled.
+#[allow(clippy::too_many_arguments)]
+fn record_compaction(
+    outcome: &CompactionOutcome,
+    stats: &mut RunStats,
+    compaction: &mut CompactionLoopState,
+    writer: &mut TranscriptWriter,
+    iteration: u32,
+    trigger: &'static str,
+    limit: u32,
+    raw_prompt_tokens: u64,
+    reserve: u32,
+) {
+    stats.compactions += 1;
+    stats.highest_compaction_tier = stats.highest_compaction_tier.max(outcome.tier);
+    stats.tool_results_elided += outcome.results_elided;
+    stats.compaction_orphan_tool_results += outcome.orphan_tool_results;
+    compaction.reclaim_prompt_before = Some(raw_prompt_tokens);
+    if compaction.pre_compaction_call_snapshot.is_none() {
+        compaction.pre_compaction_call_snapshot = Some(compaction.dispatched_call_hashes.clone());
+    }
+    if outcome.reasoning_blocks_truncated > 0 {
+        compaction.post_tier1_reasoning = true;
+    }
+    for elision in &outcome.elided {
+        compaction
+            .elided_offload_paths
+            .insert(elision.offload_path.clone());
+    }
+    if writer.is_enabled() {
+        writer.emit(
+            "compaction",
+            json!({
+                "iteration": iteration,
+                "trigger": trigger,
+                "limit": limit,
+                "raw_prompt_tokens": raw_prompt_tokens,
+                "reserve": reserve,
+                "threshold_pct": COMPACT_THRESHOLD_PCT,
+                "tier": outcome.tier,
+                "elided": outcome
+                    .elided
+                    .iter()
+                    .map(|e| json!({
+                        "call_id": e.call_id,
+                        "tool_name": e.tool_name,
+                        "offload_path": e.offload_path.display().to_string(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "orphan_tool_results": outcome.orphan_tool_results,
+                "orphan_tool_calls": outcome.orphan_tool_calls,
+                "reasoning_blocks_truncated": outcome.reasoning_blocks_truncated,
+                "reasoning_chars_dropped": outcome.reasoning_chars_dropped,
+                "prompt_tokens_before": raw_prompt_tokens,
+                "message_count_before": outcome.message_count_before,
+                "block_count_before": outcome.block_count_before,
+                "message_count_after": outcome.message_count_after,
+                "block_count_after": outcome.block_count_after,
+            }),
+        );
+    }
+}
+
+/// Stamp the run's compaction counters onto the record as
+/// [`CompactionFacts`] — the default-path durability seam: `RunStats` is
+/// never persisted, and without this a compacting run without
+/// `--transcript` would leave zero durable trace of having compacted.
+/// Called at EVERY `ctx.record.messages.clone_from(&messages)` site inside
+/// [`run_loop_body`] (terminal and checkpoint alike), so every exit path
+/// that persists the compacted history persists its counters alongside it.
+/// Per-occurrence analysis (iteration, per-event tier/trigger, elided
+/// offload paths) needs the transcript; the default path's ground truth for
+/// the compacted history itself is `record.messages`.
+fn stamp_compaction_facts(record: &mut RunRecord, stats: &RunStats) {
+    record.compaction_facts = Some(CompactionFacts {
+        compactions: stats.compactions,
+        highest_compaction_tier: stats.highest_compaction_tier,
+        compaction_tokens_reclaimed: stats.compaction_tokens_reclaimed,
+        tool_results_elided: stats.tool_results_elided,
+        compaction_elided_rereads: stats.compaction_elided_rereads,
+        compaction_repeated_calls: stats.compaction_repeated_calls,
+        compaction_orphan_tool_results: stats.compaction_orphan_tool_results,
+        compaction_pre_reasoning_chars_sum: stats.compaction_pre_reasoning_chars_sum,
+        compaction_pre_reasoning_turns: stats.compaction_pre_reasoning_turns,
+        post_compaction_reasoning_chars: stats.post_compaction_reasoning_chars.clone(),
+    });
 }
 
 /// The engine loop body proper — the renamed former `run_loop_impl`, now
@@ -2444,6 +3116,7 @@ async fn run_loop_body(
             disposition: None,
             recovery_facts: None,
             backend_settings: p.backend_settings.clone(),
+            compaction_facts: None,
             messages: messages.clone(),
         };
         Some(RunPersist { rid, record })
@@ -2532,6 +3205,25 @@ async fn run_loop_body(
     // reports cache writes).
     let mut last_prompt_tokens: Option<u32> = None;
 
+    // RAW prompt tokens of the PREVIOUS turn — `input + cache_read +
+    // cache_write`, each `Option` field taken as `unwrap_or(0)` and each
+    // `u32` widened via `u64::from` — or `None` before the first turn
+    // completes. WHY the sum and not `input_tokens` alone: since `7b2c6ea`
+    // `Usage::input_tokens` is the UNCACHED REMAINDER for Ollama
+    // (`map_response` computes `prompt_eval_count − prompt_eval_cached_count`),
+    // so a fully-cached 200K prompt reads near zero and a compaction trigger
+    // fed `input_tokens` alone would never fire — the raw-input invariant
+    // `input + cache_read + cache_write` is already documented on
+    // [`RunStats::cache_read_tokens`]. This is the trigger's ONLY input;
+    // `estimate_prompt_tokens` (ollama.rs) and its pre-flight guard stay
+    // untouched (a chars/4 tripwire, not a sizing oracle).
+    let mut last_raw_prompt_tokens: Option<u64> = None;
+
+    // In-run compaction state — see [`CompactionLoopState`] (design 08
+    // telemetry: the disorientation signals need pre-compaction behaviour
+    // kept alongside the post-compaction series).
+    let mut compaction = CompactionLoopState::default();
+
     for _ in 0..config.max_iterations {
         // Per-iteration output-cap resolution: the operator override verbatim
         // when `config.max_tokens` is `Some` (the accessor is never
@@ -2542,17 +3234,50 @@ async fn run_loop_body(
             Some(max_tokens) => max_tokens,
             None => backend.output_cap(last_prompt_tokens).max_tokens,
         };
-        let params = SamplingParams {
-            max_tokens: turn_cap,
-            temperature: None,
-            stop_sequences: Vec::new(),
-        };
-        let req = TurnRequest {
-            system: Some(&system),
-            messages: &messages,
-            tools: &tool_schemas,
-            params: &params,
-        };
+
+        // ---- in-run compaction (design 08): top-of-pass trigger ----
+        // Runs BEFORE the `TurnRequest` build (a `TurnRequest` is
+        // borrow-only, so history mutation cannot happen while one is
+        // live) and BEFORE this pass's `model_request` event, so the
+        // recorded `message_count`/`block_count` reflect the COMPACTED
+        // history and the transcript's replay invariant holds. The gate is
+        // the backend advertising a limit as a number — true only of
+        // Ollama, so Anthropic and Bedrock are excluded by construction —
+        // plus a completed turn to have measured a raw prompt from. The
+        // trigger is the raw prompt against the window alone; `turn_cap` is
+        // deliberately NOT added as a reserve (see `should_compact` — the
+        // derived cap is `limit - prompt - margin`, so adding it back
+        // cancels the prompt and makes the trigger unconditionally true).
+        // A tier-0 outcome (nothing changed) is SILENT: no event, no
+        // counter — the walk was cheap and the history is byte-identical.
+        let mut compacted_this_pass = false;
+        if let (Some(limit), Some(raw_prompt_tokens)) =
+            (backend.context_limit(), last_raw_prompt_tokens)
+            && should_compact(limit, raw_prompt_tokens)
+        {
+            compacted_this_pass = true;
+            let outcome = compact_history(
+                &mut messages,
+                ctx,
+                COMPACT_RETENTION_ASSISTANT_MSGS,
+                COMPACT_REASONING_TAIL_CHARS,
+                // The pass this compaction precedes, 1-based.
+                stats.iterations + 1,
+            );
+            if outcome.tier > 0 {
+                record_compaction(
+                    &outcome,
+                    stats,
+                    &mut compaction,
+                    writer,
+                    stats.iterations + 1,
+                    "threshold",
+                    limit,
+                    raw_prompt_tokens,
+                    turn_cap,
+                );
+            }
+        }
 
         // Count the logical iteration BEFORE the retry loop so an error on
         // the first iteration still shows `iterations = 1`. A transient error
@@ -2560,19 +3285,12 @@ async fn run_loop_body(
         // iteration — `stats.iterations` is NOT re-incremented per retry.
         stats.iterations += 1;
         if writer.is_enabled() {
-            let block_count: usize = messages
-                .iter()
-                .map(|m| match m {
-                    Message::User { content } => content.len(),
-                    Message::Assistant { content } => content.len(),
-                })
-                .sum();
             writer.emit(
                 "model_request",
                 json!({
                     "iteration": stats.iterations,
                     "message_count": messages.len(),
-                    "block_count": block_count,
+                    "block_count": history_block_count(&messages),
                     // The exact `req.params.max_tokens` sent THIS iteration —
                     // additive on the v1 wire so the per-turn cap is auditable
                     // on the derived lane, where it moves turn to turn.
@@ -2585,6 +3303,23 @@ async fn run_loop_body(
         // success — `attempts_made` is `attempt`'s value AT THE TIME of the
         // successful call, i.e. the number of PRIOR failed attempts.
         let turn_result = loop {
+            // Rebuilt per attempt so the `ContextLengthExceeded`
+            // interception below can mutate `messages` between attempts:
+            // the request borrows `messages`, so the borrow must end
+            // before compaction runs. `params` reuses this pass's
+            // already-resolved `turn_cap` AS-IS — the cap re-derives
+            // from the post-compaction prompt on the NEXT pass.
+            let params = SamplingParams {
+                max_tokens: turn_cap,
+                temperature: None,
+                stop_sequences: Vec::new(),
+            };
+            let req = TurnRequest {
+                system: Some(&system),
+                messages: &messages,
+                tools: &tool_schemas,
+                params: &params,
+            };
             let call_start = Instant::now();
             let call_result = backend.turn(&req).await;
             let call_latency = call_start.elapsed();
@@ -2619,6 +3354,49 @@ async fn run_loop_body(
                             }),
                         );
                     }
+                    // `ContextLengthExceeded` interception (design 08, the
+                    // error-path seam): a run that overruns the window
+                    // anyway compacts and retries ONCE rather than dying.
+                    // Gated on the backend advertising a limit (Ollama-only
+                    // by construction) and on no compaction having already
+                    // run this pass — the top-of-pass trigger already
+                    // compacted everything it could, so a second walk over
+                    // an unchanged history cannot help. The retry is NOT
+                    // counted against `config.max_retries` (`attempt` stays
+                    // put) and at most one interception happens per pass;
+                    // a SECOND `ContextLengthExceeded` on the same pass
+                    // falls through to the terminal `BackendError` path
+                    // unchanged. A tier-0 outcome is silent like every
+                    // tier-0 walk — the retry still happens (the error
+                    // said the window is full; the walk found nothing to
+                    // trim), and the second error then takes the terminal.
+                    if !compacted_this_pass
+                        && matches!(err, model::BackendError::ContextLengthExceeded)
+                        && let Some(limit) = backend.context_limit()
+                    {
+                        compacted_this_pass = true;
+                        let outcome = compact_history(
+                            &mut messages,
+                            ctx,
+                            COMPACT_RETENTION_ASSISTANT_MSGS,
+                            COMPACT_REASONING_TAIL_CHARS,
+                            stats.iterations,
+                        );
+                        if outcome.tier > 0 {
+                            record_compaction(
+                                &outcome,
+                                stats,
+                                &mut compaction,
+                                writer,
+                                stats.iterations,
+                                "context_length_exceeded",
+                                limit,
+                                last_raw_prompt_tokens.unwrap_or(0),
+                                turn_cap,
+                            );
+                        }
+                        continue;
+                    }
                     if will_retry {
                         sleep(retry_delay(config.retry_backoff_base, attempt)).await;
                         attempt += 1;
@@ -2651,6 +3429,7 @@ async fn run_loop_body(
                         cost_micros: initial_consumed.cost_micros,
                     };
                     ctx.record.messages.clone_from(&messages);
+                    stamp_compaction_facts(&mut ctx.record, stats);
                     ctx.record.disposition = Some(disposition.clone());
                     p.store
                         .append_event(
@@ -2686,6 +3465,51 @@ async fn run_loop_body(
                 .input_tokens
                 .saturating_add(turn.usage.cache_read_tokens.unwrap_or(0)),
         );
+
+        // Raw prompt tokens of THIS turn (`input + cache_read +
+        // cache_write`, the uncached-plus-cache total) — the compaction
+        // trigger's input next pass (see the `last_raw_prompt_tokens`
+        // declaration for WHY the sum). Captured before the turn is
+        // consumed, at the same point as `last_prompt_tokens`.
+        let raw_prompt_tokens = u64::from(turn.usage.input_tokens)
+            .saturating_add(u64::from(turn.usage.cache_read_tokens.unwrap_or(0)))
+            .saturating_add(u64::from(turn.usage.cache_write_tokens.unwrap_or(0)));
+        last_raw_prompt_tokens = Some(raw_prompt_tokens);
+
+        // Tokens reclaimed by the most recent compaction: the raw prompt it
+        // recorded minus THIS turn's raw prompt (the first turn built on the
+        // compacted history). Saturating on purpose — a compaction whose
+        // savings were immediately re-consumed reports 0, never a negative
+        // (see `RunStats::compaction_tokens_reclaimed`).
+        if let Some(before) = compaction.reclaim_prompt_before.take() {
+            stats.compaction_tokens_reclaimed += before.saturating_sub(raw_prompt_tokens);
+        }
+
+        // Re-derivation signal (design 08): reasoning CHARACTER length per
+        // successful turn — NOT `usage.reasoning_tokens`, which Ollama (the
+        // only backend that compacts) reports as `None` in every
+        // `map_response` branch, so the design-08 token metric would be
+        // constant zero on the production compaction lane. Before the first
+        // reasoning-dropping compaction the turn accumulates the pre-drop
+        // pair; after it, the per-turn series — the SHAPE is the signal.
+        let turn_reasoning_chars: u64 = turn
+            .content
+            .iter()
+            .map(|block| match block {
+                model::ContentBlock::Reasoning { text, .. } => {
+                    u64::try_from(text.chars().count()).unwrap_or(u64::MAX)
+                }
+                model::ContentBlock::Text(_) | model::ContentBlock::ToolCall(_) => 0,
+            })
+            .sum();
+        if compaction.post_tier1_reasoning {
+            stats
+                .post_compaction_reasoning_chars
+                .push(turn_reasoning_chars);
+        } else {
+            stats.compaction_pre_reasoning_chars_sum += turn_reasoning_chars;
+            stats.compaction_pre_reasoning_turns += 1;
+        }
 
         // Accumulate into run totals. Per-turn u32 values sum into u64 so a
         // long run can't overflow.
@@ -2753,6 +3577,7 @@ async fn run_loop_body(
             // tool calls have NOT been invoked yet.
             ctx.record.budgets.consumed = consumed;
             ctx.record.messages.clone_from(&messages);
+            stamp_compaction_facts(&mut ctx.record, stats);
             p.store.checkpoint(&ctx.rid, &ctx.record).await?;
         }
 
@@ -2866,6 +3691,7 @@ async fn run_loop_body(
                 };
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                     ctx.record.messages.clone_from(&messages);
+                    stamp_compaction_facts(&mut ctx.record, stats);
                     ctx.record.budgets.consumed = BudgetConsumed {
                         iterations: initial_consumed.iterations + stats.iterations,
                         tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -2947,6 +3773,36 @@ async fn run_loop_body(
         // tree-counter reset) AND clears `last_gate_green`.
         let mut mutated_this_iter: bool = false;
         for call in &calls {
+            // ---- disorientation telemetry (design 08), on the CALL ----
+            // Repeated-work signal: hash EVERY dispatched call
+            // (`(tool_name, input.to_string())`) into the live set, and —
+            // once a compaction has snapshotted it — count re-issues of
+            // anything already in the SNAPSHOT. Insertion is unconditional
+            // (every dispatched call accumulates from run start); only the
+            // snapshot comparison is compaction-gated, so a duplicate of a
+            // call first made AFTER the compaction is ordinary duplication
+            // and deliberately does not count.
+            let mut call_hasher = DefaultHasher::new();
+            (call.name.as_str(), call.input.to_string()).hash(&mut call_hasher);
+            let call_hash = call_hasher.finish();
+            if let Some(snapshot) = &compaction.pre_compaction_call_snapshot
+                && snapshot.contains(&call_hash)
+            {
+                stats.compaction_repeated_calls += 1;
+            }
+            compaction.dispatched_call_hashes.insert(call_hash);
+
+            // Elided-re-read signal: a `read_file` aimed at an offload path
+            // tier 2 wrote — the agent pulling an elided payload back.
+            // Counted BEFORE invoke, so whether or not the read succeeds is
+            // irrelevant to the signal (the attempt is the disorientation).
+            if call.name == crate::tools::read_file::READ_FILE_TOOL_NAME
+                && let Some(path) = call.input.get("path").and_then(Value::as_str)
+                && compaction.elided_offload_paths.contains(Path::new(path))
+            {
+                stats.compaction_elided_rereads += 1;
+            }
+
             // Only the FIRST accepted finish in a batch gets to terminate;
             // a later finish (or a finish while one is already accepted)
             // still executes as a normal tool invocation so its
@@ -3162,6 +4018,7 @@ async fn run_loop_body(
             // Terminal path: Finished. Write DispositionSet + terminal checkpoint.
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 ctx.record.messages.clone_from(&messages);
+                stamp_compaction_facts(&mut ctx.record, stats);
                 ctx.record.budgets.consumed = BudgetConsumed {
                     iterations: initial_consumed.iterations + stats.iterations,
                     tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -3261,6 +4118,7 @@ async fn run_loop_body(
                 };
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                     ctx.record.messages.clone_from(&messages);
+                    stamp_compaction_facts(&mut ctx.record, stats);
                     ctx.record.budgets.consumed = BudgetConsumed {
                         iterations: initial_consumed.iterations + stats.iterations,
                         tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -3335,6 +4193,7 @@ async fn run_loop_body(
             let summary = "wall-clock budget exhausted".to_string();
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 ctx.record.messages.clone_from(&messages);
+                stamp_compaction_facts(&mut ctx.record, stats);
                 ctx.record.budgets.consumed = BudgetConsumed {
                     iterations: initial_consumed.iterations + stats.iterations,
                     tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -3375,6 +4234,7 @@ async fn run_loop_body(
         // (already in messages).
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
             ctx.record.messages.clone_from(&messages);
+            stamp_compaction_facts(&mut ctx.record, stats);
             ctx.record.budgets.consumed = BudgetConsumed {
                 iterations: initial_consumed.iterations + stats.iterations,
                 tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -3391,6 +4251,7 @@ async fn run_loop_body(
             summary: "iteration cap reached before the agent finished".to_string(),
         };
         ctx.record.messages.clone_from(&messages);
+        stamp_compaction_facts(&mut ctx.record, stats);
         ctx.record.budgets.consumed = BudgetConsumed {
             iterations: initial_consumed.iterations + stats.iterations,
             tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
@@ -3616,6 +4477,9 @@ async fn reconcile_crash_tail(
 /// **Budget carry-over (0.3.0):** `budgets.consumed` accumulates across
 /// resume in the [`RunRecord`], but remaining-budget enforcement is deferred
 /// to 0.4.0. No enforcement logic is added here.
+// One line over the pedantic cap: the exhaustive `RunStats` literal the
+// compaction counters forced past 100 — splitting it would buy nothing.
+#[allow(clippy::too_many_lines)]
 pub async fn resume(
     backend: &impl model::ModelBackend,
     tools: &ToolRegistry,
@@ -3648,6 +4512,16 @@ pub async fn resume(
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
         tree_baseline_unobservable: false,
+        compactions: 0,
+        highest_compaction_tier: 0,
+        compaction_tokens_reclaimed: 0,
+        tool_results_elided: 0,
+        compaction_elided_rereads: 0,
+        compaction_repeated_calls: 0,
+        compaction_orphan_tool_results: 0,
+        compaction_pre_reasoning_chars_sum: 0,
+        compaction_pre_reasoning_turns: 0,
+        post_compaction_reasoning_chars: Vec::new(),
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -3759,13 +4633,14 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSWER_SCHEMA_ERRORS_CAP, ANSWER_SCHEMA_ERRORS_MAX_LINES, AnswerSchema, FINISH_TOOL_NAME,
-        FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence, ResumeError,
-        ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
-        coerce_stringified_result, emit_run_end, inert_precondition_warning,
+        ANSWER_SCHEMA_ERRORS_CAP, ANSWER_SCHEMA_ERRORS_MAX_LINES, AnswerSchema,
+        COMPACT_REASONING_TAIL_CHARS, COMPACT_RETENTION_ASSISTANT_MSGS, COMPACT_THRESHOLD_PCT,
+        FINISH_TOOL_NAME, FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence,
+        ResumeError, ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
+        coerce_stringified_result, compact_history, emit_run_end, inert_precondition_warning,
         missing_reason_rejection_content, missing_result_rejection_content,
         no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
-        run, run_id, run_persisted,
+        run, run_id, run_persisted, should_compact,
     };
     use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -3774,20 +4649,21 @@ mod tests {
     };
     use crate::prompt;
     use crate::run_record::{
-        BackendKind, BackendSettings, BudgetConsumed, BudgetLimits, Budgets, Disposition,
-        DurableFacts, Event, FailureMode, Phase, ProjectConfig, RunRecord, SCHEMA_VERSION, Task,
-        Verification,
+        BackendKind, BackendSettings, BudgetConsumed, BudgetLimits, Budgets, CompactionFacts,
+        Disposition, DurableFacts, Event, FailureMode, Phase, ProjectConfig, RunRecord,
+        SCHEMA_VERSION, Task, Verification,
     };
     use crate::store::{RunStore, SqliteRunStore, StoreError};
     use crate::test_support::MockBackend;
     use crate::time::{Clock, FakeClock};
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
+    use crate::tools::read_file::READ_FILE_TOOL_NAME;
     use crate::tools::standard_registry;
     use crate::transcript::{TranscriptConfig, TranscriptWriter};
     use crate::workspace::Workspace;
     use async_trait::async_trait;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
@@ -5333,6 +6209,16 @@ mod tests {
             answer_schema_rejections: 0,
             modified_workspace_rejections: 0,
             tree_baseline_unobservable: false,
+            compactions: 0,
+            highest_compaction_tier: 0,
+            compaction_tokens_reclaimed: 0,
+            tool_results_elided: 0,
+            compaction_elided_rereads: 0,
+            compaction_repeated_calls: 0,
+            compaction_orphan_tool_results: 0,
+            compaction_pre_reasoning_chars_sum: 0,
+            compaction_pre_reasoning_turns: 0,
+            post_compaction_reasoning_chars: Vec::new(),
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -7060,6 +7946,7 @@ mod tests {
             disposition: None,
             recovery_facts: None,
             backend_settings: None,
+            compaction_facts: None,
             messages: vec![],
         }
     }
@@ -11168,6 +12055,16 @@ mod tests {
             answer_schema_rejections: 0,
             modified_workspace_rejections: 0,
             tree_baseline_unobservable: false,
+            compactions: 0,
+            highest_compaction_tier: 0,
+            compaction_tokens_reclaimed: 0,
+            tool_results_elided: 0,
+            compaction_elided_rereads: 0,
+            compaction_repeated_calls: 0,
+            compaction_orphan_tool_results: 0,
+            compaction_pre_reasoning_chars_sum: 0,
+            compaction_pre_reasoning_turns: 0,
+            post_compaction_reasoning_chars: Vec::new(),
         }
     }
 
@@ -13169,5 +14066,1137 @@ mod tests {
         assert_eq!(lines[0]["config"]["mode"], "build");
         assert!(lines[0]["config"]["answer_schema"].is_null());
         assert_eq!(lines[0]["system"], expected);
+    }
+
+    // =====================================================================
+    // In-run compaction (design 08) — pure functions, then loop wiring
+    // =====================================================================
+
+    /// The trigger semantics are pinned, boundary inclusive.
+    #[test]
+    fn should_compact_boundary_is_inclusive_and_pct_pinned() {
+        assert_eq!(COMPACT_THRESHOLD_PCT, 90, "the threshold is a pinned 90%");
+        // 89% → 8_900_000 < 9_000_000 → no compaction.
+        assert!(!should_compact(100_000, 89_000));
+        // EXACT boundary: raw == 90% of limit TRIGGERS.
+        assert!(should_compact(100_000, 90_000));
+        // One token past the boundary.
+        assert!(should_compact(100_000, 90_001));
+        // Nothing consumed → never compact.
+        assert!(!should_compact(100_000, 0));
+    }
+
+    /// REGRESSION PIN: the trigger must depend on the PROMPT, not telescope
+    /// to a constant. The shipped Ollama lane derives its output cap as
+    /// `limit - prompt - OUTPUT_TOKEN_MARGIN`; an earlier revision added
+    /// that cap back as a "next-turn reserve", which cancels the prompt and
+    /// leaves `limit - margin >= 90% of limit` — unconditionally true for
+    /// every window at or above `163_840`, so compaction fired on every pass
+    /// at ~1% occupancy. These two cases reproduce that exact shape on both
+    /// real fleet windows and assert the trigger stays quiet.
+    #[test]
+    fn should_compact_does_not_telescope_to_a_constant_on_derived_caps() {
+        for limit in [262_144_u32, 1_048_576_u32] {
+            let tiny_prompt = u64::from(limit) / 100; // ~1% of the window
+            let derived_cap =
+                crate::ollama::derive_max_tokens(Some(limit), u32::try_from(tiny_prompt).ok())
+                    .max_tokens;
+            // The bug: prompt + derived_cap is independent of the prompt.
+            assert!(
+                should_compact(limit, tiny_prompt + u64::from(derived_cap)),
+                "precondition: the telescoped sum DOES cross the threshold \
+                 (limit {limit}) — that is why the old form always fired",
+            );
+            // The fix: the prompt alone is nowhere near the threshold.
+            assert!(
+                !should_compact(limit, tiny_prompt),
+                "a ~1% prompt must never trigger compaction (limit {limit})",
+            );
+        }
+        // And the trigger still fires when the prompt really is large.
+        assert!(should_compact(262_144, 240_000));
+        assert!(should_compact(1_048_576, 1_000_000));
+    }
+
+    /// A reasoning block for hand-made histories.
+    fn reasoning_block(text: &str) -> ContentBlock {
+        ContentBlock::Reasoning {
+            text: text.to_string(),
+            opaque: None,
+        }
+    }
+
+    /// A task-seed message — the anchor `messages[0]` must never change.
+    fn task_message() -> Message {
+        Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }
+    }
+
+    /// A history of `n` (assistant echo-call, user result) pairs preceded by
+    /// the task seed — the shape the loop produces on an all-echo run.
+    fn paired_history(n: usize) -> Vec<Message> {
+        let mut messages = vec![task_message()];
+        for i in 0..n {
+            messages.push(Message::Assistant {
+                content: vec![tool_call(
+                    &format!("c{i}"),
+                    "echo",
+                    serde_json::json!({ "i": i }),
+                )],
+            });
+            messages.push(Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: format!("c{i}"),
+                    content: format!("result {i}"),
+                    is_error: false,
+                }],
+            });
+        }
+        messages
+    }
+
+    /// Tier 1: reasoning blocks in Assistant messages older than the window
+    /// are truncated to their last `tail_chars` chars, `opaque` dropped, the
+    /// block RETAINED; a block that already fits is byte-identical; and the
+    /// task anchor `messages[0]` is untouched.
+    #[test]
+    fn compact_history_tier1_truncates_old_reasoning_to_char_safe_tail() {
+        let mut messages = vec![task_message()];
+        // 12 assistants: the first two are outside the 10-message window.
+        for i in 0..12 {
+            let content = match i {
+                0 => vec![ContentBlock::Reasoning {
+                    text: "a".repeat(3_000),
+                    opaque: Some("sig".to_string()),
+                }],
+                // A short block in an OLD assistant: must stay byte-identical.
+                1 => vec![reasoning_block(&"s".repeat(100)), reasoning_block("tiny")],
+                _ => vec![reasoning_block(&"r".repeat(3_000))],
+            };
+            messages.push(Message::Assistant { content });
+        }
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            7,
+        );
+
+        assert_eq!(outcome.tier, 1, "no tool result was elided, so tier 1");
+        assert_eq!(
+            outcome.reasoning_blocks_truncated, 1,
+            "only the 3000-char block"
+        );
+        assert_eq!(outcome.reasoning_chars_dropped, 1_000);
+        // The truncated block keeps its LAST 2000 chars, opaque dropped,
+        // and the whole message is retained.
+        let Message::Assistant { content } = &messages[1] else {
+            panic!("assistant retained");
+        };
+        assert_eq!(content.len(), 1, "blocks are retained, never removed");
+        match &content[0] {
+            ContentBlock::Reasoning { text, opaque } => {
+                assert_eq!(text, &"a".repeat(2_000), "the tail, not the head");
+                assert_eq!(opaque, &None, "opaque dropped with the full text");
+            }
+            other => panic!("expected the retained Reasoning block, got {other:?}"),
+        }
+        // A text that fits the window (the second old assistant's blocks) is
+        // BYTE-IDENTICAL — a no-op, uncounted.
+        assert_eq!(messages[2], before[2].clone(), "a fitting block is a no-op");
+        // The 10 most recent assistants are untouched.
+        for i in 3..=12 {
+            assert_eq!(
+                messages[i],
+                before[i].clone(),
+                "recent assistant {i} untouched"
+            );
+        }
+        // The anchor: byte-identical.
+        assert_eq!(messages[0], before[0]);
+        // Counts: nothing is ever removed.
+        assert_eq!(outcome.message_count_before, outcome.message_count_after);
+        assert_eq!(outcome.block_count_before, outcome.block_count_after);
+        assert_eq!(outcome.results_elided, 0);
+        assert_eq!(outcome.orphan_tool_results, 0);
+        assert_eq!(outcome.orphan_tool_calls, 0);
+    }
+
+    /// Multibyte reasoning text: char-boundary-safe slicing, no panic, and
+    /// the exact expected tail (a byte slice `&text[len-2000..]` would have
+    /// panicked mid-codepoint).
+    #[test]
+    fn compact_history_tier1_multibyte_tail_is_char_safe() {
+        // 3000 chars of CJK + emoji: every char is multi-byte.
+        let text: String = "語📝".repeat(1_500); // 3000 chars, 9000 bytes
+        assert!(text.len() > COMPACT_REASONING_TAIL_CHARS * 3);
+        let mut messages = vec![task_message()];
+        for _ in 0..12 {
+            messages.push(Message::Assistant {
+                content: vec![ContentBlock::Reasoning {
+                    text: text.clone(),
+                    opaque: None,
+                }],
+            });
+        }
+        let ctx = ToolCtx::stub();
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            1,
+        );
+        assert_eq!(outcome.reasoning_blocks_truncated, 2);
+        assert_eq!(outcome.reasoning_chars_dropped, 2 * 1_000);
+        let expected_tail: String = text.chars().skip(1_000).collect();
+        let Message::Assistant { content } = &messages[1] else {
+            panic!("assistant retained");
+        };
+        match &content[0] {
+            ContentBlock::Reasoning { text, .. } => {
+                assert_eq!(text, &expected_tail, "the exact char-boundary tail");
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    /// An `OffloadSink` whose write always fails, exactly as
+    /// `DiskOffloadSink` degrades on a full or unwritable disk: it returns
+    /// the `<offload-unavailable>` sentinel instead of erroring.
+    #[derive(Debug)]
+    struct FailingOffloadSink;
+
+    impl crate::tool::OffloadSink for FailingOffloadSink {
+        fn offload(&self, _contents: &str) -> PathBuf {
+            PathBuf::from(crate::workspace::OFFLOAD_UNAVAILABLE)
+        }
+    }
+
+    /// DATA-LOSS GUARD: tier 2 replaces the ONLY remaining copy of a tool
+    /// result, so it must verify the offload landed before destroying it.
+    /// A degraded sink must leave every result byte-identical and elide
+    /// nothing, rather than stubbing in a pointer to `<offload-unavailable>`
+    /// and reporting a healthy tier-2 elision.
+    #[test]
+    fn compact_history_tier2_skips_elision_when_the_offload_write_failed() {
+        let mut messages = paired_history(12);
+        let before = messages.clone();
+        let dir = TempDir::new().expect("tempdir");
+        let workspace = Workspace::new(dir.path(), None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(FailingOffloadSink));
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            4,
+        );
+
+        assert_eq!(
+            outcome.results_elided, 0,
+            "a failed offload must elide nothing"
+        );
+        assert!(
+            outcome.elided.is_empty(),
+            "no elision may be recorded for a payload that was never written"
+        );
+        for (i, (now, orig)) in messages.iter().zip(before.iter()).enumerate() {
+            if let (Message::User { content: now_c }, Message::User { content: orig_c }) =
+                (now, orig)
+            {
+                assert_eq!(
+                    now_c, orig_c,
+                    "tool-result payload at message {i} was destroyed despite a failed offload"
+                );
+            }
+        }
+    }
+
+    /// Tier 2: an old pair's `ToolResult` content becomes the pinned stub
+    /// pointing at a FRESH offload write; `call_id`/`is_error` untouched; the
+    /// block retained; `args` rendered from the RETAINED call compact and
+    /// truncated to 1000 chars with the pinned suffix.
+    #[test]
+    fn compact_history_tier2_elides_old_results_with_pinned_stub() {
+        let mut messages = paired_history(12);
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            4,
+        );
+
+        assert_eq!(outcome.tier, 2);
+        assert_eq!(outcome.results_elided, 2, "the two old pairs");
+        assert_eq!(outcome.elided.len(), 2);
+        assert_eq!(outcome.elided[0].call_id, "c0");
+        assert_eq!(outcome.elided[0].tool_name, "echo");
+        assert_eq!(
+            outcome.elided[0].offload_path,
+            PathBuf::from("<offload-stub>")
+        );
+        // The exact pinned stub: fresh offload path, name/args from the
+        // retained call, compact serde rendering of the input.
+        let expected0 = "[compacted at iteration 4: tool `echo` result elided; \
+                         call_id c0; args: {\"i\":0}; full output at <offload-stub>]";
+        let expected1 = "[compacted at iteration 4: tool `echo` result elided; \
+                         call_id c1; args: {\"i\":1}; full output at <offload-stub>]";
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "c0");
+                assert_eq!(content, expected0, "the pinned stub, byte for byte");
+                assert!(!is_error, "is_error untouched");
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        let Message::User { content } = &messages[4] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert_eq!(content, expected1);
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The 10 recent pairs are untouched.
+        for i in 6..messages.len() {
+            assert_eq!(messages[i], before[i], "recent message {i} untouched");
+        }
+        assert_eq!(messages[0], before[0], "the anchor is never modified");
+        assert_eq!(outcome.message_count_before, outcome.message_count_after);
+        assert_eq!(outcome.block_count_before, outcome.block_count_after);
+    }
+
+    /// `args` longer than 1000 chars is truncated to its first 1000 chars
+    /// (char-safe) with the literal `…(args truncated)` suffix — the stub
+    /// stays a bounded pointer and can never itself exceed `DETAIL_CAP`.
+    #[test]
+    fn compact_history_args_rendering_truncates_at_1000_chars() {
+        // Build an input whose compact serde form is > 1000 CHARS, built
+        // from multibyte chars so a byte-slice cut would land mid-codepoint.
+        let filler = "值".repeat(1_200); // 1200 chars, 3600 bytes on the wire
+        let input = serde_json::json!({ "blob": filler });
+        assert!(input.to_string().chars().count() > 1_000);
+        let mut messages = vec![task_message()];
+        for i in 0..12 {
+            messages.push(Message::Assistant {
+                content: vec![tool_call(&format!("c{i}"), "echo", input.clone())],
+            });
+            messages.push(Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: format!("c{i}"),
+                    content: "x".to_string(),
+                    is_error: false,
+                }],
+            });
+        }
+        let ctx = ToolCtx::stub();
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            9,
+        );
+        assert_eq!(outcome.results_elided, 2);
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        let stub = match &content[0] {
+            UserBlock::ToolResult { content, .. } => content.clone(),
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        };
+        let rendered = input.to_string();
+        let head: String = rendered.chars().take(1_000).collect();
+        assert!(
+            stub.contains(&head),
+            "the stub carries the first 1000 chars of the args rendering"
+        );
+        assert!(
+            stub.contains("…(args truncated)"),
+            "the literal truncation suffix must be present: {stub}"
+        );
+        assert!(stub.chars().count() < crate::tool::DETAIL_CAP);
+    }
+
+    /// Tier 2 goes through the REAL disk sink: the elided content lands in
+    /// `offload-{n:04}.txt` and the stub names that path.
+    #[test]
+    fn compact_history_tier2_writes_real_offload_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let offload_dir = dir.path().join("offload");
+        let workspace = Workspace::new(dir.path(), None).expect("workspace");
+        let ctx = ToolCtx::new(
+            Arc::new(workspace),
+            Arc::new(crate::workspace::DiskOffloadSink::new(offload_dir.clone())),
+        );
+        let mut messages = paired_history(12);
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            2,
+        );
+        assert_eq!(outcome.results_elided, 2);
+        assert_eq!(
+            outcome.elided[0].offload_path,
+            offload_dir.join("offload-0000.txt")
+        );
+        // The FULL original content is readable at the path — reversibility.
+        let on_disk =
+            std::fs::read_to_string(outcome.elided[0].offload_path.clone()).expect("offload file");
+        assert_eq!(on_disk, "result 0", "the elided payload survives verbatim");
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(content.contains("offload-0000.txt"));
+                assert!(content.contains("full output at"));
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// The MOST RECENT `run_checks` pair is excluded (the done-oracle the
+    /// agent is converging on); an OLDER `run_checks` pair is not.
+    #[test]
+    fn compact_history_excludes_only_the_most_recent_run_checks_pair() {
+        let mut messages = paired_history(12);
+        // Replace calls 0 and 10 with run_checks calls — 0 is old, 10 is
+        // the most recent run_checks in history.
+        messages[1] = Message::Assistant {
+            content: vec![tool_call("c0", "run_checks", serde_json::json!({}))],
+        };
+        messages[21] = Message::Assistant {
+            content: vec![tool_call("c10", "run_checks", serde_json::json!({}))],
+        };
+        let ctx = ToolCtx::stub();
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            5,
+        );
+        assert_eq!(outcome.tier, 2);
+        // TWO old pairs exist (assistants 0 and 1): both are elided, the
+        // run_checks exclusion applies only to the MOST RECENT one.
+        assert_eq!(outcome.results_elided, 2);
+        // The most recent run_checks result keeps its original content.
+        let Message::User { content } = &messages[22] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "result 10", "the most recent run_checks survives");
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The old run_checks pair WAS elided.
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.contains("elided"),
+                    "the old run_checks pair: {content}"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// Pair-integrity invariant + orphan accounting: after compaction every
+    /// `ToolResult.call_id` still matches a `ToolCall` in history and every
+    /// `ToolCall` still has its result; an orphan `ToolResult` (no matching
+    /// call) is passed through UNTOUCHED and tallied, never elided.
+    #[test]
+    fn compact_history_preserves_pair_integrity_and_tallies_orphans() {
+        let mut messages = paired_history(12);
+        // An orphan ToolResult with no matching call anywhere.
+        let orphan_content = "orphan result, no call";
+        let Message::User { content } = messages.last_mut().expect("non-empty") else {
+            unreachable!();
+        };
+        content.push(UserBlock::ToolResult {
+            call_id: "ghost".to_string(),
+            content: orphan_content.to_string(),
+            is_error: true,
+        });
+        // A dangling ToolCall with no result (the mirror orphan).
+        let Message::Assistant { content } = messages.get_mut(21).expect("assistant") else {
+            unreachable!();
+        };
+        content.push(tool_call("dangling", "echo", serde_json::json!({})));
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            6,
+        );
+
+        assert_eq!(
+            outcome.orphan_tool_results, 1,
+            "the ghost result is tallied"
+        );
+        assert_eq!(outcome.orphan_tool_calls, 1, "the dangling call is tallied");
+        // The orphan block passed through UNTOUCHED, never elided.
+        let Message::User { content } = messages.last().expect("non-empty") else {
+            unreachable!();
+        };
+        match content.last() {
+            Some(UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            }) => {
+                assert_eq!(call_id, "ghost");
+                assert_eq!(content, orphan_content, "orphan never elided");
+                assert!(*is_error, "is_error untouched");
+            }
+            other => panic!("expected the orphan ToolResult, got {other:?}"),
+        }
+        // Pair integrity, both sides: every result matches a call, every
+        // call matches a result (bar the two pre-existing orphans).
+        let mut calls: HashSet<&str> = HashSet::new();
+        let mut results: HashSet<&str> = HashSet::new();
+        for message in &messages {
+            match message {
+                Message::Assistant { content } => {
+                    for block in content {
+                        if let ContentBlock::ToolCall(call) = block {
+                            calls.insert(call.id.as_str());
+                        }
+                    }
+                }
+                Message::User { content } => {
+                    for block in content {
+                        if let UserBlock::ToolResult { call_id, .. } = block {
+                            results.insert(call_id.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        for id in &results {
+            assert!(
+                calls.contains(id) || *id == "ghost",
+                "no NEW orphan was created: {id} has no call (the ghost is the input one)"
+            );
+        }
+        for id in &calls {
+            if *id != "dangling" {
+                assert!(
+                    results.contains(id),
+                    "no call was orphaned: {id} has no result"
+                );
+            }
+        }
+        // The dangling call survived verbatim.
+        assert_eq!(messages[21], before[21].clone());
+    }
+
+    /// Tier 0: a history that sits entirely inside the 10-message window
+    /// returns tier 0 and is BYTE-UNCHANGED — the "silent no-op" the loop
+    /// relies on so an over-threshold prompt with nothing old enough to
+    /// compact emits nothing.
+    #[test]
+    fn compact_history_tier0_when_history_fits_the_window() {
+        let mut messages = paired_history(5);
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            8,
+        );
+        assert_eq!(outcome.tier, 0);
+        assert_eq!(outcome.reasoning_blocks_truncated, 0);
+        assert_eq!(outcome.results_elided, 0);
+        assert!(outcome.elided.is_empty());
+        assert_eq!(messages, before, "a tier-0 walk is byte-unchanged");
+    }
+
+    /// A second walk over an already-compacted history is a tier-0 no-op —
+    /// the stub prefix is recognized, so a prompt that stays over the
+    /// threshold neither rewrites history nor emits an event per pass.
+    #[test]
+    fn compact_history_is_idempotent_on_already_elided_results() {
+        let mut messages = paired_history(12);
+        let ctx = ToolCtx::stub();
+        let first = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            3,
+        );
+        assert_eq!(first.tier, 2);
+        let after_first = messages.clone();
+        let second = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            3,
+        );
+        assert_eq!(second.tier, 0, "the second walk changes nothing");
+        assert_eq!(messages, after_first, "history is byte-stable across walks");
+    }
+
+    /// A `Usage` with only the uncached remainder set — the Ollama shape
+    /// where a fully-cached prompt reports near-zero `input_tokens` — and a
+    /// helper for compaction-triggering mock turns.
+    fn hot_usage(input: u32, output: u32, cached: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: Some(cached),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// A single-call turn whose usage pins the raw prompt the next pass's
+    /// compaction trigger reads.
+    fn call_turn_usage(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        usage: Usage,
+    ) -> AssistantTurn {
+        AssistantTurn {
+            content: vec![tool_call(id, name, input)],
+            stop_reason: StopReason::ToolUse,
+            usage,
+        }
+    }
+
+    /// An echo turn whose usage pins the raw prompt the next pass's
+    /// compaction trigger reads.
+    fn echo_turn_usage(id: &str, input: serde_json::Value, usage: Usage) -> AssistantTurn {
+        call_turn_usage(id, "echo", input, usage)
+    }
+
+    /// 11 echo turns at 95K raw prompt each — enough to push the first pair
+    /// out of the 10-message window, and over the 90% trigger for a
+    /// 100_000-token mocked limit.
+    fn eleven_hot_echo_turns() -> Vec<AssistantTurn> {
+        (0..11)
+            .map(|i| {
+                echo_turn_usage(
+                    &format!("c{i}"),
+                    serde_json::json!({ "i": i }),
+                    hot_usage(95_000, 1, 0),
+                )
+            })
+            .collect()
+    }
+
+    /// The registry the compacting loop tests need: finish, echo, and
+    /// `read_file` (for the elided-re-read signal).
+    fn registry_with_finish_echo_read_file() -> ToolRegistry {
+        let mut registry = registry_with_finish_and_echo();
+        registry.register(
+            READ_FILE_TOOL_NAME,
+            Arc::new(crate::tools::read_file::ReadFileTool),
+        );
+        registry
+    }
+
+    /// The top-of-pass threshold compaction: the event lands BEFORE that
+    /// pass's `model_request` (with the compacted counts), the counters move
+    /// exactly once, and the elided pair reaches the model as the pinned stub.
+    #[tokio::test]
+    async fn threshold_compaction_emits_event_before_model_request_and_moves_counters() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut script = eleven_hot_echo_turns();
+        script.push(finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        ));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20).with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+
+        // Counters: one compaction, tier 2 (the old echo pair was elided),
+        // 1 result elided, no orphans, and the reclaim is measured against
+        // the first post-compaction turn (the finish turn reports 0).
+        assert_eq!(
+            stats.compactions, 1,
+            "passes 2..=11 are tier-0 silent walks"
+        );
+        assert_eq!(stats.highest_compaction_tier, 2);
+        assert_eq!(stats.tool_results_elided, 1);
+        assert_eq!(stats.compaction_orphan_tool_results, 0);
+        assert_eq!(stats.compaction_tokens_reclaimed, 95_000);
+        assert_eq!(stats.compaction_repeated_calls, 0);
+        assert_eq!(stats.compaction_elided_rereads, 0);
+        // Reasoning telemetry: no reasoning blocks anywhere, so the
+        // tier-1 latch never flips and every turn lands in the pre pair.
+        assert_eq!(stats.compaction_pre_reasoning_chars_sum, 0);
+        assert_eq!(stats.compaction_pre_reasoning_turns, 12);
+        assert!(stats.post_compaction_reasoning_chars.is_empty());
+
+        let lines = read_transcript_lines(&path);
+        // The compaction event sits immediately BEFORE iteration 12's
+        // model_request (after passes 1..=11's events — their trigger walks
+        // were all tier-0 SILENT): 1 run_start + 11 * (model_request,
+        // model_response, tool_result, iteration_end) = line 45.
+        let compaction_at = lines
+            .iter()
+            .position(|l| l["event"] == "compaction")
+            .expect("exactly one compaction event");
+        assert_eq!(compaction_at, 45);
+        let compaction = &lines[compaction_at];
+        assert_eq!(compaction["iteration"], 12);
+        assert_eq!(
+            lines[compaction_at + 1]["event"],
+            "model_request",
+            "compaction precedes that pass's model_request"
+        );
+        assert_eq!(lines[compaction_at + 1]["iteration"], 12);
+        assert_eq!(compaction["trigger"], "threshold");
+        assert_eq!(compaction["limit"], 100_000);
+        assert_eq!(compaction["raw_prompt_tokens"], 95_000);
+        assert_eq!(compaction["prompt_tokens_before"], 95_000);
+        assert_eq!(compaction["reserve"], 32_768);
+        assert_eq!(compaction["threshold_pct"], 90);
+        assert_eq!(compaction["tier"], 2);
+        assert_eq!(compaction["orphan_tool_results"], 0);
+        assert_eq!(compaction["orphan_tool_calls"], 0);
+        assert_eq!(compaction["reasoning_blocks_truncated"], 0);
+        assert_eq!(compaction["reasoning_chars_dropped"], 0);
+        let elided = compaction["elided"].as_array().expect("elided array");
+        assert_eq!(elided.len(), 1);
+        assert_eq!(elided[0]["call_id"], "c0");
+        assert_eq!(elided[0]["tool_name"], "echo");
+        assert_eq!(elided[0]["offload_path"], "<offload-stub>");
+        // Counts: 1 task + 11 pairs = 23 messages, 23 blocks; unchanged by
+        // the compaction (blocks are mutated, never removed).
+        assert_eq!(compaction["message_count_before"], 23);
+        assert_eq!(compaction["message_count_after"], 23);
+        assert_eq!(compaction["block_count_before"], 23);
+        assert_eq!(compaction["block_count_after"], 23);
+        assert_eq!(
+            lines[compaction_at + 1]["message_count"],
+            23,
+            "the recorded counts are post-compaction"
+        );
+
+        // The model actually SAW the stub: the finish turn's history
+        // carries the pinned stub content for the elided pair.
+        let last = backend.last_messages();
+        let stubs = last
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content.iter().filter_map(|b| match b {
+                    UserBlock::ToolResult { content, .. } => Some(content.as_str()),
+                    UserBlock::Text(_) => None,
+                })),
+                Message::Assistant { .. } => None,
+            })
+            .flatten()
+            .filter(|c| c.contains("compacted at iteration 12"))
+            .count();
+        assert_eq!(stubs, 1, "the stub reaches the model exactly once");
+    }
+
+    /// A tier-0 walk is SILENT: an over-threshold prompt whose history sits
+    /// inside the window emits no compaction event and moves no counter,
+    /// however many passes re-fire the trigger.
+    #[tokio::test]
+    async fn tier_zero_walks_are_silent_no_ops_per_pass() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            echo_turn_usage("c1", serde_json::json!({ "i": 1 }), hot_usage(95_000, 1, 0)),
+            echo_turn_usage("c2", serde_json::json!({ "i": 2 }), hot_usage(95_000, 1, 0)),
+            finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            ),
+        ])
+        .with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(stats.compactions, 0);
+        assert_eq!(stats.highest_compaction_tier, 0);
+        assert_eq!(stats.tool_results_elided, 0);
+        assert_eq!(stats.compaction_tokens_reclaimed, 0);
+        let lines = read_transcript_lines(&path);
+        assert!(
+            lines.iter().all(|l| l["event"] != "compaction"),
+            "a tier-0 walk must not emit the compaction event"
+        );
+        // And the golden shape of a non-compacting run is untouched
+        // (2 iteration_end events; the finish pass returns before its own).
+        assert_eq!(
+            lines.len(),
+            13,
+            "run_start + 2x(model_request, model_response, tool_result, iteration_end) \
+             + (model_request, model_response, tool_result) + run_end"
+        );
+    }
+
+    /// The `ContextLengthExceeded` interception: with a limit advertised,
+    /// the error compacts and retries ONCE (a second `backend.turn` call),
+    /// and the scripted second turn's outcome is the run's outcome.
+    #[tokio::test]
+    async fn context_length_exceeded_is_intercepted_and_retried_once() {
+        let backend = MockBackend::new(vec![
+            Err(BackendError::ContextLengthExceeded),
+            Ok(finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            )),
+        ])
+        .with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(
+            backend.calls(),
+            2,
+            "one intercepted retry: the second call is NOT counted against max_retries"
+        );
+        assert_eq!(stats.iterations, 1, "still one logical pass");
+        assert_eq!(stats.compactions, 0, "a tier-0 interception walk is silent");
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "the scripted second turn's outcome; got {outcome:?}"
+        );
+    }
+
+    /// A SECOND `ContextLengthExceeded` on the same pass is terminal — the
+    /// existing non-retryable path, unchanged.
+    #[tokio::test]
+    async fn second_context_length_exceeded_on_the_same_pass_is_terminal() {
+        let backend = MockBackend::new(vec![
+            Err(BackendError::ContextLengthExceeded),
+            Err(BackendError::ContextLengthExceeded),
+        ])
+        .with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(
+            backend.calls(),
+            2,
+            "the interception retry, then the terminal error"
+        );
+        assert_eq!(stats.iterations, 1);
+        match outcome {
+            LoopOutcome::BackendError(BackendError::ContextLengthExceeded) => {}
+            other => panic!("expected BackendError(ContextLengthExceeded), got {other:?}"),
+        }
+    }
+
+    /// Disorientation signal 1 — elided re-reads: a `read_file` aimed at an
+    /// offload path tier 2 wrote increments, counted on the CALL (this one
+    /// fails to resolve — the signal is the attempt, not the read).
+    #[tokio::test]
+    async fn elided_rereads_increment_on_read_file_of_an_offload_path() {
+        let backend = MockBackend::from_turns(
+            eleven_hot_echo_turns()
+                .into_iter()
+                .chain(vec![
+                    // The stub sink writes "<offload-stub>" — the elided
+                    // payload's advertised path. The read FAILS (path
+                    // violation) but the call still counts.
+                    call_turn_usage(
+                        "c-reread",
+                        READ_FILE_TOOL_NAME,
+                        serde_json::json!({ "path": "<offload-stub>" }),
+                        hot_usage(1, 1, 0),
+                    ),
+                    // A read of something else: no increment.
+                    call_turn_usage(
+                        "c-other",
+                        READ_FILE_TOOL_NAME,
+                        serde_json::json!({ "path": "src/main.rs" }),
+                        hot_usage(1, 1, 0),
+                    ),
+                    // And a read_file call with NO path field: no increment.
+                    call_turn_usage(
+                        "c-nopath",
+                        READ_FILE_TOOL_NAME,
+                        serde_json::json!({}),
+                        hot_usage(1, 1, 0),
+                    ),
+                    finish_call(
+                        "cf",
+                        serde_json::json!({ "disposition": "done", "summary": "ok" }),
+                    ),
+                ])
+                .collect(),
+        )
+        .with_context_limit_override(100_000);
+        let tools = registry_with_finish_echo_read_file();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(
+            stats.compactions, 1,
+            "one tier-2 compaction armed the signal"
+        );
+        assert_eq!(
+            stats.compaction_elided_rereads, 1,
+            "exactly the offload-path read counts — success, other paths, and \
+             missing-path calls do not"
+        );
+    }
+
+    /// Disorientation signal 2 — repeated work: a pre-compaction call
+    /// re-issued after the compaction increments; a duplicate of a call
+    /// first made AFTER the compaction does not.
+    #[tokio::test]
+    async fn repeated_calls_count_only_pre_compaction_duplicates() {
+        let mut script = eleven_hot_echo_turns();
+        // Pre-compaction hash check: re-issue `{"i":1}` (made at turn 2,
+        // before the compaction) — this INCREMENTS.
+        script.push(echo_turn_usage(
+            "c-again",
+            serde_json::json!({ "i": 1 }),
+            hot_usage(1, 1, 0),
+        ));
+        // A post-compaction-only call, made twice — the duplicate must NOT
+        // increment (ordinary duplication, not forgotten work).
+        script.push(echo_turn_usage(
+            "c-new",
+            serde_json::json!({ "i": 99 }),
+            hot_usage(1, 1, 0),
+        ));
+        script.push(echo_turn_usage(
+            "c-new2",
+            serde_json::json!({ "i": 99 }),
+            hot_usage(1, 1, 0),
+        ));
+        script.push(finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        ));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(
+            stats.compaction_repeated_calls, 1,
+            "only the re-issue of a pre-compaction call counts"
+        );
+    }
+
+    /// Disorientation signal 3 — re-derivation: pre-compaction turns feed
+    /// the (sum, turns) pair; from the first reasoning-dropping compaction
+    /// on, each turn appends to the per-turn post series.
+    #[tokio::test]
+    async fn reasoning_char_series_flips_to_post_compaction_after_tier1() {
+        let mut script: Vec<AssistantTurn> = Vec::new();
+        for i in 0..11 {
+            let reasoning_len = if i == 0 { 3_000 } else { 100 };
+            script.push(AssistantTurn {
+                content: vec![
+                    reasoning_block(&"d".repeat(reasoning_len)),
+                    tool_call(&format!("c{i}"), "echo", serde_json::json!({ "i": i })),
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: hot_usage(95_000, 1, 0),
+            });
+        }
+        // Post-compaction turns: 500 then 700 reasoning chars. Their
+        // small usage keeps the trigger OFF, so the series is clean.
+        for (n, len) in [(12, 500), (13, 700)] {
+            script.push(AssistantTurn {
+                content: vec![
+                    reasoning_block(&"p".repeat(len)),
+                    tool_call(&format!("c{n}"), "echo", serde_json::json!({ "i": n })),
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: hot_usage(1, 1, 0),
+            });
+        }
+        script.push(finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        ));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(
+            stats.highest_compaction_tier, 2,
+            "the old pair was elided too"
+        );
+        // Pre-drop pair: turns 1..=11, chars 3000 + 10*100 = 4000.
+        assert_eq!(stats.compaction_pre_reasoning_chars_sum, 4_000);
+        assert_eq!(stats.compaction_pre_reasoning_turns, 11);
+        // Post-drop series: the two post-compaction turns plus the
+        // reasoning-free finish turn — per turn, shape preserved.
+        assert_eq!(stats.post_compaction_reasoning_chars, vec![500, 700, 0]);
+    }
+
+    /// A compacting persisted run stamps `compaction_facts` on the record —
+    /// the default-path durability seam (the transcript is opt-in and
+    /// `RunStats` is never persisted).
+    #[tokio::test]
+    async fn compacting_run_persists_compaction_facts_on_the_done_terminal() {
+        let mut script = eleven_hot_echo_turns();
+        script.push(finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        ));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20);
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let facts = rec.compaction_facts.expect("compaction_facts stamped");
+        assert_eq!(facts.compactions, stats.compactions);
+        assert_eq!(
+            facts,
+            CompactionFacts {
+                compactions: 1,
+                highest_compaction_tier: 2,
+                compaction_tokens_reclaimed: 95_000,
+                tool_results_elided: 1,
+                compaction_elided_rereads: 0,
+                compaction_repeated_calls: 0,
+                compaction_orphan_tool_results: 0,
+                compaction_pre_reasoning_chars_sum: 0,
+                compaction_pre_reasoning_turns: 12,
+                post_compaction_reasoning_chars: Vec::new(),
+            }
+        );
+    }
+
+    /// A compacting run that terminates by nudge exhaustion (the
+    /// `FinishDiscipline` recovery terminal) persists the counters too —
+    /// the stamping covers every terminal exit path.
+    #[tokio::test]
+    async fn compacting_run_persists_compaction_facts_on_nudge_exhaustion() {
+        let runner = passing_runner();
+        let mut script = eleven_hot_echo_turns();
+        script.push(run_checks_turn("rc1"));
+        script.push(echo_turn("c12"));
+        script.push(echo_turn("c13"));
+        script.push(status_echo_turn("c14", "still converging"));
+        script.push(echo_turn("c15"));
+        script.push(echo_turn("c16"));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 25)
+            .with_checks(runner)
+            .with_max_nudges(1);
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
+                assert_eq!(*mode, FailureMode::FinishDiscipline);
+            }
+            other => panic!("expected FinishDiscipline, got {other:?}"),
+        }
+        assert_eq!(
+            stats.compactions, 1,
+            "the run compacted before the terminal"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let facts = rec.compaction_facts.expect("compaction_facts stamped");
+        assert_eq!(facts.compactions, 1);
+        assert_eq!(facts.highest_compaction_tier, 2);
+        assert_eq!(facts.tool_results_elided, 1);
     }
 }

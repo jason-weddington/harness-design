@@ -565,6 +565,18 @@ impl ModelBackend for Backend {
             Self::Ollama(b) => b.output_cap(prompt_tokens),
         }
     }
+
+    /// Forward the advertised context limit — same lane-parity argument as
+    /// [`Self::output_cap`]: without this forward, `Backend::Ollama` would
+    /// silently advertise no limit and the engine's compaction path would be
+    /// off on the only lane that supports it.
+    fn context_limit(&self) -> Option<u32> {
+        match self {
+            Self::Anthropic(b) => b.context_limit(),
+            Self::Bedrock(b) => b.context_limit(),
+            Self::Ollama(b) => b.context_limit(),
+        }
+    }
 }
 
 // ============================================================================
@@ -865,6 +877,13 @@ struct RunSummary {
     record_path: String,
     /// Number of model turns the loop drew.
     iterations: u32,
+    /// Compactions that changed history — surfaced on the default path
+    /// (no `--transcript`) because `RunStats` is never persisted and the
+    /// run record's `compaction_facts` is only visible through the store.
+    compactions: u32,
+    /// The highest compaction tier reached: 0 = never compacted, 1 =
+    /// reasoning tail-truncated only, 2 = tool-result payloads elided.
+    highest_compaction_tier: u8,
     /// The resolved backend the run was CONSTRUCTED with (`kind`, `model`,
     /// `think`, `num_ctx`, `num_ctx_source`, `max_tokens`,
     /// `max_tokens_source`) — the SAME value stamped on the run record, so
@@ -873,12 +892,15 @@ struct RunSummary {
 }
 
 /// Build the stdout [`RunSummary`] from a completed run.
+#[allow(clippy::too_many_arguments)]
 fn build_run_summary(
     outcome_s: &'static str,
     disposition: Disposition,
     run_id_str: String,
     record_path: String,
     iterations: u32,
+    compactions: u32,
+    highest_compaction_tier: u8,
     backend_settings: BackendSettings,
 ) -> RunSummary {
     RunSummary {
@@ -887,6 +909,8 @@ fn build_run_summary(
         run_id: run_id_str,
         record_path,
         iterations,
+        compactions,
+        highest_compaction_tier,
         backend_settings,
     }
 }
@@ -1764,6 +1788,8 @@ async fn run_cmd(args: RunArgs) {
     let outcome_s = outcome_str(&result.outcome);
     let exit_c = exit_code(&result.outcome);
     let iterations = result.stats.iterations;
+    let compactions = result.stats.compactions;
+    let highest_compaction_tier = result.stats.highest_compaction_tier;
     let disposition = result.outcome.into_disposition();
     let record_path = run_store_path.display().to_string();
     let summary = build_run_summary(
@@ -1772,6 +1798,8 @@ async fn run_cmd(args: RunArgs) {
         rid,
         record_path,
         iterations,
+        compactions,
+        highest_compaction_tier,
         settings,
     );
     println!(
@@ -2001,6 +2029,63 @@ mod tests {
         );
     }
 
+    /// The `Backend` dispatch enum forwards `context_limit` to the boxed
+    /// inner backend exactly as `output_cap` does — the wrapper must not
+    /// flatten the Ollama lane to the trait's `None` default (which would
+    /// silently disable compaction on the only backend that supports it),
+    /// and must not clobber the existing `output_cap` forward while doing it.
+    #[test]
+    fn backend_dispatch_forwards_context_limit_and_keeps_output_cap() {
+        // Unpinned inner: context_limit forwards `None`, output_cap forwards
+        // the fallback resolution.
+        let unpinned_inner = OllamaBackend::new("m", "http://localhost:11434");
+        let unpinned = Backend::Ollama(OllamaBackend::new("m", "http://localhost:11434"));
+        assert_eq!(
+            unpinned.context_limit(),
+            unpinned_inner.context_limit(),
+            "the wrapper must forward the inner backend's (None) limit"
+        );
+        assert_eq!(unpinned.context_limit(), None);
+        assert_eq!(
+            unpinned.output_cap(None),
+            unpinned_inner.output_cap(None),
+            "the new forward must not clobber the output_cap forward"
+        );
+        assert_eq!(
+            unpinned.output_cap(None),
+            OutputCapResolution {
+                max_tokens: harness::model::DEFAULT_MAX_TOKENS,
+                source: MaxTokensSource::Fallback,
+            }
+        );
+
+        // Pinned inner: context_limit forwards Some(8192), output_cap still
+        // forwards the same inner derivation.
+        let pinned_inner = OllamaBackend::new("m", "http://localhost:11434").with_num_ctx(8192);
+        let pinned =
+            Backend::Ollama(OllamaBackend::new("m", "http://localhost:11434").with_num_ctx(8192));
+        assert_eq!(
+            pinned.context_limit(),
+            pinned_inner.context_limit(),
+            "the wrapper must forward the inner backend's (Some) limit"
+        );
+        assert_eq!(pinned.context_limit(), Some(8192));
+        assert_eq!(
+            pinned.output_cap(None),
+            pinned_inner.output_cap(None),
+            "the new forward must not clobber the output_cap forward"
+        );
+
+        // The other two variants inherit the trait's `None` default (no
+        // override exists), keeping compaction off by construction.
+        assert_eq!(
+            Backend::Anthropic(AnthropicBackend::new("claude-haiku-4-5", "k")).context_limit(),
+            None
+        );
+        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5").expect("mapped"));
+        assert_eq!(bedrock.context_limit(), None);
+    }
+
     /// `with_flagged_max_tokens` is the ONE pinned mechanism the three
     /// `RunConfig` call sites share: `Some` overrides verbatim, `None` leaves
     /// the config's `max_tokens` at `None` (resolve per backend).
@@ -2095,6 +2180,8 @@ mod tests {
             "t:1".to_string(),
             "/tmp/run.sqlite".to_string(),
             1,
+            0,
+            0,
             default_settings(),
         );
         let json = serde_json::to_string(&summary).expect("serialize");
@@ -2130,6 +2217,8 @@ mod tests {
             "t:1".to_string(),
             "/tmp/run.sqlite".to_string(),
             1,
+            0,
+            0,
             default_settings(),
         );
         let json = serde_json::to_string(&summary).expect("serialize");
@@ -2162,6 +2251,8 @@ mod tests {
             "t:1".to_string(),
             "/tmp/run.sqlite".to_string(),
             1,
+            0,
+            0,
             default_settings(),
         );
         let value = serde_json::to_value(&summary).expect("serialize");
@@ -2180,6 +2271,8 @@ mod tests {
             "t:1".to_string(),
             "/tmp/run.sqlite".to_string(),
             1,
+            0,
+            0,
             default_settings(),
         );
         let verified = serde_json::to_value(&verified).expect("serialize");
@@ -3179,6 +3272,8 @@ mod tests {
             "my-task:1".into(),
             "/tmp/run.sqlite".into(),
             3,
+            0,
+            0,
             settings,
         );
         let json = serde_json::to_value(&summary).expect("summary must serialize");
@@ -3189,13 +3284,15 @@ mod tests {
             keys,
             vec![
                 "backend_settings",
+                "compactions",
                 "disposition",
+                "highest_compaction_tier",
                 "iterations",
                 "outcome",
                 "record_path",
                 "run_id"
             ],
-            "summary must have exactly the six expected fields"
+            "summary must have exactly the eight expected fields"
         );
         // The structured settings carry the kind through to stdout verbatim.
         assert_eq!(
@@ -3266,6 +3363,8 @@ mod tests {
             "task:1".into(),
             "/state/run.sqlite".into(),
             5,
+            0,
+            0,
             default_settings(),
         );
         let json = serde_json::to_value(&summary).expect("must serialize");
@@ -3295,6 +3394,8 @@ mod tests {
             "task:1".into(),
             "/state/run.sqlite".into(),
             1,
+            0,
+            0,
             default_settings(),
         );
         let json = serde_json::to_string(&summary).expect("must serialize");

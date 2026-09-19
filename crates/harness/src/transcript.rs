@@ -41,8 +41,8 @@
 //!   `max_tokens`/`max_tokens_source` are the turn-1 output-cap resolution
 //!   and its provenance (`"explicit"`/`"table"`/`"derived"`/`"fallback"`);
 //!   `null` for the no-persistence
-//!   [`crate::engine::run`] path — additive on the v1 wire, so
-//!   [`TRANSCRIPT_VERSION`] stays 1), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
+//!   [`crate::engine::run`] path — additive when it landed, and now simply
+//!   part of the v2 wire), `resume` (`true` for both [`crate::engine::ResumeMode::Crash`] and
 //!   [`crate::engine::ResumeMode::FreshContext`]), `tree_baseline` (the
 //!   serialized [`crate::exec::TreeObservation`] the leg-3 precondition
 //!   compares against, with `porcelain` capped for rendering and its
@@ -68,7 +68,7 @@
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
-//!    "transcript_version":1,"harness_version":"0.10.0","label":"claude-sonnet-5",
+//!    "transcript_version":2,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
 //!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
@@ -78,6 +78,47 @@
 //!    "config":{"max_iterations":10,"max_tokens":128000,"max_tokens_source":"table","mode":"build",
 //!              "checks":"cargo test","answer_schema":null,
 //!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
+//!   ```
+//!
+//! - **`compaction`** — emitted at the top of a pass whose previous-turn raw
+//!   prompt (`input + cache_read + cache_write` tokens) plus the next-turn
+//!   reserve (`turn_cap`) reached [`crate::engine::COMPACT_THRESHOLD_PCT`]
+//!   percent of the backend's advertised context limit, and once from the
+//!   `BackendError::ContextLengthExceeded` interception (same payload,
+//!   different `trigger`). Fields: `iteration` (the pass the compaction
+//!   precedes, 1-based), `trigger` (`"threshold"` — the top-of-pass
+//!   predicate — or `"context_length_exceeded"` — the error-path
+//!   interception; the branch taken is a first-class recorded value, not
+//!   reconstructed from adjacent events), `limit`, `raw_prompt_tokens`,
+//!   `reserve`, `threshold_pct`, `tier` (1 = reasoning tail-truncated only,
+//!   2 = at least one tool-result payload elided), `elided` (an array of
+//!   `{call_id, tool_name, offload_path}` — one entry per elided result, in
+//!   history order), `orphan_tool_results`, `orphan_tool_calls` (runtime
+//!   tripwires, 0 expected), `reasoning_blocks_truncated`,
+//!   `reasoning_chars_dropped`, `prompt_tokens_before` (the raw prompt the
+//!   trigger fired on — the same value as `raw_prompt_tokens`, recorded so
+//!   the trigger numbers and the reclaim computation read one field set),
+//!   `message_count_before`, `block_count_before`, `message_count_after`,
+//!   `block_count_after` (the same per-message content-length sums
+//!   `model_request` records; a compaction mutates blocks in place, so the
+//!   counts are equal before and after). A tier-0 walk (nothing changed) is
+//!   SILENT: no event is emitted, so a run whose prompt stays over the
+//!   threshold with nothing older than the retention window emits no
+//!   compaction event per pass. The cache-rewrite cost measurement
+//!   (design 08) lives here in the JSONL: read the
+//!   `model_response.usage.cache_read_tokens` of the turn immediately
+//!   following each `compaction` event — a drop to ~0 is a full prefix
+//!   rewrite.
+//!
+//!   ```json
+//!   {"event":"compaction","ts":"2026-09-15T02:00:05Z","elapsed_ms":5001,
+//!    "iteration":42,"trigger":"threshold","limit":262144,"raw_prompt_tokens":230000,
+//!    "reserve":16384,"threshold_pct":90,"tier":2,
+//!    "elided":[{"call_id":"c17","tool_name":"read_file","offload_path":"/…/offload-0007.txt"}],
+//!    "orphan_tool_results":0,"orphan_tool_calls":0,
+//!    "reasoning_blocks_truncated":31,"reasoning_chars_dropped":412800,
+//!    "prompt_tokens_before":230000,"message_count_before":83,"block_count_before":197,
+//!    "message_count_after":83,"block_count_after":197}
 //!   ```
 //!
 //! - **`model_request`** — emitted once per logical iteration, right after
@@ -233,7 +274,13 @@
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
 //!   `edit_file_calls_ok`, `no_change_rejections`,
 //!   `already_satisfied_check_rejections`, `answer_schema_rejections`,
-//!   `modified_workspace_rejections`, `tree_baseline_unobservable`).
+//!   `modified_workspace_rejections`, `tree_baseline_unobservable`,
+//!   `compactions`, `highest_compaction_tier`, `compaction_tokens_reclaimed`,
+//!   `tool_results_elided`, `compaction_elided_rereads`,
+//!   `compaction_repeated_calls`, `compaction_orphan_tool_results`,
+//!   `compaction_pre_reasoning_chars_sum`, `compaction_pre_reasoning_turns`,
+//!   `post_compaction_reasoning_chars` — matching
+//!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
 //!   AFTER `run_loop_impl` (and therefore this event) returns.
@@ -255,7 +302,12 @@
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
 //!             "edit_file_calls_ok":0,"no_change_rejections":0,
 //!             "already_satisfied_check_rejections":0,"answer_schema_rejections":0,
-//!             "modified_workspace_rejections":0,"tree_baseline_unobservable":false}}
+//!             "modified_workspace_rejections":0,"tree_baseline_unobservable":false,
+//!             "compactions":0,"highest_compaction_tier":0,"compaction_tokens_reclaimed":0,
+//!             "tool_results_elided":0,"compaction_elided_rereads":0,
+//!             "compaction_repeated_calls":0,"compaction_orphan_tool_results":0,
+//!             "compaction_pre_reasoning_chars_sum":0,"compaction_pre_reasoning_turns":0,
+//!             "post_compaction_reasoning_chars":[]}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -295,8 +347,9 @@
 //! ## Reconstruction contract
 //!
 //! The full message history is reconstructible from one run block using only
-//! `run_start.messages` + `model_response` + `tool_result` + `harness_message`
-//! (a reader ignores `model_request`, `backend_error`, and `iteration_end`):
+//! `run_start.messages` + `model_response` + `tool_result` +
+//! `harness_message` + `compaction` (a reader ignores `model_request`,
+//! `backend_error`, and `iteration_end`):
 //!
 //! 1. Start from `run_start.messages`.
 //! 2. On `model_response`, push `Message::Assistant { content }`.
@@ -307,7 +360,22 @@
 //! 5. On `harness_message` with `placement == "new_user_message"`, first flush
 //!    any non-empty pending batch as one `Message::User`, then push a fresh
 //!    `Message::User { content: [Text(text)] }`.
-//! 6. On the NEXT `model_request`, flush any non-empty pending batch as one
+//! 6. On `compaction`, apply the recorded transformation deterministically:
+//!    the reader already holds the original `model_response` content —
+//!    including each `ToolCallRequest`'s `input` — so tier 0/1/2 are all
+//!    reconstructible as pure functions of recorded values. Tier 1 replaces
+//!    the `text` of every `ContentBlock::Reasoning` in an Assistant message
+//!    older than the 10 most recent Assistant messages with its last 2000
+//!    chars and drops `opaque`; tier 2 replaces the `content` of every
+//!    `UserBlock::ToolResult` whose matching `ToolCall` sits in such a
+//!    message (the most recent `run_checks` pair excluded) with the pinned
+//!    stub — `[compacted at iteration N: tool NAME result elided; call_id ID;
+//!    args: ARGS; full output at PATH]` — where `ARGS` is the retained
+//!    call's `input` rendered compact and truncated to its first 1000 chars
+//!    with the literal `…(args truncated)` suffix.
+//!    `message_count`/`block_count` are unchanged by construction
+//!    (no block is ever removed), which is why the event records them.
+//! 7. On the NEXT `model_request`, flush any non-empty pending batch as one
 //!    `Message::User` before comparing.
 //!
 //! At every `model_request`, the rebuilt history's length and total block
@@ -337,13 +405,18 @@ use serde_json::{Map, Value};
 
 /// Schema version stamped on every `run_start` event as
 /// `transcript_version`. Bump when the event shapes documented on this
-/// module change incompatibly.
-pub const TRANSCRIPT_VERSION: u32 = 1;
+/// module change incompatibly. 2 adds the `compaction` event and the
+/// compaction counters on `run_end.stats` (in-run compaction, design 08,
+/// `docs/design/08-context-budget.md`).
+pub const TRANSCRIPT_VERSION: u32 = 2;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
-/// carry — see the module docs for each event's fields.
-pub const EVENT_KINDS: [&str; 8] = [
+/// carry — see the module docs for each event's fields. `contract_violation`
+/// folds in a pre-existing hole: it was already emitted from the `run_end`
+/// choke point and documented, but absent from this array before v2.
+pub const EVENT_KINDS: [&str; 10] = [
     "run_start",
+    "compaction",
     "model_request",
     "backend_error",
     "model_response",
@@ -351,6 +424,7 @@ pub const EVENT_KINDS: [&str; 8] = [
     "harness_message",
     "iteration_end",
     "run_end",
+    "contract_violation",
 ];
 
 /// Opt-in configuration for a run's transcript sink.

@@ -112,6 +112,16 @@ impl ModelBackend for Backend {
             Backend::Ollama(b) => b.output_cap(prompt_tokens),
         }
     }
+
+    /// Forward the advertised context limit — without this the eval lane's
+    /// Ollama runs would silently advertise no limit and never compact
+    /// while `talos run` does (the same drift argument as `output_cap`).
+    fn context_limit(&self) -> Option<u32> {
+        match self {
+            Backend::Anthropic(b) => b.context_limit(),
+            Backend::Ollama(b) => b.context_limit(),
+        }
+    }
 }
 
 /// Build the backend from the environment (see the module docs for the

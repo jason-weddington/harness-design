@@ -127,6 +127,60 @@ impl BackendSettings {
     }
 }
 
+// ===== Compaction facts (additive on the v2 wire) =====================
+
+/// The compaction telemetry a [`RunRecord`] persists — mirroring the ten
+/// compaction counters on the engine's `RunStats` field-for-field. The
+/// DEFAULT-path durability seam: `RunStats` itself is never persisted, and
+/// without this field a compacting run that did not pass `--transcript`
+/// would leave zero durable trace of having compacted.
+///
+/// Per-occurrence analysis — which iteration compacted, each event's
+/// tier/trigger, the elided call ids and their offload paths, per-event
+/// prompt sizes — requires `--transcript` (the `compaction` JSONL event).
+/// The ground truth for the compacted history itself on the default path is
+/// [`RunRecord::messages`]: the compacted `messages` are checkpointed
+/// verbatim, stubs included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionFacts {
+    /// Compactions that changed history (a tier-0 walk is silent and
+    /// uncounted).
+    pub compactions: u32,
+    /// 0 = never compacted, 1 = reasoning tail-truncated only,
+    /// 2 = at least one tool-result payload elided.
+    pub highest_compaction_tier: u8,
+    /// Run-level sum of `prompt_before − first post-compaction raw prompt`,
+    /// saturating: savings immediately re-consumed report 0. Per-occurrence
+    /// reclaim requires the transcript.
+    pub compaction_tokens_reclaimed: u64,
+    /// `UserBlock::ToolResult` payloads replaced by a compaction stub.
+    pub tool_results_elided: u32,
+    /// Disorientation signal 1: `read_file` calls aimed at an offload path a
+    /// compaction wrote (the agent re-reading an elided payload).
+    pub compaction_elided_rereads: u32,
+    /// Disorientation signal 2: calls re-issued after the first compaction
+    /// that the run had already made before it.
+    pub compaction_repeated_calls: u32,
+    /// Orphan `ToolResult` blocks seen during a compaction walk — runtime
+    /// tripwire, 0 expected (the pair-integrity invariant cannot breach by
+    /// construction).
+    pub compaction_orphan_tool_results: u32,
+    /// Disorientation signal 3, pre-drop half: summed reasoning CHARACTER
+    /// length before the first reasoning-dropping compaction. Chars, not
+    /// `reasoning_tokens`, because Ollama — the only backend that compacts —
+    /// reports `reasoning_tokens: None` in every `map_response` branch (a
+    /// grounded deviation from design 08's token metric, comparable at
+    /// chars/4).
+    pub compaction_pre_reasoning_chars_sum: u64,
+    /// The turn-count denominator of the pre-drop mean: mean = sum/turns.
+    pub compaction_pre_reasoning_turns: u32,
+    /// Disorientation signal 3, post-drop half: per-turn reasoning CHARACTER
+    /// length after the first reasoning-dropping compaction (per turn,
+    /// because the SHAPE is the signal: one large turn is a re-plan, a
+    /// sustained rise is genuine disorientation).
+    pub post_compaction_reasoning_chars: Vec<u64>,
+}
+
 // ===== Top-level run record ============================================
 
 /// The single serializable state the inner loop reduces over.
@@ -176,6 +230,17 @@ pub struct RunRecord {
     /// [`SCHEMA_VERSION`] stays 2 and no migration is written.
     #[serde(default)]
     pub backend_settings: Option<BackendSettings>,
+    /// The run's compaction counters (see [`CompactionFacts`]) — the
+    /// aggregate telemetry a compacting run leaves on the DEFAULT path,
+    /// where no transcript was written and `RunStats` is never persisted.
+    /// `None` for records written before this field existed:
+    /// `#[serde(default)]` makes the omission deserialize to `None`, so
+    /// [`SCHEMA_VERSION`] stays 2 and no migration is written (the same
+    /// additive precedent as [`Self::backend_settings`]). Stamped at every
+    /// terminal exit path inside the loop, so a run that compacted always
+    /// carries `Some`.
+    #[serde(default)]
+    pub compaction_facts: Option<CompactionFacts>,
 
     // ---- DISPOSABLE CONTEXT (scratch; may be dropped/compacted) ----
     /// Current model context window. Rebuildable from the event log on
@@ -620,9 +685,9 @@ pub enum Event {
 mod tests {
     use super::{
         AcceptanceCriterion, BackendKind, BackendSettings, BudgetConsumed, BudgetLimits, Budgets,
-        ChecklistItem, CriterionStatus, Disposition, DispositionReport, DurableFacts, Event,
-        Evidence, FailureMode, GateOutcome, GateResult, Phase, ProjectConfig, RecoveryFacts,
-        RunRecord, SCHEMA_VERSION, Task, Verification,
+        ChecklistItem, CompactionFacts, CriterionStatus, Disposition, DispositionReport,
+        DurableFacts, Event, Evidence, FailureMode, GateOutcome, GateResult, Phase, ProjectConfig,
+        RecoveryFacts, RunRecord, SCHEMA_VERSION, Task, Verification,
     };
     use crate::exec::ChangeEvidence;
     use crate::exec::{CheckCommand, ChecksRunner};
@@ -789,6 +854,7 @@ mod tests {
             disposition: None,
             recovery_facts: None,
             backend_settings: None,
+            compaction_facts: None,
             messages: sample_messages(),
         }
     }
@@ -1398,6 +1464,93 @@ mod tests {
             num_ctx_source: Some("explicit".to_string()),
             max_tokens: Some(986_188),
             max_tokens_source: Some("derived".to_string()),
+        });
+        round_trip(&r);
+    }
+
+    // ---- compaction_facts: additive deser, exact key set, round-trip ----
+
+    /// A `CompactionFacts` value serializes to EXACTLY these ten keys — the
+    /// mirror of the ten compaction counters on the engine's `RunStats`, so
+    /// a future counter must be added to BOTH or the default path silently
+    /// under-reports.
+    #[test]
+    fn compaction_facts_serializes_to_exactly_ten_keys() {
+        let f = CompactionFacts {
+            compactions: 2,
+            highest_compaction_tier: 2,
+            compaction_tokens_reclaimed: 12_345,
+            tool_results_elided: 7,
+            compaction_elided_rereads: 1,
+            compaction_repeated_calls: 3,
+            compaction_orphan_tool_results: 0,
+            compaction_pre_reasoning_chars_sum: 9_800,
+            compaction_pre_reasoning_turns: 11,
+            post_compaction_reasoning_chars: vec![400, 900],
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).expect("serialize");
+        let obj = v.as_object().expect("must be an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "compaction_elided_rereads",
+                "compaction_orphan_tool_results",
+                "compaction_pre_reasoning_chars_sum",
+                "compaction_pre_reasoning_turns",
+                "compaction_repeated_calls",
+                "compaction_tokens_reclaimed",
+                "compactions",
+                "highest_compaction_tier",
+                "post_compaction_reasoning_chars",
+                "tool_results_elided",
+            ],
+            "exact key set — the ten RunStats compaction counters, field for field"
+        );
+    }
+
+    /// A pre-existing v2 `RunRecord` JSON that OMITS the `compaction_facts`
+    /// key (every record written before this field existed) must deserialize
+    /// with `compaction_facts == None` — the `#[serde(default)]` additive
+    /// guarantee, mirroring `backend_settings`: no migration, no
+    /// `SCHEMA_VERSION` bump.
+    #[test]
+    fn compaction_facts_omitted_key_deserializes_to_none() {
+        let r = sample_run_record();
+        let json = serde_json::to_string(&r).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as Value");
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.remove("compaction_facts");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let parsed: RunRecord = serde_json::from_str(&stripped).expect("deserialize");
+        assert_eq!(
+            parsed.compaction_facts, None,
+            "omitted compaction_facts key must default to None (pre-additive v2 records)"
+        );
+        // And the rest of the record is unchanged.
+        assert_eq!(parsed.run_id, r.run_id);
+        assert_eq!(parsed.schema_version, r.schema_version);
+        assert_eq!(parsed.schema_version, 2, "the schema version did NOT bump");
+    }
+
+    /// A `RunRecord` carrying `Some(CompactionFacts { .. })` with every
+    /// field populated must round-trip through serde without loss.
+    #[test]
+    fn compaction_facts_some_round_trips() {
+        let mut r = sample_run_record();
+        r.compaction_facts = Some(CompactionFacts {
+            compactions: 1,
+            highest_compaction_tier: 2,
+            compaction_tokens_reclaimed: 95_000,
+            tool_results_elided: 4,
+            compaction_elided_rereads: 2,
+            compaction_repeated_calls: 1,
+            compaction_orphan_tool_results: 0,
+            compaction_pre_reasoning_chars_sum: 40_000,
+            compaction_pre_reasoning_turns: 11,
+            post_compaction_reasoning_chars: vec![500, 700, 0],
         });
         round_trip(&r);
     }

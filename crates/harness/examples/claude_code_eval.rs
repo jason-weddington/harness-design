@@ -523,6 +523,16 @@ async fn main() {
                 answer_schema_rejections: 0,
                 modified_workspace_rejections: 0,
                 tree_baseline_unobservable: false,
+                compactions: 0,
+                highest_compaction_tier: 0,
+                compaction_tokens_reclaimed: 0,
+                tool_results_elided: 0,
+                compaction_elided_rereads: 0,
+                compaction_repeated_calls: 0,
+                compaction_orphan_tool_results: 0,
+                compaction_pre_reasoning_chars_sum: 0,
+                compaction_pre_reasoning_turns: 0,
+                post_compaction_reasoning_chars: Vec::new(),
             };
 
             let trial = TrialResult {

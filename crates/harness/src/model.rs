@@ -446,6 +446,28 @@ pub trait ModelBackend: Send + Sync {
             source: MaxTokensSource::Fallback,
         }
     }
+
+    /// The model's advertised context-window budget, in tokens — the number
+    /// in-run compaction compacts against ([`crate::engine`] gates on this;
+    /// design 08, `docs/design/08-context-budget.md`).
+    ///
+    /// **`None` means "no advertised context budget"** — this backend/model
+    /// pair publishes no limit as a number, so the compaction path is OFF by
+    /// construction for that backend (design 08's "no advertised limit means
+    /// no compaction" clause: Anthropic and Bedrock only discover the limit
+    /// reactively by string-matching a 400, so a run on those backends behaves
+    /// exactly as it does today — compaction is Ollama-only without any
+    /// `if kind == ollama` special case).
+    ///
+    /// SYNC default method (no `async`) for the same dyn-safety reason as
+    /// [`Self::output_cap`]: the loop holds backends as `Arc<dyn
+    /// ModelBackend>` (see the trait docs), and a bare `async fn` in a trait
+    /// is not object-safe on this toolchain. Reading a construction-time
+    /// field needs no I/O, so there is nothing to await — making it `async`
+    /// would force a boxed future per call for zero behaviour.
+    fn context_limit(&self) -> Option<u32> {
+        None
+    }
 }
 
 // =======================================================================
@@ -946,6 +968,22 @@ mod tests {
         };
         let turn = backend.turn(&req).await.expect("turn ok");
         assert_eq!(turn.text(), "ok");
+    }
+
+    /// The default `context_limit` is `None` — no advertised context budget —
+    /// reachable through an `Arc<dyn ModelBackend>` — the routing shape the
+    /// loop uses, and the assertion that the new sync default method did not
+    /// break object safety. `None` is the compaction gate: a backend that
+    /// advertises no limit is never compacted by construction (design 08,
+    /// "Compaction is Ollama-only").
+    #[tokio::test]
+    async fn context_limit_default_is_none_through_dyn() {
+        let backend: Arc<dyn ModelBackend> = Arc::new(TurnOnlyBackend);
+        assert_eq!(
+            backend.context_limit(),
+            None,
+            "a backend overriding only `turn` must inherit the `None` default"
+        );
     }
 
     /// `as_str` returns exactly the four pinned strings — the wire/record
