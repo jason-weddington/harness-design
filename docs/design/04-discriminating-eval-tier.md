@@ -50,3 +50,17 @@ Two side benefits: **the eval measures the value of grooming itself** — score-
 3. **Harness-vs-harness deferred.** Once the ladder discriminates models on talos, the same tasks serve the talos-vs-claude-code comparison (Harness-Bench frame: fix prompts/sandbox/budget/evaluator, vary harness) as a follow-up matrix.
 4. **Separate `evals` repo** for task artifacts (snapshots, statements, sealed tests). Keeps benchmark content out of dispatch agents' reach (the csv-ledger answer-key incident), keeps five other repos' code out of this repo's history, and absorbs continuous rung growth. The harness repo keeps the runner.
 5. **grit-mile code may be used in eval tasks** (Jason, 2026-08-14) — same private trust boundary.
+
+## Count-check arming and -q sealed gates (2026-08-20 grooming of 0595137d; ratified 2026-09-18)
+
+**Mechanism.** A sealed `gate_command` ending in `-q` puts pytest at verbosity -1, where the trailing stats line (`N failed, M passed in 4.46s`) is written WITHOUT `===` padding, so `parse_pytest_summary_totals` returns `None` and `summary_count` stays `None` — while the injected `PYTEST_ADDOPTS=-rA` still produces the `short test summary info` section, so ids parse normally and the trial scores as a normal (never `parse-empty`) result. The count-mismatch cross-check (`resolve` step 2) therefore never fires: it is not armed, not agreeing. This is surfaced per trial as `count_check=off` on the trial line and aggregated as the `cnt_off` summary column (`MinedReport::count_check_off`).
+
+**Cancellation.** A repo's own `[tool.pytest.ini_options] addopts` containing `-v` nets verbosity back to 0 and restores the `===`-padded stats banner — the cross-check arms itself and `cnt_off` returns to 0 for that task.
+
+**Where it bites today.** The count-check is OFF for exactly the two tier-2 tasks whose repo lacks `-v` at the pinned parent commit: `cleanr-comment-filters` (parent bf19b47) and `cleanr-owner-comments` (parent 78c7358) — cleanr carries `addopts = "-m 'not integration'"` with no `-v`. The other six keep it ON: agent_gtd ×3 at 6ca92d3 / 604a66b / aec3f15 with `addopts = "--strict-markers -v"`; flickrasync at d5fbce9 with `"-v -m 'not integration'"`; photoqueue ×2 at e288acb / eedafb1 with `"--strict-markers -v"`.
+
+**Recommendation.** Drop `-q` from the `gate_command` of those two `task.json` files in the separate talos-evals repo, so every task emits the padded banner and the tripwire arms uniformly — this is explicitly OUT OF SCOPE for the harness repo (cross-repo data change; it also alters the agent-visible gate command and therefore the task itself, so it needs its own grooming and a before/after score comparison on the captured corpus).
+
+**No runtime rewrite.** The harness deliberately does NOT rewrite a sealed gate command at run time; the sealed command is provenance of record, and silently un-sealing it would change what the gate measured.
+
+**Diagnostic pattern.** For the current eight-task ladder at k trials, expect the `cnt_off` column to read `k` on `cleanr-comment-filters` and `cleanr-owner-comments` and `0` on the other six. ANY other pattern (nonzero on a `-v` task, or zero on a cleanr task before its `task.json` drops `-q`) means either `parse_pytest_summary_totals` regressed or a repo's pinned `addopts` changed — open that trial's `gate-output.txt` (path already printed on every trial line as `gate_output:`) to tell which.

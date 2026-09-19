@@ -385,7 +385,7 @@ async fn main() {
                 None => "-",
             };
             let mut line = format!(
-                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | invalid_finish={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | agent_gate={agent_gate} | gate_post={gate_post_desc} | gate_output: {}",
+                "  trial {}: {} | claimed={} | {} iters | {}s | fr_armed={} | green_at_exit={} | nudges={} | tree_dirty={} | static_iters={} | peak_static={} | mut_iters={} | bash_ok={} | edits_ok={} | invalid_finish={} | tests_added={} | tests_modified={} | sections={} | dropped_outside={} | count_check={} | agent_gate={agent_gate} | gate_post={gate_post_desc} | gate_output: {}",
                 trial.trial + 1,
                 trial_score_one_liner(&trial.score),
                 trial.claimed_disposition,
@@ -405,6 +405,7 @@ async fn main() {
                 trial.agent_tests_modified.len(),
                 trial.sections_seen,
                 trial.dropped_outside_section,
+                trial.count_check().label(),
                 trial.gate_output_path.display(),
             );
             if let Some(p) = &trial.agent_gate_output_path {
@@ -533,7 +534,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         header.agent_gate,
     );
     println!(
-        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "{:<name_col$}  {:>12}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
         "task",
         "resolved/val",
         "res_rate",
@@ -552,6 +553,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
         "res_red",
         "alr_sat",
         "no_chg_rj",
+        "cnt_off",
     );
     for r in summary {
         let claimed_done: u32 = r
@@ -590,7 +592,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             .filter(|t| !t.agent_tests_added.is_empty())
             .count();
         println!(
-            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+            "{:<name_col$}  {:>12}  {:>9.3}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9.3}  {:>9}  {:>9}  {:>9}  {:>9.2}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
             r.task_id,
             format!("{}/{}", r.resolved_count, r.valid_denominator()),
             r.resolved_rate(),
@@ -609,6 +611,7 @@ fn print_summary(summary: &[MinedReport], header: &SummaryHeader<'_>) {
             r.resolved_gate_red(),
             r.already_satisfied_count(),
             no_change_rejections,
+            r.count_check_off(),
         );
     }
 }

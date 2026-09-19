@@ -545,10 +545,15 @@ pub trait TestReportParser: Send + Sync {
 ///
 /// The eval MUST inject `PYTEST_ADDOPTS="-rA"` (see [`sealed_regate_score`])
 /// so pytest emits `PASSED/FAILED/ERROR/SKIPPED/XFAIL/XPASS <nodeid>` short-
-/// summary lines regardless of the gate's own `-q`. Under bare `-q`, passes
-/// print as dots and never appear in the output — the parser would return an
-/// empty map, which [`resolve`] catches as [`TrialScore::Invalid`]
-/// (`parse-empty`) rather than a silent unresolved verdict.
+/// summary lines regardless of the gate's own `-q`. Because `-rA` is always
+/// injected, ids DO parse under a gate-level `-q`; what verbosity -1 removes
+/// is the `===` padding on the trailing stats line, so
+/// [`parse_pytest_summary_totals`] returns `None`, `summary_count` is `None`,
+/// and the count-mismatch cross-check is unarmed — surfaced as
+/// [`CountCheck::Off`], never as `parse-empty`. A repo's own pytest
+/// `addopts` containing `-v` nets verbosity back to 0 and restores the padded
+/// banner. The bare `-q` run WITHOUT `-rA` (still genuinely `parse-empty`)
+/// is only reachable if the injection is ever dropped.
 ///
 /// A second-source `summary_count` is scraped from pytest's trailing summary
 /// line (`"=== N passed, M failed, ..."`), so the scorer can flag a mismatch
@@ -795,6 +800,8 @@ fn matches_exclusion(raw_nodeid: &str, normalized_nodeid: &str, excl: &str) -> b
 /// - `gate-no-exit-code` — `sealed_regate_score`, gate killed by signal with no output
 /// - `parse-empty` — `resolve`, parser emitted empty map
 /// - `parse-mismatch` — `resolve`, parsed count != summary count
+///   (a `None` summary count never fires this — it means the cross-check is
+///   NOT armed, surfaced per-trial as `count_check=off`, never as agreement)
 /// - `positive-control-uncollected` — `resolve`, a positive control id is absent
 ///
 /// Invalid means the MEASUREMENT failed and the trial leaves the denominator.
@@ -865,6 +872,9 @@ pub fn resolve(
         };
     }
     // (2) Count mismatch: parsed count disagrees with pytest's own total.
+    // A `None` summary count means the cross-check is NOT armed and is
+    // surfaced per-trial as `count_check=off`; it is never treated as
+    // agreement.
     if let Some(n) = summary_count
         && n != parsed.len()
     {
@@ -1618,6 +1628,11 @@ pub struct MinedTrialResult {
     /// Number of `short test summary info` section headers seen in the
     /// sealed re-gate output for this trial. See [`ParseReport::sections_seen`].
     pub sections_seen: usize,
+    /// Second-source count scraped from pytest's trailing stats line
+    /// (see [`ParseReport::summary_count`]). `None` means the count-mismatch
+    /// cross-check was NOT ARMED for this trial — it does NOT mean the counts
+    /// agreed. Surfaced per-trial via [`MinedTrialResult::count_check`].
+    pub summary_count: Option<usize>,
     /// Test files the AGENT created during the run, captured by
     /// [`scan_authored_tests`] BEFORE `copy_sealed` overwrites the sealed
     /// paths. This is the test-first-compliance measurement: a non-empty
@@ -1724,6 +1739,39 @@ pub struct MinedTrialResult {
     pub transcript_path: Option<PathBuf>,
 }
 
+/// Whether the count-mismatch cross-check ([`resolve`] step 2) was armed for
+/// a trial, derived from [`MinedTrialResult::summary_count`] and
+/// [`MinedTrialResult::statuses`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountCheck {
+    /// `summary_count.is_some()`: the `===`-padded stats line was present and
+    /// the cross-check ran.
+    On,
+    /// `summary_count.is_none() && !statuses.is_empty()`: ids parsed but no
+    /// `===`-padded stats line was present, so the cross-check silently did
+    /// nothing. `Off` means the parsed report had ids but no `===`-padded
+    /// stats line, whichever the cause (a gate at verbosity -1 under `-q`,
+    /// or a signal-killed gate that never reached the summary — see the
+    /// `statuses` field doc on [`MinedTrialResult`]); read it alongside
+    /// `score`.
+    Off,
+    /// `summary_count.is_none() && statuses.is_empty()`: the gate produced no
+    /// parseable report — a pre-agent `Invalid` trial or `parse-empty`.
+    NotRun,
+}
+
+impl CountCheck {
+    /// Stable per-trial-line label for this arming state.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::NotRun => "n/a",
+        }
+    }
+}
+
 /// The full run report over `k` trials of one task.
 #[derive(Debug, Clone)]
 pub struct MinedReport {
@@ -1744,6 +1792,21 @@ pub struct MinedReport {
     pub invalid_count: u32,
     /// Per-trial detail, in order.
     pub trials: Vec<MinedTrialResult>,
+}
+
+impl MinedTrialResult {
+    /// Whether the count-mismatch cross-check was armed for this trial. See
+    /// [`CountCheck`] for the exact predicate per variant.
+    #[must_use]
+    pub fn count_check(&self) -> CountCheck {
+        if self.summary_count.is_some() {
+            CountCheck::On
+        } else if !self.statuses.is_empty() {
+            CountCheck::Off
+        } else {
+            CountCheck::NotRun
+        }
+    }
 }
 
 impl MinedReport {
@@ -1772,6 +1835,19 @@ impl MinedReport {
     #[must_use]
     pub fn valid_denominator(&self) -> u32 {
         self.k.saturating_sub(self.invalid_count)
+    }
+
+    /// Number of trials whose [`MinedTrialResult::count_check`] is
+    /// [`CountCheck::Off`]. A nonzero value means the count-mismatch
+    /// cross-check was inert for that many trials; `NotRun` and `On` trials
+    /// do not count.
+    #[must_use]
+    pub fn count_check_off(&self) -> u32 {
+        self.trials
+            .iter()
+            .filter(|t| t.count_check() == CountCheck::Off)
+            .map(|_| 1u32)
+            .sum()
     }
 
     /// `resolved_count / valid_denominator` as an f64. Returns `0.0` when
@@ -2338,6 +2414,7 @@ async fn single_trial<B: ModelBackend>(
         statuses: reparse.statuses,
         dropped_outside_section: reparse.dropped_outside_section,
         sections_seen: reparse.sections_seen,
+        summary_count: reparse.summary_count,
         agent_tests_added,
         agent_tests_modified,
         gate_output_path,
@@ -2381,6 +2458,7 @@ fn invalid_trial(
         statuses: BTreeMap::new(),
         dropped_outside_section: 0,
         sections_seen: 0,
+        summary_count: None,
         agent_tests_added: Vec::new(),
         agent_tests_modified: Vec::new(),
         gate_output_path,
@@ -2438,7 +2516,7 @@ impl Drop for ScratchDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentGateMode, CLAIMED_ALREADY_SATISFIED, CLAIMED_BLOCKED, CLAIMED_DONE,
+        AgentGateMode, CLAIMED_ALREADY_SATISFIED, CLAIMED_BLOCKED, CLAIMED_DONE, CountCheck,
         DEFAULT_AGENT_GATE_TIMEOUT, MinedReport, MinedTask, MinedTrialResult, PytestParser,
         ResolveDetail, ScratchDir, SealedEntry, SpecLevel, TestReportParser, TestStatus,
         TrialScore, build_collection_errors, claimed_disposition_label, copy_sealed, expand_home,
@@ -3982,6 +4060,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             statuses: BTreeMap::new(),
             dropped_outside_section: 0,
             sections_seen: 0,
+            summary_count: None,
             agent_tests_added: Vec::new(),
             agent_tests_modified: Vec::new(),
             gate_output_path: PathBuf::from("/dev/null"),
@@ -6245,6 +6324,141 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             }
             other => panic!("expected Invalid{{parse-empty}}, got {other:?}"),
         }
+    }
+
+    // Inline quiet-gate capture (AC precedent:
+    // `status_lines_without_a_summary_header_parse_empty` below). Reproduced
+    // empirically with `PYTEST_ADDOPTS=-rA pytest 9.0.2 tests -q` on a
+    // two-test file. Verbatim pytest-9.0.2 byte shape, placeholder nodeids
+    // only — do NOT hand-edit. NOTE: the trailing `2 passed in 0.01s` line
+    // carries NO `===` padding (verbosity -1) — that absence is the point:
+    // it is why `parse_pytest_summary_totals` returns `None` on the two
+    // sealed `-q` tier-2 tasks. The `PASSES` banner is the line a future
+    // parser change is most likely to trip on.
+    const QUIET_NO_BANNER: &str = concat!(
+        "..                                                          [100%]\n",
+        "==================================== PASSES ====================================\n",
+        "=========================== short test summary info ============================\n",
+        "PASSED tests/test_x.py::test_a\n",
+        "PASSED tests/test_x.py::test_b\n",
+        "2 passed in 0.01s",
+    );
+
+    // Verbatim-shaped quiet-gate capture (see [`QUIET_NO_BANNER`] doc):
+    // `-rA` ids parse, but the trailing stats line carries no `===` padding,
+    // so `parse_pytest_summary_totals` returns `None`.
+    #[test]
+    fn pytest_parser_parses_quiet_no_banner_capture() {
+        // The `PASSES` banner is neither counted as a section nor scraped as
+        // a totals line; only the `short test summary info` header counts.
+        let report = PytestParser.parse(QUIET_NO_BANNER);
+        assert_eq!(report.summary_count, None);
+        assert_eq!(report.sections_seen, 1);
+        assert_eq!(report.statuses.len(), 2);
+        assert_eq!(report.dropped_outside_section, 0);
+    }
+
+    // A trial carrying that parse has ids but no `===`-padded stats line:
+    // the count cross-check silently did nothing → `Off`.
+    #[test]
+    fn quiet_no_banner_trial_counts_off() {
+        let report = PytestParser.parse(QUIET_NO_BANNER);
+        let trial = MinedTrialResult {
+            statuses: report.statuses,
+            summary_count: report.summary_count,
+            ..trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        assert_eq!(trial.count_check(), CountCheck::Off);
+        assert_eq!(trial.count_check().label(), "off");
+    }
+
+    // The bannered fixture still scrapes a totals count → `On`.
+    #[test]
+    fn bannered_fixture_counts_on() {
+        let fixture = include_str!("../testdata/mined_eval/attribution-trial-0.txt");
+        let report = PytestParser.parse(fixture);
+        assert_eq!(report.summary_count, Some(8));
+        let trial = MinedTrialResult {
+            statuses: report.statuses,
+            summary_count: report.summary_count,
+            ..trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        assert_eq!(trial.count_check(), CountCheck::On);
+        assert_eq!(trial.count_check().label(), "on");
+    }
+
+    #[test]
+    fn no_report_trial_counts_not_run_and_report_aggregates_zero_off() {
+        let trial = MinedTrialResult {
+            statuses: BTreeMap::new(),
+            summary_count: None,
+            ..trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        assert_eq!(trial.count_check(), CountCheck::NotRun);
+        assert_eq!(trial.count_check().label(), "n/a");
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 1,
+            resolved_count: 1,
+            invalid_count: 0,
+            trials: vec![trial],
+        };
+        assert_eq!(report.count_check_off(), 0);
+    }
+
+    #[test]
+    fn count_check_off_counts_only_off_trials() {
+        let bannered = PytestParser.parse(include_str!(
+            "../testdata/mined_eval/attribution-trial-0.txt"
+        ));
+        let on_trial = MinedTrialResult {
+            statuses: bannered.statuses,
+            summary_count: bannered.summary_count,
+            ..trial_tel(0, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        let quiet = PytestParser.parse(QUIET_NO_BANNER);
+        let off_trial = MinedTrialResult {
+            statuses: quiet.statuses,
+            summary_count: quiet.summary_count,
+            ..trial_tel(1, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        let not_run_trial = MinedTrialResult {
+            statuses: BTreeMap::new(),
+            summary_count: None,
+            ..trial_tel(2, TrialScore::Resolved, CLAIMED_DONE, false, 0)
+        };
+        let report = MinedReport {
+            task_id: "t".to_string(),
+            backend_desc: "b".to_string(),
+            spec_level: SpecLevel::S2,
+            max_iterations: 24,
+            k: 3,
+            resolved_count: 3,
+            invalid_count: 0,
+            trials: vec![on_trial, off_trial, not_run_trial],
+        };
+        assert_eq!(report.count_check_off(), 1);
+    }
+
+    // A `None` summary count never becomes agreement: the cross-check is
+    // simply not armed and `resolve` skips its step (2).
+    #[test]
+    fn resolve_skips_count_check_when_summary_count_is_none() {
+        let task = sample_task_for_scoring();
+        let parsed = status_map(&[
+            (
+                "tests/test_cleanr.py::TestCommentFilters::test_owner_comments_skipped",
+                TestStatus::Passed,
+            ),
+            (
+                "tests/test_cleanr.py::TestCommentFilters::test_reader_comments_kept",
+                TestStatus::Passed,
+            ),
+        ]);
+        assert_eq!(resolve(&parsed, None, &task), TrialScore::Resolved);
     }
 
     #[test]
