@@ -8,9 +8,18 @@
 //! Each outer iteration does EXACTLY ONE unit of work, then the HARNESS owns
 //! a per-iteration git commit (a deliberate ralph-mode-only exception to the
 //! worker-owns-git contract) — but ONLY for a green `Finished(Done)` outcome.
-//! A non-green inner outcome, or a green outcome whose per-iteration `git
-//! commit` exited non-zero (e.g. a rejecting pre-commit hook), is REVERTED to
-//! the last green commit (`git reset --hard HEAD` then `git clean -fd`; the
+//! A green outcome whose per-iteration `git commit` exited non-zero (e.g. a
+//! rejecting pre-commit hook) FIRST gets a bounded re-stage-and-retry: the
+//! harness re-runs `git add -A` and the identical commit — at most
+//! [`MAX_COMMIT_RETRIES`] (2) retries, so at most 3 total `git commit`
+//! invocations per green iteration — but ONLY when the probe after the
+//! rejection shows the hook MUTATED the work tree after the initial
+//! `git add -A` (a non-space work-tree column in the `git status --porcelain`
+//! XY code, e.g. `AM`/` M`/`MM`/`??`). A pure checker hook leaves the
+//! staged-only lines (`A `/`M `) untouched and goes straight to the revert,
+//! so a genuinely red gate is never papered over. A non-green inner outcome,
+//! or a green outcome whose commits stayed rejected, is REVERTED to the last
+//! green commit (`git reset --hard HEAD` then `git clean -fd`; the
 //! iteration's PROGRESS.md append is discarded — a deliberate clean do-over;
 //! ignored files such as `target/` survive — `git clean` never uses
 //! `-x`/`-X`), and the loop retries with a fresh context. After
@@ -51,7 +60,8 @@ pub const DEFAULT_STUCK_K: u32 = 3;
 
 /// Default consecutive-do-over cap: how many consecutive do-overs (a non-green
 /// inner outcome that left the tree dirty, or a green outcome whose per-
-/// iteration commit was rejected — e.g. by a failing pre-commit hook — both
+/// iteration commit stayed rejected — e.g. by a failing pre-commit hook that
+/// survived the bounded re-stage-and-retry of [`MAX_COMMIT_RETRIES`] — both
 /// reverted to the last green commit) the outer loop tolerates before
 /// terminating with [`RalphTerminal::DoOversExhausted`]. An inner
 /// [`LoopOutcome::BackendError`] is EXEMPT (recorded + loop continues, counter
@@ -79,14 +89,24 @@ pub const DEFAULT_STOP_COMMAND_TIMEOUT: Duration = Duration::from_mins(5);
 /// bounds a wedged repo.
 const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Bound on re-stage-and-retry attempts after a failed per-iteration
+/// `git commit` — at most 2 retries, i.e. at most 3 total `git commit`
+/// invocations per green iteration. Crate-private, mirroring
+/// [`GIT_TIMEOUT`]: unlike the `pub` sibling defaults
+/// ([`DEFAULT_STUCK_K`]/[`DEFAULT_MAX_DO_OVERS`], which `talos` reads at its
+/// flag definitions), no `talos` consumer exists for this bound.
+const MAX_COMMIT_RETRIES: u32 = 2;
+
 /// Configuration for one call to [`run_ralph`]: the objective, the
 /// stop-command oracle, the circuit breakers, and the inner-run knobs.
 ///
-/// The harness commits ONLY green `Finished(Done)` outcomes; a non-green
-/// inner outcome or a green commit that exited non-zero is reverted to the
-/// last green commit and retried as a do-over. [`Self::max_do_overs`] caps
-/// consecutive do-overs before [`RalphTerminal::DoOversExhausted`] fires; a
-/// green commit resets the count; an inner [`LoopOutcome::BackendError`] is
+/// The harness commits ONLY green `Finished(Done)` outcomes; a green outcome
+/// whose commit was rejected by a pre-commit hook FIRST gets the bounded
+/// re-stage-and-retry (see [`MAX_COMMIT_RETRIES`]) — only a rejection that
+/// persists past it, or a non-green inner outcome, is reverted to
+/// the last green commit and retried as a do-over. [`Self::max_do_overs`]
+/// caps consecutive do-overs before [`RalphTerminal::DoOversExhausted`] fires;
+/// a green commit resets the count; an inner [`LoopOutcome::BackendError`] is
 /// exempt (recorded + continued, counter untouched).
 ///
 /// Derives `Debug` and `Clone` exactly like [`RunConfig`] — `Arc<dyn Clock>`
@@ -121,7 +141,9 @@ pub struct RalphConfig {
     /// NOT advance to a new green commit: either a non-green inner outcome
     /// (NOT a [`LoopOutcome::BackendError`], which is exempt) that left the
     /// tree dirty, or a green `Finished(Done)` whose per-iteration `git commit`
-    /// exited non-zero (e.g. a rejecting pre-commit hook). Either way the tree
+    /// exited non-zero (e.g. a rejecting pre-commit hook) — where the
+    /// rejection FIRST went through the bounded re-stage-and-retry of
+    /// [`MAX_COMMIT_RETRIES`] without landing. Either way the tree
     /// is reverted to the last green commit and the loop tries again with a
     /// fresh context. After this many CONSECUTIVE do-overs (a green commit
     /// resets the count to zero) the loop terminates with
@@ -258,14 +280,17 @@ impl RalphConfig {
 /// backend error is RECORDED on the iteration outcome and the loop
 /// continues, never a terminal) so tests can assert on it directly.
 ///
-/// Commit contract: ralph commits ONLY green `Finished(Done)` outcomes; any
-/// non-green inner outcome (or a green outcome whose `git commit` exited
-/// non-zero, e.g. a rejecting pre-commit hook) is reverted to the last green
-/// commit (`git reset --hard HEAD` then `git clean -fd`; ignored files such as
-/// `target/` survive — `git clean` never uses `-x`/`-X`), the iteration's
-/// PROGRESS.md append is discarded (a deliberate clean do-over), and the loop
-/// retries with a fresh context. After `max_do_overs` CONSECUTIVE such do-
-/// overs (a green commit resets the count) the loop terminates with
+/// Commit contract: ralph commits ONLY green `Finished(Done)` outcomes; a
+/// green outcome whose `git commit` exited non-zero (e.g. a rejecting
+/// pre-commit hook) FIRST gets the bounded re-stage-and-retry of
+/// [`MAX_COMMIT_RETRIES`] — only a rejection that survives it, or a non-green
+/// inner outcome, is reverted to the
+/// last green commit (`git reset --hard HEAD` then `git clean -fd`; ignored
+/// files such as `target/` survive — `git clean` never uses `-x`/`-X`),
+/// the iteration's PROGRESS.md append is discarded (a deliberate clean
+/// do-over), and the loop retries with a fresh context. After
+/// `max_do_overs` CONSECUTIVE such do-overs (a green commit resets the count)
+/// the loop terminates with
 /// [`Self::DoOversExhausted`] (a task-side terminal, exit 20 — the completing
 /// iteration IS appended, like [`Self::Stuck`]/[`Self::MaxIterationsExhausted`]).
 /// An inner [`LoopOutcome::BackendError`] is EXEMPT from the do-over counter
@@ -288,7 +313,8 @@ pub enum RalphTerminal {
     /// `max_do_overs` CONSECUTIVE do-overs elapsed: `max_do_overs` iterations
     /// in a row failed to advance to a new green commit (a non-green inner
     /// outcome that left the tree dirty, or a green `Finished(Done)` whose
-    /// `git commit` exited non-zero — both reverted to the last green commit).
+    /// `git commit` exited non-zero even after the bounded re-stage-and-retry
+    /// of [`MAX_COMMIT_RETRIES`] — both reverted to the last green commit).
     /// A task-side terminal (exit 20), distinct from [`Self::Error`]: the
     /// completing iteration IS appended before this terminal fires, so the
     /// do-over count the breaker tests can be inspected.
@@ -311,7 +337,8 @@ pub enum RalphTerminal {
     /// describes the failure; the partial iteration's [`RalphIterationOutcome`]
     /// is NOT appended to [`RalphReport::iterations`] on this terminal (a
     /// `git commit` that RUNS but exits non-zero — e.g. a rejecting pre-commit
-    /// hook — is NOT an `Error`: it triggers a revert + do-over instead).
+    /// hook — is NOT an `Error`: it triggers the bounded re-stage-and-retry of
+    /// [`MAX_COMMIT_RETRIES`] first, then a revert + do-over instead).
     Error(String),
 }
 
@@ -334,6 +361,18 @@ pub struct RalphIterationOutcome {
     pub made_changes: bool,
     /// Whether a commit was created this iteration.
     pub committed: bool,
+    /// How many RETRY `git commit` invocations ran this iteration (the
+    /// bounded re-stage-and-retry after a hook-rejected commit): 0 when the
+    /// initial commit exited 0 or no commit was attempted, at most
+    /// [`MAX_COMMIT_RETRIES`] otherwise. Debug telemetry only — this struct
+    /// is not serialized (no serde derive, no transcript), so the count has
+    /// no persistence ripple.
+    pub commit_retries: u8,
+    /// `Some` of the LAST rejected commit's trimmed `stderr` (byte-capped at
+    /// 512) when at least one `git commit` invocation exited non-zero this
+    /// iteration; `None` otherwise. Debug telemetry only, like
+    /// [`Self::commit_retries`].
+    pub commit_reject: Option<String>,
 }
 
 /// The full result of one [`run_ralph`] call: the objective, the terminal
@@ -380,14 +419,36 @@ impl RalphReport {
     }
 }
 
+/// Trim + byte-cap a rejected commit's stderr for the
+/// [`RalphIterationOutcome::commit_reject`] telemetry: at most 512 bytes,
+/// truncated back to a char boundary so the cap never splits a UTF-8 scalar.
+fn capped_reject(stderr: &str) -> String {
+    const REJECT_CAP: usize = 512;
+    let trimmed = stderr.trim();
+    if trimmed.len() <= REJECT_CAP {
+        return trimmed.to_string();
+    }
+    let mut end = REJECT_CAP;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
+}
+
 /// Run the Ralph outer loop: re-invoke the inner [`engine::run`] with a
 /// FRESH CONTEXT each iteration until the stop-command oracle reports the
 /// objective met, or a circuit breaker fires.
 ///
 /// Commit only green finishes: the harness commits ONLY when the inner
-/// outcome is a green `Finished(Done)` AND the tree changed. A non-green
-/// inner outcome (or a green outcome whose `git commit` exited non-zero, e.g.
-/// a rejecting pre-commit hook) is REVERTED to the last green commit (`git
+/// outcome is a green `Finished(Done)` AND the tree changed. A green outcome
+/// whose `git commit` exited non-zero (e.g. a rejecting pre-commit hook)
+/// FIRST gets a bounded re-stage-and-retry — `git add -A` + the identical
+/// commit again, at most [`MAX_COMMIT_RETRIES`] (2) retries, and only when
+/// the post-rejection probe shows the hook MUTATED the work tree after the
+/// initial `git add -A` (a non-space work-tree column in the porcelain XY
+/// code); a pure checker hook never triggers a retry. A non-green inner
+/// outcome, or a rejection that survives the retries, is REVERTED to the last
+/// green commit (`git
 /// reset --hard HEAD` then `git clean -fd`; the iteration's PROGRESS.md
 /// append is discarded — a deliberate clean do-over; ignored files such as
 /// `target/` survive — `git clean` never uses `-x`/`-X`), and the loop
@@ -567,8 +628,10 @@ pub async fn run_ralph(
         // (6) Commit only green finishes. The harness commits ONLY when the
         // inner outcome is a green `Finished(Done)` AND the tree changed; a
         // non-green inner outcome, or a green commit the repo's pre-commit
-        // hook rejected, leaves the tree dirty and is reverted below (a
-        // clean do-over). `git add -A` failure remains an infra
+        // hook keeps rejecting, leaves the tree dirty and is reverted below
+        // (a clean do-over). A hook-rejected commit FIRST gets a bounded
+        // re-stage-and-retry (see the loop below) and only then falls into
+        // the revert. `git add -A` failure remains an infra
         // `RalphTerminal::Error`; a `git commit` that RUNS but exits non-zero
         // (e.g. a rejecting pre-commit hook) triggers revert + do-over
         // instead of `Error` (a commit spawn failure is still an infra
@@ -576,6 +639,8 @@ pub async fn run_ralph(
         // works in a repo with no global git config.
         let mut committed = false;
         let mut commit_failed = false;
+        let mut commit_retries: u8 = 0;
+        let mut commit_reject: Option<String> = None;
         if is_green && made_changes {
             let add = exec::run(&ExecSpec::new(
                 "git",
@@ -597,45 +662,114 @@ pub async fn run_ralph(
             }
             // Commit message pinned format: `ralph: iteration {n} — {objective}`,
             // with {n} the 0-based iteration and {objective} verbatim (NOT
-            // truncated).
+            // truncated). Built once and re-invoked IDENTICALLY on every
+            // retry.
             let message = format!("ralph: iteration {i} — {}", config.objective);
-            let commit = exec::run(&ExecSpec::new(
-                "git",
-                vec![
-                    "-c".to_string(),
-                    "user.name=talos-ralph".to_string(),
-                    "-c".to_string(),
-                    "user.email=talos-ralph@localhost".to_string(),
-                    "commit".to_string(),
-                    "-m".to_string(),
-                    message,
-                ],
-                root.clone(),
-                GIT_TIMEOUT,
-            ))
-            .await;
-            match commit.exit_code {
-                None => {
-                    // spawn failure — infra Error (not a do-over).
-                    return RalphReport {
-                        objective,
-                        terminal: RalphTerminal::Error(format!(
-                            "git commit failed to spawn: {}",
-                            commit.stderr.trim()
-                        )),
-                        iterations,
-                    };
-                }
-                Some(0) => {
-                    committed = true;
-                }
-                Some(_) => {
-                    // commit ran but was rejected (e.g. a failing pre-commit
-                    // hook) — revert the tree and do over.
-                    commit_failed = true;
+            // Bounded re-stage-and-retry loop with ONE shared match on the
+            // commit exit code — the spawn-failure `None` arm below is the
+            // single code site for the initial attempt and every retry.
+            loop {
+                let commit = exec::run(&ExecSpec::new(
+                    "git",
+                    vec![
+                        "-c".to_string(),
+                        "user.name=talos-ralph".to_string(),
+                        "-c".to_string(),
+                        "user.email=talos-ralph@localhost".to_string(),
+                        "commit".to_string(),
+                        "-m".to_string(),
+                        message.clone(),
+                    ],
+                    root.clone(),
+                    GIT_TIMEOUT,
+                ))
+                .await;
+                match commit.exit_code {
+                    None => {
+                        // spawn failure — infra Error (not a do-over).
+                        return RalphReport {
+                            objective,
+                            terminal: RalphTerminal::Error(format!(
+                                "git commit failed to spawn: {}",
+                                commit.stderr.trim()
+                            )),
+                            iterations,
+                        };
+                    }
+                    Some(0) => {
+                        committed = true;
+                        break;
+                    }
+                    Some(_) => {
+                        // Commit ran but was rejected (e.g. a failing
+                        // pre-commit hook). Record the rejection FIRST so
+                        // the telemetry always carries the LAST rejected
+                        // commit's stderr, then decide on a retry.
+                        commit_reject = Some(capped_reject(&commit.stderr));
+                        // The probe runs ONLY while a retry remains: after
+                        // the final permitted (third) attempt, go straight
+                        // to the revert + do-over path with no further
+                        // probe.
+                        if u32::from(commit_retries) >= MAX_COMMIT_RETRIES {
+                            commit_failed = true;
+                            break;
+                        }
+                        // Retry discriminator: a rejected commit leaves the
+                        // staged changes STAGED, so the porcelain is
+                        // non-empty after EVERY rejection — non-emptiness
+                        // cannot discriminate. The work-tree column (the
+                        // SECOND character of the `git status --porcelain`
+                        // XY code) can: the preceding `git add -A` leaves
+                        // every line with a SPACE in that column, so any
+                        // non-space work-tree column (`AM`, ` M`, `MM`) or
+                        // hook-created file (`??`) is provably POST-ADD
+                        // mutation — i.e. a hook that fixed the tree. A
+                        // pure checker hook leaves the staged-only lines
+                        // untouched and takes the zero-retry path.
+                        let retry = match exec::observe_tree(&root, GIT_TIMEOUT).await {
+                            TreeObservation::Observed { porcelain, .. } => porcelain
+                                .lines()
+                                .any(|l| l.as_bytes().get(1).is_some_and(|c| *c != b' ')),
+                            TreeObservation::Unobservable { .. } => false,
+                        };
+                        if !retry {
+                            // staged-only-clean (or unobservable) probe — no
+                            // post-add mutation to re-stage.
+                            commit_failed = true;
+                            break;
+                        }
+                        // Re-stage the hook's mutation, then re-invoke the
+                        // identical commit. A failing re-add is an infra
+                        // `RalphTerminal::Error` (same shape as the initial
+                        // `git add` failure above), partial iteration NOT
+                        // appended.
+                        let add = exec::run(&ExecSpec::new(
+                            "git",
+                            vec!["add".to_string(), "-A".to_string()],
+                            root.clone(),
+                            GIT_TIMEOUT,
+                        ))
+                        .await;
+                        if add.exit_code != Some(0) {
+                            return RalphReport {
+                                objective,
+                                terminal: RalphTerminal::Error(format!(
+                                    "git add exited {:?}: {}",
+                                    add.exit_code,
+                                    add.stderr.trim()
+                                )),
+                                iterations,
+                            };
+                        }
+                        commit_retries += 1;
+                    }
                 }
             }
         }
+        debug_assert!(
+            u32::from(commit_retries) <= MAX_COMMIT_RETRIES,
+            "commit retry bound breached"
+        );
 
         // (6b) Revert-to-green. On a non-green inner outcome that left the
         // tree dirty, OR a green outcome whose commit exited non-zero, reset
@@ -702,6 +836,8 @@ pub async fn run_ralph(
                 inner_stats: result.stats,
                 made_changes,
                 committed,
+                commit_retries,
+                commit_reject: commit_reject.clone(),
             });
         } else {
             match stop.exit_code {
@@ -712,6 +848,8 @@ pub async fn run_ralph(
                         inner_stats: result.stats,
                         made_changes,
                         committed,
+                        commit_retries,
+                        commit_reject: commit_reject.clone(),
                     });
                     return RalphReport {
                         objective,
@@ -738,6 +876,8 @@ pub async fn run_ralph(
                         inner_stats: result.stats,
                         made_changes,
                         committed,
+                        commit_retries,
+                        commit_reject: commit_reject.clone(),
                     });
                 }
             }
@@ -859,7 +999,8 @@ pub async fn run_ralph(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal, run_ralph,
+        DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport, RalphTerminal,
+        capped_reject, run_ralph,
     };
     use crate::engine::{FINISH_TOOL_NAME, LoopOutcome};
     use crate::exec::ChangeEvidence;
@@ -1760,6 +1901,321 @@ mod tests {
             Some(1),
             "only the init commit must land; every green commit is rejected and reverted"
         );
+    }
+
+    /// Make HEAD born with an initial commit. Anything the test already wrote
+    /// into the work tree is STAGED first, so a test can seed a tracked file
+    /// before the run starts. No global git config is needed.
+    fn initial_commit(root: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(root)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@l",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(root)
+            .output()
+            .expect("initial commit");
+    }
+
+    /// `git show <args...>` stdout via the harness's own exec seam.
+    async fn git_show(root: &std::path::Path, args: &[&str]) -> String {
+        let out = exec_run(&ExecSpec::new(
+            "git",
+            std::iter::once("show".to_string())
+                .chain(args.iter().map(std::string::ToString::to_string))
+                .collect(),
+            root.to_path_buf(),
+            Duration::from_secs(10),
+        ))
+        .await;
+        out.stdout
+    }
+
+    #[tokio::test]
+    async fn commit_retry_on_fixer_hook_then_success() {
+        // A pre-commit hook that MUTATES the work tree after `git add -A`
+        // (a fixer) rejects the first commit while leaving a staged-but-
+        // modified file. The bounded re-stage-and-retry fires once: `git add
+        // -A` again, then the IDENTICAL commit — whose second hook
+        // invocation finds nothing left to fix and exits 0, so the retry
+        // lands the hook's mutation. The marker file OUTSIDE the work tree
+        // counts hook invocations across the reverts: exactly 2 (initial +
+        // one retry — 1 would mean the retry never fired, >2 would mean the
+        // bound leaked).
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        let marker_root = TempDir::new().expect("marker tempdir");
+        let marker = marker_root.path().join("marker.txt");
+        git_init(&root_path);
+        initial_commit(&root_path);
+        // Fixer hook: append the missing trailing newline to c0.txt and exit
+        // 1 ONLY when it changed something (idempotent on re-run); append a
+        // line to the marker file at an ABSOLUTE path OUTSIDE the work tree
+        // on EVERY invocation (so the counter survives the harness's
+        // reverts and untracked-file cleans).
+        let hook = root_path.join(".git").join("hooks").join("pre-commit");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf 'invoked\\n' >> '{}'\n\
+             if [ -f c0.txt ] && [ \"$(tail -c 1 c0.txt | wc -l)\" -eq 0 ]; then\n\
+             printf '\\n' >> c0.txt\n\
+             exit 1\n\
+             fi\n\
+             exit 0\n",
+            marker.display()
+        );
+        std::fs::write(&hook, script).expect("write hook");
+        make_executable(&hook);
+        let ctx = ctx_for(&root_path);
+
+        // One iteration: create c0.txt with content `c` — NO trailing
+        // newline, so the hook necessarily mutates on the first attempt —
+        // then finish(done).
+        let backend = MockBackend::from_turns(vec![
+            edit_create_call("e0", "c0.txt", "c"),
+            finish_done("f0"),
+        ]);
+
+        let config = RalphConfig::new("fixer-objective", stop_when_n_commits(2), 5, 4);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+
+        assert_eq!(
+            report.terminal,
+            RalphTerminal::StopConditionMet,
+            "terminal must be StopConditionMet; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.outer_iterations(),
+            1,
+            "exactly one outer iteration must run; got {}",
+            report.outer_iterations()
+        );
+        assert!(
+            report.iterations[0].committed,
+            "the retried commit must land (committed == true)"
+        );
+        assert_eq!(
+            report.iterations[0].commit_retries, 1,
+            "exactly one retry commit invocation must run"
+        );
+        assert!(
+            report.iterations[0].commit_reject.is_some(),
+            "the rejected first commit's stderr must be recorded"
+        );
+        assert_eq!(
+            commit_count(&root_path).await,
+            Some(2),
+            "init + exactly one ralph commit must exist"
+        );
+        let marker_content = std::fs::read_to_string(&marker).expect("read marker");
+        assert_eq!(
+            marker_content.lines().count(),
+            2,
+            "the hook must be invoked exactly twice (initial + one retry); got {marker_content:?}"
+        );
+        // The landed blob carries the hook's appended newline.
+        let blob = git_show(&root_path, &["HEAD:c0.txt"]).await;
+        assert_eq!(
+            blob, "c\n",
+            "the committed c0.txt must be the hook-mutated content \"c\\n\"; got {blob:?}"
+        );
+        let diff = git_show(&root_path, &["HEAD", "--", "c0.txt"]).await;
+        assert!(
+            diff.contains("+c\n"),
+            "the landed commit's diff must contain the hook's appended newline; got {diff:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_retry_bound_holds_on_always_mutating_hook() {
+        // A hook that rewrites a TRACKED file and exits 1 on EVERY invocation
+        // keeps qualifying for a retry forever — the bound must hold: exactly
+        // `MAX_COMMIT_RETRIES` (2) retries per iteration, then the existing
+        // revert + do-over path, exhausting into `DoOversExhausted` after
+        // `DEFAULT_MAX_DO_OVERS` iterations with only the init commit left.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        std::fs::write(root_path.join("seed.txt"), "seed\n").expect("seed");
+        initial_commit(&root_path);
+        // Always-mutating hook: rewrite a tracked file and exit 1 on every
+        // invocation.
+        let hook = root_path.join(".git").join("hooks").join("pre-commit");
+        std::fs::write(
+            &hook,
+            b"#!/bin/sh\nprintf 'mutation\\n' >> seed.txt\nexit 1\n",
+        )
+        .expect("write hook");
+        make_executable(&hook);
+        let ctx = ctx_for(&root_path);
+
+        let backend = MockBackend::from_turns(vec![
+            edit_create_call("e0", "c0.txt", "c\n"),
+            finish_done("f0"),
+            edit_create_call("e1", "c1.txt", "c\n"),
+            finish_done("f1"),
+            edit_create_call("e2", "c2.txt", "c\n"),
+            finish_done("f2"),
+        ]);
+
+        let config = RalphConfig::new("always-mutating-objective", stop_never(), 5, 4);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+
+        assert!(
+            matches!(report.terminal, RalphTerminal::DoOversExhausted),
+            "terminal must be DoOversExhausted; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.outer_iterations(),
+            3,
+            "exactly DEFAULT_MAX_DO_OVERS iterations must run; got {}",
+            report.outer_iterations()
+        );
+        assert_eq!(
+            commit_count(&root_path).await,
+            Some(1),
+            "only the init commit must survive the reverts"
+        );
+        for (n, it) in report.iterations.iter().enumerate() {
+            assert_eq!(
+                it.commit_retries, 2,
+                "iteration {n} must exhaust the retry bound (2 retries)"
+            );
+            assert!(
+                it.commit_reject.is_some(),
+                "iteration {n} must record the last rejected commit's stderr"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checker_hook_takes_zero_retry_path() {
+        // A PURE checker hook (exit 1, no work-tree mutation) leaves the
+        // staged-only `'A '` porcelain lines the preceding `git add -A`
+        // produced — every work-tree column is a space, so NO retry fires:
+        // the reject goes straight to the revert + do-over path, and the
+        // existing checker-hook contract (kb-03099) is preserved verbatim.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        initial_commit(&root_path);
+        let hook = root_path.join(".git").join("hooks").join("pre-commit");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").expect("write hook");
+        make_executable(&hook);
+        let ctx = ctx_for(&root_path);
+
+        let backend = MockBackend::from_turns(vec![
+            edit_create_call("e0", "c0.txt", "c\n"),
+            finish_done("f0"),
+            edit_create_call("e1", "c1.txt", "c\n"),
+            finish_done("f1"),
+            edit_create_call("e2", "c2.txt", "c\n"),
+            finish_done("f2"),
+        ]);
+
+        let config = RalphConfig::new("checker-objective", stop_never(), 5, 4);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+
+        assert!(
+            matches!(report.terminal, RalphTerminal::DoOversExhausted),
+            "terminal must be DoOversExhausted; got {:?}",
+            report.terminal
+        );
+        assert_eq!(
+            report.outer_iterations(),
+            3,
+            "exactly three do-overs must run; got {}",
+            report.outer_iterations()
+        );
+        assert_eq!(
+            commit_count(&root_path).await,
+            Some(1),
+            "only the init commit must land"
+        );
+        for (n, it) in report.iterations.iter().enumerate() {
+            assert_eq!(
+                it.commit_retries, 0,
+                "iteration {n} must take the zero-retry path (staged-only porcelain)"
+            );
+            assert!(
+                it.commit_reject.is_some(),
+                "iteration {n} must still record the rejected commit's stderr"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_retry_add_failure_returns_error() {
+        // A hook that mutates the work tree AND plants a stale
+        // `.git/index.lock` before exiting 1: the probe qualifies (git
+        // status still reads the tree with a stale lock), so the retry
+        // fires — and the retry's `git add -A` fails on the lock, which is
+        // an infra `RalphTerminal::Error` with no iteration appended.
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canon root");
+        git_init(&root_path);
+        initial_commit(&root_path);
+        let hook = root_path.join(".git").join("hooks").join("pre-commit");
+        std::fs::write(
+            &hook,
+            b"#!/bin/sh\nprintf '\\n' >> c0.txt\n: > .git/index.lock\nexit 1\n",
+        )
+        .expect("write hook");
+        make_executable(&hook);
+        let ctx = ctx_for(&root_path);
+
+        let backend = MockBackend::from_turns(vec![
+            edit_create_call("e0", "c0.txt", "c"),
+            finish_done("f0"),
+        ]);
+
+        let config = RalphConfig::new("add-break-objective", stop_never(), 5, 4);
+
+        let report = run_ralph(&backend, &ctx, &config).await;
+        assert!(
+            matches!(report.terminal, RalphTerminal::Error(ref e) if e.contains("git add")),
+            "terminal must be a git-add Error; got {:?}",
+            report.terminal
+        );
+        assert!(
+            report.iterations.is_empty(),
+            "no iteration must be appended on a retry-add Error"
+        );
+    }
+
+    /// `capped_reject` trims, byte-caps at 512, and never splits a UTF-8
+    /// scalar at the cap.
+    #[test]
+    fn capped_reject_trims_and_byte_caps() {
+        assert_eq!(capped_reject("  boom  \n"), "boom");
+        let exactly = "x".repeat(512);
+        assert_eq!(capped_reject(&exactly), exactly, "512 bytes fit uncapped");
+        let over = format!("{} tail", "x".repeat(600));
+        assert_eq!(
+            capped_reject(&over).len(),
+            512,
+            "longer stderr is byte-capped at 512"
+        );
+        // A 3-byte scalar straddling the cap is truncated BACK to a char
+        // boundary rather than split mid-scalar.
+        let multi = format!("{}{}", "x".repeat(510), "€".repeat(10));
+        assert_eq!(capped_reject(&multi), "x".repeat(510));
     }
 
     // ===================================================================

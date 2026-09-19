@@ -1144,12 +1144,28 @@ fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
     assert_eq!(
         keys,
         vec![
+            "commit_rejects",
+            "commit_retries_total",
             "objective",
             "outer_iterations",
             "terminal",
             "total_inner_iterations"
         ],
-        "RalphSummary must have exactly the four expected fields; got: {summary}"
+        "RalphSummary must have exactly the six expected fields; got: {summary}"
+    );
+    assert_eq!(
+        summary
+            .get("commit_retries_total")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "no hook-rejected commit, so no retry fired; got: {summary}"
+    );
+    assert_eq!(
+        summary
+            .get("commit_rejects")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "no hook-rejected commit, so no reject was counted; got: {summary}"
     );
     assert_eq!(
         summary.get("terminal").and_then(serde_json::Value::as_str),

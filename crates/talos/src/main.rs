@@ -134,7 +134,11 @@
 //!   reverted to the last green commit and retried as a do-over; after this
 //!   many CONSECUTIVE do-overs (a green commit resets the count) the loop
 //!   terminates with [`harness::ralph::RalphTerminal::DoOversExhausted`]
-//!   (exit 20).
+//!   (exit 20). FIRST, a hook-rejected commit gets a bounded
+//!   re-stage-and-retry ([`harness::ralph::run_ralph`] re-runs `git add -A`
+//!   and the identical commit, at most 2 retries) — but ONLY when the hook
+//!   MUTATED the work tree after the initial `git add -A`, so a pure checker
+//!   hook still goes straight to the revert + do-over path.
 //! - `--max-backend-errors <u32>` (default `5`) — consecutive-backend-error
 //!   cap; matches [`harness::ralph::DEFAULT_MAX_BACKEND_ERRORS`]. This many
 //!   CONSECUTIVE outer iterations whose inner outcome was
@@ -465,8 +469,10 @@ struct RalphArgs {
     /// whose per-iteration `git commit` exited non-zero — both reverted to
     /// the last green commit) terminate with
     /// [`RalphTerminal::DoOversExhausted`] (exit 20). A green commit resets
-    /// the count; an inner `BackendError` is exempt. Matches
-    /// [`DEFAULT_MAX_DO_OVERS`].
+    /// the count; an inner `BackendError` is exempt. Before any revert, a
+    /// hook-rejected commit gets a bounded re-stage-and-retry — at most 2
+    /// retries, and only when the hook MUTATED the work tree after the
+    /// initial `git add -A`. Matches [`DEFAULT_MAX_DO_OVERS`].
     #[arg(long, default_value_t = DEFAULT_MAX_DO_OVERS)]
     max_do_overs: u32,
 
@@ -793,13 +799,24 @@ struct RalphSummary {
     objective: String,
     /// Closed [`RalphTerminal`] discriminant — one of
     /// `"StopConditionMet"`, `"Stuck"`, `"MaxIterationsExhausted"`,
-    /// `"TimeBudgetExhausted"`, `"Error"`.
+    /// `"TimeBudgetExhausted"`, `"DoOversExhausted"`,
+    /// `"BackendErrorsExhausted"`, `"Error"` (the exact set
+    /// [`ralph_terminal_str`] emits).
     terminal: &'static str,
     /// How many outer iterations ran ([`RalphReport::outer_iterations`]).
     outer_iterations: u32,
     /// Sum of every iteration's inner iterations
     /// ([`RalphReport::total_inner_iterations`]).
     total_inner_iterations: u64,
+    /// Sum over [`RalphReport::iterations`] of each iteration's
+    /// `commit_retries` — the re-stage-and-retry attempts after hook-rejected
+    /// commits. A count, like [`Self::commit_rejects`]: the summary stays
+    /// payload-free, so a reviewer can see the retry fired without the
+    /// rejected commit's stderr ever reaching stdout.
+    commit_retries_total: u32,
+    /// How many iterations had at least one `git commit` exit non-zero
+    /// (`commit_reject` is `Some`) — the count of hook-rejected iterations.
+    commit_rejects: u32,
 }
 
 /// Build the stdout [`RalphSummary`] from a completed ralph run.
@@ -808,12 +825,16 @@ fn build_ralph_summary(
     terminal_s: &'static str,
     outer_iterations: u32,
     total_inner_iterations: u64,
+    commit_retries_total: u32,
+    commit_rejects: u32,
 ) -> RalphSummary {
     RalphSummary {
         objective,
         terminal: terminal_s,
         outer_iterations,
         total_inner_iterations,
+        commit_retries_total,
+        commit_rejects,
     }
 }
 
@@ -1730,11 +1751,31 @@ async fn run_ralph_cmd(args: RalphArgs) {
     // 10. Print machine-readable summary and exit with the ralph code.
     let terminal_s = ralph_terminal_str(&report.terminal);
     let exit_c = ralph_exit_code(&report.terminal);
+    // Retry telemetry (counts only — the summary stays payload-free):
+    // `commit_retries_total` sums the per-iteration retry commit
+    // invocations; `commit_rejects` counts iterations with at least one
+    // rejected commit. Together they make the retry decision observable:
+    // a run with zero rejects never fired the re-stage-and-retry.
+    let commit_retries_total: u32 = report
+        .iterations
+        .iter()
+        .map(|it| u32::from(it.commit_retries))
+        .sum();
+    let commit_rejects = u32::try_from(
+        report
+            .iterations
+            .iter()
+            .filter(|it| it.commit_reject.is_some())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     let summary = build_ralph_summary(
         report.objective.clone(),
         terminal_s,
         report.outer_iterations(),
         report.total_inner_iterations(),
+        commit_retries_total,
+        commit_rejects,
     );
     println!(
         "{}",
@@ -2876,7 +2917,7 @@ mod tests {
 
     #[test]
     fn ralph_summary_exact_field_set() {
-        let summary = build_ralph_summary("build the thing".into(), "Stuck", 7, 42);
+        let summary = build_ralph_summary("build the thing".into(), "Stuck", 7, 42, 3, 2);
         let json = serde_json::to_value(&summary).expect("RalphSummary must serialize");
         let obj = json.as_object().expect("must be object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -2884,12 +2925,14 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "commit_rejects",
+                "commit_retries_total",
                 "objective",
                 "outer_iterations",
                 "terminal",
                 "total_inner_iterations"
             ],
-            "RalphSummary must have exactly the four expected fields (no run_id/record_path)"
+            "RalphSummary must have exactly the six expected fields (no run_id/record_path)"
         );
         assert_eq!(
             obj.get("objective").and_then(serde_json::Value::as_str),
@@ -2909,11 +2952,22 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(42)
         );
+        assert_eq!(
+            obj.get("commit_retries_total")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            obj.get("commit_rejects")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
     fn ralph_summary_is_serializable() {
-        let summary: RalphSummary = build_ralph_summary("obj".into(), "StopConditionMet", 1, 0);
+        let summary: RalphSummary =
+            build_ralph_summary("obj".into(), "StopConditionMet", 1, 0, 0, 0);
         let json = serde_json::to_string(&summary).expect("must serialize");
         assert!(
             serde_json::from_str::<serde_json::Value>(&json).is_ok(),
