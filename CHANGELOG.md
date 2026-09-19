@@ -2,6 +2,59 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.11.0 - 2026-09-19
+#### Features
+- (**engine**) name a max_tokens truncation as FailureMode::Truncated instead of masking it as StoppedWithoutFinish - (5211a15) - Jason Weddington, *Claude Fable 5.1*
+- (**engine**) answer mode — finish(answer) with a schema-validated result - (bce155b) - Jason Weddington, *Claude Fable 5.1*
+- (**engine**) require observed tree change before accepting a done claim - (1ec37b2) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**engine**) opt-in one-shot acceptance audit on the first gate-green finish(done), default off - (712fb21) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**engine**) opt-in full run transcript (JSONL), default off - (d4651b6) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**mined-eval**) default the tier-2 iteration cap to 500 (production parity) - (00b03e3) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**mined-eval**) post-run agent-gate verdict (resolved vs shippable) + per-run capture paths - (eb333c1) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**mined-eval**) production-parity agent gate for tier-2 (run_checks + finish-recovery armed) - (a0c0128) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**ollama**) parse prompt_eval_cached_count so cached input is visible and priced correctly - (7b2c6ea) - Jason Weddington, *Claude Fable 5.1*
+- (**prompt**) opt-in Criterion Coverage rules, default off everywhere - (2c74407) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**ralph**) retry a hook-rejected commit when the hook itself mutated the tree, bounded and observable - (d6e93e1) - Jason Weddington, *Claude Fable 5.1*
+- (**record**) record the resolved backend settings on the run record - (d76792d) - Jason Weddington, *Claude Fable 5.1*
+- (**talos**) resolve Ollama num_ctx from the model's advertised context, shared with the eval runners - (3584df9) - Jason Weddington, *Claude Fable 5.1*
+- (**talos**) answer mode — `talos run --mode answer --schema` - (d349a61) - Jason Weddington, *Claude Fable 5.1*
+- (**talos**) let bare --transcript default to the run's state dir - (33fee62) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**talos**) prune the XDG state dir on run start so run artifacts stop accumulating - (caf7549) - Jason Weddington, *Claude Opus 5 (1M context)*
+#### Bug Fixes
+- (**deps**) bump rustls 0.23.41 -> 0.23.45 for RUSTSEC-2026-0285 - (f33fa86) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**engine**) parse a finish(answer) result that a backend delivered as JSON text - (b034a63) - Jason Weddington, *Claude Fable 5.1*
+- (**engine**) reject an unrecognized or missing finish disposition instead of coercing it to Failed - (4c8b637) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**eval**) give tier-1 trial workspaces a git baseline, like production - (2612751) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**mined-eval**) surface when the count-mismatch tripwire is armed, never silently off - (3bdc845) - Jason Weddington, *Claude Fable 5.1*
+- (**mined-eval**) inject the per-trial state root instead of reading env in the library - (7b04ecb) - Claude Agent, *Claude Opus 5*
+- (**talos**) restore the /api/show num_ctx resolver the CLI lost in d76792d, and record the num_ctx policy - (1f56186) - Jason Weddington, *Claude Fable 5.1*
+#### Revert
+- remove the measured-negative criterion-coverage and acceptance-audit knobs - (cbddb48) - Jason Weddington, *Claude Opus 5 (1M context)*
+#### Documentation
+- (**design**) note transcripts shipped as part of the false-done instrumentation - (1a3c328) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**design**) propose per-criterion tests + a one-shot acceptance audit to cut false dones - (00d5235) - Jason Weddington, *Claude Opus 5 (1M context)*
+- (**design-06**) cache reads were unparsed, not absent — cost figures are upper bounds; arm C is this project's groom - (0662532) - Jason Weddington, *Claude Fable 5.1*
+- (**roadmap**) evening paragraph and next-up for the session close - (6ed9dfc) - Jason Weddington, *Claude Fable 5.1*
+- session close — arm C adopted as the project groom, Ollama caching answered, v0.11.0 roadmap header - (8c1f530) - Jason Weddington, *Claude Fable 5.1*
+- the talos groom (flash draft / glm critics / flash synth) is this project's default groom - (810a0ab) - Jason Weddington, *Claude Fable 5.1*
+- session log — groom-to-ready on talos, the Ollama answer-mode bug, four-arm groom comparison, three arm specs shipped (kb-03352) - (e55db53) - Jason Weddington, *Claude Fable 5.1*
+- talos-flow client shipped — design 06 status, roadmap, session log - (f1126e8) - Jason Weddington, *Claude Fable 5.1*
+- session log — Ollama rule flipped, first real flash and qwen dispatches (kb-03318) - (2d38881) - Jason Weddington, *Claude Fable 5.1*
+- roadmap — fleet published on 0.10.0-27-g53b56fb, both gates verified - (77acce9) - Jason Weddington, *Claude Fable 5.1*
+- session log — leg 3, git-native tier-1, answer mode shipped (kb-03311) - (53b56fb) - Jason Weddington, *Claude Fable 5.1*
+- design 06 — answer mode, talos as the sub-agent of a dynamic workflow - (8679fc1) - Jason Weddington, *Claude Fable 5.1*
+- drop the rollout relaunch-cap item from queued — fixed in agent-gtd-dispatch 1.24.1 - (b28a823) - Jason Weddington, *Claude Opus 5 (1M context)*
+- session log — negative knobs removed, state-dir retention, transcripts on dispatch (kb-03293) - (f6d5844) - Jason Weddington, *Claude Opus 5 (1M context)*
+- A′/B measured — negative result, neither default flips (kb-03283) - (8b13923) - Jason Weddington, *Claude Opus 5 (1M context)*
+- evals stay harder than perfect specs; harness changes must not break the perfect-spec path (kb-03268) - (c4d4f98) - Jason Weddington, *Claude Opus 5 (1M context)*
+- overnight results, transcript-based false-done diagnosis, revised design 05 (kb-03264) - (fe2934c) - Jason Weddington, *Claude Opus 5 (1M context)*
+- first representative tier-2 matrix (cap 500, k=3) results (kb-03252) - (63fa78a) - Jason Weddington, *Claude Opus 5 (1M context)*
+- tier-2 production-parity matrix results and next steps (kb-03240) - (1a67a6d) - Jason Weddington, *Claude Opus 5 (1M context)*
+#### Build system
+- (**lefthook**) skip the heavy gates on docs-only changesets, fail-safe - (055d187) - Jason Weddington, *Claude Fable 5.1*
+
+- - -
+
 ## 0.10.0 - 2026-09-13
 #### Features
 - (**eval**) A/B toggle for the test-first guidance - (eee2d3f) - Jason Weddington, *Claude*
