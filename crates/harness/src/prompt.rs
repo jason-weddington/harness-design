@@ -651,6 +651,54 @@ mod tests {
         }
     }
 
+    /// The commit contract belongs to the harness, not the agent. The
+    /// transcript study (docs/research/09, failure 2) recorded an agent that
+    /// read its task, reasonably concluded a commit was expected, and ran
+    /// `git add` + `git commit --no-verify` itself — bypassing repo hooks
+    /// and leaving the dispatch worker with nothing left to commit, which
+    /// failed the run after the work was already done. Pin the ownership
+    /// paragraph mechanically: all five literals must co-occur in ONE
+    /// blank-line-delimited chunk on BOTH check-command branches, so any
+    /// wording pass that deletes or fragments the paragraph fails here.
+    /// (`harness` and bare `commit` are deliberately NOT pinned — both
+    /// already appear elsewhere in the template, which would make such a
+    /// pin vacuous.) The length cap is a tripwire against a multi-paragraph
+    /// paste: the system prompt is an anchor that is never compacted, so
+    /// every character here is paid on every turn.
+    #[test]
+    fn system_prompt_pins_the_harness_owns_the_commit_contract() {
+        for check in [Some("cargo nextest run"), None] {
+            let rendered = render_system_prompt(&[], check);
+            let flattened_chunks: Vec<String> = rendered
+                .split("\n\n")
+                .map(|chunk| chunk.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect();
+            let ownership_chunk = flattened_chunks
+                .iter()
+                .find(|chunk| chunk.contains("uncommitted"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "system prompt must contain the git-ownership paragraph \
+                         for checks={check:?}; got:\n{rendered}"
+                    )
+                });
+            for literal in ["git add", "git commit", "git push", "owns", "uncommitted"] {
+                assert!(
+                    ownership_chunk.contains(literal),
+                    "git-ownership paragraph must contain `{literal}` \
+                     (checks={check:?}); got:\n{ownership_chunk}"
+                );
+            }
+        }
+        let rendered_none = render_system_prompt(&[], None);
+        assert!(
+            rendered_none.len() < 4000,
+            "no-tools system prompt must stay under 4000 chars (anchor, never \
+             compacted); got {}",
+            rendered_none.len()
+        );
+    }
+
     #[test]
     fn system_prompt_renders_check_command_string_verbatim() {
         let rendered = render_system_prompt(&[], Some("cargo test && cargo clippy"));
