@@ -1376,11 +1376,45 @@ impl FinishRejection {
 /// "accepted", rather than only validity-vs-not.
 #[derive(Debug, Clone, serde::Serialize)]
 struct AnswerVerdict {
-    /// `"missing_result"`, `"invalid"`, or `"valid"`.
+    /// `"missing_result"`, `"invalid"`, `"valid"`, or the `_coerced` twin of
+    /// the last two when the `result` arrived as JSON TEXT and was parsed
+    /// before validation (see [`coerce_stringified_result`]).
     branch: &'static str,
     /// The SAME bounded error list the model was shown — empty on every
     /// branch except `"invalid"`.
     errors: Vec<String>,
+}
+
+/// Recover a `finish(answer)` `result` that a backend delivered as JSON TEXT.
+///
+/// Ollama Cloud's tool-call parser (observed with glm-5.3 on 2026-09-19)
+/// flattens every tool parameter to a scalar, so an object `result` arrives at
+/// the engine as `Value::String("{...}")` and can never validate against an
+/// object schema — four grooming runs looped to `Blocked` on exactly this,
+/// each answer rejected with `"<raw JSON text>" is not of type "object"`.
+/// The Anthropic and Bedrock backends deliver `tool_use` input natively, so
+/// the same schema validated fine there and the smoke test on haiku missed it.
+///
+/// The rule is deliberately narrow so a schema that WANTS a string is
+/// untouched: the raw value is validated first and returned as-is when it
+/// passes; only a raw value that FAILS validation, is a string, and parses as
+/// a non-string JSON value is replaced by the parsed value. The second element
+/// reports whether that happened, so the transcript's `finish_answer.branch`
+/// carries `_coerced` and the flattening backend stays visible rather than
+/// being silently papered over. The parsed value is returned even when it too
+/// is invalid — the validation errors then describe the shape the model meant
+/// instead of the useless "the whole string is not an object".
+fn coerce_stringified_result(result: Value, schema: &AnswerSchema) -> (Value, bool) {
+    if schema.validation_errors(&result).is_empty() {
+        return (result, false);
+    }
+    let Value::String(text) = &result else {
+        return (result, false);
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(parsed) if !matches!(parsed, Value::String(_)) => (parsed, true),
+        _ => (result, false),
+    }
 }
 
 /// One dispatched `finish` call's outcome from the loop's point of view: the
@@ -1715,6 +1749,7 @@ async fn handle_finish_call(
             // Ordering is load-bearing: the SCHEMA is answer mode's
             // mechanical verifier, so it runs first and an invalid answer
             // never pays for a gate run.
+            let (result, coerced) = coerce_stringified_result(result, schema);
             let errors = schema.validation_errors(&result);
             if !errors.is_empty() {
                 let shown: Vec<String> = errors
@@ -1729,11 +1764,16 @@ async fn handle_finish_call(
                     Some(FinishRejection::AnswerSchema),
                 );
                 outcome.answer = Some(AnswerVerdict {
-                    branch: "invalid",
+                    branch: if coerced {
+                        "invalid_coerced"
+                    } else {
+                        "invalid"
+                    },
                     errors: shown,
                 });
                 return outcome;
             }
+            let valid_branch = if coerced { "valid_coerced" } else { "valid" };
             // Checks in answer mode: RUN if configured, NEVER reject. For
             // `Answer` the mechanical verifier is the SCHEMA, not the gate
             // (docs/design/06-answer-mode-and-workflows.md:23 — "for answer
@@ -1784,7 +1824,7 @@ async fn handle_finish_call(
                     current_tree: Some(current),
                     rejection: Some(FinishRejection::ModifiedWorkspace),
                     answer: Some(AnswerVerdict {
-                        branch: "valid",
+                        branch: valid_branch,
                         errors: Vec::new(),
                     }),
                 };
@@ -1802,7 +1842,7 @@ async fn handle_finish_call(
                 current_tree: Some(current),
                 rejection: None,
                 answer: Some(AnswerVerdict {
-                    branch: "valid",
+                    branch: valid_branch,
                     errors: Vec::new(),
                 }),
             }
@@ -3595,10 +3635,11 @@ mod tests {
     use super::{
         ANSWER_SCHEMA_ERRORS_CAP, ANSWER_SCHEMA_ERRORS_MAX_LINES, AnswerSchema, FINISH_TOOL_NAME,
         FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence, ResumeError,
-        ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content, emit_run_end,
-        inert_precondition_warning, missing_reason_rejection_content,
-        missing_result_rejection_content, no_change_rejection_content, rejection_content,
-        render_tool_result, resume, retry_delay, run, run_id, run_persisted,
+        ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
+        coerce_stringified_result, emit_run_end, inert_precondition_warning,
+        missing_reason_rejection_content, missing_result_rejection_content,
+        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
+        run, run_id, run_persisted,
     };
     use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
     use crate::model::{
@@ -11530,6 +11571,102 @@ mod tests {
         assert_eq!(valid["finish_answer"]["branch"], "valid");
         assert_eq!(valid["finish_answer"]["errors"], serde_json::json!([]));
         assert_eq!(valid["finish_accepted"], serde_json::json!(true));
+    }
+
+    /// A backend that flattens object parameters to JSON text (Ollama Cloud
+    /// with glm-5.3, 2026-09-19) must still be able to answer: the stringified
+    /// result is parsed, validated as the parsed value, and the accepted
+    /// `Disposition::Answer` carries the PARSED object — with the coercion
+    /// visible on the transcript as `valid_coerced`.
+    #[tokio::test]
+    async fn stringified_answer_result_is_parsed_before_validation() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("coerced.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            // Parses, but to the wrong shape: the errors must describe the
+            // PARSED value, not "the whole string is not an object".
+            finish_call(
+                "c-bad-text",
+                serde_json::json!({ "disposition": "answer", "result": "{\"verdict\": 3}" }),
+            ),
+            // Text that is not JSON at all stays a string and is rejected as one.
+            finish_call(
+                "c-not-json",
+                serde_json::json!({ "disposition": "answer", "result": "verdict: ok" }),
+            ),
+            finish_call(
+                "c-ok-text",
+                serde_json::json!({ "disposition": "answer", "result": "{\"verdict\": \"ok\"}" }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 5)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "coerced");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { ref result, .. }) => {
+                assert_eq!(
+                    result,
+                    &serde_json::json!({ "verdict": "ok" }),
+                    "the accepted result is the PARSED object, not the text"
+                );
+            }
+            other => panic!("expected Finished(Answer); got {other:?}"),
+        }
+        assert_eq!(stats.answer_schema_rejections, 2);
+
+        let lines = read_transcript_lines(&transcript);
+        let by_call = |id: &str| -> serde_json::Value {
+            lines
+                .iter()
+                .find(|l| l["event"] == "tool_result" && l["call_id"] == id)
+                .unwrap_or_else(|| panic!("a tool_result for {id}"))
+                .clone()
+        };
+        let bad = by_call("c-bad-text");
+        assert_eq!(bad["finish_answer"]["branch"], "invalid_coerced");
+        let bad_errors = bad["finish_answer"]["errors"].to_string();
+        assert!(
+            bad_errors.contains("/verdict"),
+            "errors describe the parsed shape; got {bad_errors}"
+        );
+        assert_eq!(by_call("c-not-json")["finish_answer"]["branch"], "invalid");
+        let ok = by_call("c-ok-text");
+        assert_eq!(ok["finish_answer"]["branch"], "valid_coerced");
+        assert_eq!(ok["finish_accepted"], serde_json::json!(true));
+    }
+
+    /// The coercion is narrow: a schema that WANTS a string never sees its
+    /// result re-parsed, even when that string happens to be valid JSON.
+    #[test]
+    fn coercion_leaves_a_schema_valid_string_alone() {
+        let schema =
+            AnswerSchema::compile(&serde_json::json!({ "type": "string" })).expect("compiles");
+        let (value, coerced) = coerce_stringified_result(serde_json::json!("{\"a\": 1}"), &schema);
+        assert_eq!(value, serde_json::json!("{\"a\": 1}"));
+        assert!(!coerced);
+
+        let obj =
+            AnswerSchema::compile(&serde_json::json!({ "type": "object" })).expect("compiles");
+        let (value, coerced) = coerce_stringified_result(serde_json::json!("\"x\""), &obj);
+        assert_eq!(
+            value,
+            serde_json::json!("\"x\""),
+            "text parsing to a string is not coerced"
+        );
+        assert!(!coerced);
+        let (value, coerced) = coerce_stringified_result(serde_json::json!(7), &obj);
+        assert_eq!(
+            value,
+            serde_json::json!(7),
+            "a non-string invalid value is untouched"
+        );
+        assert!(!coerced);
     }
 
     #[tokio::test]

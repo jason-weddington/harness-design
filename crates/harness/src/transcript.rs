@@ -152,7 +152,10 @@
 //!   `{"branch": ..., "errors": [..]}`, where `branch` is one of
 //!   `"missing_result"` (no `result` key was supplied), `"invalid"` (a
 //!   `result` was supplied and failed schema validation) or `"valid"` (it
-//!   validated). `branch` reports the SCHEMA verdict ONLY: a `"valid"` claim
+//!   validated) — or `"invalid_coerced"` / `"valid_coerced"` when the
+//!   `result` arrived as JSON TEXT (some backends flatten object parameters
+//!   to strings) and was parsed before validation; the verdict is then about
+//!   the parsed value. `branch` reports the SCHEMA verdict ONLY: a `"valid"` claim
 //!   can still have been rejected by the inverted tree precondition, in which
 //!   case `finish_accepted` is `false` and `finish_rejection` is
 //!   `"modified_workspace"`. `errors` holds the SAME bounded error list the
