@@ -1,6 +1,6 @@
 # 06 — Answer mode: talos as the sub-agent of a dynamic workflow
 
-Status: **BOTH HALVES SHIPPED (2026-09-18 — library `bce155b`, CLI: GTD 118fa92c).** Answer mode is live in `talos run --mode answer --schema`; the Python client and the first ported workflow remain open.
+Status: **TALOS SIDE AND CLIENT SHIPPED (2026-09-18/19).** Answer mode is live in `talos run --mode answer --schema` (library `bce155b`, CLI `d349a61`, on the fleet as `0.10.0-27-g53b56fb`). The Python client exists as its own repo, **talos-flow** (`git@ubuntu-vm01:repos/talos_flow`, GTD project `7b85b639`): `agent()` (`1c6ace7`, built by talos-glm in 4.25 min) and `parallel()`/`pipeline()` (built by talos-glm-flash in 4.75 min), both lead-verified live through the real binary on haiku. First data on the shared-checkout question below: two concurrent answer agents on one read-only checkout with distinct task ids returned correct results in 5.7 s with the tree clean. Still open: the first ported workflow (groom-to-ready) and the evaluation question.
 
 ## The question
 
