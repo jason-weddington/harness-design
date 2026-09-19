@@ -125,6 +125,29 @@ Two direct disorientation signals, both cheap:
 
 Plus the coarse ones: iterations between compactions, iterations from the last compaction to the terminal, and the outcome distribution of runs that compacted at least once versus runs that never did.
 
+## Default-on at 90%, with a toggle (2026-09-19, Jason)
+
+Compaction ships **enabled by default** at a 90% window-fill threshold, with an explicit knob to turn it off. Jason's reasoning, recorded because it deliberately overrides a standing rule: *compaction is a safety net, and safety nets should be on by default.*
+
+The standing rule it overrides is this project's "ship behind a default-off knob; flip only after tier-2 shows benefit and the perfect-spec guard is clean" (`CLAUDE.md`). That rule exists for features that change behaviour on every run — an extra prompt section, an extra model call — where default-off is how you avoid paying for something unmeasured. Compaction is not that shape. It is inert until the window is nearly full, and the measurement below shows it has never been reachable on real work at all. A safety net that is off by default is absent precisely when it is needed, and the run that needs it is an unattended dispatch with nobody watching.
+
+The knob is still mandatory, for two reasons that have nothing to do with safety. Without a way to disable it there is no control arm, so no experiment comparing compaction against a baseline can be run. And without a way to *lower* the threshold it can never fire in a test at all. `COMPACT_THRESHOLD_PCT` is therefore configurable end-to-end (flag, then env, then the 90 default, mirroring `--state-retention-days`), where **0 disables compaction entirely** — no walk, no event, no counter.
+
+**Vary the threshold, never the window.** Forcing compaction by shrinking `num_ctx` would be a broken experiment: the derived per-turn output cap is itself `window - prompt - margin`, so shrinking the window moves the cap too and confounds two variables. The knob exists so the window stays pinned at its production value while the trigger moves.
+
+### Measured: the trigger has never been reachable, and the pre-fix trigger always was
+
+Both predicates replayed over every transcript on the fleet — 54 eligible runs, 3,061 turn transitions:
+
+| Predicate | Fired | Rate |
+|---|---|---|
+| Pre-fix (prompt + derived cap as reserve) | 3,061 | 100% |
+| Shipped (prompt alone vs 90%) | 0 | 0% |
+
+The highest window fill ever observed on real work is **80.1%**, on a 164-iteration qwen3.8 run at 210,023 of 262,144. Every glm run sits between 7% and 20% of its 1,048,576 window. So the shipped threshold would not have fired on anything we have ever run, which is simultaneously the evidence that the fix is correct, the evidence that compaction is insurance rather than a live need, and the reason the evals must force it.
+
+That 80.1% figure is also the calibration argument for 90 rather than something lower: the one run that came closest to its window completed successfully without help, so a threshold below 80 would have compacted a run that did not need it.
+
 ## Compaction is Ollama-only (2026-09-19, Jason)
 
 Compaction ships for the Ollama backend and is deliberately not implemented for Anthropic or Bedrock. The reason is economic rather than technical: running talos against the Anthropic API trades an already-paid subscription for metered per-token billing, so in practice talos is the harness we point at open-weights models. The Anthropic and Bedrock backends exist for completeness and to keep the model-layer abstraction honest, not because we run production dispatch through them.
