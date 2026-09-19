@@ -123,16 +123,31 @@ and ergonomics, not the core contract.
   is wired.
 - **Streaming/SSE** — cost/latency, not capability; when the live-run volume
   justifies it. (Prompt caching shipped in v0.6.0 — `98fe789`, `kb-03102`.)
-- **In-run context compaction** — summarize/evict old turns as a single run
-  approaches its context window, the way Claude Code auto-compacts. Talos does
-  none today: it grows the conversation until the window is hit, then either
-  errors (pre-flight guard, once `num_ctx` is pinned) or — the bug we just
-  fixed — silently truncates. **Explicitly not planned yet.** For dispatch-size
-  work a model's real window is huge (glm 1M, qwen 256k, now pinned), and the
-  right lever *before* compaction is to decompose work into smaller tasks;
-  Ralph's fresh-context-per-iteration is the pattern-level answer for long
-  *objectives*. Revisit only if a single indivisible task genuinely overruns a
-  1M window.
+- **The context budget: resolved output cap + in-run compaction — ✅ decided
+  2026-09-19, design in [`docs/design/08-context-budget.md`](./design/08-context-budget.md), not yet built.**
+  Supersedes this entry's previous "explicitly not planned" ruling. That ruling
+  reasoned that a model's real window is huge and the right lever is
+  decomposition; it was sound and is now partly overtaken. Two dispatch runs
+  died at exactly 32,768 output tokens with ~98% of the context window free
+  (`kb-03372`), so the *output* cap — not the window — was the binding
+  constraint, and it was an arbitrary constant: Ollama advertises no output cap
+  at all, while Anthropic publishes a per-model one that a single raised
+  constant would violate on Haiku (`kb-03380`). Separately, the qwen lane now
+  peaks at 210K of its 262K window (80%), so window pressure is real on the
+  small-window lane even though we have never actually exhausted one. Removing
+  the output cap raises history growth, which couples the two. The design is
+  tiered and mostly free: reasoning and tool results are 85-99% of replayed
+  content on every lane measured, so dropping old reasoning and eliding old
+  tool-result payloads (reversibly, via the offload paths talos already writes)
+  reach most of the relief with no model call, and LLM summarization is a
+  backstop rather than the core. Telemetry is the non-negotiable half —
+  compaction events in the transcript plus direct disorientation metrics
+  (elided re-reads, repeated tool calls, re-derivation spikes), because our
+  models externalize almost nothing into visible text and the re-derivation
+  risk from dropping reasoning is sharper for us than for harnesses that clear
+  thinking freely. Decomposition and Ralph's fresh-context restart remain the
+  right levers for long *objectives*; this is the relief valve for a single
+  task, not a handoff mechanism.
 - **Ralph Loop — ✅ shipped (core `1b4c2bb` / 0.7.0, CLI `talos ralph` / 0.8.0, do-over fix `242a57f`), now growing.** Real and dogfood-proven (see "Where we are" for the dng-converter run). Forward directions:
   - **Ralph-ability characterization** (`kb-03109`) — the design heuristic for *which* tasks fit: a **static prompt that re-binds as external state mutates** (coverage %, a checklist, a failing-test list, a grep). Five requirements (monotone external state · pure-function-of-state prompt · cheap unambiguous stop-oracle · progress durable outside the context · units that fit one inner budget). "Write the highest-value missing test" is the canonical small-model case.
   - **`tasks.md` backlog executor (next experiment)** — the mid-tier (talos-glm) instance of the pattern: prompt = "complete the next unchecked task in `tasks.md`, mark it complete," stop-when = "all boxes checked." Turns Ralph into a generic autonomous project executor over a groomed backlog. Gated on the do-over fix (item `230f9e9b`) — that fix is the *enabling prerequisite*: without it one over-budget task corrupts the run; with it, a too-hard task gets 3 clean do-overs then loudly stops for a human. A `tasks.md`-specific v2: "mark blocked + skip to next" instead of halting the whole loop.
