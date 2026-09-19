@@ -119,6 +119,16 @@ Two direct disorientation signals, both cheap:
 
 Plus the coarse ones: iterations between compactions, iterations from the last compaction to the terminal, and the outcome distribution of runs that compacted at least once versus runs that never did.
 
+## Compaction is Ollama-only (2026-09-19, Jason)
+
+Compaction ships for the Ollama backend and is deliberately not implemented for Anthropic or Bedrock. The reason is economic rather than technical: running talos against the Anthropic API trades an already-paid subscription for metered per-token billing, so in practice talos is the harness we point at open-weights models. The Anthropic and Bedrock backends exist for completeness and to keep the model-layer abstraction honest, not because we run production dispatch through them.
+
+This also disposes of the open question about whether dropping reasoning is safe under Anthropic's thinking-block replay rules. That question is now moot rather than answered, and it returns the moment anyone wants compaction on that backend.
+
+Concretely: the compaction path is gated on the backend exposing a context limit, and Ollama is the only backend that holds one as a number (`ollama.rs:177`, resolved from `/api/show`). Anthropic and Bedrock only discover the limit reactively by string-matching a 400 (`anthropic.rs:533`, `bedrock.rs:519`), so "no advertised limit means no compaction" falls out of the design rather than needing a special case. A run on those backends behaves exactly as it does today.
+
+The **output cap** is not scoped this way and still covers all three backends, because it is a correctness matter rather than an optimization: the Anthropic API requires `max_tokens` on every request and rejects a value above the model's published ceiling, so removing the shared constant without giving Anthropic and Bedrock a per-model value would break them outright. A small per-model table is enough there.
+
 ## Out of scope
 
 Not built here, and named so nobody re-derives them. Cross-window handoff, which our research notes are emphatic should not lean on compaction — durable artifacts (a progress file, descriptive commits, a checklist with pass flags) are the mechanism, and ralph's fresh-context restart is the pattern-level answer for long objectives. The memory tool. Server-side compaction on the Anthropic backend, which exists as a beta primitive and would give one backend a different shape from the other two. Streaming, which is a separate roadmap item; all three backends are non-streaming today and Anthropic and Ollama set no HTTP timeout at all (`anthropic.rs:84`, `ollama.rs:190`), so large non-streaming responses are slow rather than broken.
@@ -130,7 +140,5 @@ The roadmap's current entry says in-run compaction is "explicitly not planned", 
 Whether the trigger threshold should be per-lane. The windows differ by 4x (262,144 against 1,048,576) and so does the composition — 57-62% reasoning on the glm runs against 33-43% on qwen. The reasoning-retention window is less open than it looks, since its cost curve is flat from 2 to 10 turns on the only long run we have.
 
 What rolling history edits do to the prompt cache. Every compaction rewrites a prefix that was previously cacheable, and caching is where the dispatch budget is won: `kb-03356` established that Ollama Cloud caches as a prefix trie in 64-token blocks, and `7b2c6ea` made cache reads visible per call. So the cost is now measurable rather than theoretical, and it should be measured on the first real compacting run rather than modelled.
-
-Whether tier 1 should be skipped on Anthropic. Anthropic binds thinking blocks to the producing model and has replay rules of its own; dropping old reasoning is what its own `clear_thinking` strategy does, but our backend hand-rolls the wire format and the interaction needs checking before tier 1 is enabled there. Ollama has no such constraint.
 
 Whether compacting earlier than necessary is a quality win rather than a cost. The Chroma context-rot study cited in our research notes found retrieval reliability degrades monotonically with input length, which would argue for a threshold well below the window rather than just short of it. That is measurable with the telemetry above and should not be guessed.
