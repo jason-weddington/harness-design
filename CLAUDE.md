@@ -120,7 +120,7 @@ Toolchain pinned in `rust-toolchain.toml`. Hooks orchestrated by **lefthook** �
 every fresh clone must run `lefthook install`. Tools install as prebuilt binaries
 via `cargo binstall` (see README); lefthook + gitleaks come from their GitHub
 releases. The gate config is the source of truth: `lefthook.yml`, `deny.toml`,
-`rustfmt.toml`, `cog.toml`, the `[workspace.lints]` table, and `.github/workflows/ci.yml`.
+`rustfmt.toml`, `cog.toml`, the `[workspace.lints]` table, `scripts/docs-only.sh`, and `.github/workflows/ci.yml`.
 
 | Stage | Gates |
 |---|---|
@@ -128,6 +128,8 @@ releases. The gate config is the source of truth: `lefthook.yml`, `deny.toml`,
 | pre-commit | `cargo fmt --check`, `clippy -D warnings`, `typos`, `cargo sort --check`, `gitleaks`, `cargo nextest run` |
 | pre-push | coverage `--fail-under-lines 98`, `cargo test --doc`, `cargo machete`, `cargo deny check` |
 | CI | re-runs all of the above + a daily scheduled `cargo audit` |
+
+**Docs-only skip:** `scripts/docs-only.sh` is a fail-safe predicate wired into `lefthook.yml` via `skip:` blocks: pre-commit `clippy` + `test` and all four pre-push gates (`coverage`, `doctest`, `machete`, `deny`) skip themselves when EVERY changed path is under `docs/` or is a top-level `*.md`. The skip is proof-based and fail-safe — an empty changeset, a mixed changeset, a rename out of a source directory, a missing upstream, or a broken/deleted predicate all run everything. The pre-push skip additionally requires a configured upstream, so the first `git push -u` of a new branch always runs every gate. CI always runs the full set and is the audit for a wrong local skip: if CI fails clippy/test/coverage on a commit whose local hook printed `(skip) by condition`, `scripts/docs-only.sh` has regressed — and `lefthook run pre-commit --verbose` shows the resolved path list and the `docs-only:` reason line.
 
 **rustc is a gate too** — type checking, null-safety, the borrow checker, match
 exhaustiveness, and unused-import/variable detection are free, so there's no

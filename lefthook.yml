@@ -15,6 +15,8 @@ pre-commit:
       run: cargo fmt --all -- --check
     clippy:
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      skip:
+        - run: ./scripts/docs-only.sh --staged
     typos:
       run: typos
     cargo-sort:
@@ -23,6 +25,8 @@ pre-commit:
       run: gitleaks git --staged --redact
     test:
       run: cargo nextest run --workspace
+      skip:
+        - run: ./scripts/docs-only.sh --staged
 
 pre-push:
   parallel: false
@@ -30,10 +34,18 @@ pre-push:
     coverage:
       # RATCHET this literal up as coverage climbs; keep it in sync with CI.
       run: cargo llvm-cov nextest --workspace --all-features --fail-under-lines 98
+      skip:
+        - run: ./scripts/docs-only.sh --push
     doctest:
       # nextest does NOT run doctests — without this they silently never run.
       run: cargo test --doc --workspace
+      skip:
+        - run: ./scripts/docs-only.sh --push
     machete:
       run: cargo machete
+      skip:
+        - run: ./scripts/docs-only.sh --push
     deny:
       run: cargo deny check
+      skip:
+        - run: ./scripts/docs-only.sh --push

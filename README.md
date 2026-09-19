@@ -119,6 +119,8 @@ type checking, null-safety (`Option`), memory/thread safety (borrow checker),
 match exhaustiveness, unused imports/variables, and `unsafe` is `forbid`-den
 project-wide. The gates only add what rustc can't see.
 
+**Docs-only skip:** `scripts/docs-only.sh` is a fail-safe predicate wired into `lefthook.yml` via `skip:` blocks: pre-commit `clippy` + `test` and all four pre-push gates (`coverage`, `doctest`, `machete`, `deny`) skip themselves when EVERY changed path is under `docs/` or is a top-level `*.md`. The skip is proof-based and fail-safe — an empty changeset, a mixed changeset, a rename out of a source directory, a missing upstream, or a broken/deleted predicate all run everything. The pre-push skip additionally requires a configured upstream, so the first `git push -u` of a new branch always runs every gate. CI always runs the full set and is the audit for a wrong local skip: if CI fails clippy/test/coverage on a commit whose local hook printed `(skip) by condition`, `scripts/docs-only.sh` has regressed — and `lefthook run pre-commit --verbose` shows the resolved path list and the `docs-only:` reason line.
+
 **Coverage ratchet:** the `--fail-under-lines` literal lives in `lefthook.yml`
 and `.github/workflows/ci.yml`. Bump both upward as coverage improves; never let
 it regress.
