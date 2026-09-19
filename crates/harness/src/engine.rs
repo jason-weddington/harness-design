@@ -994,12 +994,16 @@ pub struct RunStats {
     /// THIS loop invocation.
     pub compaction_repeated_calls: u32,
     /// Runtime tripwire — [`UserBlock::ToolResult`] blocks seen during a
-    /// compaction walk whose `call_id` matches no `ContentBlock::ToolCall`
-    /// in history. Expected 0 forever: the pair-integrity invariant cannot
-    /// breach by construction ([`compact_history`] never removes a block),
-    /// but a future injection site or a resume-reconciled history could —
-    /// mirrors the `iteration_end` `last_gate_green` always-true tripwire
-    /// precedent. Counted since THIS loop invocation.
+    /// compaction walk whose `call_id` matches no `ToolCall` in the
+    /// ADJACENT assistant message (the one preceding their `Message::User`;
+    /// see [`compact_history`] for why the pairing is adjacency-scoped).
+    /// Expected 0 forever: the pair-integrity invariant cannot breach by
+    /// construction ([`compact_history`] never removes a block), but a
+    /// future injection site or a resume-reconciled history could — mirrors
+    /// the `iteration_end` `last_gate_green` always-true tripwire precedent.
+    /// A results message NOT immediately preceded by an assistant (the
+    /// legitimate crash-tail reconcile shape) is skipped whole and is NOT
+    /// a tripwire hit. Counted since THIS loop invocation.
     pub compaction_orphan_tool_results: u32,
     /// Disorientation signal 3 (design 08, pre-drop half): summed CHARACTER
     /// length of `ContentBlock::Reasoning` texts across the assistant turns
@@ -2600,12 +2604,18 @@ pub struct CompactionOutcome {
     pub results_elided: u32,
     /// One entry per elided result, in history order.
     pub elided: Vec<CompactionElision>,
-    /// `ToolResult` blocks whose `call_id` matches NO `ToolCall` in
-    /// history — passed through untouched, tallied as the runtime
-    /// tripwire (0 expected).
+    /// `ToolResult` blocks whose `call_id` matches no `ToolCall` in the
+    /// ADJACENT assistant message (the one immediately preceding their
+    /// `Message::User`) — passed through untouched, tallied as the runtime
+    /// tripwire (0 expected). A results message NOT immediately preceded
+    /// by an assistant has no pairing at all and is skipped whole (no
+    /// elision, no tally) — that shape is the legitimate crash-tail
+    /// reconcile path, not a tripwire hit.
     pub orphan_tool_results: u32,
-    /// `ToolCall` blocks with no matching `ToolResult` in history —
-    /// pre-existing, passed through untouched, tallied for symmetry.
+    /// `ToolCall` blocks with no matching `ToolResult` anywhere in
+    /// history — pre-existing, passed through untouched, tallied for
+    /// symmetry. Counted per BLOCK, not per unique id: colliding ids
+    /// (the Ollama positional id space) would undercount orphans.
     pub orphan_tool_calls: u32,
     /// `messages.len()` before the walk.
     pub message_count_before: usize,
@@ -2664,18 +2674,45 @@ fn compact_stub_args(input: &Value) -> String {
 /// it decided to is trimmed.
 ///
 /// **Tier 2** — every `UserBlock::ToolResult` whose matching
-/// `ContentBlock::ToolCall` (matched by `call_id`) sits in an Assistant
-/// message older than the window has its `content` replaced by the pinned
-/// stub `[compacted at iteration N: tool NAME result elided; call_id ID;
-/// args: ARGS; full output at PATH]`, where `PATH` is a FRESH
-/// `ctx.offload(&old_content)` write (reversible: `read_file` may re-read
-/// the offload root), `NAME`/`ARGS` come from the RETAINED matching
-/// `ToolCallRequest`, and `call_id`/`is_error` are untouched. The MOST
-/// RECENT `run_checks` pair is excluded — the done-oracle the agent is
-/// converging on must survive (design 08, `exclude_tools`). An orphan
-/// `ToolResult` (`call_id` matching no call) is passed through untouched and
-/// tallied; a second walk over an already-elided result is a no-op (the
-/// stub prefix is recognized), so repeated triggers do not rewrite history.
+/// `ContentBlock::ToolCall` sits in an Assistant message older than the
+/// window has its `content` replaced by the pinned stub `[compacted at
+/// iteration N: tool NAME result elided; call_id ID; args: ARGS; full
+/// output at PATH]`, where `PATH` is a FRESH `ctx.offload(&old_content)`
+/// write (reversible: `read_file` may re-read the offload root),
+/// `NAME`/`ARGS` come from the RETAINED matching `ToolCallRequest`, and
+/// `call_id`/`is_error` are untouched.
+///
+/// **The pairing is ADJACENCY-SCOPED, never a global call-id lookup.**
+/// `run_loop_body` pushes `Message::Assistant` (the turn) and then
+/// immediately pushes `Message::User { content: results }` for that turn's
+/// calls, so a result in the user message at index `i` belongs to a call in
+/// the assistant message at index `i-1`; `call_id` is matched only within
+/// THAT assistant message. This is load-bearing: the Ollama backend
+/// synthesizes tool-call ids POSITIONALLY per response
+/// (`ollama-call-{i}`, restarting at 0 every turn), so `ollama-call-0` is
+/// not an identity — it names the first call of EVERY assistant turn in
+/// history. A global id map would resolve every colliding id to the newest
+/// turn's call, which is always inside the retention window, so tier 2
+/// would never fire (and, if forced, would render the stub from the WRONG
+/// call). Ids ARE unique within a single assistant turn (positional
+/// `0..n` of one response), so matching scoped to the adjacent assistant
+/// is correct and backend-agnostic — the engine never assumes a property
+/// no backend guarantees. A results `Message::User` NOT immediately
+/// preceded by an `Message::Assistant` (the crash-tail reconcile path
+/// pushes exactly that shape) has no pairing: every result in it is left
+/// untouched — an un-elided result costs context, one paired to the wrong
+/// call corrupts the stub.
+///
+/// The MOST RECENT `run_checks` pair is excluded — the done-oracle the
+/// agent is converging on must survive (design 08, `exclude_tools`).
+/// Like the pairing itself, the exclusion is POSITIONAL, not id-based:
+/// it saves the result whose paired call is the `run_checks` call in the
+/// most recent Assistant message containing one. Under colliding ids a
+/// call-id comparison cannot tell two turns' `run_checks` calls apart.
+/// An orphan `ToolResult` (no matching call in the adjacent assistant)
+/// is passed through untouched and tallied; a second walk over an
+/// already-elided result is a no-op (the stub prefix is recognized), so
+/// repeated triggers do not rewrite history.
 ///
 /// Takes `&ToolCtx` — NOT `&dyn OffloadSink` — because `ToolCtx`'s `sink`
 /// field is private and its only exposure is `ToolCtx::offload`, the same
@@ -2711,28 +2748,32 @@ fn compact_history(
         .copied()
         .collect();
 
-    // call_id → (the Assistant message holding the call, name, input) for
-    // EVERY call in history — the tier-2 walk matches a result to its call
-    // and classifies the pair by the CALL's age, then renders name/args
-    // from the retained call.
-    let mut call_sites: HashMap<String, (usize, String, Value)> = HashMap::new();
-    let mut most_recent_run_checks: Option<String> = None;
+    // The POSITIONAL form of the done-oracle exclusion: the most recent
+    // Assistant message containing a `run_checks` call. Tier 2 identifies
+    // the excluded result as the one whose ADJACENT call is the
+    // `run_checks` call in this assistant message — never by comparing
+    // call ids, which collide across turns on the Ollama backend
+    // (`ollama-call-0` names the first call of every turn, so an id
+    // comparison would also match every OTHER turn's `run_checks`).
+    let mut most_recent_run_checks: Option<usize> = None;
     for (i, message) in messages.iter().enumerate() {
         let Message::Assistant { content } = message else {
             continue;
         };
-        for block in content {
-            if let model::ContentBlock::ToolCall(call) = block {
-                call_sites.insert(call.id.clone(), (i, call.name.clone(), call.input.clone()));
-                if call.name == "run_checks" {
-                    // Last in history order wins — "the most recent".
-                    most_recent_run_checks = Some(call.id.clone());
-                }
-            }
+        if content.iter().any(
+            |block| matches!(block, model::ContentBlock::ToolCall(call) if call.name == "run_checks"),
+        ) {
+            // Last in history order wins — "the most recent".
+            most_recent_run_checks = Some(i);
         }
     }
     // Every result call_id present in history — the denominator for the
-    // orphan-tool-call tripwire.
+    // orphan-tool-call tripwire. The calls→results direction stays a
+    // GLOBAL id match even under the adjacency rework: a result's
+    // `call_id` is always the literal id of the call that produced it,
+    // so a call answered ANYWHERE in history is never a false orphan —
+    // including the crash-tail reconcile shape, where a call's results
+    // can sit in a non-adjacent message.
     let result_ids: HashSet<&str> = messages
         .iter()
         .filter_map(|m| match m {
@@ -2744,13 +2785,22 @@ fn compact_history(
         })
         .flatten()
         .collect();
-    let orphan_tool_calls = u32::try_from(
-        call_sites
-            .keys()
-            .filter(|id| !result_ids.contains(id.as_str()))
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
+    // Counted per ToolCall BLOCK, not per unique id: colliding ids would
+    // undercount (two calls sharing an id with one result would read as
+    // fully answered).
+    let mut orphan_tool_calls = 0u32;
+    for message in &*messages {
+        let Message::Assistant { content } = message else {
+            continue;
+        };
+        for block in content {
+            if let model::ContentBlock::ToolCall(call) = block
+                && !result_ids.contains(call.id.as_str())
+            {
+                orphan_tool_calls += 1;
+            }
+        }
+    }
 
     // ---- Tier 1: reasoning tail-truncation outside the window ----
     let mut reasoning_blocks_truncated = 0u32;
@@ -2804,13 +2854,35 @@ fn compact_history(
     let mut results_elided = 0u32;
     let mut elided: Vec<CompactionElision> = Vec::new();
     let mut orphan_tool_results = 0u32;
-    for (i, message) in messages.iter_mut().enumerate() {
-        // The anchor: the task seed message is never compacted (design 08
-        // — "losing it is losing the spec").
-        if i == 0 {
+    // `i` starts at 1, so the anchor — `messages[0]`, the task seed — is
+    // never walked, exactly as in tier 1.
+    for i in 1..messages.len() {
+        // ADJACENCY PAIRING: results in the user message at `i` belong to
+        // the calls in the assistant message at `i-1` — the adjacency
+        // `run_loop_body` itself creates (assistant turn pushed, then its
+        // results user message in the same pass). `call_id` is resolved
+        // ONLY within that adjacent assistant: ids are unique within a
+        // single response (positional `0..n`) but NOT across turns on the
+        // Ollama backend, so a global lookup would resolve every
+        // `ollama-call-0` to the newest turn's call — always inside the
+        // retention window, so nothing would ever elide, and any forced
+        // elision would render the stub from the WRONG call.
+        let (head, tail) = messages.split_at_mut(i);
+        let Some(Message::Assistant {
+            content: call_blocks,
+        }) = head.last()
+        else {
+            // NOT immediately preceded by an Assistant — no pairing (the
+            // crash-tail reconcile path pushes exactly this shape: a
+            // synthetic results message appended after a user message).
+            // Every result in it is left untouched: no elision, no
+            // counter, no event entry. Skipping is the safe direction —
+            // an un-elided result costs context, one paired to the wrong
+            // call corrupts the stub.
             continue;
-        }
-        let Message::User { content } = message else {
+        };
+        let call_msg_idx = i - 1;
+        let Message::User { content } = &mut tail[0] else {
             continue;
         };
         for block in content.iter_mut() {
@@ -2822,23 +2894,30 @@ fn compact_history(
             else {
                 continue;
             };
-            // The done-oracle pair always survives — the load-bearing
-            // signal the agent is converging on.
-            if most_recent_run_checks.as_deref() == Some(call_id.as_str()) {
-                continue;
-            }
-            let Some((call_msg_idx, name, input)) = call_sites.get(call_id.as_str()) else {
-                // Orphan: no call to pair with, nothing to elide against —
-                // passed through untouched, tallied as the tripwire.
+            // The paired call, scoped to the adjacent assistant message.
+            let Some(call) = call_blocks.iter().find_map(|b| match b {
+                model::ContentBlock::ToolCall(c) if c.id == *call_id => Some(c),
+                _ => None,
+            }) else {
+                // Orphan: no call to pair with in the adjacent assistant,
+                // nothing to elide against — passed through untouched,
+                // tallied as the tripwire.
                 orphan_tool_results += 1;
                 continue;
             };
+            // The done-oracle pair always survives — the load-bearing
+            // signal the agent is converging on. Positional: the excluded
+            // result is the one whose PAIRED call is the `run_checks` call
+            // in the most recent assistant message holding one.
+            if call.name == "run_checks" && most_recent_run_checks == Some(call_msg_idx) {
+                continue;
+            }
             // The pair's age is the CALL's age, not the result's — a
             // result never precedes its call, so classifying on the call
             // keeps a pair either wholly inside or wholly outside the
             // window (never cutting a pair: the Anthropic API rejects a
             // `tool_result` whose `tool_use` is gone, design 08).
-            if !old_assistant.contains(call_msg_idx) {
+            if !old_assistant.contains(&call_msg_idx) {
                 continue;
             }
             // Idempotence: an already-elided result keeps its stub (and its
@@ -2862,15 +2941,18 @@ fn compact_history(
             if offload_path == std::path::Path::new(crate::workspace::OFFLOAD_UNAVAILABLE) {
                 continue;
             }
-            let args = compact_stub_args(input);
+            // `name`/`args` come from the PAIRED call — never from a
+            // different turn's call that happens to share the id.
+            let args = compact_stub_args(&call.input);
             let stub = format!(
                 "[compacted at iteration {iteration}: tool `{name}` result elided; \
                  call_id {call_id}; args: {args}; full output at {path}]",
+                name = call.name,
                 path = offload_path.display()
             );
             elided.push(CompactionElision {
                 call_id: call_id.clone(),
-                tool_name: name.clone(),
+                tool_name: call.name.clone(),
                 offload_path: offload_path.clone(),
             });
             results_elided += 1;
@@ -14261,20 +14343,38 @@ mod tests {
     }
 
     /// A history of `n` (assistant echo-call, user result) pairs preceded by
-    /// the task seed — the shape the loop produces on an all-echo run.
+    /// the task seed — the shape the loop produces on an all-echo run — in
+    /// the OLLAMA id space. The Ollama backend synthesizes tool-call ids
+    /// POSITIONALLY per response (`ollama-call-{i}`, restarting at 0 every
+    /// turn), so every turn's single call here is `ollama-call-0`: ids are
+    /// NOT globally unique across turns, which is exactly what production
+    /// emits on the only backend where compaction is armed. The per-turn
+    /// `input`/`content` differ (`{"i": i}` / `result {i}`) so a wrong
+    /// pairing is detectable in assertions.
     fn paired_history(n: usize) -> Vec<Message> {
+        paired_history_with_ids(n, |_| "ollama-call-0".to_string())
+    }
+
+    /// The same pair shape in the globally-UNIQUE id space (`c0..c{n-1}`)
+    /// that the Anthropic and Bedrock backends supply — tier 2 keeps
+    /// coverage of both id spaces: the adjacency pairing must be correct
+    /// whether ids collide or not.
+    fn paired_history_unique_ids(n: usize) -> Vec<Message> {
+        paired_history_with_ids(n, |i| format!("c{i}"))
+    }
+
+    /// The shared builder behind `paired_history` and
+    /// `paired_history_unique_ids`.
+    fn paired_history_with_ids(n: usize, id_of: impl Fn(usize) -> String) -> Vec<Message> {
         let mut messages = vec![task_message()];
         for i in 0..n {
+            let id = id_of(i);
             messages.push(Message::Assistant {
-                content: vec![tool_call(
-                    &format!("c{i}"),
-                    "echo",
-                    serde_json::json!({ "i": i }),
-                )],
+                content: vec![tool_call(&id, "echo", serde_json::json!({ "i": i }))],
             });
             messages.push(Message::User {
                 content: vec![UserBlock::ToolResult {
-                    call_id: format!("c{i}"),
+                    call_id: id,
                     content: format!("result {i}"),
                     is_error: false,
                 }],
@@ -14449,10 +14549,13 @@ mod tests {
     /// Tier 2: an old pair's `ToolResult` content becomes the pinned stub
     /// pointing at a FRESH offload write; `call_id`/`is_error` untouched; the
     /// block retained; `args` rendered from the RETAINED call compact and
-    /// truncated to 1000 chars with the pinned suffix.
+    /// truncated to 1000 chars with the pinned suffix. Runs against the
+    /// globally-UNIQUE id space (Anthropic/Bedrock shape); the colliding
+    /// Ollama id space is pinned by
+    /// `compact_history_tier2_fires_when_every_turn_shares_ollama_call_0`.
     #[test]
     fn compact_history_tier2_elides_old_results_with_pinned_stub() {
-        let mut messages = paired_history(12);
+        let mut messages = paired_history_unique_ids(12);
         let before = messages.clone();
         let ctx = ToolCtx::stub();
 
@@ -14605,10 +14708,13 @@ mod tests {
     }
 
     /// The MOST RECENT `run_checks` pair is excluded (the done-oracle the
-    /// agent is converging on); an OLDER `run_checks` pair is not.
+    /// agent is converging on); an OLDER `run_checks` pair is not. Runs
+    /// against the globally-UNIQUE id space; the colliding-id form of the
+    /// exclusion is pinned by
+    /// `compact_history_run_checks_exclusion_is_positional_under_colliding_ids`.
     #[test]
     fn compact_history_excludes_only_the_most_recent_run_checks_pair() {
-        let mut messages = paired_history(12);
+        let mut messages = paired_history_unique_ids(12);
         // Replace calls 0 and 10 with run_checks calls — 0 is old, 10 is
         // the most recent run_checks in history.
         messages[1] = Message::Assistant {
@@ -14796,6 +14902,289 @@ mod tests {
         );
         assert_eq!(second.tier, 0, "the second walk changes nothing");
         assert_eq!(messages, after_first, "history is byte-stable across walks");
+    }
+
+    /// REGRESSION PIN — this test FAILS against the pre-fix implementation
+    /// and exists to prove the bug it pins was real: tier 2 used to resolve
+    /// a result's call through a GLOBAL call-id map, but the Ollama
+    /// backend synthesizes ids positionally per response
+    /// (`ollama-call-{i}`, restarting at 0 every turn), so
+    /// `ollama-call-0` is not an identity — it names the first call of
+    /// EVERY assistant turn. Last-writer-wins resolved every colliding id
+    /// to the NEWEST turn's call, always inside the retention window, so
+    /// the age guard skipped everything and `results_elided` was forever
+    /// 0 on the only backend where compaction is armed. The fix pairs by
+    /// the ADJACENCY the engine itself creates, not by id. This is a
+    /// regression pin, not a happy-path test: if it fails again, tier 2
+    /// has regressed to trusting global id uniqueness.
+    #[test]
+    fn compact_history_tier2_fires_when_every_turn_shares_ollama_call_0() {
+        // 12 pairs, every call id the SAME colliding `ollama-call-0` —
+        // exactly what an all-single-call Ollama run emits.
+        let mut messages = paired_history(12);
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            4,
+        );
+
+        assert_eq!(outcome.tier, 2);
+        assert_eq!(
+            outcome.results_elided, 2,
+            "the two OLD pairs must elide even though every call id collides"
+        );
+        // The OLDEST results are the ones elided — turns 0 and 1, whose
+        // args differ per turn so the assertion pins WHICH call the stub
+        // rendered from.
+        assert_eq!(outcome.elided[0].call_id, "ollama-call-0");
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.contains("args: {\"i\":0}"),
+                    "the stub must render the OLD turn's args; got {content}"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        let Message::User { content } = &messages[4] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.contains("args: {\"i\":1}"),
+                    "the stub must render turn 1's args; got {content}"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The 10 recent pairs are untouched — the collision must not
+        // accidentally elide a RECENT pair either.
+        for i in 6..messages.len() {
+            assert_eq!(
+                messages[i], before[i],
+                "recent message {i} untouched despite the colliding ids"
+            );
+        }
+        assert_eq!(outcome.message_count_before, outcome.message_count_after);
+        assert_eq!(outcome.block_count_before, outcome.block_count_after);
+    }
+
+    /// AC3 — the stub renders the call from the PAIRED assistant message,
+    /// never a different turn's call that happens to share the id. Two
+    /// turns share `ollama-call-0` but differ in tool name and
+    /// arguments; the elided stub must name the OLD turn's tool and
+    /// arguments. Under the pre-fix global id map this was the SECOND,
+    /// latent failure mode: had elision fired, the stub would have
+    /// rendered the WRONG call — pointing the model at a plausible tool
+    /// name with the wrong bytes.
+    #[test]
+    fn compact_history_stub_renders_the_paired_call_not_the_colliding_newest() {
+        let mut messages = vec![task_message()];
+        for i in 0..12 {
+            // Turn 0 calls read_file with its own args; every other turn
+            // calls echo — ALL with the same colliding id.
+            let (name, input) = if i == 0 {
+                (
+                    "read_file",
+                    serde_json::json!({ "path": "old-turn.txt", "offset": 0 }),
+                )
+            } else {
+                ("echo", serde_json::json!({ "i": i }))
+            };
+            messages.push(Message::Assistant {
+                content: vec![tool_call("ollama-call-0", name, input)],
+            });
+            messages.push(Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: "ollama-call-0".to_string(),
+                    content: format!("result {i}"),
+                    is_error: false,
+                }],
+            });
+        }
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            4,
+        );
+
+        assert_eq!(outcome.results_elided, 2, "the two old pairs");
+        // The recorded elision names the OLD turn's tool.
+        assert_eq!(
+            outcome.elided[0].tool_name, "read_file",
+            "the elision record must name the paired (old) call's tool"
+        );
+        assert_eq!(outcome.elided[1].tool_name, "echo");
+        // And the stub the model sees renders the OLD call's name and
+        // args — not the newest turn's.
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.contains("tool `read_file`"),
+                    "the stub names the OLD turn's tool; got {content}"
+                );
+                assert!(
+                    content.contains("old-turn.txt"),
+                    "the stub carries the OLD turn's args; got {content}"
+                );
+                assert!(
+                    !content.contains("\"i\":11"),
+                    "the NEWEST turn's args must not leak into the old stub"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// AC4 — the most-recent-`run_checks` exclusion is POSITIONAL (the
+    /// most recent Assistant message containing a `run_checks` call), so
+    /// it survives colliding ids: with EVERY call in history sharing
+    /// `ollama-call-0`, an id-based exclusion would either save every
+    /// `run_checks`-id result in history or none.
+    #[test]
+    fn compact_history_run_checks_exclusion_is_positional_under_colliding_ids() {
+        let mut messages = paired_history(12);
+        // Turns 0 and 10 are BOTH run_checks calls; every call id in
+        // history is the same colliding `ollama-call-0`.
+        messages[1] = Message::Assistant {
+            content: vec![tool_call(
+                "ollama-call-0",
+                "run_checks",
+                serde_json::json!({}),
+            )],
+        };
+        messages[21] = Message::Assistant {
+            content: vec![tool_call(
+                "ollama-call-0",
+                "run_checks",
+                serde_json::json!({}),
+            )],
+        };
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            5,
+        );
+
+        assert_eq!(outcome.tier, 2);
+        // The two OLD pairs (turns 0 and 1) elide; the exclusion saves
+        // only the most recent run_checks pair (turn 10, inside the
+        // window anyway).
+        assert_eq!(outcome.results_elided, 2);
+        // Turn 10's run_checks result keeps its original content.
+        let Message::User { content } = &messages[22] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert_eq!(
+                    content, "result 10",
+                    "the most recent run_checks survives the colliding ids"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The OLD run_checks pair (turn 0) WAS elided — the exclusion is
+        // positional, so a shared id does not save it.
+        let Message::User { content } = &messages[2] else {
+            panic!("results message retained");
+        };
+        match &content[0] {
+            UserBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.contains("elided"),
+                    "the old run_checks pair must elide: {content}"
+                );
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// AC2 — a `Message::User` containing `ToolResult` blocks that is NOT
+    /// immediately preceded by a `Message::Assistant` has no pairing
+    /// (the crash-tail reconcile path pushes exactly this shape: a
+    /// synthetic results message appended after another user message).
+    /// Every result in it is left untouched: no elision, no counter, no
+    /// orphan tally — skipping is the safe direction, an un-elided result
+    /// costs context while one paired to the wrong call corrupts the stub.
+    #[test]
+    fn compact_history_skips_unpaired_results_messages_entirely() {
+        let mut messages = paired_history(12);
+        // The crash-tail shape: a SECOND results user message after the
+        // last pair's results message — its predecessor is a User, not an
+        // Assistant, so its results have no adjacent assistant to pair
+        // with even though the call id exists elsewhere in history.
+        let synthetic = "synthetic reconcile result";
+        messages.push(Message::User {
+            content: vec![UserBlock::ToolResult {
+                call_id: "ollama-call-0".to_string(),
+                content: synthetic.to_string(),
+                is_error: false,
+            }],
+        });
+        let before = messages.clone();
+        let ctx = ToolCtx::stub();
+
+        let outcome = compact_history(
+            &mut messages,
+            &ctx,
+            COMPACT_RETENTION_ASSISTANT_MSGS,
+            COMPACT_REASONING_TAIL_CHARS,
+            4,
+        );
+
+        // Only the two old ADJACENT pairs elide; the unpaired results
+        // message is invisible to tier 2 and to the tripwire.
+        assert_eq!(outcome.results_elided, 2);
+        assert_eq!(
+            outcome.orphan_tool_results, 0,
+            "an unpaired results message is the legitimate reconcile shape, \
+             not a tripwire hit"
+        );
+        assert_eq!(outcome.orphan_tool_calls, 0);
+        let Message::User { content } = messages.last().expect("non-empty") else {
+            unreachable!();
+        };
+        match &content[0] {
+            UserBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "ollama-call-0");
+                assert_eq!(content, synthetic, "the unpaired result is untouched");
+                assert!(!is_error, "is_error untouched");
+            }
+            other @ UserBlock::Text(_) => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The rest of the walk behaved exactly as without the appended
+        // message.
+        for i in 0..before.len() - 1 {
+            if i == 2 || i == 4 {
+                continue; // the two elided pairs
+            }
+            assert_eq!(messages[i], before[i], "message {i} untouched");
+        }
     }
 
     /// A `Usage` with only the uncached remainder set — the Ollama shape
