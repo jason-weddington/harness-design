@@ -49,6 +49,23 @@ Every tier-2 task was mined from a past GTD dispatch that a Sonnet-class model c
 - **Harness changes must not break the perfect-spec path.** A talos behaviour that helps under-specified work but costs or loops on an 18-31-criterion groomed spec is a regression, even if tier-2 improves. Guard it with tier-1's spec-shaped fixtures (TaskSpec `task.json`, rendered through the production `task_spec_prompt.md`; saturated by design, so any lost pass, false done, cap hit or iteration/token blowup is a regression), plus a few supervised real dispatches of groomed GTD items before any talos default flips.
 - **Design rule:** harness features must be spec-agnostic and nearly free when the spec already did the work (e.g. a named test in the spec *is* the coverage; an audit cites existing evidence rather than re-running it). Ship behind a default-off knob; flip only after tier-2 shows benefit **and** the perfect-spec guard is clean. Decision record: `kb-03268`.
 
+## Grooming in this project: the talos groom is the default (2026-09-19)
+
+Groom this project's items with the **talos-flow port of groom-to-ready**, not the Claude Code `Workflow` tool, in the **arm C shape**: draft on `glm-5.3-flash`, the four critics on `glm-5.3`, synthesize on `glm-5.3-flash`. Jason's decision after the four-arm comparison (`kb-03342`): the Opus/Fable Workflow writes better specs but is unsustainable — it exhausts the weekly Anthropic plan limit in under half a week and usage credits are not worth paying — while arm C's specs built one-shot on talos-glm at ~$3 per item. All-flash is NOT acceptable (its own critics passed a spec about the wrong item); the critic stage is the safety layer and stays on full glm-5.3. This is a project-local rule — we dogfood talos with talos here — not a global one.
+
+How to run it (from a **detached worktree** of this repo, never the checkout you are editing — the inverted tree check bounces every in-flight answer if the tree moves):
+
+```bash
+git worktree add --detach /tmp/hd-groom main
+cd ~/git/talos_flow && TALOS_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_THINK=high \
+  uv run --frozen python -m talos_flow.workflows.groom_to_ready \
+  --args args.json --workspace /tmp/hd-groom --out finals.json \
+  --draft-env OLLAMA_MODEL=glm-5.3-flash:cloud --critic-env OLLAMA_MODEL=glm-5.3:cloud --synth-env OLLAMA_MODEL=glm-5.3-flash:cloud \
+  --rate-in 0.15 --rate-cached 0.03 --rate-out 0.50   # flash rates; recost the critic stage at 1.40/0.26/4.40 if you want exact dollars
+```
+
+Host it in `Monitor` (the eight stdout progress lines are the events), review `finals.json` as the checkpoint, then `agent-gtd update-item <id> --from-json <spec>.json --status ready`. `args.json` is `{context, items:[{id, slug, title, seed, criticalConstraint}]}` — the same shape the JS took. Cite only paths inside this repo in `context` and seeds; the answer agents can read nothing else.
+
 ## Why Rust
 
 Part of the learning goal. Rust's compiler and type system give us a layer of
