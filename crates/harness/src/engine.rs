@@ -5856,7 +5856,7 @@ mod tests {
             model: "m".to_string(),
             think: Some("on".to_string()),
             num_ctx: Some(32768),
-            num_ctx_source: Some("localhost_default".to_string()),
+            num_ctx_source: Some("explicit".to_string()),
         };
         let backend = MockBackend::from_turns(vec![finish_call(
             "c-fin",
@@ -7048,7 +7048,7 @@ mod tests {
             model: "m".to_string(),
             think: Some("on".to_string()),
             num_ctx: Some(32768),
-            num_ctx_source: Some("localhost_default".to_string()),
+            num_ctx_source: Some("explicit".to_string()),
         };
         let mut record = make_minimal_record("bs-fc-task", 1);
         record.backend_settings = Some(s.clone());
@@ -7127,7 +7127,7 @@ mod tests {
             model: "m".to_string(),
             think: Some("on".to_string()),
             num_ctx: Some(32768),
-            num_ctx_source: Some("localhost_default".to_string()),
+            num_ctx_source: Some("explicit".to_string()),
         };
         let mut record = make_minimal_record("bs-crash-task", 1);
         record.backend_settings = Some(s.clone());

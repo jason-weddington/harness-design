@@ -153,14 +153,16 @@ async fn backend_error_via_refused_port_writes_store_record() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused:
         // the FIRST TURN must fail (BackendError at run time), not backend
-        // construction — with `num_ctx` coming from the RESOLVED localhost
-        // default, not an env pin.
+        // construction.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
+        // port must fail the FIRST TURN (BackendError at run time), not
+        // backend construction (which would exit 1 before any artifacts).
+        .env("OLLAMA_NUM_CTX", "32768")
         // The talos dispatch lanes export these into the talos process env
         // (inherited through cargo nextest) — scrub them so the recorded
         // `backend_settings` below is deterministic on every lane.
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
         .env_remove("TALOS_BEDROCK")
         // Isolate this run's implicit prune pass from the real
         // `$HOME/.local/state/talos` — without this, an unmodified nextest
@@ -232,8 +234,8 @@ async fn backend_error_via_refused_port_writes_store_record() {
 
 /// The record and the stdout summary carry the SAME resolved Ollama
 /// construction settings: the verbatim model, no think knob, and the
-/// RESOLVED localhost default `num_ctx` (the test scrubs the env, so this
-/// value is a construction default, not an env pin).
+/// explicitly pinned `num_ctx` (the test env sets it, keeping the probe
+/// OFF — `num_ctx_source` records that pin as `explicit`).
 fn assert_resolved_backend_settings(
     record: &harness::run_record::RunRecord,
     summary: &serde_json::Value,
@@ -245,7 +247,7 @@ fn assert_resolved_backend_settings(
             model: "x".into(),
             think: None,
             num_ctx: Some(32768),
-            num_ctx_source: Some("localhost_default".into()),
+            num_ctx_source: Some("explicit".into()),
         }),
         "record.backend_settings must be the resolved construction settings"
     );
@@ -257,10 +259,7 @@ fn assert_resolved_backend_settings(
         "unset think must be explicit null in the summary"
     );
     assert_eq!(summary["backend_settings"]["num_ctx"], 32768);
-    assert_eq!(
-        summary["backend_settings"]["num_ctx_source"],
-        "localhost_default"
-    );
+    assert_eq!(summary["backend_settings"]["num_ctx_source"], "explicit");
 }
 
 // ============================================================================
@@ -306,8 +305,11 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
         .env("OLLAMA_MODEL", "x")
         // Port 1 on loopback is reserved; connections are always refused.
         .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF: the refused
+        // port must fail the FIRST TURN (BackendError at run time), not
+        // backend construction (which would exit 1 before any artifacts).
+        .env("OLLAMA_NUM_CTX", "32768")
         .env_remove("OLLAMA_THINK")
-        .env_remove("OLLAMA_NUM_CTX")
         .env_remove("TALOS_BEDROCK")
         // Isolate the implicit prune pass from the real state root — see the
         // comment in `backend_error_via_refused_port_writes_store_record`.
@@ -382,13 +384,13 @@ async fn transcript_flag_writes_pinned_seven_lines_on_backend_error() {
 
 /// The `run_start` line's free-text `label` and structured
 /// `backend_settings` must agree — one source, two renderings — and the
-/// label's `num_ctx` is the RESOLVED localhost default (the test scrubs
-/// `OLLAMA_NUM_CTX`, so the raw env said nothing).
+/// label's `num_ctx` is the explicitly pinned 32768 (the test env sets
+/// `OLLAMA_NUM_CTX`, keeping the probe OFF).
 fn assert_run_start_label_and_settings(run_start: &serde_json::Value) {
     assert_eq!(
         run_start["label"], "ollama:x think=unset num_ctx=32768",
-        "num_ctx is the RESOLVED localhost default (OLLAMA_NUM_CTX scrubbed) — \
-         not the raw env, which said nothing"
+        "num_ctx is the EXPLICIT env pin (OLLAMA_NUM_CTX=32768) — \
+         not a probe, which a refused port would have failed"
     );
     assert_eq!(
         run_start["backend_settings"],
@@ -397,7 +399,7 @@ fn assert_run_start_label_and_settings(run_start: &serde_json::Value) {
             "model": "x",
             "think": null,
             "num_ctx": 32768,
-            "num_ctx_source": "localhost_default"
+            "num_ctx_source": "explicit"
         }),
         "run_start.backend_settings must carry the resolved construction settings"
     );

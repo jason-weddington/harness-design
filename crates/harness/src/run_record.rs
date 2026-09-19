@@ -82,9 +82,14 @@ pub struct BackendSettings {
     /// `null`.
     #[serde(default)]
     pub num_ctx: Option<u32>,
-    /// How `num_ctx` was chosen (`"env"` or `"localhost_default"`); `None`
-    /// exactly when `num_ctx` is `None`. `None` serializes as explicit
-    /// `null`.
+    /// How `num_ctx` was chosen: `"explicit"` or `"probe"` (from
+    /// [`crate::ollama::NumCtxSource::as_str`]); `None` exactly when
+    /// `num_ctx` is `None` (the `Default` source pins no value). `None`
+    /// serializes as explicit `null`. Historical note: records written
+    /// between commits `d76792d` and the num_ctx-resolver restore carry the
+    /// LEGACY strings `"env"` / `"localhost_default"` in this field —
+    /// disambiguate by `run_start.harness_version` when querying drift
+    /// across history.
     #[serde(default)]
     pub num_ctx_source: Option<String>,
 }
@@ -1347,7 +1352,7 @@ mod tests {
             model: "qwen3.8:27b".to_string(),
             think: Some("high".to_string()),
             num_ctx: Some(131_072),
-            num_ctx_source: Some("env".to_string()),
+            num_ctx_source: Some("explicit".to_string()),
         });
         round_trip(&r);
     }

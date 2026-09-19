@@ -172,10 +172,12 @@
 //! - `OLLAMA_MODEL` — required for ollama
 //! - `OLLAMA_BASE_URL` — optional; default `http://localhost:11434`
 //! - `OLLAMA_API_KEY` — optional bearer token
-//! - `OLLAMA_NUM_CTX` — optional `u32`; defaults to 32 768 for
-//!   `localhost`/`127.0.0.1` base URLs, and stays unset for non-local base
-//!   URLs (Ollama's own default applies). Empty/whitespace is treated as
-//!   unset.
+//! - `OLLAMA_NUM_CTX` — optional. A non-empty `u32` is used verbatim (no
+//!   probe); empty/whitespace is treated as unset. Unset with a
+//!   `localhost`/`127.0.0.1` base URL probes `POST /api/show` and pins the
+//!   model's advertised context length (a probe failure exits 1 — no
+//!   fallback); unset with a non-local base URL leaves `num_ctx` unset
+//!   (Ollama's own default).
 //! - `OLLAMA_THINK` — `off|on|low|medium|high|max`
 //! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; `0` or unset = unbounded
 //!   wall-clock budget. Overridden by `--wall-clock-secs` when the flag is
@@ -744,6 +746,35 @@ fn stderr_json_error(message: &str) {
     eprintln!("{obj}");
 }
 
+/// Build the one-line structured stderr object describing a successful
+/// `num_ctx` resolution:
+/// `{"num_ctx": {"value": <u32|null>, "source": "<explicit|probe|default>",
+/// "desc": "<desc>", "warning": <string|null>}}`. Pure — the caller decides
+/// when to print it (exactly once per successful resolution, and BEFORE any
+/// `{"error": ...}` line, so the dispatch worker's last-stderr-line error
+/// parse is unaffected). Mirrors the [`stderr_json_error`] idiom. This line is
+/// DIAGNOSTIC only — nothing in-repo parses it; it is pinned so the dispatch
+/// stderr log keeps a stable shape.
+fn num_ctx_stderr_line(r: &harness::ollama::NumCtxResolution) -> String {
+    let obj = serde_json::json!({
+        "num_ctx": {
+            "value": r.value,
+            "source": r.source.as_str(),
+            "desc": r.desc,
+            "warning": r.warning,
+        }
+    });
+    obj.to_string()
+}
+
+/// The `num_ctx_source` a run RECORD carries for a resolved `num_ctx`:
+/// `Some(as_str())` when a value was pinned, `None` when it was not —
+/// `NumCtxSource::Default` pins no value, so the string `"default"` never
+/// reaches a record (it appears only in the stderr provenance line).
+fn num_ctx_source_for_record(r: &harness::ollama::NumCtxResolution) -> Option<String> {
+    r.value.map(|_| r.source.as_str().to_string())
+}
+
 // ============================================================================
 // stdout summary
 // ============================================================================
@@ -900,31 +931,40 @@ fn build_anthropic_backend(
 ///
 /// Reads `OLLAMA_MODEL` (required), `OLLAMA_BASE_URL` (default
 /// `http://localhost:11434`), `OLLAMA_API_KEY` (optional), `OLLAMA_THINK`
-/// (`off|on|low|medium|high|max`), and resolves `OLLAMA_NUM_CTX`: a non-empty
-/// value that parses as `u32` wins verbatim (recorded with
-/// `num_ctx_source == Some("env")`); an empty/whitespace value is treated as
-/// unset; unset with a `localhost`/`127.0.0.1` base URL pins the localhost
-/// default of 32 768 (recorded with `num_ctx_source ==
-/// Some("localhost_default")`); unset with a non-local base URL leaves
-/// `num_ctx` unset (Ollama's own default, `num_ctx_source == None`). The
-/// value AND its source are set in the same match arm that chooses them.
+/// (`off|on|low|medium|high|max`), and resolves `OLLAMA_NUM_CTX` via the
+/// shared `harness::ollama::resolve_num_ctx` — the five-branch precedence is
+/// documented there: a non-empty `u32` wins verbatim (no probe);
+/// empty/whitespace is treated as unset; unset with a `localhost`/`127.0.0.1`
+/// base URL probes `POST /api/show` and pins the model's advertised context
+/// length; unset with a non-local base URL leaves `num_ctx` unset (Ollama's
+/// own default). A probe failure is returned as `Err` (fail-loud) — never a
+/// fallback constant or a silent default.
+///
+/// `OLLAMA_THINK` is validated BEFORE any `num_ctx` resolution, so an
+/// invalid value can never trigger an HTTP probe. On every successful
+/// resolution a structured `{"num_ctx": {...}}` line is emitted to stderr
+/// exactly once (via [`num_ctx_stderr_line`]), before any `{"error": ...}`
+/// line.
 ///
 /// The recorded settings carry the think level as the `OLLAMA_THINK` env
 /// spelling (`ThinkLevel::as_str`) — the same `Option<ThinkLevel>` value
 /// that is passed to `with_think` — and the `num_ctx` that is passed to
-/// `with_num_ctx`: each env value is read exactly once, so the record can
-/// never disagree with the construction.
+/// `with_num_ctx`, with `num_ctx_source` `"explicit"`/`"probe"` (or `None`
+/// when no value was pinned): each value AND its source come out of the
+/// SAME resolution, so the record can never disagree with the
+/// construction.
 ///
 /// Returns `Err` on any missing required var, unrecognised `OLLAMA_THINK`
-/// value, or non-`u32` `OLLAMA_NUM_CTX` — never panics.
-fn build_ollama_backend(
+/// value, non-`u32` `OLLAMA_NUM_CTX`, or probe failure — never panics.
+async fn build_ollama_backend(
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<(Backend, BackendSettings), String> {
     let model = env("OLLAMA_MODEL")
         .ok_or_else(|| "OLLAMA_MODEL must be set when TALOS_BACKEND=ollama".to_string())?;
     let base_url = env("OLLAMA_BASE_URL").unwrap_or_else(|| "http://localhost:11434".to_string());
-    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
 
+    // `OLLAMA_THINK` is validated BEFORE any num_ctx resolution so an
+    // invalid value can never trigger a /api/show probe.
     let think: Option<ThinkLevel> = match env("OLLAMA_THINK").as_deref() {
         None => None,
         Some("off") => Some(ThinkLevel::Off),
@@ -940,28 +980,26 @@ fn build_ollama_backend(
         }
     };
 
-    // The value AND its source come out of the SAME match arm, so the
-    // recorded `num_ctx` can never disagree with the constructed one.
-    let (num_ctx, num_ctx_source): (Option<u32>, Option<&'static str>) = match env("OLLAMA_NUM_CTX")
-    {
-        None => (
-            is_local.then_some(32_768),
-            is_local.then_some("localhost_default"),
-        ),
-        Some(v) if v.trim().is_empty() => (None, None),
-        Some(v) => {
-            let n = v
-                .parse::<u32>()
-                .map_err(|_| format!("OLLAMA_NUM_CTX must be a valid u32, got \"{v}\""))?;
-            (Some(n), Some("env"))
-        }
-    };
+    // `OLLAMA_API_KEY` is used FOR THE PROBE ONLY (an empty string has no
+    // meaning as a bearer token); the `with_api_key` call below keeps today's
+    // exact behaviour (applied whenever the var is `Some`, even empty).
+    let api_key = env("OLLAMA_API_KEY").filter(|s| !s.is_empty());
+    let num_ctx = harness::ollama::resolve_num_ctx(
+        &base_url,
+        &model,
+        api_key.as_deref(),
+        env("OLLAMA_NUM_CTX").as_deref(),
+    )
+    .await?;
+    // Structured provenance line, exactly once per successful resolution
+    // (all branches), before any `{"error": ...}` line.
+    eprintln!("{}", num_ctx_stderr_line(&num_ctx));
 
     let mut ollama = OllamaBackend::new(&model, &base_url);
     if let Some(key) = env("OLLAMA_API_KEY") {
         ollama = ollama.with_api_key(key);
     }
-    if let Some(n) = num_ctx {
+    if let Some(n) = num_ctx.value {
         ollama = ollama.with_num_ctx(n);
     }
     if let Some(level) = think {
@@ -972,8 +1010,8 @@ fn build_ollama_backend(
         kind: BackendKind::Ollama,
         model,
         think: think.map(ThinkLevel::as_str).map(str::to_string),
-        num_ctx,
-        num_ctx_source: num_ctx_source.map(str::to_string),
+        num_ctx: num_ctx.value,
+        num_ctx_source: num_ctx_source_for_record(&num_ctx),
     };
     Ok((Backend::Ollama(ollama), settings))
 }
@@ -1026,7 +1064,9 @@ fn build_bedrock_backend(
 ///   `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-4-8`)
 /// - `OLLAMA_THINK` outside the accepted set
 /// - `OLLAMA_NUM_CTX` present (non-empty) but unparsable as `u32`
-fn backend_from_env(
+/// - a `POST /api/show` probe failure for a local (`localhost`/`127.0.0.1`)
+///   base URL with `OLLAMA_NUM_CTX` unset (fail-loud; never a fallback)
+async fn backend_from_env(
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<(Backend, BackendSettings), String> {
     if let Some(v) = env("TALOS_BEDROCK").as_deref()
@@ -1036,7 +1076,7 @@ fn backend_from_env(
     }
     match env("TALOS_BACKEND").as_deref() {
         Some("anthropic") | None => build_anthropic_backend(env),
-        Some("ollama") => build_ollama_backend(env),
+        Some("ollama") => build_ollama_backend(env).await,
         Some(other) => Err(format!(
             "TALOS_BACKEND must be \"anthropic\" or \"ollama\", got \"{other}\""
         )),
@@ -1451,7 +1491,7 @@ async fn run_cmd(args: RunArgs) {
 
     // 3. Select model backend from environment.
     let env_accessor = |k: &str| std::env::var(k).ok();
-    let (backend, settings) = match backend_from_env(&env_accessor) {
+    let (backend, settings) = match backend_from_env(&env_accessor).await {
         Ok(pair) => pair,
         Err(e) => {
             stderr_json_error(&e);
@@ -1666,7 +1706,7 @@ async fn run_ralph_cmd(args: RalphArgs) {
 
     // 2. Select model backend from environment (same contract as `run`).
     let env_accessor = |k: &str| std::env::var(k).ok();
-    let (backend, _settings) = match backend_from_env(&env_accessor) {
+    let (backend, _settings) = match backend_from_env(&env_accessor).await {
         Ok(pair) => pair,
         Err(e) => {
             stderr_json_error(&e);
@@ -1798,10 +1838,10 @@ mod tests {
     use super::{
         Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunMode, RunSummary, SECS_PER_DAY,
         backend_from_env, build_checks_runner, build_ralph_summary, build_run_summary, exit_code,
-        load_answer_schema, make_run_seed, outcome_str, prune_report_json, prune_state_root,
-        ralph_exit_code, ralph_terminal_str, resolve_ralph_wall_clock_secs,
-        resolve_state_retention_days, resolve_transcript_path, touch_dir_mtime, transcript_label,
-        validate_mode_flags, write_ralph_error_detail,
+        load_answer_schema, make_run_seed, num_ctx_source_for_record, num_ctx_stderr_line,
+        outcome_str, prune_report_json, prune_state_root, ralph_exit_code, ralph_terminal_str,
+        resolve_ralph_wall_clock_secs, resolve_state_retention_days, resolve_transcript_path,
+        touch_dir_mtime, transcript_label, validate_mode_flags, write_ralph_error_detail,
     };
     use harness::engine::LoopOutcome;
     use harness::exec::ChangeEvidence;
@@ -2139,7 +2179,7 @@ mod tests {
             "a non-ollama label is unchanged"
         );
         assert_eq!(
-            transcript_label(&bedrock(Some("on"), Some(65536), Some("env"))),
+            transcript_label(&bedrock(Some("on"), Some(65536), Some("explicit"))),
             "bedrock:claude-haiku-4-5",
             "a non-ollama label is unchanged regardless of populated ollama-ish fields"
         );
@@ -2149,7 +2189,7 @@ mod tests {
             model: "x".to_string(),
             think: think.map(str::to_string),
             num_ctx,
-            num_ctx_source: num_ctx.is_some().then(|| "env".to_string()),
+            num_ctx_source: num_ctx.is_some().then(|| "explicit".to_string()),
         };
         assert_eq!(
             transcript_label(&ollama(None, None)),
@@ -2245,10 +2285,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backend_from_env_defaults_to_anthropic_when_unset() {
+    #[tokio::test]
+    async fn backend_from_env_defaults_to_anthropic_when_unset() {
         let env = env_with(&[("ANTHROPIC_API_KEY", "sk-test")]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Anthropic(_)));
         // model_label is the model id verbatim (default)
         assert_eq!(settings.model_label(), "claude-haiku-4-5");
@@ -2267,10 +2307,10 @@ mod tests {
 
     // ---- TALOS_BEDROCK precedence ----------------------------------------
 
-    #[test]
-    fn talos_bedrock_selects_bedrock_with_no_other_vars() {
+    #[tokio::test]
+    async fn talos_bedrock_selects_bedrock_with_no_other_vars() {
         let env = env_with(&[("TALOS_BEDROCK", "1")]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Bedrock(_)));
         // The CANONICAL model name is recorded — NOT the inference-profile
         // id the backend was actually built with.
@@ -2282,64 +2322,64 @@ mod tests {
         assert_eq!(settings.num_ctx_source, None);
     }
 
-    #[test]
-    fn talos_bedrock_wins_over_ollama_when_both_set() {
+    #[tokio::test]
+    async fn talos_bedrock_wins_over_ollama_when_both_set() {
         let env = env_with(&[
             ("TALOS_BEDROCK", "1"),
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "qwen3:32b"),
         ]);
-        let (backend, label_settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, label_settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Bedrock(_)));
         assert_eq!(label_settings.model_label(), "bedrock:claude-haiku-4-5");
     }
 
-    #[test]
-    fn talos_bedrock_empty_falls_through_to_anthropic() {
+    #[tokio::test]
+    async fn talos_bedrock_empty_falls_through_to_anthropic() {
         let env = env_with(&[("TALOS_BEDROCK", ""), ("ANTHROPIC_API_KEY", "sk-test")]);
-        let (backend, _settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, _settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Anthropic(_)));
     }
 
-    #[test]
-    fn talos_bedrock_whitespace_only_falls_through_to_anthropic() {
+    #[tokio::test]
+    async fn talos_bedrock_whitespace_only_falls_through_to_anthropic() {
         let env = env_with(&[("TALOS_BEDROCK", "   "), ("ANTHROPIC_API_KEY", "sk-test")]);
-        let (backend, _settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, _settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(
             matches!(backend, Backend::Anthropic(_)),
             "whitespace-only TALOS_BEDROCK must NOT select Bedrock"
         );
     }
 
-    #[test]
-    fn talos_bedrock_unmapped_model_is_err() {
+    #[tokio::test]
+    async fn talos_bedrock_unmapped_model_is_err() {
         let env = env_with(&[("TALOS_BEDROCK", "1"), ("ANTHROPIC_MODEL", "claude-3-opus")]);
         assert!(
-            backend_from_env(&env).is_err(),
+            backend_from_env(&env).await.is_err(),
             "unmapped ANTHROPIC_MODEL under TALOS_BEDROCK must be Err"
         );
     }
 
-    #[test]
-    fn talos_bedrock_explicit_model_label() {
+    #[tokio::test]
+    async fn talos_bedrock_explicit_model_label() {
         let env = env_with(&[
             ("TALOS_BEDROCK", "1"),
             ("ANTHROPIC_MODEL", "claude-sonnet-5"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Bedrock(_)));
         assert_eq!(settings.model, "claude-sonnet-5");
         assert_eq!(settings.model_label(), "bedrock:claude-sonnet-5");
     }
 
-    #[test]
-    fn backend_from_env_anthropic_explicit() {
+    #[tokio::test]
+    async fn backend_from_env_anthropic_explicit() {
         let env = env_with(&[
             ("TALOS_BACKEND", "anthropic"),
             ("ANTHROPIC_API_KEY", "sk-xyz"),
             ("ANTHROPIC_MODEL", "claude-sonnet-5"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Anthropic(_)));
         assert_eq!(
             settings.model, "claude-sonnet-5",
@@ -2348,49 +2388,49 @@ mod tests {
         assert_eq!(settings.model_label(), "claude-sonnet-5");
     }
 
-    #[test]
-    fn backend_from_env_missing_anthropic_api_key_is_err() {
+    #[tokio::test]
+    async fn backend_from_env_missing_anthropic_api_key_is_err() {
         let env = env_with(&[]); // ANTHROPIC_API_KEY absent
         assert!(
-            backend_from_env(&env).is_err(),
+            backend_from_env(&env).await.is_err(),
             "missing ANTHROPIC_API_KEY must be Err"
         );
     }
 
-    #[test]
-    fn backend_from_env_unknown_backend_is_err() {
+    #[tokio::test]
+    async fn backend_from_env_unknown_backend_is_err() {
         let env = env_with(&[("TALOS_BACKEND", "gemini")]);
         assert!(
-            backend_from_env(&env).is_err(),
+            backend_from_env(&env).await.is_err(),
             "unknown TALOS_BACKEND must be Err"
         );
     }
 
-    #[test]
-    fn backend_from_env_ollama_model_label_prefix() {
+    #[tokio::test]
+    async fn backend_from_env_ollama_model_label_prefix() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "qwen3:32b"),
             ("OLLAMA_BASE_URL", "https://ollama.com"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Ollama(_)));
         // The recorded model is VERBATIM (no prefix) — the label carries it.
         assert_eq!(settings.model, "qwen3:32b");
         assert_eq!(settings.model_label(), "ollama:qwen3:32b");
     }
 
-    #[test]
-    fn backend_from_env_ollama_missing_model_is_err() {
+    #[tokio::test]
+    async fn backend_from_env_ollama_missing_model_is_err() {
         let env = env_with(&[("TALOS_BACKEND", "ollama")]);
         assert!(
-            backend_from_env(&env).is_err(),
+            backend_from_env(&env).await.is_err(),
             "OLLAMA_MODEL must be required for ollama"
         );
     }
 
-    #[test]
-    fn backend_from_env_bad_ollama_think_is_err() {
+    #[tokio::test]
+    async fn backend_from_env_bad_ollama_think_is_err() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "some-model"),
@@ -2398,19 +2438,19 @@ mod tests {
             ("OLLAMA_THINK", "turbo"),
         ]);
         assert!(
-            backend_from_env(&env).is_err(),
+            backend_from_env(&env).await.is_err(),
             "invalid OLLAMA_THINK must be Err"
         );
     }
 
-    #[test]
-    fn backend_from_env_bad_ollama_num_ctx_is_err() {
+    #[tokio::test]
+    async fn backend_from_env_bad_ollama_num_ctx_is_err() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "some-model"),
             ("OLLAMA_NUM_CTX", "not-a-number"),
         ]);
-        let Err(e) = backend_from_env(&env) else {
+        let Err(e) = backend_from_env(&env).await else {
             panic!("non-u32 OLLAMA_NUM_CTX must be Err")
         };
         assert!(
@@ -2422,8 +2462,8 @@ mod tests {
     /// Round-trip that locks `ThinkLevel::as_str` and the production `OLLAMA_THINK`
     /// parser together: every level round-trips to the same spelling the
     /// record stores.
-    #[test]
-    fn backend_from_env_all_ollama_think_values_accepted() {
+    #[tokio::test]
+    async fn backend_from_env_all_ollama_think_values_accepted() {
         for level in [
             ThinkLevel::Off,
             ThinkLevel::On,
@@ -2439,7 +2479,7 @@ mod tests {
                 ("OLLAMA_THINK", level.as_str()),
             ];
             let env = env_with(&vars);
-            let Ok((_backend, settings)) = backend_from_env(&env) else {
+            let Ok((_backend, settings)) = backend_from_env(&env).await else {
                 panic!("OLLAMA_THINK={level:?} must be accepted")
             };
             assert_eq!(
@@ -2452,54 +2492,286 @@ mod tests {
 
     // ---- backend_from_env: num_ctx resolution (hermetic) ----------------
 
-    /// Unset `OLLAMA_NUM_CTX` + the default (localhost) base URL resolves to
-    /// the localhost default 32768, recorded with source `localhost_default`
-    /// — no network call is involved, so this is deterministic anywhere.
-    #[test]
-    fn backend_from_env_ollama_local_unset_defaults_num_ctx() {
-        let env = env_with(&[("TALOS_BACKEND", "ollama"), ("OLLAMA_MODEL", "x")]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
-        assert!(matches!(backend, Backend::Ollama(_)));
-        assert_eq!(
-            settings,
-            BackendSettings {
-                kind: BackendKind::Ollama,
-                model: "x".to_string(),
-                think: None,
-                num_ctx: Some(32768),
-                num_ctx_source: Some("localhost_default".to_string())
+    // ---- backend_from_env: num_ctx resolution via POST /api/show ---------
+    //
+    // `wiremock` is NOT a dev-dependency of this crate (and must not be
+    // added), and the workspace tokio features omit `net` — so the fake
+    // `/api/show` daemon below is a raw `std::net::TcpListener` thread.
+
+    /// Bind `127.0.0.1:0` and serve ONE `POST /api/show` request with
+    /// `model_info` as the response body. Returns the port and a channel
+    /// that yields the FULL request head (request line + every header, up
+    /// to the blank line) once the connection completes — the head is what
+    /// the authorization-header assertions below read.
+    fn fake_show_daemon(
+        model_info: &serde_json::Value,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let body = format!("{{\"model_info\":{model_info}}}");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf: Vec<u8> = Vec::new();
+            let mut one = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut one) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => buf.push(one[0]),
+                }
             }
+            let head = String::from_utf8_lossy(&buf).trim_end().to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            let _ = tx.send(head);
+        });
+        (port, rx)
+    }
+
+    // (i) unset + local → the probe FIRES from talos and the advertised
+    // 262144 is pinned, recorded with source `probe`.
+    #[tokio::test]
+    async fn backend_from_env_ollama_local_unset_probes_api_show() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+        ];
+        let env = env_with(&vars);
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
+        assert!(matches!(backend, Backend::Ollama(_)));
+        assert_eq!(settings.num_ctx, Some(262_144));
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("probe"));
+        let head = head_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server must have served the probe");
+        assert_eq!(
+            head.lines().next().unwrap_or_default(),
+            "POST /api/show HTTP/1.1",
+            "the probe must be a POST /api/show request: {head}"
         );
     }
 
-    /// An explicit `127.0.0.1` base URL is the same local topology: same
-    /// resolved value and source as the default-URL case.
-    #[test]
-    fn backend_from_env_ollama_127_0_0_1_unset_defaults_num_ctx() {
+    // (ii) an explicit `OLLAMA_NUM_CTX` wins verbatim — NO probe fires, so
+    // the fake daemon (which would answer anything) must stay untouched.
+    #[tokio::test]
+    async fn backend_from_env_ollama_explicit_num_ctx_skips_the_probe() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+            ("OLLAMA_NUM_CTX", "65536"),
+        ];
+        let env = env_with(&vars);
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
+        assert!(matches!(backend, Backend::Ollama(_)));
+        assert_eq!(settings.num_ctx, Some(65_536));
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("explicit"));
+        assert!(
+            head_rx.try_recv().is_err(),
+            "an explicit value must not probe /api/show"
+        );
+    }
+
+    // (iii) a below-floor advertised value is DATA, not a failure — the run
+    // proceeds with the verbatim advertised value.
+    #[tokio::test]
+    async fn backend_from_env_ollama_local_probe_below_floor_still_ok() {
+        let (port, _head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 8_192
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+        ];
+        let env = env_with(&vars);
+        let (backend, settings) = backend_from_env(&env).await.expect("below floor is Ok");
+        assert!(matches!(backend, Backend::Ollama(_)));
+        assert_eq!(settings.num_ctx, Some(8_192));
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("probe"));
+    }
+
+    // (iv) probe connection-refused → fail-loud Err naming model + host.
+    #[tokio::test]
+    async fn backend_from_env_ollama_local_probe_refused_is_err() {
+        // Capture a port, then DROP the listener so the probe is refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+        ];
+        let env = env_with(&vars);
+        let Err(e) = backend_from_env(&env).await else {
+            panic!("probe failure must be Err")
+        };
+        assert!(e.contains("127.0.0.1"), "error must name the host: {e}");
+        assert!(e.contains("`m`"), "error must name the model: {e}");
+    }
+
+    // (v) a non-local base URL makes no request at all: no `num_ctx`, no
+    // source. (There is nothing to observe a request against — the point
+    // is that no local daemon is ever involved.)
+    #[tokio::test]
+    async fn backend_from_env_ollama_nonlocal_makes_no_request() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
-            ("OLLAMA_MODEL", "x"),
-            ("OLLAMA_BASE_URL", "http://127.0.0.1:1"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", "https://ollama.com"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Ollama(_)));
-        assert_eq!(settings.num_ctx, Some(32768));
+        assert_eq!(settings.num_ctx, None);
+        assert_eq!(settings.num_ctx_source, None);
+    }
+
+    // An empty/whitespace `OLLAMA_NUM_CTX` is UNSET (resolver branch 0), so
+    // a local base URL falls through to the probe — exactly one request.
+    #[tokio::test]
+    async fn backend_from_env_ollama_whitespace_num_ctx_is_unset_and_probes() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+            ("OLLAMA_NUM_CTX", "   "),
+        ];
+        let env = env_with(&vars);
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
+        assert!(matches!(backend, Backend::Ollama(_)));
+        assert_eq!(settings.num_ctx, Some(262_144));
         assert_eq!(
             settings.num_ctx_source.as_deref(),
-            Some("localhost_default")
+            Some("probe"),
+            "whitespace-only OLLAMA_NUM_CTX must fall through to the probe"
+        );
+        let head = head_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the daemon must have served exactly one request");
+        assert!(head.starts_with("POST /api/show HTTP/1.1"));
+        assert!(
+            head_rx.try_recv().is_err(),
+            "the probe must fire exactly once"
+        );
+    }
+
+    // `OLLAMA_THINK` is validated BEFORE the `num_ctx` resolution, so an
+    // invalid value can never trigger a `/api/show` probe.
+    #[tokio::test]
+    async fn backend_from_env_ollama_bad_think_fails_before_any_probe() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+            ("OLLAMA_THINK", "bogus"),
+        ];
+        let env = env_with(&vars);
+        let Err(e) = backend_from_env(&env).await else {
+            panic!("invalid OLLAMA_THINK must be Err")
+        };
+        assert!(e.contains("OLLAMA_THINK"), "error must name the var: {e}");
+        assert!(
+            head_rx.try_recv().is_err(),
+            "an invalid think level must not trigger a probe"
+        );
+    }
+
+    // An EMPTY `OLLAMA_API_KEY` is not a bearer token: the probe request
+    // carries no `authorization` header at all.
+    #[tokio::test]
+    async fn backend_from_env_ollama_empty_api_key_sends_no_authorization_header() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+            ("OLLAMA_API_KEY", ""),
+        ];
+        let env = env_with(&vars);
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
+        assert!(matches!(backend, Backend::Ollama(_)));
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("probe"));
+        let head = head_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the daemon must have served the probe");
+        assert!(
+            !head
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("authorization:")),
+            "an empty key must not be sent as a bearer token: {head}"
+        );
+    }
+
+    // A non-empty `OLLAMA_API_KEY` is sent as the probe credential.
+    #[tokio::test]
+    async fn backend_from_env_ollama_api_key_is_sent_as_bearer_on_the_probe() {
+        let (port, head_rx) = fake_show_daemon(&serde_json::json!({
+            "general.architecture": "qwen35",
+            "qwen35.context_length": 262_144
+        }));
+        let base_url = format!("http://127.0.0.1:{port}");
+        let vars = [
+            ("TALOS_BACKEND", "ollama"),
+            ("OLLAMA_MODEL", "m"),
+            ("OLLAMA_BASE_URL", &base_url),
+            ("OLLAMA_API_KEY", "k"),
+        ];
+        let env = env_with(&vars);
+        let (_backend, _settings) = backend_from_env(&env).await.expect("must succeed");
+        let head = head_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the daemon must have served the probe");
+        assert!(
+            head.lines().any(|l| l == "authorization: Bearer k"),
+            "the probe must carry the filtered api key as a bearer token: {head}"
         );
     }
 
     /// Unset + a non-local base URL: no `num_ctx` at all (Ollama's own
     /// default applies) and `num_ctx_source` is exactly `None`.
-    #[test]
-    fn backend_from_env_ollama_cloud_unset_num_ctx_is_none() {
+    #[tokio::test]
+    async fn backend_from_env_ollama_cloud_unset_num_ctx_is_none() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "x"),
             ("OLLAMA_BASE_URL", "https://ollama.com"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Ollama(_)));
         assert_eq!(settings.think, None);
         assert_eq!(settings.num_ctx, None);
@@ -2507,55 +2779,138 @@ mod tests {
     }
 
     /// An explicit `OLLAMA_NUM_CTX` wins verbatim, recorded with source
-    /// `env` — on a non-local base URL, so no other branch is involved.
-    #[test]
-    fn backend_from_env_ollama_explicit_num_ctx_records_env_source() {
+    /// `explicit` — on a non-local base URL, so no other branch is involved.
+    #[tokio::test]
+    async fn backend_from_env_ollama_explicit_num_ctx_records_env_source() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "x"),
             ("OLLAMA_BASE_URL", "https://ollama.com"),
             ("OLLAMA_NUM_CTX", "65536"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Ollama(_)));
         assert_eq!(settings.num_ctx, Some(65536));
-        assert_eq!(settings.num_ctx_source.as_deref(), Some("env"));
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("explicit"));
     }
 
-    /// `OLLAMA_THINK=high` records the env spelling alongside the
-    /// localhost-default `num_ctx` — the SAME values the backend was
-    /// constructed with.
-    #[test]
-    fn backend_from_env_ollama_think_high_records_resolved_settings() {
+    /// `OLLAMA_THINK=high` records the env spelling alongside an explicit
+    /// `num_ctx` — the SAME values the backend was constructed with.
+    #[tokio::test]
+    async fn backend_from_env_ollama_think_high_records_resolved_settings() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "x"),
+            ("OLLAMA_BASE_URL", "https://ollama.com"),
             ("OLLAMA_THINK", "high"),
+            ("OLLAMA_NUM_CTX", "32768"),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("must succeed");
+        let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Ollama(_)));
         assert_eq!(settings.think.as_deref(), Some("high"));
         assert_eq!(settings.num_ctx, Some(32768));
-        assert_eq!(
-            settings.num_ctx_source.as_deref(),
-            Some("localhost_default")
-        );
+        assert_eq!(settings.num_ctx_source.as_deref(), Some("explicit"));
     }
 
     /// An empty `OLLAMA_NUM_CTX` is UNSET: no `num_ctx`, no source.
-    #[test]
-    fn backend_from_env_ollama_empty_num_ctx_is_unset() {
+    #[tokio::test]
+    async fn backend_from_env_ollama_empty_num_ctx_is_unset() {
         let env = env_with(&[
             ("TALOS_BACKEND", "ollama"),
             ("OLLAMA_MODEL", "m"),
             ("OLLAMA_BASE_URL", "https://ollama.com"),
             ("OLLAMA_NUM_CTX", ""),
         ]);
-        let (backend, settings) = backend_from_env(&env).expect("empty is unset");
+        let (backend, settings) = backend_from_env(&env).await.expect("empty is unset");
         assert!(matches!(backend, Backend::Ollama(_)));
         assert_eq!(settings.model_label(), "ollama:m");
         assert_eq!(settings.num_ctx, None);
         assert_eq!(settings.num_ctx_source, None);
+    }
+
+    // ---- num_ctx_stderr_line: structured stderr shape --------------------
+
+    // Assert on the PARSED value — serde_json sorts keys, so raw-string
+    // assertions would be order-fragile.
+    #[test]
+    fn num_ctx_stderr_line_explicit_shape() {
+        let r = harness::ollama::NumCtxResolution {
+            value: Some(65536),
+            source: harness::ollama::NumCtxSource::Explicit,
+            desc: "num_ctx=65536 (explicit OLLAMA_NUM_CTX)".to_string(),
+            warning: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&num_ctx_stderr_line(&r)).expect("must be JSON");
+        assert_eq!(v["num_ctx"]["source"], "explicit");
+        assert_eq!(v["num_ctx"]["value"], 65536);
+        assert_eq!(
+            v["num_ctx"]["desc"],
+            "num_ctx=65536 (explicit OLLAMA_NUM_CTX)"
+        );
+        assert!(v["num_ctx"]["warning"].is_null());
+    }
+
+    #[test]
+    fn num_ctx_stderr_line_probe_warning_shape() {
+        let warning = format!(
+            "WARNING: resolved num_ctx=8192 for `m` (arch=qwen35, key=qwen35.context_length) \
+             is BELOW the {} sanity floor; the run may be truncation-invalid — \
+             set OLLAMA_NUM_CTX to override",
+            harness::ollama::MIN_EXPECTED_NUM_CTX
+        );
+        let r = harness::ollama::NumCtxResolution {
+            value: Some(8192),
+            source: harness::ollama::NumCtxSource::Probe,
+            desc: "num_ctx=8192 (resolved, BELOW-FLOOR: arch=qwen35 key=qwen35.context_length)"
+                .to_string(),
+            warning: Some(warning.clone()),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&num_ctx_stderr_line(&r)).expect("must be JSON");
+        assert_eq!(v["num_ctx"]["source"], "probe");
+        assert_eq!(v["num_ctx"]["value"], 8192);
+        assert_eq!(v["num_ctx"]["warning"], warning);
+    }
+
+    // The record's `num_ctx_source` follows the VALUE, never the source
+    // variant: `Default` pins no value, so `"default"` can never reach a
+    // run record (it lives only in the stderr provenance line).
+    #[test]
+    fn num_ctx_source_for_record_follows_value_not_variant() {
+        let resolution = |value: Option<u32>, source: harness::ollama::NumCtxSource, desc: &str| {
+            harness::ollama::NumCtxResolution {
+                value,
+                source,
+                desc: desc.to_string(),
+                warning: None,
+            }
+        };
+        let explicit = resolution(
+            Some(65_536),
+            harness::ollama::NumCtxSource::Explicit,
+            "num_ctx=65536 (explicit OLLAMA_NUM_CTX)",
+        );
+        assert_eq!(
+            num_ctx_source_for_record(&explicit),
+            Some("explicit".into())
+        );
+        let probe = resolution(
+            Some(262_144),
+            harness::ollama::NumCtxSource::Probe,
+            "num_ctx=262144 (resolved: arch=qwen35 key=qwen35.context_length)",
+        );
+        assert_eq!(num_ctx_source_for_record(&probe), Some("probe".into()));
+        let default = resolution(
+            None,
+            harness::ollama::NumCtxSource::Default,
+            "num_ctx=default",
+        );
+        assert_eq!(
+            num_ctx_source_for_record(&default),
+            None,
+            "the Default source pins no value, so the record carries no source either"
+        );
     }
 
     // ---- seed: byte-identical to renderer, never raw description -------
@@ -2600,7 +2955,7 @@ mod tests {
             model: "x".to_string(),
             think: Some("high".to_string()),
             num_ctx: Some(32768),
-            num_ctx_source: Some("localhost_default".to_string()),
+            num_ctx_source: Some("explicit".to_string()),
         };
         let summary = build_run_summary(
             "BackendError",
