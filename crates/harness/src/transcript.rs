@@ -227,6 +227,8 @@
 //!
 //!   The finish-recovery terminal appears as `outcome: "Finished"` with
 //!   `disposition: {"Failed":{"mode":"FinishDiscipline","summary":"..."}}`.
+//!   The truncated terminal appears as `outcome:"Finished"` with
+//!   `disposition:{"Failed":{"mode":"Truncated",...}}`.
 //!
 //!   ```json
 //!   {"event":"run_end","ts":"2026-09-15T02:00:10Z","elapsed_ms":10000,

@@ -1611,7 +1611,9 @@ pub struct MinedTrialResult {
     /// Terminal disposition the agent CLAIMED (`Done` | `Blocked` | `Failed`
     /// | `MaxIterations` | `StoppedWithoutFinish` | `BudgetExhausted` |
     /// `BackendError`). Used for the claimed-Done × Unresolved false-done
-    /// cross-tab.
+    /// cross-tab. A `max_tokens`-truncated run counts under `Failed` (it
+    /// arrives as `Finished(Failed{mode: Truncated})`), never `Done`, so it
+    /// cannot inflate the false-done cross-tab.
     pub claimed_disposition: String,
     /// Raw nodeid → status map from the sealed re-gate parser.
     /// Empty for every pre-agent `Invalid` trial (worktree/setup/offload
@@ -1866,7 +1868,9 @@ impl MinedReport {
     /// `Blocked`, `Failed`, `MaxIterations`, `StoppedWithoutFinish`,
     /// `BudgetExhausted`, `BackendError`, `NotRun` (see
     /// [`claimed_disposition_label`]). `AlreadySatisfied` keeps counting here
-    /// deliberately: it IS a green-gate non-Done stop. Always `0`
+    /// deliberately: it IS a green-gate non-Done stop. A `max_tokens`-
+    /// truncated run also counts here — its label is "Failed" (see
+    /// [`claimed_disposition_label`]), which is a non-Done label. Always `0`
     /// in [`AgentGateMode::Off`] (no `run_checks` tool is ever registered, so
     /// `gates_green_at_exit` can never be true) — see
     /// [`MinedTrialResult::gates_green_at_exit`]. Varies in
@@ -3962,6 +3966,16 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
             claimed_disposition_label(&LoopOutcome::Finished(Disposition::Failed {
                 mode: FailureMode::Loop,
                 summary: "oops".to_string(),
+            })),
+            "Failed",
+        );
+        // AC9 — the Truncated FailureMode (a `max_tokens` cutoff) rides the
+        // existing `Finished(Failed{..})` arm: it counts under "Failed",
+        // never "Done", so the false-done cross-tab is unaffected.
+        assert_eq!(
+            claimed_disposition_label(&LoopOutcome::Finished(Disposition::Failed {
+                mode: FailureMode::Truncated,
+                summary: "turn truncated at max_tokens".to_string(),
             })),
             "Failed",
         );

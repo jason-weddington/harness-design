@@ -2651,6 +2651,13 @@ async fn run_loop_body(
                 }),
             );
         }
+        // Capture the truncation predicate BEFORE the turn is consumed —
+        // `Message::from(turn)` (model.rs) intentionally drops `stop_reason`,
+        // so this is the last point the current turn's stop reason is
+        // readable. A no-tool-call turn that hit the per-turn output cap is
+        // a truncation, not a stop.
+        let truncated_no_tool =
+            calls.is_empty() && turn.stop_reason == model::StopReason::MaxTokens;
         messages.push(Message::from(turn));
 
         // Append ModelCall + BudgetTick events, then write the mid-iteration
@@ -2685,6 +2692,46 @@ async fn run_loop_body(
         }
 
         if calls.is_empty() {
+            // PINNED SEAM — the Truncated terminal sits at the TOP of the
+            // no-tool-call block, BEFORE the finish-recovery nudge guard: a
+            // MaxTokens turn physically ran out of output budget mid-turn, so
+            // nudging it toward `finish` wastes a model call on a request the
+            // just-exhausted turn made implausible, and would leave the
+            // truncation masked inside the green-gate window — the exact
+            // masking this terminal exists to remove. It also preempts the
+            // nudge-exhaustion (FinishDiscipline) terminal for the same
+            // reason. `truncated_no_tool` reads the CURRENT turn's stop
+            // reason (recomputed every iteration), so a post-nudge MaxTokens
+            // turn truncates instead of exhausting.
+            if truncated_no_tool {
+                let disposition = Disposition::Failed {
+                    mode: FailureMode::Truncated,
+                    summary: format!(
+                        "turn truncated at max_tokens (produced {per_turn_output} of {} \
+                         output-token cap) before any tool call; raise --max-tokens",
+                        config.max_tokens
+                    ),
+                };
+                if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                    // Same persistence discipline as the StoppedWithoutFinish
+                    // terminal below, but recovery_facts deliberately stays
+                    // `None` — Truncated is NOT a recovery terminal (the
+                    // remedy is a config change, not a resume).
+                    ctx.record.disposition = Some(disposition.clone());
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::DispositionSet {
+                                seq: 0,
+                                disposition: disposition.clone(),
+                            },
+                        )
+                        .await?;
+                    p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+                }
+                return Ok(LoopOutcome::Finished(disposition));
+            }
+
             // Finish-recovery at the stop terminal: when the last in-loop gate
             // was green, nudge the model toward finish before giving up.
             // Guard: max_nudges > 0 AND last_gate_green.
@@ -2785,10 +2832,26 @@ async fn run_loop_body(
             // or gate was invalidated by a later mutation) OR max_nudges == 0
             // (finish-recovery disabled). All paths below are UNCHANGED.
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
+                // AC4 — masked-truncation tripwire: some backends report NO
+                // distinguishing stop signal for a truncation (GLM via Ollama
+                // surfaces a length cut as done_reason "stop"), so a
+                // no-tool-call stop whose output hit the cap is the only
+                // observable fingerprint of that masking class. At or above
+                // the cap the summary names it; below the cap the literal is
+                // byte-unchanged.
+                let summary = if per_turn_output >= u64::from(config.max_tokens) {
+                    format!(
+                        "agent stopped generating tool calls without calling finish \
+                             (output hit the {}-token cap: {per_turn_output} produced; \
+                             possible masked truncation)",
+                        config.max_tokens
+                    )
+                } else {
+                    "agent stopped generating tool calls without calling finish".to_string()
+                };
                 let disposition = Disposition::Failed {
                     mode: FailureMode::StoppedWithoutFinish,
-                    summary: "agent stopped generating tool calls without calling finish"
-                        .to_string(),
+                    summary,
                 };
                 ctx.record.disposition = Some(disposition.clone());
                 p.store
@@ -6177,6 +6240,301 @@ mod tests {
             ),
             "persisted disposition must be Failed{{StoppedWithoutFinish}}; got {:?}",
             rec.disposition
+        );
+    }
+
+    // =====================================================================
+    // Truncated terminal (StopReason::MaxTokens no-tool-call stops)
+    // =====================================================================
+
+    /// AC5(a) — guard-false truncated terminal: a `MaxTokens` no-tool turn
+    /// with recovery enabled (default `max_nudges == DEFAULT_MAX_NUDGES > 0`)
+    /// but no checks (`last_gate_green` stays false) must land on the
+    /// Truncated branch — NOT the nudge guard, NOT `StoppedWithoutFinish`.
+    #[tokio::test]
+    async fn max_tokens_stop_returns_finished_truncated_not_stopped_without_finish() {
+        let backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![ContentBlock::Text("cut off mid-tur".to_string())],
+            StopReason::MaxTokens,
+            usage_with(0, 111),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        assert_eq!(
+            config.max_nudges,
+            super::DEFAULT_MAX_NUDGES,
+            "fixture premise: finish-recovery is enabled by default"
+        );
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(
+                    *mode,
+                    FailureMode::Truncated,
+                    "a MaxTokens no-tool turn must truncate, not stop; got {mode:?}"
+                );
+                assert_eq!(
+                    summary,
+                    "turn truncated at max_tokens (produced 111 of 32768 \
+                     output-token cap) before any tool call; raise --max-tokens",
+                    "summary must carry BOTH the observed output and the cap"
+                );
+            }
+            other => panic!("expected Finished(Failed{{Truncated}}); got {other:?}"),
+        }
+        assert_eq!(backend.calls(), 1, "truncation must not fire a nudge");
+        assert_eq!(
+            stats.nudges_fired, 0,
+            "no nudge may be consumed by a truncated turn"
+        );
+    }
+
+    /// AC5(b) — differential: the IDENTICAL setup but `StopReason::EndTurn`
+    /// keeps returning `StoppedWithoutFinish` — only the current turn's stop
+    /// reason differs between this and the test above.
+    #[tokio::test]
+    async fn end_turn_stop_still_returns_stopped_without_finish() {
+        let backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![ContentBlock::Text("all done talking".to_string())],
+            StopReason::EndTurn,
+            usage_with(0, 111),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "an EndTurn no-tool turn must stay `StoppedWithoutFinish`; got {outcome:?}"
+        );
+    }
+
+    /// AC5(c) — nudge-then-truncated: green → stop → nudge (`nudges_fired=1`)
+    /// → `MaxTokens` no-tool turn. The truncated branch must preempt BOTH a
+    /// second nudge AND the `FinishDiscipline` exhaustion terminal, proving
+    /// the predicate reads the CURRENT turn's stop reason (recomputed each
+    /// iteration).
+    #[tokio::test]
+    async fn post_nudge_max_tokens_turn_truncates_instead_of_exhausting() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 3)
+            .with_checks(runner)
+            .with_max_nudges(1);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("nudge me".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("cut off mid-tur".into())],
+                StopReason::MaxTokens,
+            ),
+        ]);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
+                assert_eq!(
+                    *mode,
+                    FailureMode::Truncated,
+                    "the post-nudge MaxTokens turn must truncate, not exhaust; got {mode:?}"
+                );
+            }
+            other => panic!("expected Finished(Failed{{Truncated}}); got {other:?}"),
+        }
+        assert_eq!(
+            stats.nudges_fired, 1,
+            "exactly the one EndTurn nudge fired; the MaxTokens turn consumed none"
+        );
+        assert_eq!(
+            backend.calls(),
+            3,
+            "the truncated turn must not draw another"
+        );
+    }
+
+    /// AC4 tripwire, at-cap fixture: an `EndTurn` no-tool stop whose output
+    /// EQUALS the cap (the GLM/Ollama done_reason-"stop"-on-truncation
+    /// masking shape) must append the masked-truncation suffix with BOTH
+    /// numbers.
+    #[tokio::test]
+    async fn stopped_without_finish_at_cap_flags_masked_truncation() {
+        let backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![ContentBlock::Text("silently cut off".to_string())],
+            StopReason::EndTurn,
+            usage_with(0, 32768),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "outcome stays StoppedWithoutFinish; got {outcome:?}"
+        );
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        match rec.disposition {
+            Some(Disposition::Failed { mode, ref summary }) => {
+                assert_eq!(mode, FailureMode::StoppedWithoutFinish);
+                assert_eq!(
+                    summary,
+                    "agent stopped generating tool calls without calling finish \
+                     (output hit the 32768-token cap: 32768 produced; possible \
+                     masked truncation)",
+                    "the masked-truncation suffix must fire at the cap"
+                );
+            }
+            other => panic!("expected Failed{{StoppedWithoutFinish}}; got {other:?}"),
+        }
+    }
+
+    /// AC4 tripwire, sub-cap fixture: below the cap the `StoppedWithoutFinish`
+    /// summary literal is byte-unchanged.
+    #[tokio::test]
+    async fn stopped_without_finish_below_cap_keeps_plain_summary() {
+        let backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![ContentBlock::Text("just a short reply".to_string())],
+            StopReason::EndTurn,
+            usage_with(0, 42),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10);
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+        assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
+
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        match rec.disposition {
+            Some(Disposition::Failed { mode, ref summary }) => {
+                assert_eq!(mode, FailureMode::StoppedWithoutFinish);
+                assert_eq!(
+                    summary, "agent stopped generating tool calls without calling finish",
+                    "below the cap the literal must be byte-identical"
+                );
+            }
+            other => panic!("expected Failed{{StoppedWithoutFinish}}; got {other:?}"),
+        }
+    }
+
+    /// AC6 — end-to-end transcript + store proof for the Truncated
+    /// terminal: the transcript's `model_response` carries
+    /// `"stop_reason":"MaxTokens"` (the FIRST assertion reading the
+    /// `stop_reason` transcript plumbing), `run_end` carries
+    /// `outcome:"Finished"` + the Failed{Truncated} disposition, and the
+    /// sqlite record carries the same disposition with `recovery_facts`
+    /// still `None` (Truncated is NOT a recovery terminal).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn truncated_terminal_transcript_and_store_proof() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("truncated.jsonl");
+        let backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![ContentBlock::Text("cut off mid-tur".to_string())],
+            StopReason::MaxTokens,
+            usage_with(0, 111),
+        )]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 5).with_transcript(path.clone(), "t");
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        let expected_summary = "turn truncated at max_tokens (produced 111 of 32768 output-token cap) \
+             before any tool call; raise --max-tokens";
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(*mode, FailureMode::Truncated);
+                assert_eq!(summary, expected_summary);
+            }
+            other => panic!("expected Finished(Failed{{Truncated}}); got {other:?}"),
+        }
+        assert_eq!(stats.output_tokens, 111);
+        assert_eq!(stats.nudges_fired, 0);
+
+        let lines = read_transcript_lines(&path);
+
+        // model_response carries the stop_reason — first such assertion.
+        let model_response = lines
+            .iter()
+            .find(|l| l["event"] == "model_response")
+            .expect("a model_response event");
+        assert_eq!(model_response["stop_reason"], "MaxTokens");
+
+        // run_end: outcome Finished, disposition rides the existing payload.
+        let run_end = lines
+            .iter()
+            .find(|l| l["event"] == "run_end")
+            .expect("a run_end event");
+        assert_eq!(run_end["outcome"], "Finished");
+        assert_eq!(
+            run_end["disposition"],
+            serde_json::json!({
+                "Failed": {
+                    "mode": "Truncated",
+                    "summary": expected_summary,
+                }
+            }),
+            "run_end disposition must be Failed{{Truncated}}: {}",
+            run_end["disposition"]
+        );
+        assert!(run_end["detail"].is_null(), "detail must be null");
+        assert_eq!(run_end["stats"]["output_tokens"], 111);
+        assert_eq!(run_end["stats"]["nudges_fired"], 0);
+
+        // The sqlite store carries the same disposition; recovery_facts
+        // stays None — Truncated is NOT a recovery terminal.
+        let rec = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(
+            matches!(
+                &rec.disposition,
+                Some(Disposition::Failed {
+                    mode: FailureMode::Truncated,
+                    summary,
+                }) if summary == expected_summary
+            ),
+            "store record must carry Failed{{Truncated}}; got {:?}",
+            rec.disposition
+        );
+        assert_eq!(
+            rec.recovery_facts, None,
+            "Truncated must NOT write recovery_facts"
         );
     }
 
@@ -11255,6 +11613,45 @@ mod tests {
 
         let lines = read_transcript_lines(&path);
         assert!(lines.iter().all(|l| l["event"] != "contract_violation"));
+    }
+
+    /// AC6 — the Truncated terminal's `run_end` shape, pinned directly:
+    /// `outcome:"Finished"`, the disposition riding the existing
+    /// `Failed{mode, summary}` payload, `detail:null` (the summary lives in
+    /// the disposition, not the detail field).
+    #[test]
+    fn emit_run_end_renders_truncated_as_finished_with_failed_disposition() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("truncated.jsonl");
+        let mut writer = TranscriptWriter::open(Some(&TranscriptConfig {
+            path: path.clone(),
+            label: "truncated".to_string(),
+        }));
+        let result: Result<LoopOutcome, StoreError> =
+            Ok(LoopOutcome::Finished(Disposition::Failed {
+                mode: FailureMode::Truncated,
+                summary: "turn truncated at max_tokens (produced 111 of 32768 \
+                          output-token cap) before any tool call; raise --max-tokens"
+                    .to_string(),
+            }));
+        emit_run_end(&mut writer, &result, &zero_stats(), None, None);
+        drop(writer);
+
+        let lines = read_transcript_lines(&path);
+        let run_end = lines
+            .iter()
+            .find(|l| l["event"] == "run_end")
+            .expect("a run_end event");
+        assert_eq!(run_end["outcome"], "Finished");
+        assert_eq!(run_end["disposition"]["Failed"]["mode"], "Truncated");
+        assert!(
+            run_end["disposition"]["Failed"]["summary"]
+                .as_str()
+                .expect("summary is a string")
+                .contains("raise --max-tokens"),
+            "the disposition summary must name the remedy"
+        );
+        assert!(run_end["detail"].is_null(), "detail must be null");
     }
 
     // ---- answer mode ----------------------------------------------------

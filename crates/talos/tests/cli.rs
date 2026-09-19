@@ -661,6 +661,114 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
 }
 
 // ============================================================================
+// (c3) --max-tokens: the per-turn cap's ONE external observable
+// ============================================================================
+
+/// Shared driver for the `--max-tokens` tests: spawn `talos run` with an
+/// explicit `--transcript` path (the refused-port Ollama path still writes a
+/// full transcript whose first line is `run_start`), an optional
+/// `--max-tokens` value, and return the parsed `run_start` line's
+/// `config.max_tokens`. The sqlite run record persists no cap
+/// (`BackendSettings` is deliberately closed), so the transcript's
+/// `run_start` event is the only external record of the cap.
+fn run_start_max_tokens(max_tokens_arg: Option<&str>) -> serde_json::Value {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("run.jsonl");
+
+    let mut cmd = Command::new(TALOS_BIN);
+    cmd.args([
+        "run",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--run-store",
+        dir.path().join("run.sqlite").to_str().unwrap(),
+        "--offload-dir",
+        offload_dir.to_str().unwrap(),
+        "--task-id",
+        "cli-test-max-tokens",
+        "--attempt",
+        "1",
+        "--transcript",
+        transcript_path.to_str().unwrap(),
+        "--state-retention-days",
+        "0",
+    ]);
+    if let Some(value) = max_tokens_arg {
+        cmd.arg("--max-tokens").arg(value);
+    }
+    let mut child = cmd
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        // Port 1 on loopback is reserved; connections are always refused —
+        // the run terminates via the refused-port BackendError path, which
+        // still writes the full transcript including run_start.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        // Explicit `num_ctx` keeps the /api/show probe OFF (see
+        // `backend_error_via_refused_port_writes_store_record`).
+        .env("OLLAMA_NUM_CTX", "32768")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("wait for talos");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the refused-port fixture run must exit 1 (BackendError)"
+    );
+
+    let contents = std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+    let run_start: serde_json::Value = contents
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .expect("each transcript line is valid JSON")
+        })
+        .find(|l| l["event"] == "run_start")
+        .expect("the transcript must carry a run_start line");
+    run_start["config"]["max_tokens"].clone()
+}
+
+/// No `--max-tokens` flag: the `run_start` event carries the harness default
+/// (`DEFAULT_MAX_TOKENS` = 32768).
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_defaults_max_tokens_to_32768() {
+    let max_tokens = run_start_max_tokens(None);
+    assert_eq!(
+        max_tokens, 32768,
+        "run_start.config.max_tokens must carry the DEFAULT_MAX_TOKENS default"
+    );
+}
+
+/// `--max-tokens 4096`: the `run_start` event carries the flagged value.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_flagged_max_tokens() {
+    let max_tokens = run_start_max_tokens(Some("4096"));
+    assert_eq!(
+        max_tokens, 4096,
+        "run_start.config.max_tokens must carry the --max-tokens flag value"
+    );
+}
+
+// ============================================================================
 // (d) --help is not a usage error: plain help on stdout, exit 0
 // ============================================================================
 

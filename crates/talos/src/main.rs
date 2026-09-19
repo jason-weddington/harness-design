@@ -14,7 +14,7 @@
 //! |------|---------|
 //! | 0    | Task verified Done |
 //! | 10   | Task Blocked |
-//! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` |
+//! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` — including `FailureMode::Truncated` (a `max_tokens` cutoff), which rides 20 under `Finished(Failed{..})` |
 //! | 30   | Task was already satisfied — gates green, nothing changed; NOT pushable |
 //! | 40   | Task produced a schema-validated Answer; NOT pushable |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
@@ -365,6 +365,16 @@ struct RunArgs {
     #[arg(long, default_value_t = 500u32)]
     max_iterations: u32,
 
+    /// Per-turn output-token cap handed to the backend. A turn that hits the
+    /// cap without emitting a tool call terminates the run as
+    /// `Failed { mode: Truncated }` (exit 20) instead of masquerading as an
+    /// ordinary stop. Defaults to the harness's
+    /// [`harness::engine::DEFAULT_MAX_TOKENS`] (32768); the value is recorded
+    /// on the transcript's `run_start` `config.max_tokens` — the sqlite run
+    /// record persists no cap.
+    #[arg(long, default_value_t = harness::engine::DEFAULT_MAX_TOKENS)]
+    max_tokens: u32,
+
     /// Timeout for the gate command, in seconds.
     #[arg(long, default_value_t = 300u64)]
     gate_timeout_secs: u64,
@@ -552,7 +562,7 @@ impl ModelBackend for Backend {
 /// |---------|------|
 /// | `Finished(Done{..})` | 0 |
 /// | `Finished(Blocked{..})` | 10 |
-/// | `Finished(Failed{..})` | 20 |
+/// | `Finished(Failed{..})` (incl. `FailureMode::Truncated`) | 20 |
 /// | `StoppedWithoutFinish` | 20 |
 /// | `MaxIterations` | 20 |
 /// | `BudgetExhausted` | 20 |
@@ -1610,6 +1620,7 @@ async fn run_cmd(args: RunArgs) {
             let config = RunConfig::new(seed, args.max_iterations)
                 .with_answer_schema(compiled)
                 .with_wall_clock_secs(wall_clock_secs)
+                .with_max_tokens(args.max_tokens)
                 .with_max_nudges(0);
             (answer_registry(None), config)
         }
@@ -1626,8 +1637,11 @@ async fn run_cmd(args: RunArgs) {
                 RunConfig::new(seed, args.max_iterations)
                     .with_checks(runner)
                     .with_wall_clock_secs(wall_clock_secs)
+                    .with_max_tokens(args.max_tokens)
             } else {
-                RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs)
+                RunConfig::new(seed, args.max_iterations)
+                    .with_wall_clock_secs(wall_clock_secs)
+                    .with_max_tokens(args.max_tokens)
             };
             (tools, config)
         }
@@ -2083,6 +2097,22 @@ mod tests {
             summary: "looped".into(),
         });
         assert_eq!(exit_code(&outcome), 20);
+    }
+
+    /// AC7 — a `max_tokens` truncation rides exit 20 through the existing
+    /// `Finished(Failed{..})` arm; NO new arm exists (the table is keyed by
+    /// `LoopOutcome`, and `Truncated` is a `FailureMode`).
+    #[test]
+    fn exit_code_finished_failed_truncated_is_20() {
+        let outcome = LoopOutcome::Finished(Disposition::Failed {
+            mode: FailureMode::Truncated,
+            summary: "x".into(),
+        });
+        assert_eq!(
+            exit_code(&outcome),
+            20,
+            "Truncated must ride 20 under Finished(Failed{{..}})"
+        );
     }
 
     #[test]
@@ -3059,6 +3089,39 @@ mod tests {
         assert!(
             json.get("disposition").is_some(),
             "disposition field must be present"
+        );
+    }
+
+    /// AC8 — a Truncated disposition reaches stdout unchanged through the
+    /// production `into_disposition()` pass-through (its `Finished` arm
+    /// returns the disposition verbatim), so the JSON the dispatch worker
+    /// parses names the truncation.
+    #[test]
+    fn run_summary_serializes_truncated_disposition() {
+        let outcome = LoopOutcome::Finished(Disposition::Failed {
+            mode: FailureMode::Truncated,
+            summary: "turn truncated at max_tokens (produced 111 of 32768 \
+                      output-token cap) before any tool call; raise --max-tokens"
+                .into(),
+        });
+        // The production caller's verbatim pass-through (main.rs builds the
+        // summary from `result.outcome.into_disposition()`).
+        let summary: RunSummary = build_run_summary(
+            outcome_str(&outcome),
+            outcome.into_disposition(),
+            "task:1".into(),
+            "/state/run.sqlite".into(),
+            1,
+            default_settings(),
+        );
+        let json = serde_json::to_string(&summary).expect("must serialize");
+        assert!(
+            json.contains("Truncated"),
+            "serialized summary must name the Truncated mode; got {json}"
+        );
+        assert!(
+            json.contains("raise --max-tokens"),
+            "serialized summary must carry the remedy; got {json}"
         );
     }
 

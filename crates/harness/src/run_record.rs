@@ -473,6 +473,10 @@ pub enum FailureMode {
     /// the outer harness can recognize the recovery terminal on the
     /// non-persistent `run` path too.
     FinishDiscipline,
+    /// The model hit the per-turn `max_tokens` cap without emitting a tool
+    /// call; the task is NOT the problem — a config change (raise the cap)
+    /// plausibly fixes the retry.
+    Truncated,
 }
 
 /// Structured report attached to a disposition — also the eval-case seed
@@ -871,6 +875,7 @@ mod tests {
             FailureMode::TransientInfra,
             FailureMode::StoppedWithoutFinish,
             FailureMode::FinishDiscipline,
+            FailureMode::Truncated,
         ] {
             round_trip(&Disposition::Failed {
                 mode,
