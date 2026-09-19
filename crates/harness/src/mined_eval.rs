@@ -2210,6 +2210,15 @@ pub struct MinedRunConfig<'a> {
     /// `.with_transcript(trial_state_dir(config.state_root, &task.id, trial).join("transcript.jsonl"),
     /// backend_desc.clone())`.
     pub transcripts: bool,
+    /// In-run compaction trigger threshold, in percent of the advertised
+    /// context window, applied to every trial's [`RunConfig`] via
+    /// [`crate::engine::RunConfig::with_compact_threshold_pct`]. The
+    /// compaction A/B knob: `0` DISABLES compaction entirely (the OFF
+    /// control arm), low values force it early (at the default 90 the
+    /// trigger never fires on real work). Resolved by the example runner
+    /// (`MINED_EVAL_COMPACT_THRESHOLD_PCT` > `TALOS_COMPACT_THRESHOLD_PCT`
+    /// > [`crate::engine::COMPACT_THRESHOLD_PCT`]).
+    pub compact_threshold_pct: u64,
 }
 
 /// Run the whole mined-task eval: `k` independent trials, each with a fresh
@@ -2332,7 +2341,10 @@ async fn single_trial<B: ModelBackend>(
         tier2_task_prompt(config.statement, agent_gate_cmd, config.test_first),
         config.max_iterations,
     )
-    .with_wall_clock_secs(config.wall_clock_secs);
+    .with_wall_clock_secs(config.wall_clock_secs)
+    // The compaction A/B knob, resolved by the example runner — `0` disables
+    // compaction entirely for this trial's run.
+    .with_compact_threshold_pct(config.compact_threshold_pct);
     if let Some(runner) = checks.clone() {
         run_config = run_config.with_checks(runner);
     }
@@ -4664,6 +4676,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "Finish, please.".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -4782,6 +4795,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "Finish, please.".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -4917,6 +4931,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5033,6 +5048,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5081,6 +5097,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let backend = MockBackend::from_turns(Vec::new());
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5125,6 +5142,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let backend = MockBackend::from_turns(Vec::new());
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5211,6 +5229,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5295,6 +5314,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5358,6 +5378,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5429,6 +5450,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5496,6 +5518,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let backend = MockBackend::from_turns(Vec::new());
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5562,6 +5585,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
 
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5607,6 +5631,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -5654,6 +5679,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -6083,6 +6109,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -6137,6 +6164,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,
@@ -6187,6 +6215,7 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         let statement = "hi".to_string();
         let state_root = tempdir().expect("state root");
         let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
             task_dir: task_dir.path(),
             state_root: state_root.path(),
             task: &task,

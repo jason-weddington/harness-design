@@ -519,6 +519,13 @@ pub async fn run_ralph(
         // `RunConfig` per pass IS fresh context by construction —
         // `engine::run` seeds `initial_messages` from `config.task` every
         // call. Reuse the SAME injected clock (one seam, not two).
+        // NOTE: this deliberately does NOT call
+        // `RunConfig::with_compact_threshold_pct` — ralph INHERITS the
+        // default ([`crate::engine::COMPACT_THRESHOLD_PCT`]) on purpose.
+        // Ralph's fresh-context-per-pass loop never accumulates a long
+        // history, so the in-run compaction knob (a `talos run` / eval
+        // lane concern — forced, disabled, and A/B measured there) must
+        // not drift into a second ralph-side setting; do not "fix" this.
         let registry = tools::standard_registry(config.inner_checks.clone());
         let mut inner_config =
             RunConfig::new(task, config.inner_max_iterations).with_clock(config.clock.clone());

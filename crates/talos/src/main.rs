@@ -197,6 +197,22 @@
 //!   (kb-02979 shape). Each `talos run` overwrites
 //!   `<state-root>/talos/prune-last.json` with a retention report (last
 //!   writer wins under concurrency; the file's own mtime is the timestamp).
+//! - `TALOS_COMPACT_THRESHOLD_PCT` — optional `u64` percent: the in-run
+//!   compaction trigger threshold, the percent of the backend's advertised
+//!   context window at which the previous turn's raw prompt triggers
+//!   compaction (see [`harness::engine::should_compact`]). Precedence:
+//!   `--compact-threshold-pct` flag > `TALOS_COMPACT_THRESHOLD_PCT` env >
+//!   the compiled default of 90 ([`harness::engine::COMPACT_THRESHOLD_PCT`]).
+//!   `0` DISABLES compaction entirely — no walk, no event, no counter.
+//!   Values above 100 are accepted and simply never reachable. An empty or
+//!   whitespace-only value is treated as unset; a NON-NUMERIC value is a
+//!   hard construction error (JSON error + exit 1) — never a silent
+//!   fallback, because a typo'd threshold would silently arm or disarm the
+//!   very arm an A/B experiment is measuring. The resolved value is
+//!   recorded on the transcript's `run_start.config.compact_threshold_pct`.
+//!   Same sudo-boundary caveat as `TALOS_STATE_RETENTION_DAYS` (kb-02979
+//!   shape): under `env_reset` the fleet runs the compiled default until
+//!   the worker passes the flag.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -438,6 +454,29 @@ struct RunArgs {
     /// compiled default until the worker passes this flag explicitly.
     #[arg(long)]
     state_retention_days: Option<u64>,
+
+    /// In-run compaction trigger threshold, in PERCENT of the backend's
+    /// advertised context window: the loop compacts at the top of a pass
+    /// when the previous turn's raw prompt reaches this share of the window
+    /// (see `harness::engine::should_compact`). Precedence: this flag >
+    /// `TALOS_COMPACT_THRESHOLD_PCT` env > the compiled default of 90
+    /// (`harness::engine::COMPACT_THRESHOLD_PCT`). `0` DISABLES compaction
+    /// entirely — no walk, no event, no counter, byte-identical to a run on
+    /// a backend with no advertised limit. Values above 100 are accepted
+    /// and simply never reachable. This is the compaction A/B knob — lower
+    /// it (e.g. `1`) to force compaction early, set `0` for the OFF control
+    /// arm; do NOT simulate it by shrinking `OLLAMA_NUM_CTX`, which also
+    /// moves the derived per-turn output cap and confounds two variables.
+    /// The resolved value rides the transcript's
+    /// `run_start.config.compact_threshold_pct` so an experiment can prove
+    /// its arms really differ.
+    ///
+    /// The env fallback does NOT survive dispatch's sudo boundary — same
+    /// `RunArgs::transcript` / `TALOS_STATE_RETENTION_DAYS` caveat: under
+    /// `env_reset` the fleet runs the compiled default until the worker
+    /// passes this flag explicitly.
+    #[arg(long)]
+    compact_threshold_pct: Option<u64>,
 }
 
 /// Arguments for `talos ralph`.
@@ -991,6 +1030,37 @@ fn resolve_state_retention_days(
         return (v, "env");
     }
     (DEFAULT_STATE_RETENTION_DAYS, "default")
+}
+
+/// Resolve the in-run compaction trigger threshold, in percent:
+/// `--compact-threshold-pct` flag > `TALOS_COMPACT_THRESHOLD_PCT` env >
+/// [`harness::engine::COMPACT_THRESHOLD_PCT`] (the compiled 90). Pure —
+/// reads no `std::env` directly, only the injected `env` accessor, and
+/// never panics. `0` DISABLES compaction entirely; values above 100 are
+/// accepted and simply never reachable.
+///
+/// An empty or whitespace-only env value is treated as unset. A
+/// NON-NUMERIC env value is a hard construction error (`Err`) — never a
+/// silent fallback, because a typo'd threshold would silently arm or
+/// disarm the very arm an A/B experiment is measuring. (This deliberately
+/// diverges from [`resolve_state_retention_days`], whose non-numeric env
+/// falls through to the default: a wrong retention window only misprunes,
+/// a wrong threshold poisons the experiment.)
+fn resolve_compact_threshold_pct(
+    flag: Option<u64>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<u64, String> {
+    if let Some(v) = flag {
+        return Ok(v);
+    }
+    if let Some(raw) = env("TALOS_COMPACT_THRESHOLD_PCT").filter(|v| !v.trim().is_empty()) {
+        return raw.parse::<u64>().map_err(|_| {
+            format!(
+                "TALOS_COMPACT_THRESHOLD_PCT must be a number (a percent; 0 disables), got `{raw}`"
+            )
+        });
+    }
+    Ok(harness::engine::COMPACT_THRESHOLD_PCT)
 }
 
 // ============================================================================
@@ -1699,6 +1769,18 @@ async fn run_cmd(args: RunArgs) {
         .or_else(|| env_accessor("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(0);
 
+    // Resolve the compaction trigger threshold: flag > TALOS_COMPACT_THRESHOLD_PCT
+    // env > the compiled default. A non-numeric env value is a hard construction
+    // error — never a silent fallback (see `resolve_compact_threshold_pct`).
+    let compact_threshold_pct =
+        match resolve_compact_threshold_pct(args.compact_threshold_pct, &env_accessor) {
+            Ok(v) => v,
+            Err(e) => {
+                stderr_json_error(&e);
+                std::process::exit(1);
+            }
+        };
+
     // 9/10. Registry + seed prompt + RunConfig, per mode. The seed is always
     //       byte-for-byte from a renderer, never hand-formatted.
     let (tools, mut config) = match (answer_schema, spec) {
@@ -1757,6 +1839,11 @@ async fn run_cmd(args: RunArgs) {
             std::process::exit(1);
         }
     };
+    // The resolved compaction threshold — flag > env > default — applied
+    // once here so BOTH mode arms carry it, and `run_start.config` records
+    // the value actually in force (the A/B experiment's proof its arms
+    // really differ).
+    config = config.with_compact_threshold_pct(compact_threshold_pct);
     // Label is computed from `settings` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
     // flag was passed) and has no env fallback — see `RunArgs::transcript`.
@@ -1961,9 +2048,9 @@ mod tests {
         SECS_PER_DAY, backend_from_env, build_checks_runner, build_ralph_summary,
         build_run_summary, exit_code, load_answer_schema, make_run_seed, num_ctx_source_for_record,
         num_ctx_stderr_line, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
-        ralph_terminal_str, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
-        resolve_transcript_path, stamp_max_tokens, touch_dir_mtime, transcript_label,
-        validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
+        ralph_terminal_str, resolve_compact_threshold_pct, resolve_ralph_wall_clock_secs,
+        resolve_state_retention_days, resolve_transcript_path, stamp_max_tokens, touch_dir_mtime,
+        transcript_label, validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
     };
     use harness::anthropic::AnthropicBackend;
     use harness::bedrock::BedrockBackend;
@@ -3756,6 +3843,74 @@ mod tests {
     fn state_retention_days_env_zero_disables() {
         let env = env_with(&[("TALOS_STATE_RETENTION_DAYS", "0")]);
         assert_eq!(resolve_state_retention_days(None, &env), (0, "env"));
+    }
+
+    // ---- resolve_compact_threshold_pct: every branch, with the fatal-env
+    // ---- rule that deliberately diverges from state-retention ----------
+
+    #[test]
+    fn compact_threshold_pct_flag_beats_env() {
+        let env = env_with(&[("TALOS_COMPACT_THRESHOLD_PCT", "99")]);
+        assert_eq!(resolve_compact_threshold_pct(Some(7), &env), Ok(7));
+    }
+
+    #[test]
+    fn compact_threshold_pct_env_beats_default() {
+        let env = env_with(&[("TALOS_COMPACT_THRESHOLD_PCT", "99")]);
+        assert_eq!(resolve_compact_threshold_pct(None, &env), Ok(99));
+    }
+
+    #[test]
+    fn compact_threshold_pct_default_when_both_absent() {
+        let env = env_with(&[]);
+        assert_eq!(
+            resolve_compact_threshold_pct(None, &env),
+            Ok(harness::engine::COMPACT_THRESHOLD_PCT),
+            "the default must be the compiled engine constant"
+        );
+    }
+
+    #[test]
+    fn compact_threshold_pct_empty_and_whitespace_env_are_unset() {
+        for raw in ["", "   "] {
+            let vars = [("TALOS_COMPACT_THRESHOLD_PCT", raw)];
+            let env = env_with(&vars);
+            assert_eq!(
+                resolve_compact_threshold_pct(None, &env),
+                Ok(harness::engine::COMPACT_THRESHOLD_PCT),
+                "an empty or whitespace-only value ({raw:?}) must be treated as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_threshold_pct_non_numeric_env_is_a_hard_error() {
+        let env = env_with(&[("TALOS_COMPACT_THRESHOLD_PCT", "abc")]);
+        let err = resolve_compact_threshold_pct(None, &env)
+            .expect_err("a non-numeric env value must never silently fall back");
+        assert!(
+            err.contains("TALOS_COMPACT_THRESHOLD_PCT") && err.contains("abc"),
+            "the error must name the variable and the raw value; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compact_threshold_pct_flag_zero_disables() {
+        let env = env_with(&[("TALOS_COMPACT_THRESHOLD_PCT", "99")]);
+        assert_eq!(resolve_compact_threshold_pct(Some(0), &env), Ok(0));
+    }
+
+    #[test]
+    fn compact_threshold_pct_env_zero_disables() {
+        let env = env_with(&[("TALOS_COMPACT_THRESHOLD_PCT", "0")]);
+        assert_eq!(resolve_compact_threshold_pct(None, &env), Ok(0));
+    }
+
+    #[test]
+    fn compact_threshold_pct_flag_over_100_round_trips() {
+        // Values above 100 are accepted verbatim — simply never reachable.
+        let env = env_with(&[]);
+        assert_eq!(resolve_compact_threshold_pct(Some(150), &env), Ok(150));
     }
 
     // ---- touch_dir_mtime --------------------------------------------------

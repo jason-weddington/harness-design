@@ -47,6 +47,18 @@ async fn main() {
 
     // `finish_env` wires no `ChecksRunner`, so a `finish(done)` here yields the
     // NoChecksConfigured verification path. `|_| {}` ignores per-trial output.
-    let report = run_eval(&task, &backend, finish_env, TRIALS, MAX_ITERATIONS, |_| {}).await;
+    // The compaction threshold is left at the compiled default — this is a
+    // one-lane smoke eval, not an A/B arm (the knob lives in coding_eval /
+    // mined_eval, mirroring `talos run --compact-threshold-pct`).
+    let report = run_eval(
+        &task,
+        &backend,
+        finish_env,
+        TRIALS,
+        MAX_ITERATIONS,
+        harness::engine::COMPACT_THRESHOLD_PCT,
+        |_| {},
+    )
+    .await;
     println!("{report:#?}");
 }

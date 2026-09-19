@@ -67,6 +67,20 @@
 //!   `<state-root>/talos/coding-eval/<unix-secs>-<pid>/<fixture>/trial-<i>.jsonl`;
 //!   `0`/empty/unset = off (the default). See
 //!   `harness::transcript::parse_transcripts_flag`.
+//! - `CODING_EVAL_COMPACT_THRESHOLD_PCT` (optional) — the in-run compaction
+//!   trigger threshold, in percent of the advertised context window, handed
+//!   to every trial's `RunConfig` via `with_compact_threshold_pct`. This is
+//!   the compaction A/B knob: `0` DISABLES compaction entirely (the OFF
+//!   control arm), low values (e.g. `1`) force it early (the forcing
+//!   mechanism — at the compiled default of 90 the trigger never fires on
+//!   real work; the highest window fill ever observed across the fleet is
+//!   80.1%). Falls back to `TALOS_COMPACT_THRESHOLD_PCT`, then to the
+//!   compiled default `harness::engine::COMPACT_THRESHOLD_PCT` (90). Empty
+//!   or whitespace-only is treated as unset; a non-numeric value PANICS —
+//!   never a silent fallback, because a typo would silently arm or disarm
+//!   the arm being measured. Do NOT simulate the knob by shrinking
+//!   `OLLAMA_NUM_CTX` — the window also moves the derived per-turn output
+//!   cap, which would confound two variables.
 
 use std::env;
 use std::fmt::Write as _;
@@ -238,6 +252,29 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Resolve the in-run compaction trigger threshold for this eval run:
+/// `CODING_EVAL_COMPACT_THRESHOLD_PCT` env > `TALOS_COMPACT_THRESHOLD_PCT`
+/// env > the compiled default. `0` disables compaction entirely (the OFF
+/// control arm); low values force it early. An empty or whitespace-only
+/// value is treated as unset; a non-numeric value is FATAL — a typo'd
+/// threshold would silently arm or disarm the very arm being measured, so
+/// it must never fall back quietly. Deliberately duplicated per eval runner
+/// (the `env_u32` precedent): the harness library must not grow
+/// eval-runner-specific env-var names.
+fn resolve_compact_threshold_pct() -> u64 {
+    for name in [
+        "CODING_EVAL_COMPACT_THRESHOLD_PCT",
+        "TALOS_COMPACT_THRESHOLD_PCT",
+    ] {
+        if let Some(raw) = env::var(name).ok().filter(|v| !v.trim().is_empty()) {
+            return raw.parse::<u64>().unwrap_or_else(|_| {
+                panic!("{name} must be a number (a percent; 0 disables), got `{raw}`")
+            });
+        }
+    }
+    harness::engine::COMPACT_THRESHOLD_PCT
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let (backend, backend_desc) = backend_from_env().await;
@@ -255,6 +292,9 @@ async fn main() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let transcripts_root = transcripts_on.then(coding_eval_transcripts_root);
+    // The compaction A/B knob, resolved ONCE for the whole run so every
+    // fixture and trial in this invocation runs the same arm.
+    let compact_threshold_pct = resolve_compact_threshold_pct();
     // Empty string is treated as "unset" — the shell's `VAR= cmd` idiom clears
     // the narrow-to-one-fixture override.
     let fixture_filter = env::var("CODING_EVAL_FIXTURE")
@@ -289,7 +329,7 @@ async fn main() {
     println!(
         "running coding_fix eval across {} fixture(s) (k={k}) against {backend_desc} \
          (max_iterations={max_iterations}, test_first={include_test_first}, \
-         transcripts={})",
+         compact_threshold_pct={compact_threshold_pct}, transcripts={})",
         fixtures.len(),
         if transcripts_on { "on" } else { "off" },
     );
@@ -324,6 +364,7 @@ async fn main() {
             env_factory,
             k,
             max_iterations,
+            compact_threshold_pct,
             transcripts.as_ref(),
             |trial: &TrialResult| {
                 let mut line = format!(

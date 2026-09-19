@@ -679,7 +679,14 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
 /// lands in THREE places: `run_start.config` (`max_tokens` — the effective
 /// turn-1 cap — plus `max_tokens_source`), the run record's
 /// `backend_settings` (and the stdout summary's copy of it).
-fn run_start_line(max_tokens_arg: Option<&str>) -> serde_json::Value {
+///
+/// `compact_threshold_pct_arg` adds an optional `--compact-threshold-pct`
+/// value — `None` leaves the flag off (the default-90 arm).
+#[allow(clippy::too_many_arguments)]
+fn run_start_line(
+    max_tokens_arg: Option<&str>,
+    compact_threshold_pct_arg: Option<&str>,
+) -> serde_json::Value {
     let dir = tempfile::tempdir().expect("create temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -708,6 +715,9 @@ fn run_start_line(max_tokens_arg: Option<&str>) -> serde_json::Value {
     if let Some(value) = max_tokens_arg {
         cmd.arg("--max-tokens").arg(value);
     }
+    if let Some(value) = compact_threshold_pct_arg {
+        cmd.arg("--compact-threshold-pct").arg(value);
+    }
     let mut child = cmd
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
@@ -723,6 +733,7 @@ fn run_start_line(max_tokens_arg: Option<&str>) -> serde_json::Value {
         .env("XDG_STATE_HOME", dir.path().join("state-home"))
         .env("HOME", dir.path())
         .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .env_remove("TALOS_COMPACT_THRESHOLD_PCT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -761,7 +772,7 @@ fn run_start_line(max_tokens_arg: Option<&str>) -> serde_json::Value {
 /// BOTH `run_start.config` and `run_start.backend_settings`.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_resolves_max_tokens_from_backend_when_unset() {
-    let run_start = run_start_line(None);
+    let run_start = run_start_line(None, None);
     assert_eq!(
         run_start["config"]["max_tokens"], 16384,
         "run_start.config.max_tokens must carry the backend-resolved turn-1 cap"
@@ -783,7 +794,7 @@ async fn run_start_resolves_max_tokens_from_backend_when_unset() {
 /// `--max-tokens 4096`: the `run_start` event carries the flagged value.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_flagged_max_tokens() {
-    let run_start = run_start_line(Some("4096"));
+    let run_start = run_start_line(Some("4096"), None);
     assert_eq!(
         run_start["config"]["max_tokens"], 4096,
         "run_start.config.max_tokens must carry the --max-tokens flag value"
@@ -799,6 +810,199 @@ async fn run_start_carries_flagged_max_tokens() {
     assert_eq!(
         run_start["backend_settings"]["max_tokens_source"],
         "explicit"
+    );
+}
+
+// ============================================================================
+// (c4) --compact-threshold-pct: the compaction knob's ONE external observable
+// ============================================================================
+
+/// No `--compact-threshold-pct` flag: `run_start.config.compact_threshold_pct`
+/// carries the compiled default of 90.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_default_compact_threshold_pct_when_unset() {
+    let run_start = run_start_line(None, None);
+    assert_eq!(
+        run_start["config"]["compact_threshold_pct"], 90,
+        "unset must resolve to the compiled engine default"
+    );
+}
+
+/// `--compact-threshold-pct 5`: the `run_start` event carries the flagged
+/// value — the A/B experiment's proof its arms really differ.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_flagged_compact_threshold_pct() {
+    let run_start = run_start_line(None, Some("5"));
+    assert_eq!(
+        run_start["config"]["compact_threshold_pct"], 5,
+        "run_start.config.compact_threshold_pct must carry the --compact-threshold-pct flag value"
+    );
+}
+
+/// `TALOS_COMPACT_THRESHOLD_PCT` env beats the default, and the flag beats
+/// the env — the exact `--state-retention-days` precedence.
+#[tokio::test(flavor = "current_thread")]
+async fn compact_threshold_pct_env_beats_default_and_flag_beats_env() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("run.jsonl");
+
+    let base = |extra: &mut Command| {
+        extra
+            .args([
+                "run",
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--run-store",
+                dir.path().join("run.sqlite").to_str().unwrap(),
+                "--offload-dir",
+                offload_dir.to_str().unwrap(),
+                "--task-id",
+                "cli-test-compact-threshold",
+                "--attempt",
+                "1",
+                "--transcript",
+                transcript_path.to_str().unwrap(),
+                "--state-retention-days",
+                "0",
+            ])
+            .env("TALOS_BACKEND", "ollama")
+            .env("OLLAMA_MODEL", "x")
+            // Port 1 on loopback is reserved; connections are always refused —
+            // the run terminates via the refused-port BackendError path, which
+            // still writes the full transcript including run_start.
+            .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+            .env("OLLAMA_NUM_CTX", "32768")
+            .env_remove("OLLAMA_THINK")
+            .env_remove("TALOS_BEDROCK")
+            .env("XDG_STATE_HOME", dir.path().join("state-home"))
+            .env("HOME", dir.path())
+            .env_remove("TALOS_STATE_RETENTION_DAYS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    };
+
+    let run_start_for = |flag: Option<&str>, env_val: Option<&str>| -> serde_json::Value {
+        let mut cmd = Command::new(TALOS_BIN);
+        base(&mut cmd);
+        if let Some(v) = flag {
+            cmd.arg("--compact-threshold-pct").arg(v);
+        }
+        if let Some(v) = env_val {
+            cmd.env("TALOS_COMPACT_THRESHOLD_PCT", v);
+        } else {
+            cmd.env_remove("TALOS_COMPACT_THRESHOLD_PCT");
+        }
+        let mut child = cmd.spawn().expect("spawn talos");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(valid_spec_json().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("wait for talos");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the refused-port fixture run must exit 1 (BackendError)"
+        );
+        let contents =
+            std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+        std::fs::remove_file(&transcript_path).expect("reset transcript between spawns");
+        contents
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .expect("each transcript line is valid JSON")
+            })
+            .find(|l| l["event"] == "run_start")
+            .expect("the transcript must carry a run_start line")
+    };
+
+    // env beats default…
+    assert_eq!(
+        run_start_for(None, Some("7"))["config"]["compact_threshold_pct"],
+        7
+    );
+    // …and the flag beats the env.
+    assert_eq!(
+        run_start_for(Some("5"), Some("7"))["config"]["compact_threshold_pct"],
+        5
+    );
+}
+
+/// A NON-NUMERIC `TALOS_COMPACT_THRESHOLD_PCT` is a hard construction
+/// error — JSON error on stderr, exit 1, and NO transcript file written
+/// (the error precedes the run). Never a silent fallback to the default.
+#[tokio::test(flavor = "current_thread")]
+async fn non_numeric_compact_threshold_pct_env_exits_1_with_json_error() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("run.jsonl");
+
+    let mut cmd = Command::new(TALOS_BIN);
+    cmd.args([
+        "run",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--run-store",
+        dir.path().join("run.sqlite").to_str().unwrap(),
+        "--offload-dir",
+        offload_dir.to_str().unwrap(),
+        "--task-id",
+        "cli-test-compact-threshold-bad-env",
+        "--attempt",
+        "1",
+        "--transcript",
+        transcript_path.to_str().unwrap(),
+        "--state-retention-days",
+        "0",
+    ])
+    .env("TALOS_BACKEND", "ollama")
+    .env("OLLAMA_MODEL", "x")
+    .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+    .env("OLLAMA_NUM_CTX", "32768")
+    .env_remove("OLLAMA_THINK")
+    .env_remove("TALOS_BEDROCK")
+    .env("XDG_STATE_HOME", dir.path().join("state-home"))
+    .env("HOME", dir.path())
+    .env_remove("TALOS_STATE_RETENTION_DAYS")
+    .env("TALOS_COMPACT_THRESHOLD_PCT", "not-a-number")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn talos");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("wait for talos");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a non-numeric threshold env must exit 1, never run with a fallback"
+    );
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr_str.contains("TALOS_COMPACT_THRESHOLD_PCT"),
+        "the JSON error must name the variable; got: {stderr_str:?}"
+    );
+    // The error is a construction error: no run ever started, so no
+    // transcript may exist.
+    assert!(
+        !transcript_path.exists(),
+        "a construction error must not write a transcript"
     );
 }
 

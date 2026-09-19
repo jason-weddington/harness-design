@@ -64,7 +64,12 @@
 //!   `answer_schema` (the compiled answer-mode result schema VERBATIM, so a
 //!   reader can re-verify any `finish(answer)` verdict off the record; `null`
 //!   in build mode), `wall_clock_secs`, `static_tree_k`, `max_nudges`,
-//!   `max_retries`).
+//!   `max_retries`, `compact_threshold_pct` (the RESOLVED in-run compaction
+//!   trigger threshold in force for the run — the percent of the advertised
+//!   context window at which the previous turn's raw prompt triggers
+//!   compaction; `0` = disabled; the compiled default is
+//!   [`crate::engine::COMPACT_THRESHOLD_PCT`]. This is how an A/B experiment
+//!   proves its two arms really differ rather than assuming it).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
@@ -77,20 +82,27 @@
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":128000,"max_tokens_source":"table","mode":"build",
 //!              "checks":"cargo test","answer_schema":null,
-//!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3}}
+//!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3,
+//!              "compact_threshold_pct":90}}
 //!   ```
 //!
 //! - **`compaction`** — emitted at the top of a pass whose previous-turn raw
-//!   prompt (`input + cache_read + cache_write` tokens) plus the next-turn
-//!   reserve (`turn_cap`) reached [`crate::engine::COMPACT_THRESHOLD_PCT`]
-//!   percent of the backend's advertised context limit, and once from the
+//!   prompt (`input + cache_read + cache_write` tokens) reached the run's
+//!   configured compaction threshold
+//!   (`run_start.config.compact_threshold_pct`, the compiled default being
+//!   [`crate::engine::COMPACT_THRESHOLD_PCT`]) percent of the backend's
+//!   advertised context limit — the reserve (`turn_cap`) is RECORDED but,
+//!   deliberately, not part of the trigger (see
+//!   [`crate::engine::should_compact`]) — and once from the
 //!   `BackendError::ContextLengthExceeded` interception (same payload,
 //!   different `trigger`). Fields: `iteration` (the pass the compaction
 //!   precedes, 1-based), `trigger` (`"threshold"` — the top-of-pass
 //!   predicate — or `"context_length_exceeded"` — the error-path
 //!   interception; the branch taken is a first-class recorded value, not
 //!   reconstructed from adjacent events), `limit`, `raw_prompt_tokens`,
-//!   `reserve`, `threshold_pct`, `tier` (1 = reasoning tail-truncated only,
+//!   `reserve`, `threshold_pct` (the RESOLVED threshold the run was
+//!   configured with — the same value `run_start.config.compact_threshold_pct`
+//!   carries), `tier` (1 = reasoning tail-truncated only,
 //!   2 = at least one tool-result payload elided), `elided` (an array of
 //!   `{call_id, tool_name, offload_path}` — one entry per elided result, in
 //!   history order), `orphan_tool_results`, `orphan_tool_calls` (runtime

@@ -337,7 +337,10 @@ pub struct TrialEnv {
 /// `env_factory` is invoked **once per trial** to produce a fresh, isolated
 /// [`TrialEnv`] (see the module docs on per-trial isolation); the trial then
 /// runs [`engine::run`] with a [`RunConfig`] carrying the task's seed prompt,
-/// the given `max_iterations`, and the env's checks. Trials are **sequential**.
+/// the given `max_iterations`, the given `compact_threshold_pct` (via
+/// [`RunConfig::with_compact_threshold_pct`] — the compaction A/B knob: `0`
+/// disables compaction entirely, low values force it early), and the env's
+/// checks. Trials are **sequential**.
 ///
 /// `on_trial` is called with each trial's [`TrialResult`] as it completes —
 /// the live example uses it to stream per-trial one-liners that include the
@@ -356,12 +359,14 @@ pub struct TrialEnv {
 /// workspace or holdout source directory is unreadable/unwritable after the
 /// agent loop ran). This condition indicates a broken host, not a recoverable
 /// eval failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_eval(
     task: &EvalTask,
     backend: &impl ModelBackend,
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
+    compact_threshold_pct: u64,
     on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
     run_eval_with_transcripts(
@@ -370,6 +375,7 @@ pub async fn run_eval(
         env_factory,
         k,
         max_iterations,
+        compact_threshold_pct,
         None,
         on_trial,
     )
@@ -399,14 +405,21 @@ pub struct EvalTranscripts {
 /// [`TrialResult::transcript_path`]. When `None`, no transcript config is
 /// attached and every trial's `transcript_path` is `None`.
 ///
+/// Every trial's [`RunConfig`] is built with
+/// [`RunConfig::with_compact_threshold_pct`]`(compact_threshold_pct)` — the
+/// caller-resolved compaction A/B knob (`0` disables compaction entirely,
+/// low values force it early; see [`crate::engine::COMPACT_THRESHOLD_PCT`]).
+///
 /// # Panics
 /// See [`run_eval`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_eval_with_transcripts(
     task: &EvalTask,
     backend: &impl ModelBackend,
     env_factory: impl Fn() -> TrialEnv,
     k: u32,
     max_iterations: u32,
+    compact_threshold_pct: u64,
     transcripts: Option<&EvalTranscripts>,
     mut on_trial: impl FnMut(&TrialResult),
 ) -> EvalReport {
@@ -414,7 +427,10 @@ pub async fn run_eval_with_transcripts(
     let mut trial_results: Vec<TrialResult> = Vec::with_capacity(k as usize);
     for i in 0..k {
         let env = env_factory();
-        let mut config = RunConfig::new(task.task.clone(), max_iterations);
+        // The compaction A/B knob, resolved by the example runner
+        // (flag-shaped env > TALOS_COMPACT_THRESHOLD_PCT > default).
+        let mut config = RunConfig::new(task.task.clone(), max_iterations)
+            .with_compact_threshold_pct(compact_threshold_pct);
         if let Some(checks) = env.checks.clone() {
             config = config.with_checks(checks);
         }
@@ -859,7 +875,9 @@ mod tests {
         coding_fix_task, copy_dir_recursive, discover_fixtures, finish_env, finish_task, run_eval,
         run_eval_with_transcripts, score_holdout,
     };
-    use crate::engine::{FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats};
+    use crate::engine::{
+        COMPACT_THRESHOLD_PCT, FINISH_TOOL_NAME, FinishTool, LoopOutcome, RunStats,
+    };
     use crate::exec::{ChangeEvidence, CheckCommand, ChecksRunner};
     use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
     use crate::run_record::{Disposition, FailureMode, Verification};
@@ -950,7 +968,16 @@ mod tests {
         let backend = MockBackend::from_turns(script);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, k, 10, |_| {}).await;
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            k,
+            10,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
 
         assert_eq!(report.task_name, task.name);
         assert_eq!(report.trials, k);
@@ -979,6 +1006,7 @@ mod tests {
             echo_finish_env,
             k,
             10,
+            COMPACT_THRESHOLD_PCT,
             Some(&transcripts),
             |_| {},
         )
@@ -1000,7 +1028,16 @@ mod tests {
 
         // Plain run_eval always leaves transcript_path None.
         let backend2 = MockBackend::from_turns((0..k).map(|_| finish_done_turn()).collect());
-        let report2 = run_eval(&task, &backend2, echo_finish_env, k, 10, |_| {}).await;
+        let report2 = run_eval(
+            &task,
+            &backend2,
+            echo_finish_env,
+            k,
+            10,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
         assert!(
             report2
                 .trial_results
@@ -1019,7 +1056,16 @@ mod tests {
         let backend = MockBackend::from_turns(script);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_| {}).await;
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            k,
+            max_iter,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
 
         assert_eq!(report.task_name, "finish");
         assert_eq!(report.trials, k);
@@ -1045,7 +1091,16 @@ mod tests {
         let task = finish_task();
 
         let k: u32 = 4;
-        let report = run_eval(&task, &backend, echo_finish_env, k, max_iter, |_| {}).await;
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            k,
+            max_iter,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
 
         assert_eq!(report.trials, k);
         assert_eq!(report.passes, 2);
@@ -1071,7 +1126,16 @@ mod tests {
         let backend = MockBackend::from_turns(vec![]);
         let task = finish_task();
 
-        let report = run_eval(&task, &backend, echo_finish_env, 0, 5, |_| {}).await;
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            0,
+            5,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
 
         assert_eq!(report.trials, 0);
         assert_eq!(report.passes, 0);
@@ -1323,6 +1387,7 @@ mod tests {
             echo_finish_env,
             3,
             5,
+            COMPACT_THRESHOLD_PCT,
             move |t: &TrialResult| {
                 seen_c.lock().expect("seen lock").push(t.trial);
             },
@@ -1637,7 +1702,16 @@ mod tests {
         // Reuse the real coding-fix predicate (Checks-verified Done).
         let (task, _ignored_factory) = coding_fix_task(src.path());
 
-        let report = run_eval(&task, &backend, factory, 2, 3, |_| {}).await;
+        let report = run_eval(
+            &task,
+            &backend,
+            factory,
+            2,
+            3,
+            COMPACT_THRESHOLD_PCT,
+            |_| {},
+        )
+        .await;
         assert_eq!(report.passes, 2, "both trials verify green");
 
         let dirs = recorded.lock().expect("rec lock").clone();
@@ -2042,9 +2116,17 @@ mod tests {
 
         let observed: Arc<Mutex<Vec<Option<bool>>>> = Arc::new(Mutex::new(Vec::new()));
         let obs_c = Arc::clone(&observed);
-        let report = run_eval(&task, &backend, echo_finish_env, 1, 5, move |t| {
-            obs_c.lock().expect("lock").push(t.holdout_passed);
-        })
+        let report = run_eval(
+            &task,
+            &backend,
+            echo_finish_env,
+            1,
+            5,
+            COMPACT_THRESHOLD_PCT,
+            move |t| {
+                obs_c.lock().expect("lock").push(t.holdout_passed);
+            },
+        )
         .await;
 
         assert_eq!(
@@ -2101,9 +2183,17 @@ mod tests {
 
         let observed: Arc<Mutex<Option<Option<bool>>>> = Arc::new(Mutex::new(None));
         let obs_c = Arc::clone(&observed);
-        let report = run_eval(&task, &backend, factory, 1, 5, move |t| {
-            *obs_c.lock().expect("lock") = Some(t.holdout_passed);
-        })
+        let report = run_eval(
+            &task,
+            &backend,
+            factory,
+            1,
+            5,
+            COMPACT_THRESHOLD_PCT,
+            move |t| {
+                *obs_c.lock().expect("lock") = Some(t.holdout_passed);
+            },
+        )
         .await;
 
         assert_eq!(

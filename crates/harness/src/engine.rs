@@ -303,6 +303,22 @@ pub struct RunConfig {
     /// mechanical verifier for its `result`. Set via
     /// [`RunConfig::with_answer_schema`].
     pub answer_schema: Option<AnswerSchema>,
+    /// Compaction trigger threshold, in PERCENT of the backend's advertised
+    /// context limit ([`model::ModelBackend::context_limit`]): the loop
+    /// compacts at the top of a pass when the PREVIOUS turn's raw prompt
+    /// tokens reach this share of the limit (see [`should_compact`] — the
+    /// boundary is inclusive).
+    ///
+    /// **`0` DISABLES compaction entirely**: no `compact_history` walk, no
+    /// `compaction` transcript event, no [`RunStats`] counter — byte-identical
+    /// to a run on a backend with no advertised limit, including the
+    /// `ContextLengthExceeded` interception (that error-path walk is gated on
+    /// the same value). Values above `100` are accepted and simply never
+    /// reachable — the raw prompt cannot fill more than the whole window.
+    ///
+    /// Defaults to [`COMPACT_THRESHOLD_PCT`] (the pinned 90). Override via
+    /// [`RunConfig::with_compact_threshold_pct`].
+    pub compact_threshold_pct: u64,
 }
 
 /// The fallback per-turn output cap — re-exported from
@@ -365,6 +381,7 @@ impl RunConfig {
             clock: Arc::new(SystemClock),
             transcript: None,
             answer_schema: None,
+            compact_threshold_pct: COMPACT_THRESHOLD_PCT,
         }
     }
 
@@ -457,6 +474,16 @@ impl RunConfig {
             path: path.into(),
             label: label.into(),
         });
+        self
+    }
+
+    /// Override the compaction trigger threshold
+    /// ([`COMPACT_THRESHOLD_PCT`] by default). `0` disables compaction
+    /// entirely; values above `100` are accepted and simply never reachable.
+    /// See [`RunConfig::compact_threshold_pct`].
+    #[must_use]
+    pub fn with_compact_threshold_pct(mut self, pct: u64) -> Self {
+        self.compact_threshold_pct = pct;
         self
     }
 }
@@ -2438,13 +2465,22 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
 /// Compaction trigger threshold, in PERCENT of the backend's advertised
 /// context limit ([`crate::model::ModelBackend::context_limit`]): the loop
 /// compacts at the top of a pass when the PREVIOUS turn's raw prompt tokens
-/// plus the next-turn reserve (`turn_cap`) reach this share of the limit.
-/// At or above 90% triggers — the boundary `raw + reserve == 90% of limit`
-/// TRIGGERS (see [`should_compact`]). WHY a percentage of the limit and not
-/// a fixed token count: the windows differ 4x across the fleet's lanes
-/// (262,144 against 1,048,576), so one fixed count is either uselessly
-/// conservative on the wide lane or too late on the narrow one (design 08,
-/// "Open questions").
+/// reach this share of the limit. At or above 90% triggers — the boundary
+/// `raw == 90% of limit` TRIGGERS (see [`should_compact`]). WHY a percentage
+/// of the limit and not a fixed token count: the windows differ 4x across the
+/// fleet's lanes (262,144 against 1,048,576), so one fixed count is either
+/// uselessly conservative on the wide lane or too late on the narrow one
+/// (design 08, "Open questions").
+///
+/// This is the DEFAULT of the configurable knob
+/// [`RunConfig::compact_threshold_pct`] (set via
+/// [`RunConfig::with_compact_threshold_pct`] / `talos run
+/// --compact-threshold-pct`), NOT a bound on it — `0` disables compaction
+/// entirely and lower values force it early (replaying the predicate over
+/// all 54 eligible fleet transcripts, 3,061 turn transitions, the highest
+/// window fill ever observed is 80.1%, so at this default the trigger has
+/// never been reachable on real work). The pinned-90 regression test and the
+/// design record both cite this constant — do not delete it.
 pub const COMPACT_THRESHOLD_PCT: u64 = 90;
 
 /// Tier-1 retention window, in ASSISTANT MESSAGES: reasoning blocks in
@@ -2486,11 +2522,25 @@ const COMPACT_ARGS_CHARS: usize = 1_000;
 const COMPACT_STUB_PREFIX: &str = "[compacted at iteration ";
 
 /// The pure compaction trigger predicate: true when the previous turn's
-/// raw prompt has reached [`COMPACT_THRESHOLD_PCT`] percent of the
-/// advertised `limit`. The boundary is INCLUSIVE — `raw == 90% of limit`
+/// raw prompt has reached `threshold_pct` percent of the advertised
+/// `limit`. The boundary is INCLUSIVE — `raw == threshold_pct% of limit`
 /// triggers — so a run sailing into the wall at exactly the threshold still
 /// compacts. All math is `u64`/saturating: `raw_prompt_tokens` is a sum of
-/// three `u32` usage fields, and no real limit times 90 can overflow.
+/// three `u32` usage fields, and no real limit times 100 can overflow.
+///
+/// `threshold_pct` is the run's configured knob
+/// ([`RunConfig::compact_threshold_pct`], [`COMPACT_THRESHOLD_PCT`] by
+/// default). **`threshold_pct == 0` DISABLES compaction and the zero check
+/// comes FIRST, short-circuiting**: a 0 threshold can never fire — not even
+/// at a raw prompt of 0 against a limit of 0, where the percentage
+/// comparison alone would be `0 >= 0`, true. Values above `100` are accepted
+/// and simply never reachable, because the raw prompt cannot exceed the
+/// whole window. Varying THIS knob at a fixed window — and never shrinking
+/// `OLLAMA_NUM_CTX` — is the only clean way to force, disable, or A/B the
+/// trigger: the window also moves the derived per-turn output cap
+/// (`limit - prompt - OUTPUT_TOKEN_MARGIN`, see `ollama::derive_max_tokens`),
+/// so shrinking the window confounds the trigger with the cap and the
+/// result is uninterpretable.
 ///
 /// **NO next-turn reserve is added, deliberately, and this is load-bearing.**
 /// Design 08 originally said the reserve "is the same number the output cap
@@ -2509,8 +2559,8 @@ const COMPACT_STUB_PREFIX: &str = "[compacted at iteration ";
 /// output cap already guarantees `prompt + output <= limit` on the derived
 /// lane, so overflow is the cap's job and pressure is this predicate's.
 #[must_use]
-pub fn should_compact(limit: u32, raw_prompt_tokens: u64) -> bool {
-    raw_prompt_tokens * 100 >= u64::from(limit) * COMPACT_THRESHOLD_PCT
+pub fn should_compact(limit: u32, raw_prompt_tokens: u64, threshold_pct: u64) -> bool {
+    threshold_pct != 0 && raw_prompt_tokens * 100 >= u64::from(limit) * threshold_pct
 }
 
 /// One tier-2 elision — the reversible half of a compaction. The elided
@@ -2916,6 +2966,7 @@ fn record_compaction(
     limit: u32,
     raw_prompt_tokens: u64,
     reserve: u32,
+    threshold_pct: u64,
 ) {
     stats.compactions += 1;
     stats.highest_compaction_tier = stats.highest_compaction_tier.max(outcome.tier);
@@ -2942,7 +2993,7 @@ fn record_compaction(
                 "limit": limit,
                 "raw_prompt_tokens": raw_prompt_tokens,
                 "reserve": reserve,
-                "threshold_pct": COMPACT_THRESHOLD_PCT,
+                "threshold_pct": threshold_pct,
                 "tier": outcome.tier,
                 "elided": outcome
                     .elided
@@ -3172,6 +3223,10 @@ async fn run_loop_body(
                     "static_tree_k": config.static_tree_k,
                     "max_nudges": config.max_nudges,
                     "max_retries": config.max_retries,
+                    // The RESOLVED compaction threshold in force for the run
+                    // (0 = disabled) — what an A/B experiment reads to prove
+                    // the two arms really differ.
+                    "compact_threshold_pct": config.compact_threshold_pct,
                 },
             }),
         );
@@ -3240,20 +3295,27 @@ async fn run_loop_body(
         // borrow-only, so history mutation cannot happen while one is
         // live) and BEFORE this pass's `model_request` event, so the
         // recorded `message_count`/`block_count` reflect the COMPACTED
-        // history and the transcript's replay invariant holds. The gate is
-        // the backend advertising a limit as a number — true only of
-        // Ollama, so Anthropic and Bedrock are excluded by construction —
-        // plus a completed turn to have measured a raw prompt from. The
-        // trigger is the raw prompt against the window alone; `turn_cap` is
-        // deliberately NOT added as a reserve (see `should_compact` — the
-        // derived cap is `limit - prompt - margin`, so adding it back
-        // cancels the prompt and makes the trigger unconditionally true).
+        // history and the transcript's replay invariant holds. The FIRST
+        // condition is the configured threshold's zero DISABLE — checked
+        // before anything else is evaluated, so a disabled run does zero
+        // extra work per iteration (no `context_limit` call, no
+        // `compact_history` walk, no event, no counter; the
+        // `ContextLengthExceeded` interception below is gated on the same
+        // value). The gate is then the backend advertising a limit as a
+        // number — true only of Ollama, so Anthropic and Bedrock are
+        // excluded by construction — plus a completed turn to have
+        // measured a raw prompt from. The trigger is the raw prompt
+        // against the window alone; `turn_cap` is deliberately NOT added
+        // as a reserve (see `should_compact` — the derived cap is
+        // `limit - prompt - margin`, so adding it back cancels the
+        // prompt and makes the trigger unconditionally true).
         // A tier-0 outcome (nothing changed) is SILENT: no event, no
         // counter — the walk was cheap and the history is byte-identical.
         let mut compacted_this_pass = false;
-        if let (Some(limit), Some(raw_prompt_tokens)) =
-            (backend.context_limit(), last_raw_prompt_tokens)
-            && should_compact(limit, raw_prompt_tokens)
+        if config.compact_threshold_pct != 0
+            && let (Some(limit), Some(raw_prompt_tokens)) =
+                (backend.context_limit(), last_raw_prompt_tokens)
+            && should_compact(limit, raw_prompt_tokens, config.compact_threshold_pct)
         {
             compacted_this_pass = true;
             let outcome = compact_history(
@@ -3275,6 +3337,7 @@ async fn run_loop_body(
                     limit,
                     raw_prompt_tokens,
                     turn_cap,
+                    config.compact_threshold_pct,
                 );
             }
         }
@@ -3357,8 +3420,12 @@ async fn run_loop_body(
                     // `ContextLengthExceeded` interception (design 08, the
                     // error-path seam): a run that overruns the window
                     // anyway compacts and retries ONCE rather than dying.
-                    // Gated on the backend advertising a limit (Ollama-only
-                    // by construction) and on no compaction having already
+                    // Gated on compaction being ENABLED
+                    // (`config.compact_threshold_pct != 0` — a disabled
+                    // run is byte-identical to one on a backend with no
+                    // advertised limit, where this error is terminal), on
+                    // the backend advertising a limit (Ollama-only by
+                    // construction), and on no compaction having already
                     // run this pass — the top-of-pass trigger already
                     // compacted everything it could, so a second walk over
                     // an unchanged history cannot help. The retry is NOT
@@ -3371,6 +3438,7 @@ async fn run_loop_body(
                     // said the window is full; the walk found nothing to
                     // trim), and the second error then takes the terminal.
                     if !compacted_this_pass
+                        && config.compact_threshold_pct != 0
                         && matches!(err, model::BackendError::ContextLengthExceeded)
                         && let Some(limit) = backend.context_limit()
                     {
@@ -3393,6 +3461,7 @@ async fn run_loop_body(
                                 limit,
                                 last_raw_prompt_tokens.unwrap_or(0),
                                 turn_cap,
+                                config.compact_threshold_pct,
                             );
                         }
                         continue;
@@ -14077,13 +14146,67 @@ mod tests {
     fn should_compact_boundary_is_inclusive_and_pct_pinned() {
         assert_eq!(COMPACT_THRESHOLD_PCT, 90, "the threshold is a pinned 90%");
         // 89% → 8_900_000 < 9_000_000 → no compaction.
-        assert!(!should_compact(100_000, 89_000));
+        assert!(!should_compact(100_000, 89_000, COMPACT_THRESHOLD_PCT));
         // EXACT boundary: raw == 90% of limit TRIGGERS.
-        assert!(should_compact(100_000, 90_000));
+        assert!(should_compact(100_000, 90_000, COMPACT_THRESHOLD_PCT));
         // One token past the boundary.
-        assert!(should_compact(100_000, 90_001));
+        assert!(should_compact(100_000, 90_001, COMPACT_THRESHOLD_PCT));
         // Nothing consumed → never compact.
-        assert!(!should_compact(100_000, 0));
+        assert!(!should_compact(100_000, 0, COMPACT_THRESHOLD_PCT));
+        // The fleet-shape anchors from the knob's motivation: a typical glm
+        // raw prompt sits far below the threshold, a 90%-filled window is
+        // over it.
+        assert!(!should_compact(262_144, 3_548, 90));
+        assert!(should_compact(262_144, 240_000, 90));
+    }
+
+    /// The knob's two extreme arms: `1` FORCES compaction on a nearly-empty
+    /// window (the eval lane's forcing mechanism), and `0` DISABLES it even
+    /// at 100% window fill — the zero check short-circuits BEFORE the
+    /// percentage comparison, so it cannot fire even where the raw math
+    /// alone would be `0 >= 0`, true.
+    #[test]
+    fn should_compact_threshold_one_forces_and_zero_disables() {
+        // A 1% threshold fires on a nearly-empty window: 10_500 tokens is
+        // 1,050,000 when scaled by 100 — already past 1% of 1_048_576.
+        assert!(should_compact(1_048_576, 10_500, 1));
+        // Zero disables even at 100% fill (one token shy of the window).
+        assert!(!should_compact(1_048_576, 1_048_575, 0));
+        // Zero disables even where the comparison alone would be vacuously
+        // true: raw prompt 0 against limit 0.
+        assert!(!should_compact(100_000, 0, 0));
+        assert!(!should_compact(0, 0, 0));
+    }
+
+    /// `RunConfig` defaults the knob to the pinned constant and the builder
+    /// overrides it verbatim — including the `0` (disabled) arm.
+    #[test]
+    fn run_config_compact_threshold_pct_defaults_and_overrides() {
+        assert_eq!(
+            RunConfig::new("t", 1).compact_threshold_pct,
+            COMPACT_THRESHOLD_PCT,
+            "RunConfig::new must default the knob to COMPACT_THRESHOLD_PCT"
+        );
+        assert_eq!(
+            RunConfig::new("t", 1)
+                .with_compact_threshold_pct(1)
+                .compact_threshold_pct,
+            1
+        );
+        assert_eq!(
+            RunConfig::new("t", 1)
+                .with_compact_threshold_pct(0)
+                .compact_threshold_pct,
+            0,
+            "0 (disable) must round-trip verbatim, not fall back to the default"
+        );
+        // Values above 100 are accepted verbatim — simply never reachable.
+        assert_eq!(
+            RunConfig::new("t", 1)
+                .with_compact_threshold_pct(101)
+                .compact_threshold_pct,
+            101
+        );
     }
 
     /// REGRESSION PIN: the trigger must depend on the PROMPT, not telescope
@@ -14103,19 +14226,23 @@ mod tests {
                     .max_tokens;
             // The bug: prompt + derived_cap is independent of the prompt.
             assert!(
-                should_compact(limit, tiny_prompt + u64::from(derived_cap)),
+                should_compact(
+                    limit,
+                    tiny_prompt + u64::from(derived_cap),
+                    COMPACT_THRESHOLD_PCT
+                ),
                 "precondition: the telescoped sum DOES cross the threshold \
                  (limit {limit}) — that is why the old form always fired",
             );
             // The fix: the prompt alone is nowhere near the threshold.
             assert!(
-                !should_compact(limit, tiny_prompt),
+                !should_compact(limit, tiny_prompt, COMPACT_THRESHOLD_PCT),
                 "a ~1% prompt must never trigger compaction (limit {limit})",
             );
         }
         // And the trigger still fires when the prompt really is large.
-        assert!(should_compact(262_144, 240_000));
-        assert!(should_compact(1_048_576, 1_000_000));
+        assert!(should_compact(262_144, 240_000, COMPACT_THRESHOLD_PCT));
+        assert!(should_compact(1_048_576, 1_000_000, COMPACT_THRESHOLD_PCT));
     }
 
     /// A reasoning block for hand-made histories.
@@ -14879,6 +15006,169 @@ mod tests {
             "run_start + 2x(model_request, model_response, tool_result, iteration_end) \
              + (model_request, model_response, tool_result) + run_end"
         );
+    }
+
+    /// The knob's OFF arm: `compact_threshold_pct = 0` disables compaction
+    /// ENTIRELY on the SAME script that compacts once at the default — no
+    /// walk, no event, no counter — even with a limit advertised and the
+    /// raw prompt far over what the default threshold would fire on.
+    #[tokio::test]
+    async fn compact_threshold_zero_disables_compaction_entirely() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut script = eleven_hot_echo_turns();
+        script.push(finish_call(
+            "cf",
+            serde_json::json!({ "disposition": "done", "summary": "ok" }),
+        ));
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        // The control (default 90) compacts exactly once on this script —
+        // pinned by `threshold_compaction_emits_event_before_model_request_\
+        // and_moves_counters` above — so 0 is the only difference here.
+        let config = RunConfig::new("do the task", 20)
+            .with_compact_threshold_pct(0)
+            .with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        assert_eq!(stats.compactions, 0, "a disabled run must never compact");
+        assert_eq!(stats.highest_compaction_tier, 0);
+        assert_eq!(stats.tool_results_elided, 0);
+        assert_eq!(stats.compaction_tokens_reclaimed, 0);
+        let lines = read_transcript_lines(&path);
+        assert!(
+            lines.iter().all(|l| l["event"] != "compaction"),
+            "a disabled run must not emit the compaction event"
+        );
+        // The model never sees a stub either — byte-identical history.
+        let last = backend.last_messages();
+        let stubs = last
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content.iter().filter_map(|b| match b {
+                    UserBlock::ToolResult { content, .. } => Some(content.as_str()),
+                    UserBlock::Text(_) => None,
+                })),
+                Message::Assistant { .. } => None,
+            })
+            .flatten()
+            .filter(|c| c.contains("compacted at iteration"))
+            .count();
+        assert_eq!(stubs, 0, "no stub may reach the model on a disabled run");
+    }
+
+    /// The knob's FORCING arm: `compact_threshold_pct = 1` fires on a
+    /// nearly-empty window (a 1,000-token raw prompt against a 100,000-token
+    /// mocked limit — 1% fill, far below the default 90) and the compaction
+    /// event carries the RESOLVED threshold, not the compiled constant.
+    #[tokio::test]
+    async fn compact_threshold_one_forces_compaction_on_a_nearly_empty_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        // Same 11-pair shape as the default-threshold test, but each turn
+        // reports a 1,000-token raw prompt: under the default 90% the
+        // predicate never fires; under 1% it fires from pass 2.
+        let script: Vec<AssistantTurn> = (0..11)
+            .map(|i| {
+                echo_turn_usage(
+                    &format!("c{i}"),
+                    serde_json::json!({ "i": i }),
+                    hot_usage(1_000, 1, 0),
+                )
+            })
+            .chain(vec![finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            )])
+            .collect();
+        let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 20)
+            .with_compact_threshold_pct(1)
+            .with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "expected Finished(Done); got {outcome:?}"
+        );
+        // Passes 2..=11 trigger tier-0 silent walks (nothing outside the
+        // window yet); pass 12 elides the c0 pair — exactly like the
+        // default-threshold test, but from a 1%-filled window.
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(stats.highest_compaction_tier, 2);
+        assert_eq!(stats.tool_results_elided, 1);
+        let lines = read_transcript_lines(&path);
+        let compactions: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "compaction")
+            .collect();
+        assert_eq!(compactions.len(), 1);
+        assert_eq!(compactions[0]["trigger"], "threshold");
+        assert_eq!(
+            compactions[0]["threshold_pct"], 1,
+            "the event must carry the RESOLVED threshold, not the compiled constant"
+        );
+        assert_eq!(compactions[0]["raw_prompt_tokens"], 1_000);
+        assert_eq!(compactions[0]["tier"], 2);
+
+        // The control: the SAME script at the default threshold never
+        // crosses 90% and never compacts — the forcing is the knob's doing.
+        let script2: Vec<AssistantTurn> = (0..11)
+            .map(|i| {
+                echo_turn_usage(
+                    &format!("c{i}"),
+                    serde_json::json!({ "i": i }),
+                    hot_usage(1_000, 1, 0),
+                )
+            })
+            .chain(vec![finish_call(
+                "cf",
+                serde_json::json!({ "disposition": "done", "summary": "ok" }),
+            )])
+            .collect();
+        let backend2 = MockBackend::from_turns(script2).with_context_limit_override(100_000);
+        let config2 = RunConfig::new("do the task", 20);
+        let RunResult { stats: stats2, .. } = run(&backend2, &tools, &ctx, &config2).await;
+        assert_eq!(
+            stats2.compactions, 0,
+            "a 1%-filled window must never compact at the default 90"
+        );
+    }
+
+    /// The knob's OFF arm reaches the error-path seam too: with compaction
+    /// disabled, a `ContextLengthExceeded` is TERMINAL — no intercepting
+    /// walk, no retry — byte-identical to a backend with no advertised
+    /// limit.
+    #[tokio::test]
+    async fn compact_threshold_zero_makes_context_length_exceeded_terminal() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContextLengthExceeded)])
+            .with_context_limit_override(100_000);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10)
+            .with_compact_threshold_pct(0)
+            .with_retry_backoff_base(Duration::ZERO);
+
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert_eq!(
+            backend.calls(),
+            1,
+            "no interception retry when compaction is disabled"
+        );
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.compactions, 0);
+        match outcome {
+            LoopOutcome::BackendError(BackendError::ContextLengthExceeded) => {}
+            other => panic!("expected BackendError(ContextLengthExceeded), got {other:?}"),
+        }
     }
 
     /// The `ContextLengthExceeded` interception: with a limit advertised,
