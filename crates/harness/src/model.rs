@@ -148,8 +148,18 @@ pub enum StopReason {
 /// here means "this provider didn't report it", not "it was zero".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Tokens the provider counted as freshly (non-cache) evaluated input.
+    /// For the Ollama backend this is the UNCACHED prompt tokens —
+    /// `prompt_eval_count − prompt_eval_cached_count` (saturating) — matching
+    /// the Anthropic/Bedrock convention (input excludes cached reads), so
+    /// `input * rate_in + cache_read * rate_cached` pricing never
+    /// double-counts.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the provider's cache. For the Ollama backend
+    /// this is `Some(prompt_eval_cached_count)` when the daemon (≥ 0.33.3)
+    /// reports the field — including `Some(0)` on a cold cache — and `None`
+    /// when the daemon omits it (see below: not reported ≠ zero).
     pub cache_read_tokens: Option<u32>,
     pub cache_write_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,

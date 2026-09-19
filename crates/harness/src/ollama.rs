@@ -50,6 +50,34 @@
 //! - **The backend only classifies; the loop reacts.** Failures map to
 //!   [`BackendError`] variants; nothing here retries or backs off.
 //!
+//! ## `prompt_eval_cached_count` (Ollama ≥ 0.33.3)
+//!
+//! Ollama daemons 0.33.3+ report `prompt_eval_cached_count` alongside
+//! `prompt_eval_count` — the prompt tokens served from the KV prefix cache.
+//! Empirically (2026-09-19, a 29,721-token prompt):
+//!
+//! - first call: `prompt_eval_count` 29721 / `prompt_eval_cached_count` 0 →
+//!   `input_tokens` 29721, `cache_read_tokens` Some(0);
+//! - second call: 29721 / 29696 → `input_tokens` 25, `cache_read_tokens`
+//!   Some(29696).
+//!
+//! `prompt_eval_count` is the TOTAL prompt tokens (cached INCLUDED);
+//! the normalized [`Usage::input_tokens`] carries the UNCACHED remainder
+//! (`prompt_eval_count − prompt_eval_cached_count`, saturating), matching the
+//! Anthropic/Bedrock convention so `input * rate_in + cache_read *
+//! rate_cached` pricing never double-counts. A daemon older than 0.33.3 omits
+//! the field entirely: `input_tokens` = the total, `cache_read_tokens` =
+//! None — not reported is not the same as zero hits.
+//!
+//! Ambiguity note: when the report is inconsistent
+//! (`prompt_eval_cached_count` > `prompt_eval_count`), [`map_response`]
+//! clamps `input_tokens` to 0 and emits a stderr warning.
+//! `input_tokens` 0 + `cache_read_tokens` Some(n) is then indistinguishable
+//! in the durable record between a fully-cached prompt and a clamped
+//! inconsistent report — the stderr line is the only discriminator
+//! (persisting it as a structured transcript event is deferred;
+//! `map_response` has no writer).
+//!
 //! ## Testing
 //!
 //! Tests use `wiremock` — a local HTTP mock server — so the suite never
@@ -207,10 +235,14 @@ impl ModelBackend for OllamaBackend {
         // request client-side before it is sent.
         //
         // A *post-hoc* prompt_eval_count-vs-estimate check is deliberately NOT
-        // an error: Ollama's KV-cache prefix reuse makes `prompt_eval_count`
-        // report only the *newly* evaluated tokens on a multi-turn
-        // conversation, so a post-hoc comparison would false-positive on
-        // perfectly healthy runs. The guard only runs when `num_ctx` is set;
+        // an error: `prompt_eval_count` is the TOTAL prompt tokens for the
+        // request (cached tokens INCLUDED — see the `prompt_eval_cached_count`
+        // split in `map_response`), while `estimate_prompt_tokens` is a
+        // chars/4 approximation, so a post-hoc mismatch would signal estimate
+        // error, not context loss. And the real dropped-context failure
+        // (ollama/ollama#11885) produces NO response-side signal at all —
+        // hence the client-side pre-flight guard. The guard only runs when
+        // `num_ctx` is set;
         // with it unset (typical for cloud, which defaults to the model max)
         // there is nothing to compare against.
         if let Some(num_ctx) = self.num_ctx
@@ -899,6 +931,11 @@ struct ResponseBody {
     prompt_eval_count: Option<u32>,
     #[serde(default)]
     eval_count: Option<u32>,
+    // Ollama ≥ 0.33.3: prompt tokens served from the KV prefix cache. Older
+    // daemons omit the field entirely — `#[serde(default)]` keeps the whole
+    // body deserializable, same pattern as the fields above.
+    #[serde(default)]
+    prompt_eval_cached_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -925,6 +962,48 @@ struct ResponseToolCallFunction {
     arguments: Value,
 }
 
+/// Build the stderr warning emitted when Ollama reports
+/// `prompt_eval_cached_count` greater than `prompt_eval_count` — a
+/// self-contradictory usage report (cached tokens cannot exceed the total).
+///
+/// Pure and `String`-returning so the overflow branch is unit-testable
+/// without capturing stderr (pattern: `inert_precondition_warning`).
+fn ollama_usage_inconsistency_warning(total: u32, cached: u32) -> String {
+    format!(
+        "warning: ollama usage inconsistency — prompt_eval_cached_count \
+         {cached} > prompt_eval_count {total}; clamping input_tokens to 0"
+    )
+}
+
+/// Translate Ollama's native chat response into an [`AssistantTurn`].
+///
+/// Usage mapping (`prompt_eval_cached_count` split — see the module doc):
+/// `prompt_eval_count` is the TOTAL prompt tokens (cached included). One
+/// total rule with three branches:
+///
+/// - `Some(c)` with `c <= total`: `input_tokens = total - c` (the uncached
+///   remainder), `cache_read_tokens = Some(c)`.
+/// - `Some(c)` with `c > total` (including `total == 0` — both wire fields
+///   are independent `#[serde(default)] Option<u32>`, so an absent
+///   `prompt_eval_count` plus a present cached count lands here): the report
+///   is inconsistent, so `input_tokens` is clamped to 0,
+///   `cache_read_tokens = Some(c)`, and exactly one stderr warning is
+///   emitted via [`ollama_usage_inconsistency_warning`]. Never an `Err` —
+///   the return type has no error channel.
+/// - `None` (daemon < 0.33.3 omits the field): `input_tokens = total`,
+///   `cache_read_tokens = None` (not reported ≠ zero).
+///
+/// In all three branches `cache_write_tokens` and `reasoning_tokens` stay
+/// `None` — Ollama reports neither (the reported exception is
+/// `prompt_eval_cached_count`, daemons ≥ 0.33.3; absent ≠ zero).
+///
+/// Persisted-seam consequence: because `input_tokens` here is the UNCACHED
+/// remainder, `RunStats.input_tokens` / `BudgetConsumed.tokens` and
+/// `Event::ModelCall.prompt_tokens` carry that remainder for Ollama turns —
+/// a cached second call contributes 25, not 29,721, to the persisted token
+/// budget (mirroring Anthropic/Bedrock, whose `input_tokens` already exclude
+/// cache reads). The raw-input invariant `input + cache_read == total` keeps
+/// eval's `total_raw_input_tokens` unchanged.
 fn map_response(body: ResponseBody) -> AssistantTurn {
     let ResponseMessage {
         content,
@@ -955,21 +1034,49 @@ fn map_response(body: ResponseBody) -> AssistantTurn {
         }));
     }
 
-    AssistantTurn {
-        content: blocks,
-        stop_reason: map_stop_reason(has_tool_calls, body.done_reason.as_deref()),
-        usage: Usage {
-            // Absent ≠ zero, but the trait's Usage requires a concrete u32 for
-            // the two mandatory counters; Ollama always reports these on a
-            // successful non-streaming turn, so `unwrap_or(0)` is a
-            // belt-and-braces fallback rather than an expected path.
-            input_tokens: body.prompt_eval_count.unwrap_or(0),
+    // One total rule: `prompt_eval_count` is the TOTAL prompt tokens (cached
+    // included); split it by the reported prefix-cache hits.
+    let total = body.prompt_eval_count.unwrap_or(0);
+    let usage = match body.prompt_eval_cached_count {
+        // Consistent report: input is the uncached remainder, cache_read is
+        // the reported prefix-cache hits.
+        Some(c) if c <= total => Usage {
+            input_tokens: total - c,
             output_tokens: body.eval_count.unwrap_or(0),
-            // Ollama reports none of these — leave them None (absent ≠ zero).
+            cache_read_tokens: Some(c),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        },
+        // Inconsistent report (cached > total, including total == 0 when
+        // prompt_eval_count was absent). Clamp rather than panic or Err —
+        // map_response returns AssistantTurn, so Err is impossible by
+        // signature — and warn exactly once on stderr.
+        Some(c) => {
+            eprintln!("{}", ollama_usage_inconsistency_warning(total, c));
+            Usage {
+                input_tokens: 0,
+                output_tokens: body.eval_count.unwrap_or(0),
+                cache_read_tokens: Some(c),
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            }
+        }
+        // Field not reported (daemon < 0.33.3): the whole prompt was
+        // evaluated — input is the total, cache_read is None (not reported
+        // ≠ zero). Byte-for-byte today's behaviour.
+        None => Usage {
+            input_tokens: total,
+            output_tokens: body.eval_count.unwrap_or(0),
             cache_read_tokens: None,
             cache_write_tokens: None,
             reasoning_tokens: None,
         },
+    };
+
+    AssistantTurn {
+        content: blocks,
+        stop_reason: map_stop_reason(has_tool_calls, body.done_reason.as_deref()),
+        usage,
     }
 }
 
@@ -1102,7 +1209,8 @@ fn map_error_status(status: StatusCode, body_text: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::{
-        OllamaBackend, ThinkLevel, classify_transport_error, extract_error_message, map_stop_reason,
+        OllamaBackend, ThinkLevel, classify_transport_error, extract_error_message,
+        map_stop_reason, ollama_usage_inconsistency_warning,
     };
     use crate::model::{
         BackendError, ContentBlock, Message, ModelBackend, SamplingParams, StopReason,
@@ -1202,6 +1310,146 @@ mod tests {
         assert_eq!(turn.usage.cache_read_tokens, None);
         assert_eq!(turn.usage.cache_write_tokens, None);
         assert_eq!(turn.usage.reasoning_tokens, None);
+    }
+
+    // ---- (a2) cached prompt tokens → cache_read_tokens ---------------------
+    //
+    // The empirically observed second-call numbers: a 29,721-token prompt
+    // where 29,696 tokens were prefix-cache hits → 25 uncached.
+
+    #[tokio::test]
+    async fn maps_cached_prompt_tokens_into_cache_read() {
+        let server = MockServer::start().await;
+        let body = json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done_reason": "stop",
+            "prompt_eval_count": 29721,
+            "prompt_eval_cached_count": 29696,
+            "eval_count": 7
+        })
+        .to_string();
+        mount_success(&server, &body).await;
+
+        let backend = OllamaBackend::new("qwen3.6", server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = simple_req(&messages, &tools, &p);
+
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(turn.usage.input_tokens, 25);
+        assert_eq!(turn.usage.cache_read_tokens, Some(29696));
+        assert_eq!(turn.usage.output_tokens, 7);
+        assert_eq!(turn.usage.cache_write_tokens, None);
+        assert_eq!(turn.usage.reasoning_tokens, None);
+        // Raw-input invariant: uncached + cached == total prompt tokens.
+        assert_eq!(
+            turn.usage
+                .input_tokens
+                .saturating_add(turn.usage.cache_read_tokens.unwrap_or(0)),
+            29721
+        );
+    }
+
+    // ---- (a3) inconsistent report: cached > total → clamp + warn -----------
+
+    #[tokio::test]
+    async fn clamps_input_when_cached_exceeds_total_and_warns() {
+        let server = MockServer::start().await;
+        let body = json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done_reason": "stop",
+            "prompt_eval_count": 10,
+            "prompt_eval_cached_count": 25,
+            "eval_count": 1
+        })
+        .to_string();
+        mount_success(&server, &body).await;
+
+        let backend = OllamaBackend::new("qwen3.6", server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = simple_req(&messages, &tools, &p);
+
+        // Clamped, not rejected: map_response returns AssistantTurn, so an
+        // inconsistent usage report can never be an Err.
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(turn.usage.input_tokens, 0);
+        assert_eq!(turn.usage.cache_read_tokens, Some(25));
+        assert_eq!(turn.usage.output_tokens, 1);
+        assert_eq!(turn.usage.cache_write_tokens, None);
+        assert_eq!(turn.usage.reasoning_tokens, None);
+
+        // The warning string is testable without capturing stderr (repo
+        // convention: the emission itself is review-verifiable, the pure fn's
+        // return value is asserted).
+        let warning = ollama_usage_inconsistency_warning(10, 25);
+        assert!(
+            warning.starts_with("warning: ollama usage inconsistency — prompt_eval_cached_count ")
+        );
+        assert!(warning.contains("25 > prompt_eval_count 10"));
+        assert!(warning.ends_with("; clamping input_tokens to 0"));
+    }
+
+    // ---- (a4) cached field present with zero hits → Some(0), not None ------
+
+    #[tokio::test]
+    async fn zero_cached_count_is_some_zero() {
+        let server = MockServer::start().await;
+        // Empirical FIRST-call wire shape: the field is PRESENT with zero hits
+        // (distinct from an old daemon omitting the field).
+        let body = json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done_reason": "stop",
+            "prompt_eval_count": 29721,
+            "prompt_eval_cached_count": 0,
+            "eval_count": 7
+        })
+        .to_string();
+        mount_success(&server, &body).await;
+
+        let backend = OllamaBackend::new("qwen3.6", server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = simple_req(&messages, &tools, &p);
+
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(turn.usage.input_tokens, 29721);
+        assert_eq!(turn.usage.cache_read_tokens, Some(0));
+        assert_eq!(turn.usage.output_tokens, 7);
+        assert_eq!(turn.usage.cache_write_tokens, None);
+    }
+
+    // ---- (a5) cached field absent → None, not zero --------------------------
+
+    #[tokio::test]
+    async fn absent_cached_count_stays_none_not_zero() {
+        let server = MockServer::start().await;
+        // Daemon < 0.33.3 wire shape: NO prompt_eval_cached_count key.
+        let body = json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done_reason": "stop",
+            "prompt_eval_count": 29721,
+            "eval_count": 7
+        })
+        .to_string();
+        mount_success(&server, &body).await;
+
+        let backend = OllamaBackend::new("qwen3.6", server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = simple_req(&messages, &tools, &p);
+
+        let turn = backend.turn(&req).await.expect("turn ok");
+        // Input is the TOTAL (not an uncached remainder) and cache_read is
+        // None — "not reported" is distinguishable from "not cached" (Some(0)).
+        assert_eq!(turn.usage.input_tokens, 29721);
+        assert_eq!(turn.usage.cache_read_tokens, None);
+        assert_eq!(turn.usage.output_tokens, 7);
+        assert_eq!(turn.usage.cache_write_tokens, None);
     }
 
     // ---- (b) request-shape capture ----------------------------------------

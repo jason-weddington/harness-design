@@ -700,7 +700,10 @@ impl FinishClaim {
 ///   across every SUCCESSFUL turn, treating `None` as 0 (a provider that
 ///   doesn't report cache tokens contributes nothing). With prompt caching
 ///   on, Anthropic MOVES cached input out of `input_tokens` into these two
-///   buckets — so the harness-overhead number comparable to an UNCACHED run
+///   buckets — and Ollama (daemons ≥ 0.33.3) likewise reports
+///   `prompt_eval_cached_count` separately, with `input_tokens` carrying the
+///   uncached remainder — so the harness-overhead number comparable to an
+///   UNCACHED run
 ///   is `input_tokens + cache_read_tokens + cache_write_tokens` (the
 ///   "raw input"), NOT `input_tokens` alone.
 /// - `wall_clock`: measured across the whole [`run`] call — from just before
@@ -788,13 +791,16 @@ pub struct RunStats {
     pub output_tokens: u64,
     /// Sum of `usage.cache_read_tokens` across successful turns (`None` → 0).
     /// With prompt caching on, Anthropic moves cached input out of
-    /// `input_tokens` into this bucket — so the harness-overhead number
-    /// comparable to an UNCACHED run is `input_tokens + cache_read_tokens +
-    /// cache_write_tokens` (raw input), NOT `input_tokens` alone.
+    /// `input_tokens` into this bucket — and Ollama (daemons ≥ 0.33.3) does
+    /// the same via `prompt_eval_cached_count` — so the harness-overhead
+    /// number comparable to an UNCACHED run is `input_tokens +
+    /// cache_read_tokens + cache_write_tokens` (raw input), NOT
+    /// `input_tokens` alone.
     pub cache_read_tokens: u64,
     /// Sum of `usage.cache_write_tokens` across successful turns (`None` → 0).
-    /// See [`Self::cache_read_tokens`] — populated by Anthropic when a turn
-    /// writes a fresh cache entry.
+    /// See [`Self::cache_read_tokens`] — populated by Anthropic prompt caching
+    /// AND Ollama prefix-cache hits (`prompt_eval_cached_count`, daemons
+    /// ≥ 0.33.3) when a turn writes a fresh cache entry.
     pub cache_write_tokens: u64,
     /// Wall-clock elapsed across the whole [`run`] call.
     pub wall_clock: Duration,
@@ -2618,7 +2624,9 @@ async fn run_loop_body(
         let per_turn_output = u64::from(turn.usage.output_tokens);
         // Cache tokens are `Option<u32>`: `None` means "this provider didn't
         // report it", treated as 0 for accumulation (a provider that never
-        // reports cache tokens — Ollama today — simply contributes 0).
+        // reports cache tokens — Ollama on a daemon < 0.33.3 — simply
+        // contributes 0). Ollama daemons ≥ 0.33.3 DO report prefix-cache
+        // hits (`prompt_eval_cached_count`), which flow through here.
         let per_turn_cache_read = u64::from(turn.usage.cache_read_tokens.unwrap_or(0));
         let per_turn_cache_write = u64::from(turn.usage.cache_write_tokens.unwrap_or(0));
 

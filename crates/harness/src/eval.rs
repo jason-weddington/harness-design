@@ -210,7 +210,8 @@ impl EvalReport {
             .sum()
     }
 
-    /// Sum of every trial's `cache_read_tokens` (Anthropic cache hits).
+    /// Sum of every trial's `cache_read_tokens` (Anthropic and Ollama
+    /// prefix-cache hits).
     #[must_use]
     pub fn total_cache_read_tokens(&self) -> u64 {
         self.trial_results
@@ -219,7 +220,8 @@ impl EvalReport {
             .sum()
     }
 
-    /// Sum of every trial's `cache_write_tokens` (Anthropic cache writes).
+    /// Sum of every trial's `cache_write_tokens` (Anthropic and Ollama
+    /// prefix-cache writes).
     #[must_use]
     pub fn total_cache_write_tokens(&self) -> u64 {
         self.trial_results
@@ -1246,7 +1248,7 @@ mod tests {
         //     usage per turn:  (40, 4, 8, 6), (50, 5, 12, 9)
         //     → input=90, output=9, cache_read=20, cache_write=15, raw_in=125
         //   trial 2: finish               → 1 iteration
-        //     usage per turn:  (60, 6, None, None)   [uncached — like Ollama]
+        //     usage per turn:  (60, 6, None, None)   [uncached — like an Ollama turn on a daemon < 0.33.3]
         //     → input=60, output=6, cache_read=0, cache_write=0, raw_in=60
         //
         // Totals:
@@ -1306,7 +1308,7 @@ mod tests {
                 },
             },
             finish_done_turn_with_usage(50, 5, Some(12), Some(9)),
-            // trial 2 — uncached (cache fields None, like an Ollama turn).
+            // trial 2 — uncached (cache fields None, like an Ollama turn on a daemon < 0.33.3).
             finish_done_turn_with_usage(60, 6, None, None),
         ];
         let backend = MockBackend::from_turns(script);
