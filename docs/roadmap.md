@@ -10,7 +10,7 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.10.0 (2026-09-13)
+## Where we are — v0.11.0 (2026-09-19)
 
 Talos now has **three model backends** — Anthropic, Ollama, and **AWS Bedrock** (`886aa2f`) — so it runs where the Anthropic API isn't reachable (e.g. a work machine). The Bedrock backend drives `aws-sdk-bedrockruntime`'s non-streaming Converse API over the standard AWS credential chain (no keys in code), gated by `TALOS_BEDROCK` (a non-empty value wins over any Anthropic/Ollama env), restricted to haiku-4-5/sonnet-5/opus-4-8. It is **live-verified** against real Bedrock Haiku (`gritmile-bedrock-test`). Also this release: the canonical Sonnet moved to **Sonnet 5** (`ddba2d3`).
 
