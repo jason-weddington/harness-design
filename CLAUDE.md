@@ -66,6 +66,10 @@ cd ~/git/talos_flow && TALOS_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com O
 
 Host it in `Monitor` (the eight stdout progress lines are the events), review `finals.json` as the checkpoint, then `agent-gtd update-item <id> --from-json <spec>.json --status ready`. `args.json` is `{context, items:[{id, slug, title, seed, criticalConstraint}]}` — the same shape the JS took. Cite only paths inside this repo in `context` and seeds; the answer agents can read nothing else.
 
+**Three rules for the worktree, and the third is the one that bites.** (1) Never point at a checkout you or anyone else may edit — a tree that moves under a run bounces every in-flight answer. (2) For a multi-repo root, every child repo must stay clean and readable for the duration; any unobservable child poisons the whole observation. (3) **Do not merge to the branch the worktree was created from while the groom is running.** The worktree stays pinned at its creation commit, so it never goes dirty and nothing fails — the guard is perfectly happy, every stage reports success, and the specs come back *correctly grounded in a tree that is already stale*. Line drift is the harmless half; the damaging half is a merge that changes the very function a spec is inserting a clause into, so the spec cannot state the one ordering decision that mattered. It is silent in both directions: the groom cannot detect it, and the specs look well-grounded because they are — against yesterday's tree.
+
+The cheap fix is to re-groom against current `main` rather than patch line numbers; a re-groom is a couple of dollars and a wrong ordering decision is a wave. Either finish the groom before merging, or recreate the worktree at the new tip and re-run. This bit the agent_gtd session on 2026-09-20 (`kb-03432`) and this session was exposed to it the same evening — a groom ran pinned at `884ac9a` while six commits landed on main, and only survived because the batch's cross-item contracts had been injected by hand.
+
 ## Why Rust
 
 Part of the learning goal. Rust's compiler and type system give us a layer of
