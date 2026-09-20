@@ -150,6 +150,67 @@ consumed budgets carry over (0.3.0 already does this for accounting) — so a
 budget is a whole-run bound, not a per-attempt one, and a run can't dodge its cap
 by crashing and resuming.
 
+**Addendum (post-landing, this change):** the two sentences above are partially
+superseded by the shipped code — code wins.
+
+- **Check placement.** The breach check now runs at the TOP of every loop
+  iteration, BEFORE `backend.turn` (before the per-iteration output-cap
+  re-resolution), plus ONE post-loop evaluation after the `for` loop closes and
+  before the `MaxIterations` terminal. This explicitly SUPERSEDES the record's
+  sentence "The check runs at the same end-of-iteration point where `consumed`
+  is updated" — `consumed` continues to be ticked at the end-of-iteration
+  point; only the wall-clock consult moved. Top placement is what closes the
+  stop-site-nudge `continue` hole (that `continue` jumps past the
+  end-of-iteration block, so an end-of-iteration check could be skipped for an
+  unbounded number of iterations), and the post-loop check keeps a budget
+  expiring DURING the final iteration reporting `BudgetExhausted` rather than
+  silently `MaxIterations`.
+- **Turn granularity.** A turn already in flight when the budget expires runs
+  to completion — the check is consultative, not preemptive. This is
+  backend-agnostic: NO production chat client sets a request timeout
+  (`OllamaBackend::new` uses a bare `reqwest::Client::new()` — its 10-second
+  `SHOW_TIMEOUT` covers only `POST /api/show`; `AnthropicBackend::new` is a
+  bare `Client::new()`; the production `BedrockBackend::new` sets no
+  `TimeoutConfig` — the 1-second `operation_timeout` exists only in the
+  `with_test_endpoint` test helper). Worst-case overshoot is therefore one
+  full turn.
+- **Budget window.** `loop_start` is captured fresh at each run entry
+  (`run_loop_body`), so the budget is a PER-PROCESS window, not a whole-run
+  bound. This supersedes the record's "a budget is a whole-run bound ... a run
+  can't dodge its cap by crashing and resuming" sentence above: a resumed run
+  gets a fresh window (matching the worker's own per-process hard-kill
+  semantics). On-resume `consumed` accounting still carries over; only the
+  wall-clock window is per-process.
+- **Dispatch arming.** Dispatch is armed by the TALOS default
+  (`DEFAULT_WALL_CLOCK_SECS = 1500` in `talos`) rather than by a
+  dispatch-passed flag: `talos run` now self-terminates `BudgetExhausted`
+  (exit 20, recovery facts written, run resumable) at 25 minutes even when the
+  caller passes nothing. The dispatch-side flag plumbing (passing an explicit
+  `--wall-clock-secs` derived from the worker's real effective timeout) stays
+  peer-owned in agent-gtd-dispatch.
+- **Post-hoc audit recipe.** Every transcript line carries `elapsed_ms`, so
+  for any complete run block (split on `run_start`):
+  `max(iteration_end.elapsed_ms) >= run_start.config.wall_clock_secs` (when
+  that value is non-zero) must imply `run_end.outcome == "BudgetExhausted"` —
+  a one-line queryable audit that both confirms correct firing on untested
+  inputs and surfaces a reintroduced skip. On the store path the equivalent
+  join is the `DispositionSet` row's `events.ts` (SQLite `datetime('now')`,
+  format `YYYY-MM-DD HH:MM:SS`) against `budgets.wall_clock_start` (RFC3339
+  from the injected clock) — the FORMAT MISMATCH is deliberate here so an
+  auditor does not rediscover it: parse both to a common instant before
+  comparing.
+- **The converse is NOT an invariant.** A run may exit non-BudgetExhausted
+  with total elapsed above the armed budget when the last in-flight turn
+  overshoots (turn granularity, above). That is why a done/answer-style
+  `contract_violation` audit at the run_end choke point is deliberately NOT
+  specified here: elapsed overshoot from a legitimate final turn would false-positive.
+- **The accepted trade.** With the default armed at 1500 s, a run that would
+  legitimately have finished between minute 25 and the worker's kill
+  self-terminates `BudgetExhausted` at minute 25. That is deliberate: a clean
+  terminal at exit 20 with recovery facts written and the run resumable is
+  strictly better than being hard-killed from outside with no record. The
+  budget is not free.
+
 ## Retry / backoff
 
 `BackendError::is_retryable()` returns `true` only for `Transient`, and it exists

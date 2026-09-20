@@ -682,10 +682,17 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
 ///
 /// `compact_threshold_pct_arg` adds an optional `--compact-threshold-pct`
 /// value — `None` leaves the flag off (the default-90 arm).
+///
+/// `wall_clock_secs_arg` adds an optional `--wall-clock-secs` value — `None`
+/// leaves the flag off (the default-1500 arm). `TALOS_WALL_CLOCK_SECS` is
+/// env-removed alongside `TALOS_COMPACT_THRESHOLD_PCT` /
+/// `TALOS_STATE_RETENTION_DAYS`, so a dev/CI host exporting the variable
+/// cannot flip the default arm.
 #[allow(clippy::too_many_arguments)]
 fn run_start_line(
     max_tokens_arg: Option<&str>,
     compact_threshold_pct_arg: Option<&str>,
+    wall_clock_secs_arg: Option<&str>,
 ) -> serde_json::Value {
     let dir = tempfile::tempdir().expect("create temp dir");
     let workspace = dir.path().join("workspace");
@@ -718,6 +725,9 @@ fn run_start_line(
     if let Some(value) = compact_threshold_pct_arg {
         cmd.arg("--compact-threshold-pct").arg(value);
     }
+    if let Some(value) = wall_clock_secs_arg {
+        cmd.arg("--wall-clock-secs").arg(value);
+    }
     let mut child = cmd
         .env("TALOS_BACKEND", "ollama")
         .env("OLLAMA_MODEL", "x")
@@ -734,6 +744,7 @@ fn run_start_line(
         .env("HOME", dir.path())
         .env_remove("TALOS_STATE_RETENTION_DAYS")
         .env_remove("TALOS_COMPACT_THRESHOLD_PCT")
+        .env_remove("TALOS_WALL_CLOCK_SECS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -772,7 +783,7 @@ fn run_start_line(
 /// BOTH `run_start.config` and `run_start.backend_settings`.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_resolves_max_tokens_from_backend_when_unset() {
-    let run_start = run_start_line(None, None);
+    let run_start = run_start_line(None, None, None);
     assert_eq!(
         run_start["config"]["max_tokens"], 16384,
         "run_start.config.max_tokens must carry the backend-resolved turn-1 cap"
@@ -794,7 +805,7 @@ async fn run_start_resolves_max_tokens_from_backend_when_unset() {
 /// `--max-tokens 4096`: the `run_start` event carries the flagged value.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_flagged_max_tokens() {
-    let run_start = run_start_line(Some("4096"), None);
+    let run_start = run_start_line(Some("4096"), None, None);
     assert_eq!(
         run_start["config"]["max_tokens"], 4096,
         "run_start.config.max_tokens must carry the --max-tokens flag value"
@@ -821,7 +832,7 @@ async fn run_start_carries_flagged_max_tokens() {
 /// carries the compiled default of 90.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_default_compact_threshold_pct_when_unset() {
-    let run_start = run_start_line(None, None);
+    let run_start = run_start_line(None, None, None);
     assert_eq!(
         run_start["config"]["compact_threshold_pct"], 90,
         "unset must resolve to the compiled engine default"
@@ -832,10 +843,145 @@ async fn run_start_carries_default_compact_threshold_pct_when_unset() {
 /// value — the A/B experiment's proof its arms really differ.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_flagged_compact_threshold_pct() {
-    let run_start = run_start_line(None, Some("5"));
+    let run_start = run_start_line(None, Some("5"), None);
     assert_eq!(
         run_start["config"]["compact_threshold_pct"], 5,
         "run_start.config.compact_threshold_pct must carry the --compact-threshold-pct flag value"
+    );
+}
+
+// ============================================================================
+// --wall-clock-secs: the time budget knob's ONE external observable
+// ============================================================================
+
+/// No `--wall-clock-secs` flag (and `TALOS_WALL_CLOCK_SECS` env-removed by
+/// the helper): `run_start.config.wall_clock_secs` carries the compiled
+/// default of 1500 — the ARMED budget, not the unbounded sentinel.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_default_wall_clock_secs_when_unset() {
+    let run_start = run_start_line(None, None, None);
+    assert_eq!(
+        run_start["config"]["wall_clock_secs"], 1500,
+        "unset must resolve to the compiled DEFAULT_WALL_CLOCK_SECS of 1500"
+    );
+}
+
+/// `--wall-clock-secs 42`: the `run_start` event carries the flagged value.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_flagged_wall_clock_secs() {
+    let run_start = run_start_line(None, None, Some("42"));
+    assert_eq!(
+        run_start["config"]["wall_clock_secs"], 42,
+        "run_start.config.wall_clock_secs must carry the --wall-clock-secs flag value"
+    );
+}
+
+/// `--wall-clock-secs 0`: the sentinel DISABLE — the run records 0
+/// (unbounded), exactly as the flag semantics pin on the engine.
+#[tokio::test(flavor = "current_thread")]
+async fn run_start_carries_disabled_wall_clock_secs() {
+    let run_start = run_start_line(None, None, Some("0"));
+    assert_eq!(
+        run_start["config"]["wall_clock_secs"], 0,
+        "an explicit --wall-clock-secs 0 must record the unbounded sentinel"
+    );
+}
+
+/// `TALOS_WALL_CLOCK_SECS` env beats the default, and the flag beats the
+/// env — the exact `--state-retention-days` / `--compact-threshold-pct`
+/// precedence, pinned end-to-end at the real resolution site.
+#[tokio::test(flavor = "current_thread")]
+async fn wall_clock_secs_env_beats_default_and_flag_beats_env() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("run.jsonl");
+
+    let base = |extra: &mut Command| {
+        extra
+            .args([
+                "run",
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--run-store",
+                dir.path().join("run.sqlite").to_str().unwrap(),
+                "--offload-dir",
+                offload_dir.to_str().unwrap(),
+                "--task-id",
+                "cli-test-wall-clock-secs",
+                "--attempt",
+                "1",
+                "--transcript",
+                transcript_path.to_str().unwrap(),
+                "--state-retention-days",
+                "0",
+            ])
+            .env("TALOS_BACKEND", "ollama")
+            .env("OLLAMA_MODEL", "x")
+            // Port 1 on loopback is reserved; connections are always refused —
+            // the run terminates via the refused-port BackendError path, which
+            // still writes the full transcript including run_start.
+            .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+            .env("OLLAMA_NUM_CTX", "32768")
+            .env_remove("OLLAMA_THINK")
+            .env_remove("TALOS_BEDROCK")
+            .env("XDG_STATE_HOME", dir.path().join("state-home"))
+            .env("HOME", dir.path())
+            .env_remove("TALOS_STATE_RETENTION_DAYS")
+            .env_remove("TALOS_COMPACT_THRESHOLD_PCT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    };
+
+    let run_start_for = |flag: Option<&str>, env_val: Option<&str>| -> serde_json::Value {
+        let mut cmd = Command::new(TALOS_BIN);
+        base(&mut cmd);
+        if let Some(v) = flag {
+            cmd.arg("--wall-clock-secs").arg(v);
+        }
+        if let Some(v) = env_val {
+            cmd.env("TALOS_WALL_CLOCK_SECS", v);
+        } else {
+            cmd.env_remove("TALOS_WALL_CLOCK_SECS");
+        }
+        let mut child = cmd.spawn().expect("spawn talos");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(valid_spec_json().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("wait for talos");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the refused-port fixture run must exit 1 (BackendError)"
+        );
+        let contents =
+            std::fs::read_to_string(&transcript_path).expect("transcript file must exist");
+        std::fs::remove_file(&transcript_path).expect("reset transcript between spawns");
+        contents
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .expect("each transcript line is valid JSON")
+            })
+            .find(|l| l["event"] == "run_start")
+            .expect("the transcript must carry a run_start line")
+    };
+
+    // env beats default…
+    assert_eq!(
+        run_start_for(None, Some("300"))["config"]["wall_clock_secs"],
+        300
+    );
+    // …and the flag beats the env.
+    assert_eq!(
+        run_start_for(Some("42"), Some("300"))["config"]["wall_clock_secs"],
+        42
     );
 }
 

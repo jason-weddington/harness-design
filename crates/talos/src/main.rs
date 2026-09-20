@@ -179,10 +179,22 @@
 //!   fallback); unset with a non-local base URL leaves `num_ctx` unset
 //!   (Ollama's own default).
 //! - `OLLAMA_THINK` — `off|on|low|medium|high|max`
-//! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; `0` or unset = unbounded
-//!   wall-clock budget. Overridden by `--wall-clock-secs` when the flag is
-//!   present. The harness self-terminates gracefully before the worker's hard
-//!   kill when this budget is reached.
+//! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; default `1500`
+//!   seconds; `0` disables (unbounded). Precedence: the `--wall-clock-secs`
+//!   flag, then the `TALOS_WALL_CLOCK_SECS` env, then the compiled default
+//!   of `1500`. The
+//!   harness self-terminates gracefully with recovery facts before the
+//!   worker's hard kill when this budget is reached. The compiled default is
+//!   a conservative floor that guarantees a clean `BudgetExhausted` terminal
+//!   under the worst-case worker timeout (derived from the dispatch
+//!   backstop's 1800 s); only the dispatch worker knows its own effective
+//!   timeout for a given run, so a caller that knows its real timeout should
+//!   pass a value derived from it (its effective timeout minus a slack
+//!   margin) — the env var is the INTENDED PRODUCTION PATH, not an escape
+//!   hatch. A non-numeric env value falls through silently to the default
+//!   (an armed 1500 s, not unbounded). Note: the trade — a run that would
+//!   legitimately finish after the budget self-terminates cleanly at exit 20
+//!   instead of being hard-killed — is deliberate.
 //! - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based
 //!   retention for talos's own XDG state dir (`run.sqlite`, `offload/`, and
 //!   opt-in transcripts under `${XDG_STATE_HOME:-$HOME/.local/state}/talos/`).
@@ -245,6 +257,26 @@ use serde::Serialize;
 /// Precedence: `--state-retention-days` flag > `TALOS_STATE_RETENTION_DAYS`
 /// env > this default. See [`resolve_state_retention_days`].
 const DEFAULT_STATE_RETENTION_DAYS: u64 = 30;
+
+/// Default wall-clock budget, in seconds, for `talos run`. Precedence:
+/// `--wall-clock-secs` flag > `TALOS_WALL_CLOCK_SECS` env > this default;
+/// `0` disables (unbounded). See [`resolve_wall_clock_secs`].
+///
+/// The value is derived from the dispatch worker's 1800 s BACKSTOP timeout
+/// (`agent-gtd-dispatch` `config.py` `TIMEOUT_SECONDS = 30 * 60`), leaving 5
+/// minutes of slack under the smallest timeout any consumer of this binary
+/// can have. That 1800 s figure is a backstop only — a consumer whose real
+/// effective timeout is larger (e.g. the harness-design GTD project's
+/// `dispatch_timeout_minutes = 60`, i.e. 3600 s) is expected to RAISE the
+/// budget for its runs via the `TALOS_WALL_CLOCK_SECS` env var (its
+/// effective timeout minus a slack margin) rather than by editing this
+/// constant: a constant compiled into the binary applies to every consumer,
+/// including those that never set a dispatch-side timeout. The compiled
+/// default is therefore a conservative floor that guarantees a clean
+/// `BudgetExhausted` terminal — recovery facts written, run resumable,
+/// exit 20 — under the worst-case worker timeout; a hard kill from outside
+/// loses the work entirely, which is strictly worse.
+const DEFAULT_WALL_CLOCK_SECS: u64 = 1500;
 
 /// Seconds per day, used to convert a retention day-count into a
 /// [`Duration`] for [`prune_state_root`].
@@ -409,11 +441,17 @@ struct RunArgs {
     #[arg(long, default_value_t = 300u64)]
     gate_timeout_secs: u64,
 
-    /// Wall-clock budget in seconds. `0` or absent = unbounded.
+    /// Wall-clock budget in seconds. Default `1500` seconds; `0` disables
+    /// (unbounded).
     ///
-    /// When set, the harness self-terminates gracefully with recovery facts
-    /// before the worker's hard timeout. Can also be set via the environment
-    /// variable `TALOS_WALL_CLOCK_SECS` (flag takes precedence over env).
+    /// When non-zero, the harness self-terminates gracefully with recovery
+    /// facts before the worker's hard timeout. Can also be set via the
+    /// environment variable `TALOS_WALL_CLOCK_SECS` (flag takes precedence
+    /// over env). The compiled default is a conservative floor sized against
+    /// the worst-case worker timeout (the dispatch backstop's 1800 s); a
+    /// caller that knows its real effective timeout should pass a value
+    /// derived from it — the env var is the intended production path, since
+    /// only the dispatch worker knows its own timeout for a given run.
     ///
     /// Note: the `env` feature is NOT enabled for this project's clap
     /// dependency, so `#[arg(env = ...)]` cannot be used — the env fallback
@@ -1003,11 +1041,30 @@ fn build_ralph_summary(
     }
 }
 
+/// Resolve the `run` wall-clock budget: `--wall-clock-secs` flag >
+/// `TALOS_WALL_CLOCK_SECS` env > [`DEFAULT_WALL_CLOCK_SECS`] (1500; `0` =
+/// unbounded). The clap `env` feature is NOT enabled, so the env fallback is
+/// resolved manually.
+///
+/// Unlike [`resolve_compact_threshold_pct`], a NON-NUMERIC env value here
+/// falls through SILENTLY to the default instead of hard-erroring — with the
+/// default armed, a typo'd env value lands on 1500 rather than unbounded
+/// (previously it landed on the 0/unbounded sentinel), so the failure mode
+/// is an armed-but-conservative budget, not an unbounded run. A wrong
+/// threshold would poison an A/B experiment; a wrong wall-clock budget only
+/// changes WHEN a graceful self-termination happens.
+fn resolve_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
+    flag.or_else(|| env("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(DEFAULT_WALL_CLOCK_SECS)
+}
+
 /// Resolve the ralph wall-clock budget: `flag > TALOS_RALPH_WALL_CLOCK_SECS
-/// env > 0` (unbounded). Mirrors the [`resolve_wall_clock_secs`] test-helper
-/// pattern for `run`'s `--wall-clock-secs` — the clap `env` feature is NOT
-/// enabled, so the env fallback is resolved manually. A non-`u64` env value
-/// falls through to `0` (unbounded) without panicking.
+/// env > 0` (unbounded). Mirrors the [`resolve_wall_clock_secs`] pattern for
+/// `run`'s `--wall-clock-secs` — the clap `env` feature is NOT enabled, so
+/// the env fallback is resolved manually. Ralph keeps the `0` default
+/// (unbounded): the ralph loop is a long-horizon outer driver, and arming a
+/// default there is a separate decision from arming `run`. A non-`u64` env
+/// value falls through to `0` (unbounded) without panicking.
 fn resolve_ralph_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
     flag.or_else(|| env("TALOS_RALPH_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(0)
@@ -1761,13 +1818,11 @@ async fn run_cmd(args: RunArgs) {
     };
     let store: Arc<dyn RunStore> = Arc::new(store);
 
-    // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env > 0 (unbounded).
-    // The `env` clap feature is NOT enabled (Cargo.toml features=['derive'] only),
-    // so the env fallback is resolved here via the env_accessor closure.
-    let wall_clock_secs = args
-        .wall_clock_secs
-        .or_else(|| env_accessor("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
-        .unwrap_or(0);
+    // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env >
+    // DEFAULT_WALL_CLOCK_SECS (1500; 0 = unbounded). The `env` clap feature
+    // is NOT enabled (Cargo.toml features=['derive'] only), so the env
+    // fallback is resolved here via the env_accessor closure.
+    let wall_clock_secs = resolve_wall_clock_secs(args.wall_clock_secs, &env_accessor);
 
     // Resolve the compaction trigger threshold: flag > TALOS_COMPACT_THRESHOLD_PCT
     // env > the compiled default. A non-numeric env value is a hard construction
@@ -2044,13 +2099,14 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunConfig, RunMode, RunSummary,
-        SECS_PER_DAY, backend_from_env, build_checks_runner, build_ralph_summary,
-        build_run_summary, exit_code, load_answer_schema, make_run_seed, num_ctx_source_for_record,
-        num_ctx_stderr_line, outcome_str, prune_report_json, prune_state_root, ralph_exit_code,
-        ralph_terminal_str, resolve_compact_threshold_pct, resolve_ralph_wall_clock_secs,
-        resolve_state_retention_days, resolve_transcript_path, stamp_max_tokens, touch_dir_mtime,
-        transcript_label, validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
+        Backend, DEFAULT_WALL_CLOCK_SECS, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunConfig,
+        RunMode, RunSummary, SECS_PER_DAY, backend_from_env, build_checks_runner,
+        build_ralph_summary, build_run_summary, exit_code, load_answer_schema, make_run_seed,
+        num_ctx_source_for_record, num_ctx_stderr_line, outcome_str, prune_report_json,
+        prune_state_root, ralph_exit_code, ralph_terminal_str, resolve_compact_threshold_pct,
+        resolve_ralph_wall_clock_secs, resolve_state_retention_days, resolve_transcript_path,
+        resolve_wall_clock_secs, stamp_max_tokens, touch_dir_mtime, transcript_label,
+        validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
     };
     use harness::anthropic::AnthropicBackend;
     use harness::bedrock::BedrockBackend;
@@ -3508,14 +3564,8 @@ mod tests {
         assert_eq!(runner.command().program, "/bin/sh");
     }
 
-    // ---- wall_clock_secs: flag > env > default 0 -------------------------
-
-    /// Helper that simulates the `wall_clock_secs` resolution logic from `main()`:
-    ///   `flag > TALOS_WALL_CLOCK_SECS env > default 0`
-    fn resolve_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
-        flag.or_else(|| env("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
-            .unwrap_or(0)
-    }
+    // ---- wall_clock_secs: flag > TALOS_WALL_CLOCK_SECS env >
+    // DEFAULT_WALL_CLOCK_SECS (1500; 0 = unbounded) ----------------------
 
     #[test]
     fn wall_clock_secs_flag_beats_env() {
@@ -3533,28 +3583,52 @@ mod tests {
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
             300,
-            "env must beat the default 0"
+            "env must beat the default 1500"
         );
     }
 
     #[test]
-    fn wall_clock_secs_both_unset_yields_zero() {
+    fn wall_clock_secs_both_unset_yields_default() {
         let env = env_with(&[]);
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
-            0,
-            "both-unset must yield the sentinel 0 (unbounded)"
+            DEFAULT_WALL_CLOCK_SECS,
+            "both-unset must yield the ARMED default 1500, not the unbounded \
+             sentinel 0"
         );
     }
 
     #[test]
-    fn wall_clock_secs_invalid_env_value_falls_back_to_zero() {
-        // A non-u64 env value must not panic — it falls through to default 0.
+    fn wall_clock_secs_invalid_env_value_falls_back_to_default() {
+        // A non-u64 env value must not panic — it falls through to the ARMED
+        // default 1500 (a stated divergence from `resolve_compact_threshold_pct`'s
+        // hard error: a typo'd env now lands on 1500 rather than unbounded).
         let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "not-a-number")]);
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
+            DEFAULT_WALL_CLOCK_SECS,
+            "invalid env value must fall back to the armed default 1500"
+        );
+    }
+
+    #[test]
+    fn wall_clock_secs_zero_env_is_the_disable_sentinel() {
+        // `0` on the env path is the unbounded sentinel, passed through.
+        let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "0")]);
+        assert_eq!(
+            resolve_wall_clock_secs(None, &env),
             0,
-            "invalid env value must fall back to 0 (unbounded)"
+            "env `0` must disable the budget (unbounded sentinel)"
+        );
+    }
+
+    #[test]
+    fn wall_clock_secs_explicit_zero_flag_beats_env() {
+        let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "300")]);
+        assert_eq!(
+            resolve_wall_clock_secs(Some(0), &env),
+            0,
+            "an explicit `--wall-clock-secs 0` disable must beat a numeric env"
         );
     }
 

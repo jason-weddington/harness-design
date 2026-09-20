@@ -73,7 +73,7 @@
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
-//!    "transcript_version":2,"harness_version":"0.10.0","label":"claude-sonnet-5",
+//!    "transcript_version":3,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
 //!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
@@ -346,6 +346,25 @@
 //!     configured schema. Carries the non-empty `errors` array from
 //!     re-running that validation at the choke point.
 //!
+//! - **`budget_breach`** — emitted from the wall-clock breach site (top of a
+//!   loop iteration, or the post-loop evaluation) BEFORE the terminal
+//!   persistence write, exactly once per breach, on the persisted and
+//!   non-persisted paths alike. Records the decision's inputs so a breach is
+//!   queryable from the transcript alone. Fields: `armed_secs` (the run's
+//!   `config.wall_clock_secs` — the sentinel `0` never reaches this event,
+//!   since an unbounded budget never breaches), `elapsed_secs` (the SAME
+//!   `duration_since(loop_start).as_secs()` value the breach predicate just
+//!   compared — the loop's own decision input, never a fresh writer
+//!   timestamp), `iteration` (`stats.iterations` at the breach site — the
+//!   number of COMPLETED iterations; a top-of-iteration breach therefore
+//!   reports the count before the pass that would have started). A run
+//!   carries at most one `budget_breach` line: the breach is terminal.
+//!
+//!   ```json
+//!   {"event":"budget_breach","ts":"2026-09-15T02:25:00Z","elapsed_ms":1500000,
+//!    "armed_secs":1500,"elapsed_secs":1500,"iteration":41}
+//!   ```
+//!
 //! ## Nested shapes (externally tagged serde)
 //!
 //! - `stop_reason`: `"ToolUse"` (unit variant) or `{"Other":".."}` (newtype).
@@ -426,14 +445,20 @@ use serde_json::{Map, Value};
 /// `transcript_version`. Bump when the event shapes documented on this
 /// module change incompatibly. 2 adds the `compaction` event and the
 /// compaction counters on `run_end.stats` (in-run compaction, design 08,
-/// `docs/design/08-context-budget.md`).
-pub const TRANSCRIPT_VERSION: u32 = 2;
+/// `docs/design/08-context-budget.md`). 3 adds the `budget_breach` event —
+/// emitted from the relocated wall-clock breach sites (top-of-loop and
+/// post-loop) so the breach decision's inputs (`armed_secs`, `elapsed_secs`,
+/// `iteration`) are queryable from the transcript.
+pub const TRANSCRIPT_VERSION: u32 = 3;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
 /// carry — see the module docs for each event's fields. `contract_violation`
 /// folds in a pre-existing hole: it was already emitted from the `run_end`
 /// choke point and documented, but absent from this array before v2.
-pub const EVENT_KINDS: [&str; 10] = [
+/// `budget_breach` joins at v3, documented with its emission (no
+/// previously-emitted hole this time — the event and its array entry land
+/// together).
+pub const EVENT_KINDS: [&str; 11] = [
     "run_start",
     "compaction",
     "model_request",
@@ -444,6 +469,7 @@ pub const EVENT_KINDS: [&str; 10] = [
     "iteration_end",
     "run_end",
     "contract_violation",
+    "budget_breach",
 ];
 
 /// Opt-in configuration for a run's transcript sink.

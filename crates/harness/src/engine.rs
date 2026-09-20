@@ -118,7 +118,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -281,11 +281,22 @@ pub struct RunConfig {
     /// Wall-clock budget in seconds. `0` means unbounded — the loop only
     /// stops when `max_iterations` is hit or the agent calls `finish`.
     ///
-    /// When non-zero, the loop checks elapsed wall-clock time at the end of
-    /// each iteration (after tool execution, before the non-terminal
-    /// checkpoint) and self-terminates with [`LoopOutcome::BudgetExhausted`]
-    /// when elapsed ≥ this value. Recovery facts are persisted so the outer
-    /// harness can decide whether to resume.
+    /// When non-zero, the loop checks elapsed wall-clock time at the TOP of
+    /// every loop iteration (before the per-iteration output-cap
+    /// re-resolution and before each `backend.turn`), plus one post-loop
+    /// evaluation before the `MaxIterations` terminal, and self-terminates
+    /// with [`LoopOutcome::BudgetExhausted`] when elapsed ≥ this value.
+    /// Recovery facts are persisted so the outer harness can decide whether
+    /// to resume.
+    ///
+    /// Granularity is TURN-level: a turn already in flight when the budget
+    /// expires runs to completion, so the worst-case overshoot is one full
+    /// turn. No production chat client sets a request timeout —
+    /// `OllamaBackend::new` uses a bare `reqwest::Client::new()` (the
+    /// 10-second `SHOW_TIMEOUT` covers only `POST /api/show`),
+    /// `AnthropicBackend::new` is a bare `Client::new()`, and the production
+    /// `BedrockBackend::new` sets no `TimeoutConfig` — so a hung model call
+    /// is bounded only by the caller's outer timeout, not by this check.
     pub wall_clock_secs: u64,
     /// The clock implementation used to read "now" inside the loop. Inject a
     /// [`crate::time::FakeClock`] (test-only) for deterministic timing tests
@@ -465,9 +476,14 @@ impl RunConfig {
 
     /// Set the wall-clock budget in seconds (`0` = unbounded, the default).
     ///
-    /// When non-zero, `run_loop_impl` checks elapsed time at the end of each
-    /// iteration and self-terminates with [`LoopOutcome::BudgetExhausted`]
-    /// when `elapsed >= wall_clock_secs`.
+    /// When non-zero, `run_loop_impl` checks elapsed time at the TOP of every
+    /// loop iteration (before each `backend.turn`) plus one post-loop
+    /// evaluation, and self-terminates with [`LoopOutcome::BudgetExhausted`]
+    /// when `elapsed >= wall_clock_secs`. The bound is turn-granularity: a
+    /// turn already in flight when the budget expires runs to completion (no
+    /// production chat client sets a request timeout — Ollama, Anthropic, and
+    /// Bedrock backends are all bare clients), so worst-case overshoot is one
+    /// full turn.
     #[must_use]
     pub fn with_wall_clock_secs(mut self, secs: u64) -> Self {
         self.wall_clock_secs = secs;
@@ -3199,6 +3215,108 @@ fn stamp_compaction_facts(record: &mut RunRecord, stats: &RunStats) {
     });
 }
 
+/// Evaluate the wall-clock breach predicate for the engine loop and, on
+/// breach, emit the `budget_breach` transcript event — the observability
+/// record of the decision's inputs — BEFORE the terminal persistence write.
+///
+/// Sentinel: `wall_clock_secs == 0` means UNBOUNDED — the check is skipped
+/// entirely when the budget is not set (and no clock read happens, so a
+/// zero-step `FakeClock` never auto-advances on a disabled budget).
+///
+/// `elapsed_secs` in the event is the loop's OWN decision input — the same
+/// `duration_since(loop_start).as_secs()` value the predicate just compared —
+/// never a fresh writer timestamp. The transcript module docs forbid routing
+/// the injected `Clock` through the writer; this is the seam that keeps the
+/// emitted event consistent with the decision it explains.
+///
+/// Returns `true` when the budget is breached; the caller then performs the
+/// identical terminal write via [`write_budget_exhausted_terminal`] and
+/// returns [`LoopOutcome::BudgetExhausted`].
+fn wall_clock_breach_check(
+    config: &RunConfig,
+    loop_start: SystemTime,
+    stats: &RunStats,
+    writer: &mut TranscriptWriter,
+) -> bool {
+    if config.wall_clock_secs == 0 {
+        return false;
+    }
+    let elapsed_secs = config
+        .clock
+        .now()
+        .duration_since(loop_start)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    if elapsed_secs < config.wall_clock_secs {
+        return false;
+    }
+    writer.emit(
+        "budget_breach",
+        json!({
+            "armed_secs": config.wall_clock_secs,
+            "elapsed_secs": elapsed_secs,
+            "iteration": stats.iterations,
+        }),
+    );
+    true
+}
+
+/// The shared wall-clock breach terminal: identical from both breach sites
+/// (top-of-loop and post-loop). Writes the unconditional recovery facts,
+/// the `Failed { mode: BudgetExhausted, summary: "wall-clock budget
+/// exhausted" }` disposition plus its `DispositionSet` event, and a terminal
+/// checkpoint on the persisted path, then returns
+/// [`LoopOutcome::BudgetExhausted`] unconditionally — mirroring the
+/// `MaxIterations` pattern so the non-persistent path still terminates on
+/// breach.
+#[allow(clippy::too_many_arguments)]
+async fn write_budget_exhausted_terminal(
+    persist: Option<&mut RunPersist>,
+    persistence: Option<&Persistence>,
+    messages: &[Message],
+    stats: &RunStats,
+    initial_consumed: &BudgetConsumed,
+    last_gate_green: bool,
+    tree_dirty: bool,
+    nudge_statuses: &[String],
+) -> Result<LoopOutcome, StoreError> {
+    let summary = "wall-clock budget exhausted".to_string();
+    if let (Some(ctx), Some(p)) = (persist, persistence) {
+        ctx.record.messages = messages.to_vec();
+        stamp_compaction_facts(&mut ctx.record, stats);
+        ctx.record.budgets.consumed = BudgetConsumed {
+            iterations: initial_consumed.iterations + stats.iterations,
+            tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
+            cost_micros: initial_consumed.cost_micros,
+        };
+        // Recovery facts mirror the FinishDiscipline terminal exactly:
+        // same `last_gate_green` / `tree_dirty` / `nudge_statuses`
+        // loop-locals so the outer harness sees a consistent shape
+        // regardless of which recovery terminal fired.
+        ctx.record.recovery_facts = Some(RecoveryFacts {
+            gates_green_at_exit: last_gate_green,
+            tree_dirty,
+            nudge_statuses: nudge_statuses.to_vec(),
+        });
+        let disposition = Disposition::Failed {
+            mode: FailureMode::BudgetExhausted,
+            summary: summary.clone(),
+        };
+        ctx.record.disposition = Some(disposition.clone());
+        p.store
+            .append_event(
+                &ctx.rid,
+                Event::DispositionSet {
+                    seq: 0,
+                    disposition,
+                },
+            )
+            .await?;
+        p.store.checkpoint(&ctx.rid, &ctx.record).await?;
+    }
+    Ok(LoopOutcome::BudgetExhausted { summary })
+}
+
 /// The engine loop body proper — the renamed former `run_loop_impl`, now
 /// taking an extra `writer` so it can emit per-iteration transcript events.
 /// See [`run_loop_impl`] for the wrapper that opens `writer` and emits
@@ -3452,6 +3570,35 @@ async fn run_loop_body(
     let mut compaction = CompactionLoopState::default();
 
     for _ in 0..config.max_iterations {
+        // Wall-clock breach check: TOP of every loop iteration, BEFORE the
+        // per-iteration output-cap re-resolution and before this pass's
+        // `backend.turn`, so the budget is consulted before every model call.
+        // Being at the top (not end-of-iteration) also means the stop-site
+        // nudge `continue` — which jumps past the end-of-iteration block —
+        // can no longer skip the budget consult. Because a top-of-loop check
+        // leaves no pass after the final iteration, the same condition is
+        // re-evaluated after the loop closes (see the post-loop check below)
+        // so a budget expiring DURING the final iteration still reports
+        // BudgetExhausted rather than MaxIterations.
+        //
+        // Per-process semantics: `loop_start` is captured fresh at
+        // `run_loop_body` entry, giving each resumed process its own budget
+        // window — NOT whole-run elapsed. This matches the worker's
+        // per-process hard-kill behaviour.
+        if wall_clock_breach_check(config, loop_start, stats, writer) {
+            return write_budget_exhausted_terminal(
+                persist.as_mut(),
+                persistence,
+                &messages,
+                stats,
+                &initial_consumed,
+                last_gate_green,
+                tree_dirty,
+                &nudge_statuses,
+            )
+            .await;
+        }
+
         // Per-iteration output-cap resolution: the operator override verbatim
         // when `config.max_tokens` is `Some` (the accessor is never
         // consulted), else the backend's resolution against the previous
@@ -4440,70 +4587,11 @@ async fn run_loop_body(
             );
         }
 
-        // Wall-clock breach check: evaluated BEFORE the non-terminal
-        // end-of-iteration checkpoint so the Finished terminal (and the
-        // FinishDiscipline recovery terminal above) take precedence. A breach
-        // writes exactly ONE terminal checkpoint; no non-terminal checkpoint
-        // is written for the same iteration.
-        //
-        // Sentinel: `wall_clock_secs == 0` means UNBOUNDED — the check is
-        // skipped entirely when the budget is not set.
-        //
-        // Per-process semantics: `loop_start` is captured fresh at
-        // `run_loop_impl` entry, giving each resumed process its own budget
-        // window — NOT whole-run elapsed. This matches the worker's per-process
-        // hard-kill behaviour.
-        if config.wall_clock_secs != 0
-            && config
-                .clock
-                .now()
-                .duration_since(loop_start)
-                .unwrap_or(Duration::ZERO)
-                .as_secs()
-                >= config.wall_clock_secs
-        {
-            let summary = "wall-clock budget exhausted".to_string();
-            if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
-                ctx.record.messages.clone_from(&messages);
-                stamp_compaction_facts(&mut ctx.record, stats);
-                ctx.record.budgets.consumed = BudgetConsumed {
-                    iterations: initial_consumed.iterations + stats.iterations,
-                    tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                    cost_micros: initial_consumed.cost_micros,
-                };
-                // Recovery facts mirror the FinishDiscipline terminal exactly:
-                // same `last_gate_green` / `tree_dirty` / `nudge_statuses`
-                // loop-locals so the outer harness sees a consistent shape
-                // regardless of which recovery terminal fired.
-                ctx.record.recovery_facts = Some(RecoveryFacts {
-                    gates_green_at_exit: last_gate_green,
-                    tree_dirty,
-                    nudge_statuses: nudge_statuses.clone(),
-                });
-                let disposition = Disposition::Failed {
-                    mode: FailureMode::BudgetExhausted,
-                    summary: summary.clone(),
-                };
-                ctx.record.disposition = Some(disposition.clone());
-                p.store
-                    .append_event(
-                        &ctx.rid,
-                        Event::DispositionSet {
-                            seq: 0,
-                            disposition,
-                        },
-                    )
-                    .await?;
-                p.store.checkpoint(&ctx.rid, &ctx.record).await?;
-            }
-            // UNCONDITIONAL return — mirrors the MaxIterations pattern so the
-            // non-persistent path still terminates on breach.
-            return Ok(LoopOutcome::BudgetExhausted { summary });
-        }
-
         // Non-terminal end of iteration: write the end-of-iteration checkpoint
         // so a crash here loses at most the current iteration's tool results
-        // (already in messages).
+        // (already in messages). The wall-clock breach check no longer runs
+        // here — it moved to the TOP of the loop (before each `backend.turn`)
+        // plus one post-loop evaluation, both above/below this block.
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
             ctx.record.messages.clone_from(&messages);
             stamp_compaction_facts(&mut ctx.record, stats);
@@ -4514,6 +4602,28 @@ async fn run_loop_body(
             };
             p.store.checkpoint(&ctx.rid, &ctx.record).await?;
         }
+    }
+
+    // Post-loop wall-clock breach check: the top-of-loop check leaves no
+    // pass after the final iteration, so a budget expiring DURING the final
+    // iteration is re-evaluated HERE, before the MaxIterations terminal
+    // write — the identical breach condition, the identical terminal write,
+    // and the identical `BudgetExhausted` return. Without this, a budget
+    // that expires on the last pass would silently report `MaxIterations`
+    // (recovery facts only when `last_gate_green`), mislabelling the same
+    // run the top-of-loop check would have caught a pass earlier.
+    if wall_clock_breach_check(config, loop_start, stats, writer) {
+        return write_budget_exhausted_terminal(
+            persist.as_mut(),
+            persistence,
+            &messages,
+            stats,
+            &initial_consumed,
+            last_gate_green,
+            tree_dirty,
+            &nudge_statuses,
+        )
+        .await;
     }
 
     // Terminal path: MaxIterations.
@@ -6720,11 +6830,12 @@ mod tests {
     }
 
     /// POSITIVE TEST (non-persisted path): auto-advance [`FakeClock`] fires the
-    /// breach on the first iteration.
+    /// breach at the TOP of iteration 1 — before any `backend.turn`.
     ///
     /// The [`FakeClock`] auto-advances by 31 s on each `now()` call. With
-    /// budget = 30 s: `loop_start = T0`, breach-check reads `T0 + 31s`, elapsed
-    /// = 31 s ≥ 30 s → `BudgetExhausted`.
+    /// budget = 30 s: `loop_start = T0` (read 1), the relocated top-of-loop
+    /// breach check reads `T0 + 31s` (read 2), elapsed = 31 s ≥ 30 s →
+    /// `BudgetExhausted` before the scripted echo turn is ever drawn.
     #[tokio::test]
     async fn wall_clock_breach_non_persistent_path_returns_budget_exhausted() {
         // Script: one echo iteration (breach fires before the next turn).
@@ -6738,7 +6849,8 @@ mod tests {
         let ctx = ToolCtx::stub();
         // Each now() call auto-advances 31s. Budget = 30s.
         //   Call 1: loop_start = T0, clock → T0+31s
-        //   Call 2 (breach check): now = T0+31s, elapsed = 31s ≥ 30s → BREACH
+        //   Call 2 (top-of-iteration-1 breach check): now = T0+31s,
+        //     elapsed = 31s ≥ 30s → BREACH, before the echo turn is drawn
         let fake = Arc::new(FakeClock::new_auto_advance(
             UNIX_EPOCH,
             Duration::from_secs(31),
@@ -6771,7 +6883,11 @@ mod tests {
 
         let tools = registry_with_finish_and_echo();
         let ctx = ToolCtx::stub();
-        // Auto-advance 31s per call. Budget = 30s → breach on first iteration.
+        // Auto-advance 31s per call. Budget = 30s → breach at the TOP of
+        // iteration 1 (before any `backend.turn`); the scripted echo turn is
+        // undrawn. The persisted record still carries exactly one terminal
+        // checkpoint with `recovery_facts` (`tree_dirty == false`,
+        // `gates_green_at_exit == false`).
         let fake = Arc::new(FakeClock::new_auto_advance(
             UNIX_EPOCH,
             Duration::from_secs(31),
@@ -6826,6 +6942,182 @@ mod tests {
         );
         // gates_green_at_exit = false: no run_checks was called.
         assert!(!rf.gates_green_at_exit);
+    }
+
+    /// RELOCATION TEST (the nudge `continue` seam): the wall-clock breach
+    /// check runs at the TOP of every loop iteration, so a stop-site nudge
+    /// `continue` — which jumps past the old end-of-iteration check — can no
+    /// longer skip the budget consult before the next `backend.turn`.
+    ///
+    /// Clock arithmetic (`FakeClock` auto-advance 10 s, budget 30 s):
+    ///   T0       `loop_start`
+    ///   T0+10s   top of iteration 1 — `run_checks` turn (gate green)
+    ///   T0+20s   top of iteration 2 — text stop fires the nudge, `continue`
+    ///   T0+30s   top of iteration 3 — elapsed ≥ 30 → BREACH, before a third
+    ///            turn is drawn.
+    /// Under the old end-of-iteration check this run kept drawing turns past
+    /// the nudge `continue`; now it self-terminates with the budget terminal.
+    #[tokio::test]
+    async fn wall_clock_breach_fires_on_nudge_continue_path() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 3)
+            .with_checks(runner)
+            .with_max_nudges(1)
+            .with_wall_clock_secs(30)
+            .with_clock(Arc::new(FakeClock::new_auto_advance(
+                UNIX_EPOCH,
+                Duration::from_secs(10),
+            )) as Arc<dyn Clock>);
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("looks fixed".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let store: Arc<dyn RunStore> = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(store.clone());
+
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no store error");
+
+        // Outcome must be BudgetExhausted with the pinned summary literal.
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert!(
+                    summary.contains("wall-clock budget exhausted"),
+                    "summary must contain the pinned literal; got {summary:?}"
+                );
+            }
+            other => panic!("expected BudgetExhausted; got {other:?}"),
+        }
+
+        // The nudge `continue` WAS taken before the breach.
+        assert_eq!(
+            stats.nudges_fired, 1,
+            "the stop-site nudge must have fired (the continue path was exercised)"
+        );
+
+        // The breach preceded the third turn: only two scripted turns drawn.
+        assert_eq!(
+            backend.calls(),
+            2,
+            "the breach must fire before a third backend.turn"
+        );
+
+        // Exactly one terminal DispositionSet — Failed { BudgetExhausted }.
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+        let dispositions: Vec<&Disposition> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::DispositionSet { disposition, .. } => Some(disposition),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dispositions.len(),
+            1,
+            "exactly one DispositionSet expected; got {dispositions:?}"
+        );
+        assert!(
+            matches!(
+                dispositions[0],
+                Disposition::Failed {
+                    mode: FailureMode::BudgetExhausted,
+                    summary
+                }
+                if summary == "wall-clock budget exhausted"
+            ),
+            "DispositionSet must be Failed{{BudgetExhausted, \"wall-clock budget \
+             exhausted\"}}; got {:?}",
+            dispositions[0]
+        );
+
+        // The final record carries recovery facts: run_checks went green and
+        // nothing mutated the tree.
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("record must exist");
+        let rf = record
+            .recovery_facts
+            .expect("recovery_facts must be Some on the breach terminal");
+        assert!(
+            rf.gates_green_at_exit,
+            "gates_green_at_exit must be true — run_checks went green"
+        );
+        assert!(
+            !rf.tree_dirty,
+            "tree_dirty must be false — no edit_file/bash ran"
+        );
+    }
+
+    /// RELOCATION SEAM TEST (post-loop): a budget expiring DURING the final
+    /// iteration must still report `BudgetExhausted` — not `MaxIterations`.
+    /// A top-of-loop check alone leaves no pass after the last iteration, so
+    /// the same breach condition is re-evaluated after the `for` loop closes,
+    /// before the `MaxIterations` terminal write.
+    ///
+    /// Clock arithmetic (`FakeClock` auto-advance 10 s, budget 30 s,
+    /// `max_iterations` 2):
+    ///   T0       `loop_start`
+    ///   T0+10s   top of iteration 1 — echo turn 1
+    ///   T0+20s   top of iteration 2 — echo turn 2
+    ///   T0+30s   post-loop check — elapsed ≥ 30 → BREACH.
+    /// Without the post-loop check this exact run falls through to the
+    /// `MaxIterations` terminal.
+    #[tokio::test]
+    async fn wall_clock_breach_on_final_iteration_returns_budget_exhausted() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(5, 5),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with(5, 5),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let fake = Arc::new(FakeClock::new_auto_advance(
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+        ));
+        let config = RunConfig::new("task", 2)
+            .with_wall_clock_secs(30)
+            .with_clock(fake as Arc<dyn Clock>);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert!(
+                    summary.contains("wall-clock budget exhausted"),
+                    "summary must contain the pinned literal; got {summary:?}"
+                );
+            }
+            LoopOutcome::MaxIterations => {
+                panic!(
+                    "a budget expiring during the final iteration must yield \
+                     BudgetExhausted, not MaxIterations"
+                );
+            }
+            other => panic!("expected BudgetExhausted; got {other:?}"),
+        }
+        assert_eq!(
+            backend.calls(),
+            2,
+            "both scripted turns must have been drawn before the post-loop breach"
+        );
     }
 
     /// RESUME DETERMINISM: a Crash-mode resume with a [`FakeClock`] still
@@ -12407,8 +12699,12 @@ mod tests {
                 matches!(outcome, LoopOutcome::BudgetExhausted { .. }),
                 "transcript_on={transcript_on}: expected BudgetExhausted, got {outcome:?}"
             );
+            // Post-relocation the breach check runs at the TOP of the loop:
+            // T0 (loop_start), T0+10s (top of iter 1), T0+20s (top of iter 2),
+            // T0+30s (top of iter 3 → breach) — so TWO iterations complete
+            // before the breach, and transcript on/off must agree.
             assert_eq!(
-                stats.iterations, 3,
+                stats.iterations, 2,
                 "transcript_on={transcript_on}: breach must fire at the same iteration"
             );
         }
