@@ -684,7 +684,7 @@ async fn explicit_transcript_path_is_not_redirected_to_state_dir() {
 /// value — `None` leaves the flag off (the default-90 arm).
 ///
 /// `wall_clock_secs_arg` adds an optional `--wall-clock-secs` value — `None`
-/// leaves the flag off (the default-1500 arm). `TALOS_WALL_CLOCK_SECS` is
+/// leaves the flag off (the unbounded-default arm). `TALOS_WALL_CLOCK_SECS` is
 /// env-removed alongside `TALOS_COMPACT_THRESHOLD_PCT` /
 /// `TALOS_STATE_RETENTION_DAYS`, so a dev/CI host exporting the variable
 /// cannot flip the default arm.
@@ -856,13 +856,14 @@ async fn run_start_carries_flagged_compact_threshold_pct() {
 
 /// No `--wall-clock-secs` flag (and `TALOS_WALL_CLOCK_SECS` env-removed by
 /// the helper): `run_start.config.wall_clock_secs` carries the compiled
-/// default of 1500 — the ARMED budget, not the unbounded sentinel.
+/// compiled default of 0 — unbounded, since only a caller knows its own
+/// external timeout.
 #[tokio::test(flavor = "current_thread")]
 async fn run_start_carries_default_wall_clock_secs_when_unset() {
     let run_start = run_start_line(None, None, None);
     assert_eq!(
-        run_start["config"]["wall_clock_secs"], 1500,
-        "unset must resolve to the compiled DEFAULT_WALL_CLOCK_SECS of 1500"
+        run_start["config"]["wall_clock_secs"], 0,
+        "unset must resolve to the compiled DEFAULT_WALL_CLOCK_SECS of 0 (unbounded)"
     );
 }
 

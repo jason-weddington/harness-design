@@ -181,13 +181,7 @@ superseded by the shipped code — code wins.
   gets a fresh window (matching the worker's own per-process hard-kill
   semantics). On-resume `consumed` accounting still carries over; only the
   wall-clock window is per-process.
-- **Dispatch arming.** Dispatch is armed by the TALOS default
-  (`DEFAULT_WALL_CLOCK_SECS = 1500` in `talos`) rather than by a
-  dispatch-passed flag: `talos run` now self-terminates `BudgetExhausted`
-  (exit 20, recovery facts written, run resumable) at 25 minutes even when the
-  caller passes nothing. The dispatch-side flag plumbing (passing an explicit
-  `--wall-clock-secs` derived from the worker's real effective timeout) stays
-  peer-owned in agent-gtd-dispatch.
+- **Dispatch arming — the caller arms it, not talos.** `DEFAULT_WALL_CLOCK_SECS` is `0` (unbounded): talos holds no opinion about when a run should stop, because it cannot know when the caller's external kill arrives. The dispatch worker derives `TALOS_WALL_CLOCK_SECS` from the timeout Agent GTD resolved for that run — project override > global worker setting > GTD's own fallback — minus a slack margin, and exports it. `somnus` and other library consumers set their own. Unset means unbounded, which is the behaviour that existed before this budget.
 - **Post-hoc audit recipe.** Every transcript line carries `elapsed_ms`, so
   for any complete run block (split on `run_start`):
   `max(iteration_end.elapsed_ms) >= run_start.config.wall_clock_secs` (when
@@ -204,12 +198,11 @@ superseded by the shipped code — code wins.
   overshoots (turn granularity, above). That is why a done/answer-style
   `contract_violation` audit at the run_end choke point is deliberately NOT
   specified here: elapsed overshoot from a legitimate final turn would false-positive.
-- **The accepted trade.** With the default armed at 1500 s, a run that would
-  legitimately have finished between minute 25 and the worker's kill
-  self-terminates `BudgetExhausted` at minute 25. That is deliberate: a clean
-  terminal at exit 20 with recovery facts written and the run resumable is
-  strictly better than being hard-killed from outside with no record. The
-  budget is not free.
+- **Why a compiled default was tried, and why it was reversed the same day.** The budget first shipped with `DEFAULT_WALL_CLOCK_SECS = 1500`, sized against the dispatch service's `TIMEOUT_SECONDS = 30 * 60` backstop so that it would fire before the worst-case external kill. Within hours it self-terminated a 16-file build at 25 minutes that had 180 minutes available and was at 97.67% coverage against a 98% gate — nearly finished, and destroyed.
+
+  Two errors, and the second is the durable one. The number came from a constant the GTD side almost never reaches: it resolves an effective timeout and sends it explicitly, so the backstop is a fallback rather than a floor. And the asymmetry was inverted — a default set too HIGH degrades to the pre-feature behaviour (the caller's timeout kills the run from outside), while a default set too LOW destroys work that was about to finish. Those costs are not comparable, so a guess must err high.
+
+  The deeper reason no compiled default is right: this trigger is a wall clock, which carries no information about whether the work is done. That is unlike the compaction threshold, which is pressure-sensitive — 90% of a context window is a real signal about real state, so defaulting it on is sound. Seconds elapsed is not such a signal. A budget is still not free when armed: a run that would legitimately finish after it terminates cleanly at exit 20 instead. That trade is the caller's to make, because only the caller knows the alternative.
 
 **Addendum (2026-09, the tokens cap is armed):** the `tokens` cap is now enforced —
 this is the same shape of change as the wall-clock arming above, not the 2026-07-11 narrowing's "token caps are inscrutable" deferral re-litigated blind: a concrete metered consumer (the KB session's `somnus` nightly loop running unattended against a metered Anthropic lane) supplied the missing right value question's answer context, and the mechanism was already fully plumbed (`BudgetLimits.tokens` existed, hardcoded `0` = unbounded, beside `consumed.tokens` already ticked every iteration). The distinction from the 2026-09-19 output-cap ruling (`docs/design/08-context-budget.md`) is pinned in `RunConfig::token_budget`'s docs: a CUMULATIVE RUN BUDGET terminates the run cleanly BETWEEN turns exactly as the wall-clock budget does and never truncates a generation mid-flight — it is not the `DEFAULT_MAX_TOKENS = 32768` per-turn output cap (which survives as `MaxTokensSource::Fallback`), and a groom must not collapse the two into "token caps are bad". Consumption is the billed-token sum `input_tokens + output_tokens + cache_read_tokens + cache_write_tokens` (NOT `Usage::input_tokens` alone — the uncached remainder — and NOT the Anthropic wire sum `input + cache_creation + cache_read`, which omits completions). The knob is OFF by default (`token_budget: 0` = unbounded) — the deliberate divergence from the wall-clock budget's armed default: production talos runs on a PREPAID open-weights pool where an unspent credit is wasted and a cost ceiling has no value, while a metered lane is precisely where an unattended retry storm hurts. The budget is whole-run across resumes (consumed carries over in `budgets.consumed`) with a PER-INVOCATION arm the resume caller must re-pass; enforcement reads the live `config.token_budget` while `budgets.limits.tokens` records the record-creating invocation's arm. COST STAYS DEFERRED on the pricing-source gap: no token→price source exists in this repo, a compiled rate table goes stale silently (under-charging a metered lane with no error), and caller-supplied rates are a separate config surface — `cost_micros` is still never incremented.

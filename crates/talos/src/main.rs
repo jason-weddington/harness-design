@@ -179,22 +179,25 @@
 //!   fallback); unset with a non-local base URL leaves `num_ctx` unset
 //!   (Ollama's own default).
 //! - `OLLAMA_THINK` — `off|on|low|medium|high|max`
-//! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; default `1500`
-//!   seconds; `0` disables (unbounded). Precedence: the `--wall-clock-secs`
-//!   flag, then the `TALOS_WALL_CLOCK_SECS` env, then the compiled default
-//!   of `1500`. The
-//!   harness self-terminates gracefully with recovery facts before the
-//!   worker's hard kill when this budget is reached. The compiled default is
-//!   a conservative floor that guarantees a clean `BudgetExhausted` terminal
-//!   under the worst-case worker timeout (derived from the dispatch
-//!   backstop's 1800 s); only the dispatch worker knows its own effective
-//!   timeout for a given run, so a caller that knows its real timeout should
-//!   pass a value derived from it (its effective timeout minus a slack
-//!   margin) — the env var is the INTENDED PRODUCTION PATH, not an escape
-//!   hatch. A non-numeric env value falls through silently to the default
-//!   (an armed 1500 s, not unbounded). Note: the trade — a run that would
-//!   legitimately finish after the budget self-terminates cleanly at exit 20
-//!   instead of being hard-killed — is deliberate.
+//! - `TALOS_WALL_CLOCK_SECS` — optional `u64` seconds; **default `0`,
+//!   meaning unbounded**. Precedence: the `--wall-clock-secs` flag, then the
+//!   `TALOS_WALL_CLOCK_SECS` env, then the compiled default. When non-zero
+//!   the harness self-terminates gracefully with recovery facts before the
+//!   caller's hard kill.
+//!
+//!   **The env var is the intended production path, not an escape hatch, and
+//!   talos deliberately holds no opinion of its own.** Only the caller knows
+//!   when its external kill arrives: the dispatch worker derives this from
+//!   the timeout Agent GTD resolved for the run (project override > global
+//!   worker setting > GTD's own fallback) minus a slack margin, and other
+//!   library consumers set their own. Unset means unbounded — the behaviour
+//!   that existed before this budget, where the caller's own timeout ends the
+//!   run from outside.
+//!
+//!   This default was `1500` for part of 2026-09-20 and was reversed after it
+//!   destroyed a nearly-finished run that had 10800 s available. A non-numeric
+//!   env value falls through silently to the default, which is now unbounded
+//!   rather than an armed floor.
 //! - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based
 //!   retention for talos's own XDG state dir (`run.sqlite`, `offload/`, and
 //!   opt-in transcripts under `${XDG_STATE_HOME:-$HOME/.local/state}/talos/`).
@@ -272,21 +275,41 @@ const DEFAULT_STATE_RETENTION_DAYS: u64 = 30;
 /// `--wall-clock-secs` flag > `TALOS_WALL_CLOCK_SECS` env > this default;
 /// `0` disables (unbounded). See [`resolve_wall_clock_secs`].
 ///
-/// The value is derived from the dispatch worker's 1800 s BACKSTOP timeout
-/// (`agent-gtd-dispatch` `config.py` `TIMEOUT_SECONDS = 30 * 60`), leaving 5
-/// minutes of slack under the smallest timeout any consumer of this binary
-/// can have. That 1800 s figure is a backstop only — a consumer whose real
-/// effective timeout is larger (e.g. the harness-design GTD project's
-/// `dispatch_timeout_minutes = 60`, i.e. 3600 s) is expected to RAISE the
-/// budget for its runs via the `TALOS_WALL_CLOCK_SECS` env var (its
-/// effective timeout minus a slack margin) rather than by editing this
-/// constant: a constant compiled into the binary applies to every consumer,
-/// including those that never set a dispatch-side timeout. The compiled
-/// default is therefore a conservative floor that guarantees a clean
-/// `BudgetExhausted` terminal — recovery facts written, run resumable,
-/// exit 20 — under the worst-case worker timeout; a hard kill from outside
-/// loses the work entirely, which is strictly worse.
-const DEFAULT_WALL_CLOCK_SECS: u64 = 1500;
+/// **`0`, meaning the budget is OFF unless a caller sets one — deliberately,
+/// and reversed from this constant's first value on 2026-09-20 after it
+/// destroyed a run.**
+///
+/// This default was briefly `1500`, derived from the dispatch service's
+/// `TIMEOUT_SECONDS = 30 * 60` backstop on the reasoning that a compiled
+/// constant must be safe under the smallest timeout any consumer could have.
+/// Two things were wrong with that.
+///
+/// The number was wrong: that backstop is a fallback the GTD side almost
+/// never reaches, because it resolves an effective timeout — a project
+/// override, else the global worker setting, else its own 30-minute fallback
+/// — and sends it explicitly; the configured global on this fleet is 180
+/// minutes. A run
+/// with 10800 s available self-terminated at 1500 s.
+///
+/// The asymmetry was wrong, and that is the durable lesson: a default set too
+/// HIGH degrades to the behaviour that existed before this feature — the
+/// caller's own timeout kills the run from outside — while a default set too
+/// LOW destroys work that was nearly finished. Those are not comparable
+/// costs, so a guess must err high. It erred low and cost a 16-file build at
+/// 97.67% coverage against a 98% gate.
+///
+/// The deeper reason a compiled default cannot be right here: this budget's
+/// trigger is a wall clock, which carries NO information about whether the
+/// work is done. That is unlike the compaction threshold, which is
+/// pressure-sensitive — 90% of a context window is a real signal about real
+/// state, so defaulting it on is sound. Seconds elapsed is not such a signal,
+/// so any compiled value is a bet placed without looking at the table.
+///
+/// Only the caller knows when its external kill arrives. The dispatch worker
+/// derives and exports `TALOS_WALL_CLOCK_SECS` from the run's effective
+/// timeout; `somnus` and other library consumers set their own. Unset means
+/// unbounded, which is honest rather than merely permissive.
+const DEFAULT_WALL_CLOCK_SECS: u64 = 0;
 
 /// Default token budget, in billed tokens, for `talos run`. Precedence:
 /// `--token-budget` flag > `TALOS_TOKEN_BUDGET` env > this default (`0` =
@@ -464,8 +487,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 300u64)]
     gate_timeout_secs: u64,
 
-    /// Wall-clock budget in seconds. Default `1500` seconds; `0` disables
-    /// (unbounded).
+    /// Wall-clock budget in seconds. **Default `0`, meaning unbounded.**
     ///
     /// When non-zero, the harness self-terminates gracefully with recovery
     /// facts before the worker's hard timeout. Can also be set via the
@@ -1081,13 +1103,13 @@ fn build_ralph_summary(
 }
 
 /// Resolve the `run` wall-clock budget: `--wall-clock-secs` flag >
-/// `TALOS_WALL_CLOCK_SECS` env > [`DEFAULT_WALL_CLOCK_SECS`] (1500; `0` =
-/// unbounded). The clap `env` feature is NOT enabled, so the env fallback is
+/// `TALOS_WALL_CLOCK_SECS` env > [`DEFAULT_WALL_CLOCK_SECS`] (`0` =
+/// unbounded, the compiled default). The clap `env` feature is NOT enabled, so the env fallback is
 /// resolved manually.
 ///
 /// Unlike [`resolve_compact_threshold_pct`], a NON-NUMERIC env value here
 /// falls through SILENTLY to the default instead of hard-erroring — with the
-/// default armed, a typo'd env value lands on 1500 rather than unbounded
+/// default of 0, a typo'd env value lands on unbounded — the same outcome as
 /// (previously it landed on the 0/unbounded sentinel), so the failure mode
 /// is an armed-but-conservative budget, not an unbounded run. A wrong
 /// threshold would poison an A/B experiment; a wrong wall-clock budget only
@@ -1104,7 +1126,7 @@ fn resolve_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<Stri
 /// resolved manually. Mirrors [`resolve_wall_clock_secs`]'s silent
 /// fall-through: a NON-NUMERIC env value lands on 0 (unbounded) without
 /// erroring — harmless here because 0 IS the intended default, whereas the
-/// wall-clock resolver's silent fall-through lands on an armed 1500 s.
+/// wall-clock resolver's silent fall-through lands on the unbounded default.
 fn resolve_token_budget(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
     flag.or_else(|| env("TALOS_TOKEN_BUDGET").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(DEFAULT_TOKEN_BUDGET)
@@ -1871,7 +1893,7 @@ async fn run_cmd(args: RunArgs) {
     let store: Arc<dyn RunStore> = Arc::new(store);
 
     // Resolve wall-clock budget: flag > TALOS_WALL_CLOCK_SECS env >
-    // DEFAULT_WALL_CLOCK_SECS (1500; 0 = unbounded). The `env` clap feature
+    // DEFAULT_WALL_CLOCK_SECS (0 = unbounded). The `env` clap feature
     // is NOT enabled (Cargo.toml features=['derive'] only), so the env
     // fallback is resolved here via the env_accessor closure.
     let wall_clock_secs = resolve_wall_clock_secs(args.wall_clock_secs, &env_accessor);
@@ -3645,7 +3667,7 @@ mod tests {
     }
 
     // ---- wall_clock_secs: flag > TALOS_WALL_CLOCK_SECS env >
-    // DEFAULT_WALL_CLOCK_SECS (1500; 0 = unbounded) ----------------------
+    // DEFAULT_WALL_CLOCK_SECS (0 = unbounded) ----------------------------
 
     #[test]
     fn wall_clock_secs_flag_beats_env() {
@@ -3663,7 +3685,7 @@ mod tests {
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
             300,
-            "env must beat the default 1500"
+            "env must beat the compiled default"
         );
     }
 
@@ -3673,21 +3695,22 @@ mod tests {
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
             DEFAULT_WALL_CLOCK_SECS,
-            "both-unset must yield the ARMED default 1500, not the unbounded \
-             sentinel 0"
+            "both-unset must yield the compiled default, which is now the \
+             unbounded sentinel 0 — talos holds no opinion; the caller sets it"
         );
     }
 
     #[test]
     fn wall_clock_secs_invalid_env_value_falls_back_to_default() {
-        // A non-u64 env value must not panic — it falls through to the ARMED
-        // default 1500 (a stated divergence from `resolve_compact_threshold_pct`'s
-        // hard error: a typo'd env now lands on 1500 rather than unbounded).
+        // A non-u64 env value must not panic — it falls through to the compiled
+        // default (a stated divergence from `resolve_compact_threshold_pct`'s hard
+        // error). With the default now 0, a typo'd env lands on UNBOUNDED, which is
+        // the same outcome as not setting it at all rather than a surprise ceiling.
         let env = env_with(&[("TALOS_WALL_CLOCK_SECS", "not-a-number")]);
         assert_eq!(
             resolve_wall_clock_secs(None, &env),
             DEFAULT_WALL_CLOCK_SECS,
-            "invalid env value must fall back to the armed default 1500"
+            "invalid env value must fall back to the compiled default (unbounded)"
         );
     }
 
