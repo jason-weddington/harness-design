@@ -26,7 +26,7 @@ use harness::model::ModelBackend;
 use harness::tool::ToolCtx;
 use serde::Serialize;
 
-use crate::ledger::{ClusterLedger, LedgerCandidate, filter_pockets};
+use crate::ledger::{ClusterLedger, LedgerCandidate, LedgerVerdictRecord, filter_pockets};
 use crate::loop_input::{
     Cluster, FetchOutcome, LoopInputCountSource, LoopInputSource, PocketsStatus, pockets_status,
     render_ledger_filter_line, render_pockets_not_computed_line, validate_project_ref,
@@ -184,7 +184,10 @@ pub struct GateReportRecord {
 }
 
 /// The report one unit leaves on disk. Every refusal, decline, body, gate
-/// verdict, and cost number the night produced is in here.
+/// verdict, and cost number the night produced is in here — including the
+/// per-candidate ledger verdicts (`ledger_verdicts`), so the report alone
+/// reconstructs which cluster was declined, against which stored decline,
+/// at what jaccard.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnitReport {
     /// The project this unit ran for.
@@ -199,6 +202,9 @@ pub struct UnitReport {
     pub pockets_declined: usize,
     /// Verdicts the ledger matched.
     pub matched_verdicts: usize,
+    /// One record per ledger verdict, the candidate's member ids zipped
+    /// with its verdict by index.
+    pub ledger_verdicts: Vec<LedgerVerdictRecord>,
     /// Why pockets were unavailable, if they were.
     pub pockets_status: PocketsStatus,
     /// One record per cluster rung 2 processed.
@@ -244,6 +250,7 @@ impl UnitReport {
             pockets_kept: 0,
             pockets_declined: 0,
             matched_verdicts: 0,
+            ledger_verdicts: Vec::new(),
             pockets_status: PocketsStatus::NoneFound,
             clusters: Vec::new(),
             declines_recorded: Vec::new(),
@@ -277,6 +284,29 @@ pub fn render_call_count_audit_line(calls: u64, cluster_count: usize) -> Option<
     } else {
         None
     }
+}
+
+/// The stderr line for one recorded decline, naming the cluster whose
+/// decline was written. Pure so the shape is byte-pinned by a unit test;
+/// the pipeline only `eprintln!`s it.
+#[must_use]
+pub fn render_decline_recorded_line(project_ref: &str, member_entry_ids: &[String]) -> String {
+    format!(
+        "somnus: decline recorded for {project_ref}: [{}]",
+        member_entry_ids.join(", ")
+    )
+}
+
+/// The stderr line for one decline write that failed, naming the cluster
+/// whose decline was lost — so a multi-decline loop that aborts names which
+/// cluster's decline did not land. Pure so the shape is byte-pinned by a
+/// unit test; the pipeline only `eprintln!`s it.
+#[must_use]
+pub fn render_decline_write_failed_line(project_ref: &str, member_entry_ids: &[String]) -> String {
+    format!(
+        "somnus: decline write failed for {project_ref}: [{}]",
+        member_entry_ids.join(", ")
+    )
 }
 
 /// Write `text` to `path`, creating parent directories.
@@ -416,6 +446,20 @@ async fn run_unit_inner(
     report.pockets_kept = kept.len();
     report.pockets_declined = declined.len();
     report.matched_verdicts = verdicts.iter().filter(|verdict| verdict.matched).count();
+    report.ledger_verdicts = input
+        .pockets
+        .iter()
+        .zip(verdicts.iter())
+        .map(|(pocket, verdict)| LedgerVerdictRecord {
+            index: verdict.index,
+            member_entry_ids: pocket.member_entry_ids.clone(),
+            matched: verdict.matched,
+            ledger_id: verdict.ledger_id.clone(),
+            status: verdict.status.clone(),
+            jaccard: verdict.jaccard,
+            reopen_eligible: verdict.reopen_eligible,
+        })
+        .collect();
     eprintln!(
         "{}",
         render_ledger_filter_line(
@@ -544,10 +588,23 @@ async fn run_unit_inner(
             .record_decline(project_ref, &record.member_entry_ids)
             .await
         {
-            Ok(()) => report
-                .declines_recorded
-                .push(record.member_entry_ids.clone()),
+            Ok(()) => {
+                eprintln!(
+                    "{}",
+                    render_decline_recorded_line(project_ref, &record.member_entry_ids)
+                );
+                report
+                    .declines_recorded
+                    .push(record.member_entry_ids.clone());
+            }
             Err(err) => {
+                // Name the cluster whose decline was lost BEFORE the
+                // fail-closed abort return, so a multi-decline loop that
+                // aborts says which one did not land.
+                eprintln!(
+                    "{}",
+                    render_decline_write_failed_line(project_ref, &record.member_entry_ids)
+                );
                 // Fail closed: a decline that cannot be recorded would be
                 // re-proposed every night, so the run does not claim success.
                 report.outcome = UnitOutcome::Aborted {
@@ -1106,6 +1163,33 @@ mod tests {
         assert_eq!(report.pockets_kept, 1);
         assert_eq!(report.pockets_declined, 1);
         assert_eq!(report.matched_verdicts, 1);
+        assert_eq!(
+            report.ledger_verdicts,
+            vec![
+                LedgerVerdictRecord {
+                    index: 0,
+                    member_entry_ids: vec![
+                        "kb-10001".to_string(),
+                        "kb-10002".to_string(),
+                        "kb-10003".to_string(),
+                    ],
+                    matched: false,
+                    ledger_id: None,
+                    status: None,
+                    jaccard: None,
+                    reopen_eligible: false,
+                },
+                LedgerVerdictRecord {
+                    index: 1,
+                    member_entry_ids: vec!["kb-10004".to_string(), "kb-10005".to_string(),],
+                    matched: true,
+                    ledger_id: Some("decline-1".to_string()),
+                    status: Some("declined".to_string()),
+                    jaccard: None,
+                    reopen_eligible: false,
+                },
+            ]
+        );
         assert_eq!(report.pockets_status, PocketsStatus::NoneFound);
         assert_eq!(report.backend_calls, 3);
         assert_eq!(
@@ -1150,6 +1234,7 @@ mod tests {
             "pockets_kept",
             "pockets_declined",
             "matched_verdicts",
+            "ledger_verdicts",
             "pockets_status",
             "clusters",
             "declines_recorded",
@@ -1416,6 +1501,13 @@ mod tests {
             }
         );
         assert_eq!(backend.calls(), 0, "running unfiltered is never a fallback");
+        // The report IS written by `finalize` on every path, so a ledger
+        // abort is post-hoc greppable in the on-disk JSON.
+        let text = std::fs::read_to_string(&report.report_path).expect("the report is on disk");
+        assert!(
+            text.contains("somnus: ledger source error: ledger endpoint unavailable"),
+            "the abort reason must be greppable on disk: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2027,6 +2119,29 @@ mod tests {
             Some(
                 "somnus: call-count audit: 25 backend calls for 23 clusters (expected at most 24); the single-shot discipline was violated"
             )
+        );
+    }
+
+    #[test]
+    fn the_decline_recorded_line_is_byte_pinned() {
+        assert_eq!(
+            render_decline_recorded_line("demo-project", &["a".to_string(), "b".to_string()]),
+            "somnus: decline recorded for demo-project: [a, b]"
+        );
+        assert_eq!(
+            render_decline_recorded_line("solo", &[]),
+            "somnus: decline recorded for solo: []"
+        );
+    }
+
+    #[test]
+    fn the_decline_write_failed_line_is_byte_pinned() {
+        assert_eq!(
+            render_decline_write_failed_line(
+                "demo-project",
+                &["kb-10001".to_string(), "kb-10002".to_string()]
+            ),
+            "somnus: decline write failed for demo-project: [kb-10001, kb-10002]"
         );
     }
 
