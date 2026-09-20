@@ -6,6 +6,13 @@ license.workspace = true
 authors.workspace = true
 description = "Core agent-harness library."
 
+# `test-support`: compiles `src/test_support.rs` (the scripted `MockBackend`
+# and friends) for a CONSUMER's dev-test target. Default OFF, so nothing in
+# the module ships in any release build — enabling the feature is a dev-only
+# affordance for downstream crates' test suites, never a production one.
+[features]
+test-support = []
+
 [dependencies]
 askama.workspace = true
 async-trait.workspace = true

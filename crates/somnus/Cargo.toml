@@ -14,15 +14,23 @@ path = "src/main.rs"
 async-trait.workspace = true
 clap.workspace = true
 harness = { path = "../harness" }
+reqwest.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+# `harness` dev-dep ADDS the default-off `test-support` feature so somnus's
+# own test targets can drive the same scripted `MockBackend` harness's suite
+# does. The feature never ships in a release build of either crate.
+harness = { path = "../harness", features = ["test-support"] }
+tempfile.workspace = true
 # `test-util` is ADDITIVE here (the workspace tokio dep does not carry it) and
 # exists ONLY to compile the `#[tokio::test(start_paused = true)]` timeout
-# test in `src/observer.rs`. The ROOT manifest is not touched.
+# tests in `src/observer.rs` and `src/unit.rs`. The ROOT manifest is not
+# touched.
 tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true

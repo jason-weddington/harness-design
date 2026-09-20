@@ -1,9 +1,13 @@
-//! Crate-wide, **test-only** support utilities.
+//! Crate-wide support utilities for TEST code.
 //!
-//! This module is compiled only under `#[cfg(test)]`. It exists so that the
-//! scripted [`MockBackend`] can be shared across modules' test suites (the
-//! engine loop here, and Item F's eval harness later) without each re-deriving
-//! a fake backend. Nothing here ships in a release build.
+//! This module is compiled under `#[cfg(test)]` OR the default-off, dev-only
+//! `test-support` feature (see `crates/harness/Cargo.toml`) — so a consumer
+//! crate's dev-test target can drive the same scripted fakes this crate's own
+//! suite does. It is compiled in NEITHER shape by a default-featured build, so
+//! nothing here ships in a release build.
+//!
+//! It exists so that the scripted [`MockBackend`] can be shared across test
+//! suites without each re-deriving a fake backend.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -28,9 +32,10 @@ use crate::model::{
 /// returns a terminal [`BackendError`] rather than silently looping — so a test
 /// that miscounts iterations fails loudly instead of hanging.
 ///
-/// **Test-only:** the whole module is `#[cfg(test)]`, so this type never exists
-/// in a non-test build.
-pub(crate) struct MockBackend {
+/// **Test-only:** the module is compiled under `#[cfg(test)]` or the
+/// default-off `test-support` feature and never in a default-featured build,
+/// so this type does not exist in a production build.
+pub struct MockBackend {
     script: Mutex<VecDeque<Result<AssistantTurn, BackendError>>>,
     calls: Mutex<u32>,
     /// Snapshot of the `messages` slice passed to the most recent `turn`
@@ -47,6 +52,11 @@ pub(crate) struct MockBackend {
     /// the messages the loop sent on the FIRST turn of a multi-turn script,
     /// which is the key assertion for crash-resume and fresh-context resume.
     messages_seen: Mutex<Vec<Vec<Message>>>,
+    /// One entry per `turn` call, in order, capturing the FULL `req.tools`
+    /// slice (owned copies of the JSON schemas) the loop sent that call —
+    /// lets tests assert on the tool union actually advertised to the model,
+    /// which is the output-capability boundary the loop controls.
+    tools_seen: Mutex<Vec<Vec<serde_json::Value>>>,
     /// One entry per `turn` call, in order, capturing the
     /// `req.params.max_tokens` the loop sent that call — lets tests pin the
     /// per-iteration output-cap resolution.
@@ -67,13 +77,14 @@ pub(crate) struct MockBackend {
 impl MockBackend {
     /// Build a backend from an explicit sequence of per-turn outcomes
     /// (`Ok(turn)` or `Err(backend_error)`), consumed front-to-back.
-    pub(crate) fn new(script: Vec<Result<AssistantTurn, BackendError>>) -> Self {
+    pub fn new(script: Vec<Result<AssistantTurn, BackendError>>) -> Self {
         Self {
             script: Mutex::new(script.into()),
             calls: Mutex::new(0),
             last_messages: Mutex::new(Vec::new()),
             systems_seen: Mutex::new(Vec::new()),
             messages_seen: Mutex::new(Vec::new()),
+            tools_seen: Mutex::new(Vec::new()),
             params_seen: Mutex::new(Vec::new()),
             output_cap_calls: Mutex::new(0),
             output_cap_override: None,
@@ -83,18 +94,28 @@ impl MockBackend {
 
     /// Convenience constructor for the common all-success case: every scripted
     /// turn is wrapped in `Ok`.
-    pub(crate) fn from_turns(turns: Vec<AssistantTurn>) -> Self {
+    pub fn from_turns(turns: Vec<AssistantTurn>) -> Self {
         Self::new(turns.into_iter().map(Ok).collect())
     }
 
     /// How many times [`ModelBackend::turn`] has been called so far — used by
     /// tests to assert the iteration count.
-    pub(crate) fn calls(&self) -> u32 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn calls(&self) -> u32 {
         *self.calls.lock().expect("calls lock poisoned")
     }
 
     /// The `messages` the loop sent on the most recent `turn` call.
-    pub(crate) fn last_messages(&self) -> Vec<Message> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn last_messages(&self) -> Vec<Message> {
         self.last_messages
             .lock()
             .expect("last_messages lock poisoned")
@@ -105,7 +126,12 @@ impl MockBackend {
     /// loop sent that turn. Tests assert every entry is equal to prove the
     /// engine renders the prompt exactly once and re-sends byte-identical
     /// bytes.
-    pub(crate) fn systems_seen(&self) -> Vec<Option<String>> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn systems_seen(&self) -> Vec<Option<String>> {
         self.systems_seen
             .lock()
             .expect("systems_seen lock poisoned")
@@ -116,17 +142,45 @@ impl MockBackend {
     /// loop sent that turn. Unlike [`Self::last_messages`], this accumulates
     /// across turns so tests can assert on the FIRST turn's messages (the
     /// key assertion for crash-resume and fresh-context resume).
-    pub(crate) fn messages_seen(&self) -> Vec<Vec<Message>> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    #[must_use]
+    pub fn messages_seen(&self) -> Vec<Vec<Message>> {
         self.messages_seen
             .lock()
             .expect("messages_seen lock poisoned")
             .clone()
     }
 
+    /// One entry per `turn` call, in order: the `tools` slice the loop
+    /// advertised that turn (owned JSON schema copies). Tests assert on this
+    /// to pin the tool union — including `vec![]` for a turn where NOTHING
+    /// must be callable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    #[must_use]
+    pub fn tools_seen(&self) -> Vec<Vec<serde_json::Value>> {
+        self.tools_seen
+            .lock()
+            .expect("tools_seen lock poisoned")
+            .clone()
+    }
+
     /// One entry per `turn` call, in order: the `req.params.max_tokens` the
     /// loop sent that call. Tests assert on this to pin the per-iteration
     /// output-cap resolution (derived caps move turn to turn).
-    pub(crate) fn params_seen(&self) -> Vec<u32> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn params_seen(&self) -> Vec<u32> {
         self.params_seen
             .lock()
             .expect("params_seen lock poisoned")
@@ -135,7 +189,12 @@ impl MockBackend {
 
     /// How many times [`ModelBackend::output_cap`] has been called on this
     /// mock — zero proves the operator override short-circuits resolution.
-    pub(crate) fn output_cap_calls(&self) -> u32 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn output_cap_calls(&self) -> u32 {
         *self
             .output_cap_calls
             .lock()
@@ -145,7 +204,8 @@ impl MockBackend {
     /// Script [`ModelBackend::output_cap`] with a closure over the
     /// `prompt_tokens` argument. Without this, the mock inherits the trait
     /// fallback resolution.
-    pub(crate) fn with_output_cap_override(
+    #[must_use]
+    pub fn with_output_cap_override(
         mut self,
         f: Box<dyn Fn(Option<u32>) -> OutputCapResolution + Send + Sync>,
     ) -> Self {
@@ -157,7 +217,8 @@ impl MockBackend {
     /// mocked equivalent of `OllamaBackend::with_num_ctx`. Without this, the
     /// mock inherits the `None` default and the engine's compaction path is
     /// off (exactly as it is for a real unpinned backend).
-    pub(crate) fn with_context_limit_override(mut self, limit: u32) -> Self {
+    #[must_use]
+    pub fn with_context_limit_override(mut self, limit: u32) -> Self {
         self.context_limit_override = Some(limit);
         self
     }
@@ -190,10 +251,10 @@ impl ModelBackend for MockBackend {
             .expect("params_seen lock poisoned")
             .push(req.params.max_tokens);
         let msgs = req.messages.to_vec();
-        *self
-            .last_messages
+        self.last_messages
             .lock()
-            .expect("last_messages lock poisoned") = msgs.clone();
+            .expect("last_messages lock poisoned")
+            .clone_from(&msgs);
         self.systems_seen
             .lock()
             .expect("systems_seen lock poisoned")
@@ -202,6 +263,10 @@ impl ModelBackend for MockBackend {
             .lock()
             .expect("messages_seen lock poisoned")
             .push(msgs);
+        self.tools_seen
+            .lock()
+            .expect("tools_seen lock poisoned")
+            .push(req.tools.to_vec());
         let next = self
             .script
             .lock()
@@ -231,10 +296,11 @@ impl ModelBackend for MockBackend {
 /// returns `TreeObservation::Unobservable` with a fixed reason rather than
 /// panicking — mirroring [`MockBackend`]'s fail-loudly-over-draw posture.
 ///
-/// **Test-only:** the whole module is `#[cfg(test)]`, so this type never
-/// exists in a non-test build.
+/// **Test-only:** the module is compiled under `#[cfg(test)]` or the
+/// default-off `test-support` feature and never in a default-featured build,
+/// so this type does not exist in a production build.
 #[derive(Debug)]
-pub(crate) struct StubChangeObserver {
+pub struct StubChangeObserver {
     script: Mutex<VecDeque<TreeObservation>>,
     calls: Mutex<u32>,
 }
@@ -243,7 +309,7 @@ impl StubChangeObserver {
     /// Build an observer from an explicit sequence of observations, consumed
     /// front-to-back: the first feeds the baseline, the second the finish-time
     /// observation, and so on.
-    pub(crate) fn new(script: Vec<TreeObservation>) -> Self {
+    pub fn new(script: Vec<TreeObservation>) -> Self {
         Self {
             script: Mutex::new(script.into()),
             calls: Mutex::new(0),
@@ -253,7 +319,12 @@ impl StubChangeObserver {
     /// How many times [`ChangeObserver::observe`] has been called so far.
     /// A test asserting `calls() == 2` (1 baseline + 1 finish) proves BOTH
     /// sides route through the provider.
-    pub(crate) fn calls(&self) -> u32 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned (another test panicked while
+    /// holding it — a fail-loudly, test-only posture).
+    pub fn calls(&self) -> u32 {
         *self.calls.lock().expect("calls lock poisoned")
     }
 }
@@ -269,5 +340,57 @@ impl ChangeObserver for StubChangeObserver {
             .unwrap_or_else(|| TreeObservation::Unobservable {
                 reason: "StubChangeObserver script exhausted (over-drawn)".to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ContentBlock, StopReason, Usage};
+
+    /// `tools_seen` must capture the `req.tools` slice verbatim, one entry
+    /// per `turn` call — the assertion seam a consumer crate uses to pin the
+    /// tool union the loop advertises (including the empty union).
+    #[tokio::test]
+    async fn tools_seen_captures_the_advertised_tool_union_per_call() {
+        let tools = vec![
+            serde_json::json!({"name": "add_pointer", "input_schema": {}}),
+            serde_json::json!({"name": "create_map", "input_schema": {}}),
+        ];
+        let turn = AssistantTurn {
+            content: vec![ContentBlock::Text("hi".to_string())],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        };
+        let backend = MockBackend::from_turns(vec![turn]);
+        let messages = [Message::User {
+            content: vec![crate::model::UserBlock::Text("hi".to_string())],
+        }];
+        let params = crate::model::SamplingParams {
+            max_tokens: 8,
+            temperature: None,
+            stop_sequences: vec![],
+        };
+        let request = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &params,
+        };
+
+        backend.turn(&request).await.expect("scripted turn");
+
+        assert_eq!(backend.calls(), 1);
+        let seen = backend.tools_seen();
+        assert_eq!(seen.len(), 1, "one entry per turn call");
+        assert_eq!(seen[0], tools, "the tool union is captured verbatim");
+        assert_eq!(backend.params_seen(), vec![8]);
+        assert_eq!(backend.systems_seen(), vec![None::<String>]);
     }
 }

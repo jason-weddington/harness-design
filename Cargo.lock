@@ -2366,9 +2366,12 @@ dependencies = [
  "async-trait",
  "clap",
  "harness",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

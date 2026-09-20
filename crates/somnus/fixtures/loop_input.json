@@ -1,0 +1,118 @@
+{
+  "project_ref": "demo-project",
+  "excerpt_chars": 600,
+  "entries": [
+    {
+      "id": "kb-10001",
+      "short_title": "Switch VLAN tagging",
+      "long_title": "Home-network switch VLAN tagging baseline",
+      "entry_type": "note",
+      "tags": ["network", "linux"],
+      "excerpt": "The trunk port carries VLAN 10 for the wired network and VLAN 20 for guests; management lives on VLAN 99.",
+      "details_length": 1204,
+      "unpointed": true
+    },
+    {
+      "id": "kb-10002",
+      "short_title": "Recursive DNS resolvers",
+      "long_title": "Recursive DNS resolvers on the home network",
+      "entry_type": "note",
+      "tags": ["network", "dns"],
+      "excerpt": "Two recursive resolvers answer on the LAN; upstream forwarding goes over TLS to the two nearest caches.",
+      "details_length": 987,
+      "unpointed": true
+    },
+    {
+      "id": "kb-10003",
+      "short_title": "Wireguard client config",
+      "long_title": "Wireguard client configuration for the road laptop",
+      "entry_type": "note",
+      "tags": ["network", "vpn"],
+      "excerpt": "The client config pins the endpoint to the home router's wireguard port and routes only the two internal subnets.",
+      "details_length": 1422,
+      "unpointed": true
+    },
+    {
+      "id": "kb-10004",
+      "short_title": "DHCP lease hygiene",
+      "long_title": "DHCP lease hygiene and reservation bookkeeping",
+      "entry_type": "note",
+      "tags": ["network", "dhcp"],
+      "excerpt": "Reservations are recorded next to the MAC addresses; lease times drop to twelve hours so a re-addressed host cannot linger.",
+      "details_length": 731,
+      "unpointed": true
+    },
+    {
+      "id": "kb-10005",
+      "short_title": "Nginx TLS termination",
+      "long_title": "Nginx TLS termination for the hosted services",
+      "entry_type": "note",
+      "tags": ["services", "tls"],
+      "excerpt": "Nginx terminates TLS at the edge and forwards to the backend over the loopback interface; certificates renew by DNS challenge.",
+      "details_length": 1580,
+      "unpointed": false
+    },
+    {
+      "id": "kb-10006",
+      "short_title": "Backup job schedule",
+      "long_title": "Nightly backup job schedule and retention",
+      "entry_type": "note",
+      "tags": ["services", "backup"],
+      "excerpt": "The backup job snapshots each service volume at two in the morning and prunes to thirty days of dailies.",
+      "details_length": 1109,
+      "unpointed": false
+    },
+    {
+      "id": "kb-10007",
+      "short_title": "Log retention policy",
+      "long_title": "Log retention policy for the hosted services",
+      "entry_type": "note",
+      "tags": ["services", "logging"],
+      "excerpt": "Service logs rotate weekly and are kept ninety days; the archive tier holds a year of compressed monthly rolls.",
+      "details_length": 864,
+      "unpointed": false
+    }
+  ],
+  "maps": [
+    {
+      "id": "kb-20001",
+      "short_title": "Home network orientation",
+      "long_title": "Home network orientation map",
+      "pointers": ["kb-10001", "kb-10002", "kb-10003", "kb-99999", "kb-10004"],
+      "body": "Lives in knowledge/linux/network\n\nOrients the switch, DNS, and VPN entries for the home network.\n\nDetail entries:\n- kb-10001 — switch VLAN tagging baseline\n- kb-10002 — recursive DNS resolvers\n- kb-10003 — wireguard client config\n- kb-99999 — cross-project wireguard hub notes\n- kb-10004 — DHCP lease hygiene\n\nNot yet documented:\n- Site-to-site wireguard topology",
+      "contributor": "somnus",
+      "updated_by": "somnus"
+    },
+    {
+      "id": "kb-20002",
+      "short_title": "Hosted services orientation",
+      "long_title": "Hosted services orientation map",
+      "pointers": ["kb-10005", "kb-10006", "kb-10007"],
+      "body": "Lives in knowledge/services\n\nHuman-written orientation for the service entries.\n\nDetail entries:\n- kb-10005 — nginx TLS termination\n- kb-10006 — backup job schedule\n- kb-10007 — log retention policy\n\nNot yet documented:\n- Off-site restore drill",
+      "contributor": "jason",
+      "updated_by": null
+    }
+  ],
+  "pockets": [
+    {
+      "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"],
+      "mean_similarity": 0.71,
+      "min_similarity": 0.62,
+      "max_similarity": 0.83,
+      "edges": [
+        { "a": "kb-10001", "b": "kb-10002", "similarity": 0.71 },
+        { "a": "kb-10002", "b": "kb-10003", "similarity": 0.83 }
+      ]
+    },
+    {
+      "member_entry_ids": ["kb-10004", "kb-10005"],
+      "mean_similarity": 0.55,
+      "min_similarity": 0.48,
+      "max_similarity": 0.62,
+      "edges": [
+        { "a": "kb-10004", "b": "kb-10005", "similarity": 0.62 }
+      ]
+    }
+  ],
+  "pockets_omitted_reason": null
+}

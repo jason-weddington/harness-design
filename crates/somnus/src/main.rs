@@ -2,12 +2,12 @@
 //! service, nothing for an installer to restart (the installer's only
 //! `systemctl` string is a comment explaining its absence).
 //!
-//! This cut the run body is a LOUD stub, not a silent one: the functional
-//! specification of the nightly loop is the KB session's to write, and its
-//! two in-flight input contracts (`somnus-loop-input`,
-//! `somnus-cluster-ledger`) are not landed, so an accidental nightly
-//! invocation fails loudly with exit 1 instead of burning the metered
-//! Anthropic lane or silently doing nothing.
+//! This cut the run body is a LOUD stub, not a silent one: the KB
+//! write-endpoint contract behind `MapOpSink` is not pinned anywhere in this
+//! repo, so an accidental nightly invocation fails loudly with exit 1 instead
+//! of burning the metered Anthropic lane or silently doing nothing. The
+//! library code it waits on — loop-input fetch, the decline ledger filter,
+//! and rungs 1-3 — is wired and exercised by the crate's own tests.
 //!
 //! Every library construct lives in the `somnus` lib target (`src/lib.rs`);
 //! this bin is thin on purpose.
@@ -41,10 +41,10 @@ struct RunArgs {
 /// BEFORE any other work.
 const EMPTY_PROJECT_MSG: &str = "somnus: --project must be a non-empty project ref";
 
-/// The not-wired run stub's stderr message: names the two in-flight GTD items
-/// the run body is waiting on and the two deferred inference rungs, so a
-/// reader of the log knows exactly why nothing happened.
-const NOT_WIRED_MSG: &str = "somnus: run body not wired this cut — the run-body input contract is in flight as somnus-loop-input and the cluster/decline ledger as somnus-cluster-ledger; the rung-1 cluster extraction and rung-2 op inference calls are deferred until both land. Exiting without doing anything.";
+/// The not-wired run stub's stderr message: names the ONE remaining gap (the
+/// KB write-endpoint contract behind `MapOpSink`) and what IS already wired,
+/// so a reader of the log knows exactly why nothing happened.
+const NOT_WIRED_MSG: &str = "somnus: run body not wired this cut — the KB write-endpoint contract behind MapOpSink is not pinned; loop-input fetch, the decline ledger filter, and rungs 1-3 are wired as library code and exercised by tests. Exiting without doing anything.";
 
 fn main() {
     let cli = Cli::parse();
@@ -54,18 +54,18 @@ fn main() {
 }
 
 /// The `run` body. The stub is the FIRST statement after argument validation —
-/// before any count-source call, backend construction, or network I/O (none
-/// of which exist in this cut).
+/// before any count-source call, backend construction, or network I/O (none of
+/// which exist in this cut's binary).
 ///
 // The vendored spec's line-103 startup assertion (working directory is NOT a
 // git repo) is deliberately NOT implemented, per the lead's correction which
-// overrides the spec: somnus supplies a custom `ChangeObserver` via
-// `RunConfig::with_change_observer` (see `somnus::build_run_config`), so git
-// is never consulted — the observer serves BOTH the run-start baseline and
-// every finish-time observation, and `observe_tree` is not called on either.
-// A stray `.git` is therefore inert, and an assertion refusing to start in a
-// directory that happens to be a repo would block a legitimate deployment for
-// no reason.
+// overrides the spec: somnus supplies a custom `ChangeObserver`
+// (`observer::MapPointerObserver`, which the pipeline in `unit::run_unit`
+// constructs over the loop-input source), so git is never consulted — the
+// observer serves BOTH the run-start baseline and the final observation, and
+// `observe_tree` is not called on either. A stray `.git` is therefore inert,
+// and an assertion refusing to start in a directory that happens to be a repo
+// would block a legitimate deployment for no reason.
 fn run(project: &str) {
     if project.trim().is_empty() {
         eprintln!("{EMPTY_PROJECT_MSG}");

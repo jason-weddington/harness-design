@@ -98,12 +98,12 @@ fn empty_project_ref_is_rejected_before_any_other_work() {
 // ============================================================================
 
 /// After the empty-project check, the run body is a stub that exits 1 with a
-/// stderr message naming the two in-flight GTD items and the deferred
-/// rung-1/rung-2 inference calls — so an accidental nightly invocation fails
-/// loudly instead of burning the metered Anthropic lane or silently doing
-/// nothing.
+/// stderr message naming the one remaining gap — the KB write-endpoint
+/// contract behind `MapOpSink` — and what is already wired as library code —
+/// so an accidental nightly invocation fails loudly instead of burning the
+/// metered Anthropic lane or silently doing nothing.
 #[test]
-fn run_body_stub_fails_loudly_naming_the_deferred_items() {
+fn run_body_stub_fails_loudly_naming_the_remaining_gap() {
     let (code, _stdout, stderr) = run_cli(&["run", "--project", "any"]);
     assert_eq!(
         code,
@@ -111,14 +111,27 @@ fn run_body_stub_fails_loudly_naming_the_deferred_items() {
         "the not-wired stub must exit 1, stderr: {stderr}"
     );
     for substring in [
+        "MapOpSink",
+        "write-endpoint",
+        "Exiting without doing anything",
+    ] {
+        assert!(
+            stderr.contains(substring),
+            "stub message must name {substring}; stderr was: {stderr}"
+        );
+    }
+    // The loop-input fetch, the decline ledger filter, and rungs 1-3 are
+    // WIRED as library code and exercised by the crate's tests, so the stub
+    // must not claim they are in flight.
+    for absent in [
         "somnus-loop-input",
         "somnus-cluster-ledger",
         "rung-1",
         "rung-2",
     ] {
         assert!(
-            stderr.contains(substring),
-            "stub message must name {substring}; stderr was: {stderr}"
+            !stderr.contains(absent),
+            "stub message must NOT name {absent}; stderr was: {stderr}"
         );
     }
 }

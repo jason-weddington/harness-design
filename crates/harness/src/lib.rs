@@ -24,10 +24,12 @@ pub mod tools;
 pub mod transcript;
 pub mod workspace;
 
-/// Crate-wide, test-only support (scripted backends, etc.). Compiled only
-/// under `#[cfg(test)]` so it never ships in a release build.
-#[cfg(test)]
-mod test_support;
+/// Crate-wide support utilities for TEST code: this crate's own suite and —
+/// behind the default-off, dev-only `test-support` feature — consumer crates'
+/// test suites. Compiled under `#[cfg(test)]` or that feature, so it never
+/// ships in a default-featured (release) build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 /// The project's name. Placeholder until the real harness API exists.
 #[must_use]

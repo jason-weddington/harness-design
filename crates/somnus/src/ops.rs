@@ -9,9 +9,9 @@
 //! the model a tool for it.
 //!
 //! Op execution stays behind a [`MapOpSink`] seam: the KB write-endpoint
-//! paths and the cluster/decline ledger are pinned nowhere in this repo, so
-//! no HTTP write code may be invented. The only implementation this cut
-//! returns a loud, named error.
+//! paths are pinned nowhere in this repo (the `MapOpSink` production
+//! transport is the remaining gap), so no HTTP write code may be invented.
+//! The only implementation this cut returns a loud, named error.
 //!
 //! [`map_disposition`] maps the loop's inputs to the HARNESS
 //! [`Disposition`] enum (not a somnus twin, so there is one disposition
@@ -92,8 +92,8 @@ pub enum FinishClaim {
 }
 
 /// The op-execution seam. Every op the model picks is applied through this
-/// sink; the production transport is the KB's write endpoints, whose paths
-/// and the ledger (`somnus-cluster-ledger`) are pinned nowhere in this repo.
+/// sink; the production transport is the KB's write endpoints, whose
+/// contract is not pinned in this repo (the remaining gap this cut).
 #[async_trait]
 pub trait MapOpSink: Send + Sync {
     /// Apply one op.
@@ -107,7 +107,7 @@ pub trait MapOpSink: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnwiredOpSink;
 
-pub(crate) const OP_APPLY_REFUSAL: &str = "somnus: op execution is not wired this cut — the run-body input contract is in flight as somnus-loop-input and the cluster/decline ledger as somnus-cluster-ledger; no KB write endpoint is pinned in this repo, so ops cannot be applied.";
+pub(crate) const OP_APPLY_REFUSAL: &str = "somnus: op execution is not wired this cut — no KB write endpoint is pinned in this repo (the MapOpSink production transport is the remaining gap); the loop-input fetch, the decline filter, and rungs 1-3 are wired as library code, but ops cannot be applied.";
 
 #[async_trait]
 impl MapOpSink for UnwiredOpSink {
@@ -186,30 +186,11 @@ impl OpTool {
         Self { kind, sink }
     }
 
-    /// Parse a tool-call input into the corresponding [`Op`]. Field names
-    /// match the pinned schema exactly, so deserialization IS the mapping.
+    /// Parse a tool-call input into the corresponding [`Op`] by delegating
+    /// the per-kind field extraction to [`parse_op_fields`] with
+    /// `self.kind`.
     fn parse_op(&self, input: &Value) -> Result<Op, String> {
-        match self.kind {
-            OpKind::AddPointer => Ok(Op::AddPointer {
-                map_id: req_str(input, "map_id")?,
-                entry_id: req_str(input, "entry_id")?,
-                gloss: req_str(input, "gloss")?,
-            }),
-            OpKind::CreateMap => Ok(Op::CreateMap {
-                cluster_id: req_str(input, "cluster_id")?,
-                title: req_str(input, "title")?,
-                orientation_prose: req_str(input, "orientation_prose")?,
-            }),
-            OpKind::StrikeGap => Ok(Op::StrikeGap {
-                map_id: req_str(input, "map_id")?,
-                gap_text: req_str(input, "gap_text")?,
-                closing_entry_id: req_str(input, "closing_entry_id")?,
-            }),
-            OpKind::ProposeGap => Ok(Op::ProposeGap {
-                cluster_id: req_str(input, "cluster_id")?,
-                reason: req_str(input, "reason")?,
-            }),
-        }
+        parse_op_fields(self.kind, input)
     }
 }
 
@@ -220,6 +201,63 @@ fn req_str(input: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("missing required string field `{key}`"))
+}
+
+/// The per-kind field extraction behind [`OpTool::parse_op`]: routing an
+/// already-resolved [`OpKind`] over a raw tool-call input. Shared with the
+/// free function the rung-2 loop parses model turns through
+/// ([`op_from_call`]), so the tool's registered schema and the loop's parse
+/// seam can never drift apart.
+fn parse_op_fields(kind: OpKind, input: &Value) -> Result<Op, String> {
+    match kind {
+        OpKind::AddPointer => Ok(Op::AddPointer {
+            map_id: req_str(input, "map_id")?,
+            entry_id: req_str(input, "entry_id")?,
+            gloss: req_str(input, "gloss")?,
+        }),
+        OpKind::CreateMap => Ok(Op::CreateMap {
+            cluster_id: req_str(input, "cluster_id")?,
+            title: req_str(input, "title")?,
+            orientation_prose: req_str(input, "orientation_prose")?,
+        }),
+        OpKind::StrikeGap => Ok(Op::StrikeGap {
+            map_id: req_str(input, "map_id")?,
+            gap_text: req_str(input, "gap_text")?,
+            closing_entry_id: req_str(input, "closing_entry_id")?,
+        }),
+        OpKind::ProposeGap => Ok(Op::ProposeGap {
+            cluster_id: req_str(input, "cluster_id")?,
+            reason: req_str(input, "reason")?,
+        }),
+    }
+}
+
+/// Parse a rung-2 tool call (`name`, `input`) into an [`Op`], routing the
+/// NAME first: any string outside the four op names is a named `Err` before
+/// any field is read and before any [`OpTool`] is constructed — `finish`,
+/// `run_checks`, `no_change`, and anything else the model might reach for
+/// are parse errors, never panics, never silently applied.
+///
+/// # Errors
+/// `Err` naming the unknown tool, or naming the missing/ill-typed field.
+pub fn op_from_call(name: &str, input: &Value) -> Result<Op, String> {
+    let kind = OpKind::from_name(name).ok_or_else(|| {
+        format!("unknown tool `{name}`: the rung-2 closed vocabulary is add_pointer, create_map, strike_gap, propose_gap")
+    })?;
+    parse_op_fields(kind, input)
+}
+
+/// The four op tool schemas, byte-identical to what
+/// [`crate::gate::build_registry`] registers — built over the same
+/// [`UnwiredOpSink`] and the same [`OpTool`] construction, so the rung-2
+/// tool union and the registry can never drift apart.
+#[must_use]
+pub fn op_tool_schemas() -> Vec<Value> {
+    let sink: Arc<dyn MapOpSink> = Arc::new(UnwiredOpSink);
+    ["add_pointer", "create_map", "strike_gap", "propose_gap"]
+        .into_iter()
+        .map(|name| OpTool::new(name, Arc::clone(&sink)).schema())
+        .collect()
 }
 
 #[async_trait]
@@ -475,29 +513,40 @@ mod tests {
     // --- the op tools: the unwired sink is the ONLY implementation ---
 
     #[tokio::test]
-    async fn unwired_sink_refuses_loudly_naming_both_in_flight_items() {
+    async fn unwired_sink_refuses_loudly_naming_the_remaining_gap() {
         let result = UnwiredOpSink
             .apply(Op::NoChange {
                 cluster_id: "c1".to_string(),
             })
             .await;
         assert!(result.is_error);
-        assert!(result.summary.contains("somnus-loop-input"));
-        assert!(result.summary.contains("somnus-cluster-ledger"));
+        assert!(result.summary.contains("MapOpSink"), "{}", result.summary);
+        assert!(
+            result.summary.contains("KB write endpoint"),
+            "{}",
+            result.summary
+        );
+        assert!(!result.summary.contains("somnus-loop-input"));
+        assert!(!result.summary.contains("somnus-cluster-ledger"));
     }
 
     #[tokio::test]
-    async fn all_four_op_tools_refuse_through_the_registry_with_both_item_names() {
-        let registry = crate::gate::build_registry("http://kb.invalid");
+    async fn all_four_op_tools_refuse_through_the_registry_naming_the_remaining_gap() {
+        let registry = crate::gate::build_registry(
+            "http://kb.invalid",
+            std::path::Path::new("/tmp/somnus-body.json"),
+        );
         for name in ["add_pointer", "create_map", "strike_gap", "propose_gap"] {
             let result = registry
                 .invoke(name, serde_json::json!({}), &harness::tool::ToolCtx::stub())
                 .await;
             assert!(result.is_error, "{name} must refuse");
             assert!(
-                result.summary.contains("somnus-loop-input")
-                    && result.summary.contains("somnus-cluster-ledger"),
-                "{name} summary must name both in-flight items: {}",
+                result.summary.contains("MapOpSink")
+                    && result.summary.contains("KB write endpoint")
+                    && !result.summary.contains("somnus-loop-input")
+                    && !result.summary.contains("somnus-cluster-ledger"),
+                "{name} summary must name the remaining gap only: {}",
                 result.summary
             );
         }
@@ -505,7 +554,10 @@ mod tests {
 
     #[tokio::test]
     async fn op_tool_parses_valid_input_into_the_op_vocabulary() {
-        let registry = crate::gate::build_registry("http://kb.invalid");
+        let registry = crate::gate::build_registry(
+            "http://kb.invalid",
+            std::path::Path::new("/tmp/somnus-body.json"),
+        );
         let result = registry
             .invoke(
                 "propose_gap",
@@ -516,7 +568,7 @@ mod tests {
         // Still an error (the sink is unwired), but the op WAS parsed and
         // handed to the sink — the mapping is mechanical, not a schema error.
         assert!(result.is_error);
-        assert!(result.summary.contains("somnus-loop-input"));
+        assert!(result.summary.contains("MapOpSink"));
     }
 
     // --- map_disposition: the pinned rows ---
@@ -804,5 +856,89 @@ mod tests {
             .parse_op(&serde_json::json!({}))
             .expect_err("absent field is rejected");
         assert_eq!(error, "missing required string field `map_id`");
+    }
+
+    // --- op_from_call: the rung-2 parse seam, names routed FIRST ----------
+
+    #[test]
+    fn op_from_call_routes_the_name_before_any_field_is_read() {
+        // Every one of the four op names parses through the same per-kind
+        // extraction the registered tool uses.
+        let op = op_from_call(
+            "add_pointer",
+            &serde_json::json!({"map_id": "m1", "entry_id": "e1", "gloss": "g"}),
+        )
+        .expect("a known op name with valid fields parses");
+        assert_eq!(
+            op,
+            Op::AddPointer {
+                map_id: "m1".to_string(),
+                entry_id: "e1".to_string(),
+                gloss: "g".to_string(),
+            }
+        );
+        let op = op_from_call(
+            "create_map",
+            &serde_json::json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
+        )
+        .expect("create_map parses");
+        assert_eq!(
+            op,
+            Op::CreateMap {
+                cluster_id: "c1".to_string(),
+                title: "t".to_string(),
+                orientation_prose: "p".to_string(),
+            }
+        );
+        // A missing field inside a KNOWN op is a named field error.
+        let error = op_from_call("strike_gap", &serde_json::json!({"map_id": "m1"}))
+            .expect_err("a missing field is a named error");
+        assert_eq!(error, "missing required string field `gap_text`");
+    }
+
+    #[test]
+    fn op_from_call_refuses_every_name_outside_the_closed_vocabulary() {
+        // `finish`, `run_checks`, `no_change`, and anything else the model
+        // might reach for: a named Err, never a panic, never an op.
+        for name in ["finish", "run_checks", "no_change", "bogus"] {
+            let error = op_from_call(name, &serde_json::json!({}))
+                .expect_err("every non-op tool name must be refused");
+            assert!(
+                error.contains("unknown tool"),
+                "{name} must be named as an unknown tool, got {error}"
+            );
+            assert!(error.contains(name), "the error must name {name}: {error}");
+        }
+    }
+
+    // --- op_tool_schemas: the rung-2 tool union ---------------------------
+
+    #[test]
+    fn op_tool_schemas_are_exactly_the_four_registered_op_schemas() {
+        let schemas = op_tool_schemas();
+        assert_eq!(schemas.len(), 4);
+        let registry = crate::gate::build_registry(
+            "http://kb.invalid",
+            std::path::Path::new("/tmp/somnus-body.json"),
+        );
+        let mut names: Vec<String> = schemas
+            .iter()
+            .map(|schema| schema["name"].as_str().expect("a name").to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "add_pointer".to_string(),
+                "create_map".to_string(),
+                "propose_gap".to_string(),
+                "strike_gap".to_string(),
+            ]
+        );
+        for schema in &schemas {
+            let name = schema["name"].as_str().expect("a name");
+            let tool = registry.get(name).expect("registered in the registry");
+            assert_eq!(tool.schema(), *schema, "{name} must be byte-identical");
+        }
     }
 }
