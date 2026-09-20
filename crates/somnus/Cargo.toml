@@ -1,0 +1,28 @@
+[package]
+name = "somnus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "KB nightly map-maintenance loop: a timer-invoked binary, no daemon."
+
+[[bin]]
+name = "somnus"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+harness = { path = "../harness" }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `test-util` is ADDITIVE here (the workspace tokio dep does not carry it) and
+# exists ONLY to compile the `#[tokio::test(start_paused = true)]` timeout
+# test in `src/observer.rs`. The ROOT manifest is not touched.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

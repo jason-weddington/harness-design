@@ -2,7 +2,7 @@
 # adapter) get added to `members` as the harness grows.
 [workspace]
 resolver = "3"
-members = ["crates/harness", "crates/talos"]
+members = ["crates/harness", "crates/somnus", "crates/talos"]
 # `fixtures/*` are self-contained cargo packages used as eval inputs (e.g.
 # `fixtures/broken-adder`, committed deliberately red). Excluding them keeps the
 # project's own gates from ever building, testing, or linting fixture code —
