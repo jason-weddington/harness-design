@@ -2,6 +2,29 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.12.0 - 2026-09-20
+#### Features
+- (**engine**) make the compaction trigger threshold a configurable knob - (aacef15) - Jason Weddington, *Claude Opus 5*
+- (**engine**) Ollama-only in-run context compaction with disorientation telemetry - (11e8133) - Jason Weddington, *Claude Opus 5*
+- (**engine**) resolve the per-turn output cap per backend and model - (f5a9f60) - Jason Weddington, *Claude Opus 5*
+- (**prompt**) state that the harness owns the commit, not the agent - (31a07ba) - Jason Weddington, *Claude Opus 5*
+#### Bug Fixes
+- (**engine**) pair tier-2 compaction by adjacency, not global call ids - (ac2cfc3) - Jason Weddington, *Claude Opus 5*
+#### Documentation
+- (**design-06**) answer mode's read-only guarantee is filesystem-scoped, not general - (2820781) - Jason Weddington, *Claude Opus 5*
+- (**design-07**) cloud /api/show verified; no Ollama output cap exists - (3fcffa8) - Jason Weddington, *Claude Opus 5*
+- (**design-08**) the dose-response settles it — harmful only under a setting production cannot produce - (7a35620) - Jason Weddington, *Claude Opus 5*
+- (**design-08**) first measured compaction runs — correct, but the telemetry is blind to the harm - (62f9704) - Jason Weddington, *Claude Opus 5*
+- (**design-08**) compaction ships default-on at 90% with a toggle - (ceb95db) - Jason Weddington, *Claude Opus 5*
+- (**design-08**) compaction is Ollama-only; the output cap still covers all three backends - (b7eddbf) - Jason Weddington, *Claude Opus 5*
+- (**design-08**) context budget — resolved output cap and a tiered compaction scheme - (0bcc4d1) - Jason Weddington, *Claude Opus 5*
+- (**research**) transcript study of two talos dispatch misses (item 050252ba) - (e198fd7) - Jason Weddington, *Claude Opus 5*
+- (**roadmap**) context budget is decided, superseding "not planned" on compaction - (e40b677) - Jason Weddington, *Claude Opus 5*
+- session 18 log and roadmap — the context budget - (0523643) - Jason Weddington, *Claude Opus 5*
+- latest has independent consumers — scope the version check per host set - (b902449) - Jason Weddington, *Claude Opus 5*
+
+- - -
+
 ## 0.11.0 - 2026-09-19
 #### Features
 - (**engine**) name a max_tokens truncation as FailureMode::Truncated instead of masking it as StoppedWithoutFinish - (5211a15) - Jason Weddington, *Claude Fable 5.1*
