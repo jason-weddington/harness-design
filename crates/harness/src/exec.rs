@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -272,7 +273,12 @@ pub struct CheckReport {
 /// observe.** Any constructor that did not itself call [`observe_tree`] and
 /// [`classify_change`] MUST use `Unobservable { reason }` — an external-harness
 /// adapter that wrote `TreeChanged` would make the invariant false at exactly
-/// the surface that mirrors the production path.
+/// the surface that mirrors the production path. Evidence produced by
+/// [`classify_change`] over observations returned by the run's configured
+/// [`ChangeObserver`] is legitimately observed — a provider observing its own
+/// durable state is the provider-side analogue of [`observe_tree`] — and the
+/// rule continues to forbid constructing [`ChangeEvidence::TreeChanged`] or
+/// [`ChangeEvidence::TreeUnchanged`] without a real pair of observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeEvidence {
     /// The workspace is not in the state this run started from.
@@ -323,6 +329,70 @@ pub enum TreeObservation {
         /// Why the observation failed, capped at 200 characters.
         reason: String,
     },
+}
+
+/// The pluggable leg-3 observation seam: whatever produces the pair of
+/// [`TreeObservation`]s the engine compares via [`classify_change`].
+///
+/// **Naming:** this trait is `ChangeObserver`, NOT `ChangeEvidence` — the
+/// latter name is already taken by the classification enum in this module
+/// (see [`ChangeEvidence`]), and reusing it would collide.
+///
+/// The engine calls `observe` at BOTH leg-3 sites: the run-start baseline and
+/// every finish-time current-tree observation. The default implementation,
+/// [`GitTreeObserver`], shells out to `git status --porcelain` exactly as the
+/// engine always has; a consumer whose effects are not filesystem effects —
+/// an agent whose tools write into a database-backed service over HTTP, say —
+/// supplies its own observer via [`crate::engine::RunConfig::with_change_observer`]
+/// and gets a real leg 3 (before != after) instead of a fail-open.
+///
+/// **Implementations must bound their own `observe` call.** A provider may
+/// make a network call, and an unbounded network call inside the engine loop
+/// would hang a run exactly as an unbounded child process would. Use a
+/// timeout at least as tight as [`TREE_OBSERVE_TIMEOUT`] (30s) — the reference
+/// bound the filesystem observer uses. Per-provider timeout configuration is
+/// deferred: for now each implementation pins its own bound.
+///
+/// The `Debug` + `Send` + `Sync` supertraits are REQUIRED, not stylistic:
+/// [`crate::engine::RunConfig`] derives `Debug` + `Clone` and holds the
+/// observer as an `Arc<dyn ChangeObserver>` — the same shape as
+/// `Arc<dyn Clock>`, whose trait carries the identical supertraits.
+#[async_trait]
+pub trait ChangeObserver: std::fmt::Debug + Send + Sync {
+    /// Observe the durable state rooted at `root`, exactly once per call.
+    ///
+    /// `root` is the run's workspace root; a provider whose state does not
+    /// live on the filesystem will typically ignore it, but it is passed so
+    /// filesystem-backed implementations stay drop-in symmetric with
+    /// [`observe_tree`].
+    async fn observe(&self, root: &Path) -> TreeObservation;
+
+    /// The telemetry label recorded on the `run_start` event's
+    /// `config.change_observer` key — `"git"` for [`GitTreeObserver`],
+    /// `"custom"` by default for any configured provider.
+    fn label(&self) -> &'static str {
+        "custom"
+    }
+}
+
+/// The default [`ChangeObserver`] for every run that does not call
+/// [`crate::engine::RunConfig::with_change_observer`]: filesystem
+/// `git status --porcelain` semantics, delegating to [`observe_tree`] under
+/// [`TREE_OBSERVE_TIMEOUT`] — the SAME function and the SAME bound the engine
+/// used inline before this seam existed, so the default path is behaviorally
+/// identical by construction.
+#[derive(Debug, Clone, Copy)]
+pub struct GitTreeObserver;
+
+#[async_trait]
+impl ChangeObserver for GitTreeObserver {
+    async fn observe(&self, root: &Path) -> TreeObservation {
+        observe_tree(root, TREE_OBSERVE_TIMEOUT).await
+    }
+
+    fn label(&self) -> &'static str {
+        "git"
+    }
 }
 
 /// Observe the git work tree rooted at `root`, bounded by `timeout`.
@@ -547,13 +617,13 @@ pub fn shell_checks_runner(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeEvidence, CheckCommand, CheckReport, ChecksRunner, ExecOutcome, ExecSpec,
-        TreeObservation, classify_change, format_duration, observe_tree, run, shell_checks_runner,
-        tail,
+        ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, ExecOutcome,
+        ExecSpec, GitTreeObserver, TREE_OBSERVE_TIMEOUT, TreeObservation, classify_change,
+        format_duration, observe_tree, run, shell_checks_runner, tail,
     };
     use crate::tool::ToolCtx;
     use crate::workspace::{DiskOffloadSink, Workspace};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1061,5 +1131,84 @@ mod tests {
             }
             other => panic!("expected Unobservable, got {other:?}"),
         }
+    }
+
+    /// The default observer must be a byte-for-byte DELEGATE, not a
+    /// re-implementation: on a real git repo after a real edit, both the
+    /// porcelain and the head must match [`observe_tree`]'s output exactly.
+    #[tokio::test]
+    async fn git_tree_observer_delegates_to_observe_tree_on_a_real_git_repo() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git init runs");
+        assert!(out.status.success(), "git init failed: {out:?}");
+        std::fs::write(root.join("seed.txt"), "v1\n").expect("write");
+        std::fs::write(root.join("edited.txt"), "edited\n").expect("write");
+
+        let via_observer = GitTreeObserver.observe(root).await;
+        let direct = observe_tree(root, TREE_OBSERVE_TIMEOUT).await;
+        assert_eq!(via_observer, direct);
+        match &via_observer {
+            TreeObservation::Observed { porcelain, head: _ } => {
+                assert!(porcelain.contains("seed.txt"), "porcelain was {porcelain}");
+                assert!(
+                    porcelain.contains("edited.txt"),
+                    "porcelain was {porcelain}"
+                );
+            }
+            TreeObservation::Unobservable { reason: _ } => {
+                panic!("expected Observed on a git repo")
+            }
+        }
+    }
+
+    /// Same delegation invariant on the fail-open side: a bare non-git
+    /// directory yields `Unobservable` with the SAME reason string both ways.
+    #[tokio::test]
+    async fn git_tree_observer_delegates_to_observe_tree_on_a_non_git_dir() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let via_observer = GitTreeObserver.observe(root).await;
+        let direct = observe_tree(root, TREE_OBSERVE_TIMEOUT).await;
+        assert_eq!(via_observer, direct);
+        match &via_observer {
+            TreeObservation::Unobservable { reason } => {
+                assert!(
+                    reason.contains("git status --porcelain"),
+                    "reason was {reason}"
+                );
+            }
+            TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable on a non-git dir")
+            }
+        }
+    }
+
+    #[test]
+    fn git_tree_observer_labels_itself_git_and_trait_default_is_custom() {
+        use async_trait::async_trait;
+
+        struct Unlabeled;
+        impl std::fmt::Debug for Unlabeled {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Unlabeled")
+            }
+        }
+        #[async_trait]
+        impl ChangeObserver for Unlabeled {
+            async fn observe(&self, _root: &Path) -> TreeObservation {
+                TreeObservation::Unobservable {
+                    reason: "n/a".to_string(),
+                }
+            }
+        }
+
+        assert_eq!(GitTreeObserver.label(), "git");
+        assert_eq!(Unlabeled.label(), "custom");
     }
 }

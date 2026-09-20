@@ -125,7 +125,8 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::exec::{
-    self, ChangeEvidence, CheckReport, ChecksRunner, TREE_OBSERVE_TIMEOUT, TreeObservation,
+    self, ChangeEvidence, ChangeObserver, CheckReport, ChecksRunner, GitTreeObserver,
+    TreeObservation,
 };
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
@@ -290,6 +291,18 @@ pub struct RunConfig {
     /// (via `Arc::clone`) and the `Debug` supertrait on [`Clock`] satisfies
     /// `#[derive(Debug)]`.
     pub clock: Arc<dyn Clock>,
+    /// The leg-3 change observer used for BOTH the run-start baseline and
+    /// every finish-time observation. The default set by [`RunConfig::new`]
+    /// is [`exec::GitTreeObserver`] — filesystem git semantics, unchanged for
+    /// every existing consumer. Supply a custom observer via
+    /// [`RunConfig::with_change_observer`] when the run's effects are not
+    /// filesystem effects (HTTP writes into a database-backed service, etc.).
+    ///
+    /// `Arc<dyn ChangeObserver>` satisfies the `Clone` requirement on
+    /// `RunConfig` (via `Arc::clone`) and the `Debug` supertrait on
+    /// [`ChangeObserver`] satisfies `#[derive(Debug)]` — the same shape as
+    /// [`RunConfig::clock`].
+    pub change_observer: Arc<dyn ChangeObserver>,
     /// Opt-in full run transcript sink (see [`crate::transcript`]). `None`
     /// (the default set by [`RunConfig::new`]) means no transcript is
     /// written and the loop does zero transcript-related filesystem I/O or
@@ -379,6 +392,7 @@ impl RunConfig {
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
             wall_clock_secs: 0,
             clock: Arc::new(SystemClock),
+            change_observer: Arc::new(GitTreeObserver),
             transcript: None,
             answer_schema: None,
             compact_threshold_pct: COMPACT_THRESHOLD_PCT,
@@ -462,6 +476,18 @@ impl RunConfig {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Override the leg-3 change observer (see
+    /// [`RunConfig::change_observer`]). Use [`crate::exec::GitTreeObserver`]
+    /// to restore the default filesystem git semantics, or a custom
+    /// [`exec::ChangeObserver`] implementation when the run's durable state
+    /// is not on the filesystem. The observer is used for BOTH the
+    /// run-start baseline and every finish-time observation.
+    #[must_use]
+    pub fn with_change_observer(mut self, observer: Arc<dyn ChangeObserver>) -> Self {
+        self.change_observer = observer;
         self
     }
 
@@ -1739,6 +1765,7 @@ async fn handle_finish_call(
     checks: Option<&ChecksRunner>,
     answer_schema: Option<&AnswerSchema>,
     baseline: &TreeObservation,
+    observer: &dyn ChangeObserver,
     ctx: &ToolCtx,
 ) -> FinishOutcome {
     match FinishClaim::from_input(input, answer_schema.is_some()) {
@@ -1771,7 +1798,7 @@ async fn handle_finish_call(
                     verification,
                 } => (report, verification),
             };
-            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let current = observer.observe(ctx.workspace().root()).await;
             let change = exec::classify_change(baseline, &current);
             // The `Unobservable` arm is a DELIBERATE fail-open and must not
             // be "fixed" into a rejection: every existing engine / `eval.rs` /
@@ -1833,7 +1860,7 @@ async fn handle_finish_call(
                     verification,
                 } => (report, verification),
             };
-            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let current = observer.observe(ctx.workspace().root()).await;
             let change = exec::classify_change(baseline, &current);
             FinishOutcome {
                 result: ack(call_id),
@@ -1938,7 +1965,7 @@ async fn handle_finish_call(
             // `Unobservable` evidence on the accepted `Disposition::Answer`
             // itself) so a caller can tell a verified read-only answer from
             // an unverifiable one.
-            let current = exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await;
+            let current = observer.observe(ctx.workspace().root()).await;
             let change = exec::classify_change(baseline, &current);
             if change == ChangeEvidence::TreeChanged {
                 return FinishOutcome {
@@ -3258,12 +3285,20 @@ async fn run_loop_body(
     };
 
     // ---- leg-3 baseline: observed ONCE per loop invocation ----
-    // `baseline_override` is `Some` only on the resume path, which supplies
-    // its own `Unobservable` baseline (see `resume`).
+    // Precedence: explicit `baseline_override` (resume only) >
+    // `config.change_observer` > `GitTreeObserver` (the default). The
+    // override wins because a resumed run's TRUE starting tree predates the
+    // crash — consulting the provider at resume time would fold pre-crash
+    // effects into the baseline, the exact defect the override exists to
+    // prevent. An `Unobservable` from ANY of the three flows through the
+    // same warning path below.
+    let tree_baseline_start = Instant::now();
     let tree_baseline = match baseline_override {
         Some(obs) => obs,
-        None => exec::observe_tree(ctx.workspace().root(), TREE_OBSERVE_TIMEOUT).await,
+        None => config.change_observer.observe(ctx.workspace().root()).await,
     };
+    let tree_baseline_duration_ms =
+        u64::try_from(tree_baseline_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     if let TreeObservation::Unobservable { reason } = &tree_baseline {
         stats.tree_baseline_unobservable = true;
         eprintln!(
@@ -3291,6 +3326,7 @@ async fn run_loop_body(
                     .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
                 "resume": is_resume,
                 "tree_baseline": render_tree_observation(&tree_baseline),
+                "tree_baseline_duration_ms": tree_baseline_duration_ms,
                 "system": system,
                 "tools": Value::Array(tool_schemas.clone()),
                 "messages": serde_json::to_value(&messages).unwrap_or(Value::Null),
@@ -3299,6 +3335,7 @@ async fn run_loop_body(
                     "max_tokens": turn1_cap_resolution.max_tokens,
                     "max_tokens_source": turn1_cap_resolution.source.as_str(),
                     "mode": if answer_mode { "answer" } else { "build" },
+                    "change_observer": config.change_observer.label(),
                     "checks": config.checks.as_ref().map(ChecksRunner::command_display),
                     "answer_schema": config.answer_schema.as_ref().map(AnswerSchema::source),
                     "wall_clock_secs": config.wall_clock_secs,
@@ -3967,6 +4004,7 @@ async fn run_loop_body(
                     config.checks.as_ref(),
                     config.answer_schema.as_ref(),
                     &tree_baseline,
+                    config.change_observer.as_ref(),
                     ctx,
                 )
                 .await;
@@ -4790,10 +4828,12 @@ mod tests {
         ResumeError, ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
         coerce_stringified_result, compact_history, emit_run_end, inert_precondition_warning,
         missing_reason_rejection_content, missing_result_rejection_content,
-        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
-        run, run_id, run_persisted, should_compact,
+        modified_workspace_rejection_content, no_change_rejection_content, rejection_content,
+        render_tool_result, resume, retry_delay, run, run_id, run_persisted, should_compact,
     };
-    use crate::exec::{ChangeEvidence, CheckCommand, CheckReport, ChecksRunner};
+    use crate::exec::{
+        ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, TreeObservation,
+    };
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, MaxTokensSource, Message, OutputCapResolution,
         StopReason, TerminalKind, ToolCallRequest, TransientKind, Usage, UserBlock,
@@ -4805,7 +4845,7 @@ mod tests {
         SCHEMA_VERSION, Task, Verification,
     };
     use crate::store::{RunStore, SqliteRunStore, StoreError};
-    use crate::test_support::MockBackend;
+    use crate::test_support::{MockBackend, StubChangeObserver};
     use crate::time::{Clock, FakeClock};
     use crate::tool::{EchoTool, Tool, ToolCtx, ToolRegistry, ToolResult};
     use crate::tools::edit_file::EditFileTool;
@@ -15877,5 +15917,517 @@ mod tests {
         assert_eq!(facts.compactions, 1);
         assert_eq!(facts.highest_compaction_tier, 2);
         assert_eq!(facts.tool_results_elided, 1);
+    }
+
+    // =====================================================================
+    // ChangeObserver seam (RunConfig::with_change_observer)
+    // =====================================================================
+
+    fn observed(porcelain: &str) -> TreeObservation {
+        TreeObservation::Observed {
+            porcelain: porcelain.to_string(),
+            head: None,
+        }
+    }
+
+    fn unobserved(reason: &str) -> TreeObservation {
+        TreeObservation::Unobservable {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn plain_ctx(root: &std::path::Path) -> ToolCtx {
+        let workspace = Workspace::new(root, None).expect("workspace");
+        ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink))
+    }
+
+    /// AC 7 (A + C): a stub observer scripted with two DIFFERING observations
+    /// serves BOTH leg-3 sites — the run-start baseline and the finish-time
+    /// observation — so a `done` claim is accepted on real provider evidence
+    /// (`TreeChanged`) with no filesystem involvement at all.
+    #[tokio::test]
+    async fn stub_change_observer_serves_both_sides_of_the_done_precondition() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? seed.txt"),
+            observed("?? seed.txt\n?? edited.txt"),
+        ]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "wrote the map" }),
+        )]);
+        let config = RunConfig::new("update the map", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.no_change_rejections, 0);
+        // 1 baseline + 1 finish — BOTH sides route through the provider, and
+        // neither fell back to the filesystem.
+        assert_eq!(stub.calls(), 2);
+    }
+
+    /// AC 7 (B): identical observations classify `TreeUnchanged` and the done
+    /// claim is REJECTED with the pinned no-change wording — the provider is
+    /// held to exactly the same contract the git tree is.
+    #[tokio::test]
+    async fn stub_change_observer_identical_observations_reject_no_change() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? seed.txt"),
+            observed("?? seed.txt"),
+        ]));
+        let transcript = std::env::temp_dir().join(format!(
+            "stub-observer-no-change-{}-t.jsonl",
+            std::process::id()
+        ));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+        )]);
+        let config = RunConfig::new("do the work", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>)
+            .with_transcript(transcript.clone(), "stub-observer");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        // With the single scripted turn the loop continues after the
+        // rejection and terminates on the over-draw terminal.
+        match outcome {
+            LoopOutcome::BackendError(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message,
+            }) => {
+                assert_eq!(message, "MockBackend script exhausted (over-drawn)");
+            }
+            other => panic!("expected over-draw BackendError; got {other:?}"),
+        }
+        assert_eq!(stats.no_change_rejections, 1);
+
+        let lines = read_transcript_lines(&transcript);
+        std::fs::remove_file(&transcript).ok();
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert_eq!(tool_result["finish_accepted"], false);
+        assert_eq!(
+            tool_result["finish_change"],
+            serde_json::json!("TreeUnchanged")
+        );
+        assert_eq!(
+            tool_result["tree_current"]["Observed"]["porcelain"],
+            "?? seed.txt"
+        );
+        assert_eq!(tool_result["finish_rejection"], "no_change");
+        assert_eq!(
+            tool_result["content"],
+            serde_json::json!(no_change_rejection_content())
+        );
+        // AC 13(c): the finish-path duration_ms key continues to exist and
+        // wraps the provider observation too.
+        assert!(tool_result["duration_ms"].is_u64());
+    }
+
+    /// AC 8: a provider that returns `Unobservable` on BOTH calls fails open
+    /// EXACTLY like an unobservable git tree — the done claim is accepted on
+    /// trust, the PROVIDER's own reason (not a git-flavored one) is recorded,
+    /// and the unobservable baseline is latched in stats and queryable
+    /// post-hoc from the transcript.
+    #[tokio::test]
+    async fn stub_change_observer_unobservable_fails_open_with_provider_reason() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            unobserved("provider unavailable"),
+            unobserved("provider unavailable"),
+        ]));
+        let transcript = std::env::temp_dir().join(format!(
+            "stub-observer-unobservable-{}-t.jsonl",
+            std::process::id()
+        ));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "trusting" }),
+        )]);
+        let config = RunConfig::new("do the work", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>)
+            .with_transcript(transcript.clone(), "stub-unobservable");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => match change {
+                ChangeEvidence::Unobservable { reason } => {
+                    assert_eq!(reason, "provider unavailable");
+                }
+                other => panic!("expected Unobservable, got {other:?}"),
+            },
+            other => panic!("expected Finished(Done); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+
+        let lines = read_transcript_lines(&transcript);
+        std::fs::remove_file(&transcript).ok();
+        assert_eq!(
+            lines[0]["tree_baseline"]["Unobservable"]["reason"],
+            "provider unavailable"
+        );
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert_eq!(
+            tool_result["tree_current"]["Unobservable"]["reason"],
+            "provider unavailable"
+        );
+    }
+
+    /// AC 9: resume's explicit `baseline_override` WINS over a configured
+    /// provider for the BASELINE — the provider's value at resume time is not
+    /// the run's pre-crash starting value. `stub.calls() == 1` proves the
+    /// baseline did NOT come from the stub (only the finish-time observation
+    /// did), and the resume reason literal on the Disposition proves the
+    /// baseline was the override (a stub-supplied identical Observed baseline
+    /// would have classified `TreeUnchanged` and been rejected).
+    #[tokio::test]
+    async fn resume_baseline_override_wins_over_a_configured_change_observer() {
+        let dir = TempDir::new().expect("tempdir");
+        let root_path = dir.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        std::fs::write(root_path.join("pre_crash.txt"), "wip\n").expect("write");
+        let tools = registry_with_finish_and_edit();
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let mut record = make_minimal_record("resumed-provider", 1);
+        record.messages = vec![Message::User {
+            content: vec![UserBlock::Text("do the task".to_string())],
+        }];
+        store
+            .checkpoint(&record.run_id, &record)
+            .await
+            .expect("checkpoint");
+        let rid = record.run_id.clone();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![observed("?? post-crash.txt")]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "already fixed pre-crash" }),
+        )]);
+        let config = RunConfig::new("finish the pre-crash work", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = resume(
+            &backend,
+            &tools,
+            &ctx,
+            &config,
+            Arc::clone(&store),
+            &rid,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume");
+
+        // The finish-time observation only; 0 baseline calls is what proves
+        // the override won.
+        assert_eq!(stub.calls(), 1);
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => match change {
+                ChangeEvidence::Unobservable { reason } => {
+                    assert_eq!(
+                        reason,
+                        "resumed run — the pre-crash starting tree is unavailable"
+                    );
+                }
+                other => panic!("expected Unobservable with the resume reason, got {other:?}"),
+            },
+            other => panic!("expected Finished(Done); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+    }
+
+    /// AC 13 + AC 10(d): `run_start` telemetry. The default run reports
+    /// `change_observer: "git"`; a stub-observer run reports `"custom"`. Both
+    /// carry a `tree_baseline_duration_ms` next to `tree_baseline`, measured
+    /// around the baseline observation call, and the finish event keeps its
+    /// existing `duration_ms`.
+    #[tokio::test]
+    async fn run_start_records_change_observer_label_and_baseline_duration() {
+        // Default arm: a plain (non-git) temp workspace — the GitTreeObserver
+        // default degrades to Unobservable and the bare done fails open, which
+        // is fine for a telemetry assertion.
+        let dir = TempDir::new().expect("tempdir");
+        let root_path = dir.path().canonicalize().expect("canonicalize");
+        let ctx = plain_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let transcript = root_path.join("t-default.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config =
+            RunConfig::new("do the work", 2).with_transcript(transcript.clone(), "default-obs");
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "a bare done on an unobservable default tree fails open; got {outcome:?}"
+        );
+
+        let lines = read_transcript_lines(&transcript);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert_eq!(lines[0]["config"]["change_observer"], "git");
+        let baseline_ms = lines[0]["tree_baseline_duration_ms"]
+            .as_u64()
+            .expect("tree_baseline_duration_ms is a non-negative integer");
+        let _ = baseline_ms;
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert!(tool_result["duration_ms"].is_u64());
+
+        // Override arm: same run shape with a stub observer.
+        let ctx = ToolCtx::stub();
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? a.txt"),
+            observed("?? a.txt\n?? b.txt"),
+        ]));
+        let transcript = std::env::temp_dir().join(format!(
+            "stub-observer-label-{}-t.jsonl",
+            std::process::id()
+        ));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config = RunConfig::new("do the work", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>)
+            .with_transcript(transcript.clone(), "stub-obs");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+
+        let lines = read_transcript_lines(&transcript);
+        std::fs::remove_file(&transcript).ok();
+        assert_eq!(lines[0]["config"]["change_observer"], "custom");
+        assert!(lines[0]["tree_baseline_duration_ms"].is_u64());
+    }
+
+    /// AC 10(c): the DEFAULT path stays byte-identical end to end — a real
+    /// git repo, a real mid-run edit, and the finish-time porcelain equal to
+    /// what `git status --porcelain` prints when invoked directly in the same
+    /// workspace.
+    #[tokio::test]
+    async fn default_path_git_repo_done_yields_tree_changed_matching_git_status() {
+        let dir = TempDir::new().expect("tempdir");
+        let root_path = dir.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "seed.txt",
+                        "old_string": "",
+                        "new_string": "created by the run\n"
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "created seed.txt" }),
+            ),
+        ]);
+        let transcript =
+            std::env::temp_dir().join(format!("git-default-{}-t.jsonl", std::process::id()));
+        let config = RunConfig::new("create a file", 3).with_transcript(transcript.clone(), "git");
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+
+        let direct = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root_path)
+            .output()
+            .expect("git status runs");
+        assert!(direct.status.success(), "git status failed: {direct:?}");
+        let lines = read_transcript_lines(&transcript);
+        std::fs::remove_file(&transcript).ok();
+        let tool_result = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result" && l["tool_name"] == FINISH_TOOL_NAME)
+            .expect("a finish tool_result event");
+        assert_eq!(
+            tool_result["tree_current"]["Observed"]["porcelain"],
+            String::from_utf8(direct.stdout).expect("utf8").trim()
+        );
+    }
+
+    /// AC 11 (i): answer mode, changed-at-finish — a schema-valid
+    /// `finish(answer)` on a provider observation that CHANGED is rejected
+    /// with the pinned modified-workspace wording, counted, and the loop
+    /// continues (terminating on the over-draw terminal).
+    #[tokio::test]
+    async fn answer_mode_with_stub_observer_rejects_a_changed_workspace() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let finish_observation = observed("?? b.txt");
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? a.txt"),
+            finish_observation.clone(),
+        ]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-answer",
+            serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+        )]);
+        let config = RunConfig::new("answer me", 2)
+            .with_answer_schema(verdict_schema())
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::BackendError(BackendError::Terminal {
+                kind: TerminalKind::Other,
+                message,
+            }) => {
+                assert_eq!(message, "MockBackend script exhausted (over-drawn)");
+            }
+            other => panic!("expected over-draw BackendError; got {other:?}"),
+        }
+        assert_eq!(stats.modified_workspace_rejections, 1);
+        assert_eq!(stub.calls(), 2);
+
+        // The fed-back rejection carries the pinned wording over the
+        // finish-time observation.
+        let fed_back = backend.last_messages();
+        assert!(
+            fed_back.iter().any(|m| matches!(
+                m,
+                Message::User { content }
+                    if content.iter().any(|b| matches!(
+                        b,
+                        UserBlock::ToolResult { content, is_error, .. }
+                            if *is_error
+                                && *content == modified_workspace_rejection_content(&finish_observation)
+                    ))
+            )),
+            "the modified-workspace rejection must quote the provider observation"
+        );
+    }
+
+    /// AC 11 (ii): answer mode, unchanged — a schema-valid `finish(answer)`
+    /// over identical provider observations is ACCEPTED, terminating with
+    /// `Answer` carrying `TreeUnchanged`.
+    #[tokio::test]
+    async fn answer_mode_with_stub_observer_accepts_an_unchanged_workspace() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? a.txt"),
+            observed("?? a.txt"),
+        ]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-answer",
+            serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+        )]);
+        let config = RunConfig::new("answer me", 2)
+            .with_answer_schema(verdict_schema())
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeUnchanged);
+            }
+            other => panic!("expected Finished(Answer{{TreeUnchanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.modified_workspace_rejections, 0);
+        assert_eq!(stub.calls(), 2);
+    }
+
+    /// AC 11 (iii): answer mode, Unobservable — the fail-open-and-record
+    /// semantics are preserved verbatim through the provider: the answer is
+    /// accepted with the provider's reason on the Disposition and the
+    /// unobservable baseline latched.
+    #[tokio::test]
+    async fn answer_mode_with_stub_observer_fails_open_when_unobservable() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            unobserved("provider unavailable"),
+            unobserved("provider unavailable"),
+        ]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-answer",
+            serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+        )]);
+        let config = RunConfig::new("answer me", 2)
+            .with_answer_schema(verdict_schema())
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { change, .. }) => match change {
+                ChangeEvidence::Unobservable { reason } => {
+                    assert_eq!(reason, "provider unavailable");
+                }
+                other => panic!("expected Unobservable, got {other:?}"),
+            },
+            other => panic!("expected Finished(Answer); got {other:?}"),
+        }
+        assert!(stats.tree_baseline_unobservable);
+    }
+
+    /// AC 12: `already_satisfied` with a non-empty reason over a CHANGED
+    /// provider observation is accepted — a `TreeChanged` observation is
+    /// recorded on `AlreadySatisfied`, never rejected.
+    #[tokio::test]
+    async fn already_satisfied_with_stub_observer_records_a_changed_observation() {
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+
+        let stub = Arc::new(StubChangeObserver::new(vec![
+            observed("?? seed.txt"),
+            observed("?? seed.txt\n?? edited.txt"),
+        ]));
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-as",
+            serde_json::json!({
+                "disposition": "already_satisfied",
+                "reason": "verified the gates were green and the task complete"
+            }),
+        )]);
+        let config = RunConfig::new("confirm", 2)
+            .with_change_observer(Arc::clone(&stub) as Arc<dyn ChangeObserver>);
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::AlreadySatisfied { change, .. }) => {
+                assert_eq!(change, ChangeEvidence::TreeChanged);
+            }
+            other => panic!("expected Finished(AlreadySatisfied{{TreeChanged}}); got {other:?}"),
+        }
+        assert_eq!(stats.already_satisfied_check_rejections, 0);
+        assert_eq!(stats.no_change_rejections, 0);
+        assert_eq!(stub.calls(), 2);
     }
 }

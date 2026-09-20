@@ -6,10 +6,12 @@
 //! a fake backend. Nothing here ships in a release build.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::exec::{ChangeObserver, TreeObservation};
 use crate::model::{
     AssistantTurn, BackendError, Message, ModelBackend, OutputCapResolution, TerminalKind,
     TurnRequest,
@@ -211,5 +213,61 @@ impl ModelBackend for MockBackend {
                 message: "MockBackend script exhausted (over-drawn)".to_string(),
             })
         })
+    }
+}
+
+/// A scripted [`ChangeObserver`] for tests — the observation-side twin of
+/// [`MockBackend`].
+///
+/// It replays a pre-set queue of [`TreeObservation`]s — the first is consumed
+/// by the engine's run-start baseline capture, the second (when scripted) by
+/// the finish-time current-tree observation. This lets a test drive BOTH leg-3
+/// sites deterministically through a provider with no filesystem and no
+/// network, proving that both sides route through
+/// [`crate::engine::RunConfig::with_change_observer`] rather than falling back
+/// to the default [`crate::exec::GitTreeObserver`].
+///
+/// If the engine observes more often than scripted (an "over-draw"), `observe`
+/// returns `TreeObservation::Unobservable` with a fixed reason rather than
+/// panicking — mirroring [`MockBackend`]'s fail-loudly-over-draw posture.
+///
+/// **Test-only:** the whole module is `#[cfg(test)]`, so this type never
+/// exists in a non-test build.
+#[derive(Debug)]
+pub(crate) struct StubChangeObserver {
+    script: Mutex<VecDeque<TreeObservation>>,
+    calls: Mutex<u32>,
+}
+
+impl StubChangeObserver {
+    /// Build an observer from an explicit sequence of observations, consumed
+    /// front-to-back: the first feeds the baseline, the second the finish-time
+    /// observation, and so on.
+    pub(crate) fn new(script: Vec<TreeObservation>) -> Self {
+        Self {
+            script: Mutex::new(script.into()),
+            calls: Mutex::new(0),
+        }
+    }
+
+    /// How many times [`ChangeObserver::observe`] has been called so far.
+    /// A test asserting `calls() == 2` (1 baseline + 1 finish) proves BOTH
+    /// sides route through the provider.
+    pub(crate) fn calls(&self) -> u32 {
+        *self.calls.lock().expect("calls lock poisoned")
+    }
+}
+
+#[async_trait]
+impl ChangeObserver for StubChangeObserver {
+    async fn observe(&self, _root: &Path) -> TreeObservation {
+        *self.calls.lock().expect("calls lock poisoned") += 1;
+        self.script
+            .lock()
+            .expect("script lock poisoned")
+            .pop_front()
+            .unwrap_or_else(|| TreeObservation::Unobservable {
+                reason: "StubChangeObserver script exhausted (over-drawn)".to_string(),
+            })
     }
 }
