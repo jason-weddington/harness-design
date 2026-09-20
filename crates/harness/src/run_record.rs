@@ -598,7 +598,12 @@ pub struct DispositionReport {
 /// in-loop and then stopped producing tool calls entirely (`EndTurn` with no calls)
 /// without calling `finish`. Both sites exhaust the nudge budget before
 /// terminating and produce the same `RecoveryFacts` structure with the same
-/// persistence discipline.
+/// persistence discipline. A third arming case reaches the same (2)
+/// stop-terminal site: a nudge armed by observed work (`tree_dirty` latched
+/// by a successful `edit_file`/`bash`) with a gate that was NEVER verified
+/// green in-loop — exhausting into the same `FailureMode::FinishDiscipline`
+/// terminal and writing the same `RecoveryFacts` with
+/// `gates_green_at_exit == false`.
 ///
 /// The three fields record what the loop observed at the recovery terminal so
 /// the outer harness (or a reviewer) can recognize a probably-done-but-unclaimed

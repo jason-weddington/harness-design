@@ -527,8 +527,23 @@ pub async fn run_ralph(
         // lane concern — forced, disabled, and A/B measured there) must
         // not drift into a second ralph-side setting; do not "fix" this.
         let registry = tools::standard_registry(config.inner_checks.clone());
-        let mut inner_config =
-            RunConfig::new(task, config.inner_max_iterations).with_clock(config.clock.clone());
+        let mut inner_config = RunConfig::new(task, config.inner_max_iterations)
+            .with_clock(config.clock.clone())
+            // Finish-recovery is DISABLED for ralph inner passes
+            // (`max_nudges == 0` disables BOTH arming legs — a green gate and
+            // observed work). Ralph's own do-over protocol owns recovery at
+            // this boundary: a stop-without-finish pass is retried with fresh
+            // context by the OUTER loop, so nothing is forfeited the way a
+            // single-run talos agent lane forfeits WIP at exit — the nudge's
+            // reason to exist is absent. Leaving the default nudges on would
+            // also silently burn two model calls and two of the
+            // `inner_max_iterations` budget on every stop-after-mutation
+            // pass, and flip the inner terminal from `StoppedWithoutFinish`
+            // to the nudge-exhaustion `FinishDiscipline` — both non-green
+            // do-overs, so the outer classification is unchanged but the
+            // cost per pass is not. This mirrors answer mode, which also
+            // pins `with_max_nudges(0)`.
+            .with_max_nudges(0);
         if let Some(runner) = config.inner_checks.clone() {
             inner_config = inner_config.with_checks(runner);
         }

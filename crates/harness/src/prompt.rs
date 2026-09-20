@@ -178,6 +178,18 @@ struct RalphPromptTemplate<'a> {
 #[template(path = "nudge_prompt.md", escape = "none")]
 struct NudgePromptTemplate;
 
+/// The unverified-work nudge template — the second, variable-free nudge
+/// string the finish-recovery protocol injects at the stop terminal when the
+/// nudge is armed by OBSERVED WORK (`tree_dirty` latched) rather than a green
+/// gate. The wording deliberately does NOT claim the gates are green — a
+/// claim that would be false when the gate was never verified in-loop.
+/// `escape = "none"` is pinned explicitly so the backticks around
+/// `run_checks`, `finish(done)`, and `finish(already_satisfied)` pass
+/// through untouched.
+#[derive(Template)]
+#[template(path = "nudge_prompt_unverified.md", escape = "none")]
+struct NudgePromptUnverifiedTemplate;
+
 /// Answer mode's task-framing template: the question, the result schema
 /// verbatim inside a fenced `json` block, and the three rules the frame states.
 /// Renders the content of the `{{ task }}` slot — the engine wraps it under
@@ -333,6 +345,28 @@ pub fn render_nudge_prompt() -> String {
         .expect("nudge_prompt.md is a static variable-free template that renders infallibly")
 }
 
+/// Render the unverified-work nudge steering text — the second, variable-free
+/// string the finish-recovery protocol injects at the stop terminal when the
+/// nudge is armed by observed work (`tree_dirty` latched by a successful
+/// `edit_file`/`bash`) with a gate that was NEVER verified green in-loop.
+/// The exact wording is pinned by a prompt-layer test
+/// (`render_nudge_prompt_unverified_pins_exact_wording`) and an engine
+/// regression test; the wording deliberately does not contain the substring
+/// "currently green" because that claim is false on this arming path.
+///
+/// The render is a pure function of its (empty) inputs and is
+/// byte-deterministic — re-rendering produces identical bytes.
+///
+/// # Panics
+/// Never in practice — see [`render_system_prompt`].
+#[must_use]
+pub fn render_nudge_prompt_unverified() -> String {
+    NudgePromptUnverifiedTemplate.render().expect(
+        "nudge_prompt_unverified.md is a static variable-free template that renders \
+             infallibly",
+    )
+}
+
 /// Render the test-first approach guidance on its own.
 ///
 /// For callers that assemble an agent prompt WITHOUT the task-spec template —
@@ -426,8 +460,9 @@ pub fn render_answer_system_prompt(tools: &[ToolLine]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerPromptTemplate, AnswerSystemPromptTemplate, NudgePromptTemplate, RalphPromptTemplate,
-        ToolLine, render_answer_prompt, render_answer_system_prompt, render_nudge_prompt,
+        AnswerPromptTemplate, AnswerSystemPromptTemplate, NudgePromptTemplate,
+        NudgePromptUnverifiedTemplate, RalphPromptTemplate, ToolLine, render_answer_prompt,
+        render_answer_system_prompt, render_nudge_prompt, render_nudge_prompt_unverified,
         render_ralph_prompt, render_system_prompt, render_task_prompt,
         render_task_prompt_from_spec, render_task_prompt_from_spec_with,
         render_test_first_approach, render_verification_section, tool_lines,
@@ -1273,6 +1308,64 @@ mod tests {
             .render()
             .expect("variable-free template renders infallibly");
         let via_fn = render_nudge_prompt();
+        assert_eq!(via_struct, via_fn);
+    }
+
+    // --- render_nudge_prompt_unverified tests --------------------------------
+
+    /// The unverified-work nudge wording is load-bearing — engine tests pin
+    /// it against `record.messages` and the transcript. Pin the exact text at
+    /// the prompt layer too so a template edit that drifts fails here before
+    /// it reaches the engine. The wording must NOT contain the substring
+    /// "currently green" — that claim is false when the gate was never
+    /// verified in-loop — and must advertise both off-ramps (`finish(done)`
+    /// and `finish(already_satisfied)`) plus the `run_checks` tool by name.
+    #[test]
+    fn render_nudge_prompt_unverified_pins_exact_wording() {
+        let rendered = render_nudge_prompt_unverified();
+        let expected = "The harness has observed work in the working tree but has NOT \
+            observed a green verification gate this run. \
+            If the acceptance criteria are met, run the project verification via \
+            the `run_checks` tool, then call `finish(done)` now. \
+            If nothing needed changing because the task was already complete, \
+            call `finish(already_satisfied)` with a `reason`. \
+            If they are not yet met, reply with a one-sentence status: \
+            what remains, and why you are still working.";
+        assert_eq!(
+            rendered, expected,
+            "unverified nudge wording must match the pinned text exactly; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("currently green"),
+            "the unverified nudge must not claim the gates are green"
+        );
+        assert!(rendered.contains("finish(done)"));
+        assert!(rendered.contains("finish(already_satisfied)"));
+        assert!(rendered.contains("`run_checks`"));
+    }
+
+    /// The unverified nudge is a variable-free template — rendering it twice
+    /// must produce byte-identical output (prompt-cache correctness).
+    #[test]
+    fn render_nudge_prompt_unverified_is_byte_deterministic() {
+        let a = render_nudge_prompt_unverified();
+        let b = render_nudge_prompt_unverified();
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "same (empty) inputs must produce byte-identical unverified nudge output"
+        );
+    }
+
+    /// `NudgePromptUnverifiedTemplate` is a unit struct with no fields — its
+    /// `render` must succeed via the askama derive (a compile-time check) and
+    /// return the same bytes as the free function.
+    #[test]
+    fn nudge_prompt_unverified_template_renders_via_derive() {
+        let via_struct = NudgePromptUnverifiedTemplate
+            .render()
+            .expect("variable-free template renders infallibly");
+        let via_fn = render_nudge_prompt_unverified();
         assert_eq!(via_struct, via_fn);
     }
 

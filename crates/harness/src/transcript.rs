@@ -247,15 +247,22 @@
 //!   `Message::User` is pushed; `"appended_to_tool_results"` at the
 //!   green-static nudge site, where a `UserBlock::Text` is appended to the
 //!   existing tool-results `Message::User`), `text` (the exact injected
-//!   string), `last_gate_green` (always `true` — a runtime tripwire),
+//!   string), `last_gate_green` (`true` iff the nudge was armed by a green
+//!   gate, i.e. `armed_by == "gate_green"` — the green-gate leg of the
+//!   runtime tripwire; `false` on the work-observed leg),
 //!   `iters_since_tree_change`, `static_tree_k`, `nudge_number` (1-based),
-//!   `max_nudges`.
+//!   `max_nudges`, plus the additive keys `armed_by` (`"gate_green"` when a
+//!   green gate armed the nudge, `"work_observed"` when only the latched
+//!   `tree_dirty` fact did — the gate was never verified green in-loop) and
+//!   `tree_dirty` (the latched latch value at emit time; `false` at the
+//!   green-static site, whose guard already implies a green gate).
 //!
 //!   ```json
 //!   {"event":"harness_message","ts":"2026-09-15T02:00:05Z","elapsed_ms":5000,
 //!    "iteration":4,"kind":"nudge","placement":"appended_to_tool_results",
 //!    "text":"You have not called finish...","last_gate_green":true,
-//!    "iters_since_tree_change":3,"static_tree_k":3,"nudge_number":1,"max_nudges":2}
+//!    "iters_since_tree_change":3,"static_tree_k":3,"nudge_number":1,"max_nudges":2,
+//!    "armed_by":"gate_green","tree_dirty":false}
 //!   ```
 //!
 //! - **`iteration_end`** — emitted immediately before the wall-clock breach

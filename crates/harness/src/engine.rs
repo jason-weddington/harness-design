@@ -250,9 +250,14 @@ pub struct RunConfig {
     /// [`DEFAULT_STATIC_TREE_K`].
     pub static_tree_k: u32,
     /// Maximum nudges the harness will inject before taking the recovery
-    /// terminal ([`FailureMode::FinishDiscipline`]). `0` DISABLES
-    /// finish-recovery entirely — no nudge is ever injected and the recovery
-    /// terminal is never taken. See [`DEFAULT_MAX_NUDGES`].
+    /// terminal ([`FailureMode::FinishDiscipline`]). A nudge is armed at the
+    /// stop terminal when EITHER arming leg holds — a green in-loop gate
+    /// (`last_gate_green`) OR observed work (`tree_dirty`, latched by a
+    /// successful `edit_file`/`bash`) — and by the green-static-spin
+    /// detector (green gate + K static iterations). `0` DISABLES
+    /// finish-recovery entirely — no nudge is ever injected (on either arming
+    /// leg) and the recovery terminal is never taken. See
+    /// [`DEFAULT_MAX_NUDGES`].
     pub max_nudges: u32,
     /// Number of ADDITIONAL attempts after the first try when a
     /// [`model::BackendError::Transient`] failure is returned. With the
@@ -885,8 +890,10 @@ pub struct RunStats {
     /// distinguish a [`LoopOutcome::StoppedWithoutFinish`] where the model had
     /// verified green in-loop then stopped (a finish-discipline miss that
     /// finish-recovery's precondition *could* target) from one where the gate
-    /// was never green in-loop (correctly out of scope — nudging toward
-    /// `finish` on an unverified state would risk a false claim). Best-effort
+    /// was never green in-loop. Note that finish-recovery ALSO arms on
+    /// `tree_dirty` (observed work): a `StoppedWithoutFinish` reached after
+    /// nudges fired means NEITHER arming leg held — the gate was never green
+    /// in-loop AND the tree was never successfully mutated. Best-effort
     /// telemetry: an error-propagation (`?`) exit reports the last observed
     /// value.
     pub gates_green_at_exit: bool,
@@ -3127,6 +3134,46 @@ fn record_compaction(
     }
 }
 
+/// Decide whether the stop-terminal finish-recovery nudge is armed.
+///
+/// The predicate is `max_nudges > 0 && (last_gate_green || tree_dirty)` — the
+/// TERMINAL CONDITION ITSELF (a no-tool-call stop turn while the harness has
+/// OBSERVED work or a green gate), not a sniff of which tool the agent used.
+/// Two arming legs, deliberately asymmetric in trust:
+///
+/// - `last_gate_green` — the harness-latched done-oracle, written ONLY by the
+///   per-call tool-result observer: `last_gate_green = !is_error` on the
+///   `run_checks` branch (the sole SETTER) and `last_gate_green = false` in
+///   the successful `edit_file`/`bash` branch (the sole CLEARER). No other
+///   writer exists anywhere in the codebase, and none may be added — the
+///   done-oracle stays agent-unforgeable.
+/// - `tree_dirty` — a harness-latched fact set only by a successful
+///   `edit_file`/`bash` `ToolResult` in the same observer, and NEVER cleared
+///   for the run: the agent cannot UN-observe its own work.
+///
+/// Rationale (pinned by the run b0ac3875 postmortem: a 147-iteration run did
+/// the whole job, verified the gate green via `bash`, and was discarded as
+/// `StoppedWithoutFinish` because the recovery guard only ever saw
+/// `run_checks`-tool greens):
+///
+/// (a) Sniffing bash invocations for a zero-exit gate command is REJECTED —
+///     the agent could then ARM its own recovery by running anything that
+///     exits 0, forging the honest `gates_green_at_exit` /
+///     `RecoveryFacts.gates_green_at_exit` telemetry. The
+///     agent-disableable direction is forbidden by the project's
+///     claim-vs-verify contract.
+/// (b) `tree_dirty` is harness-latched (see above), so arming on it cannot be
+///     un-observed by the agent and keeps the telemetry honest: a run nudged
+///     on this leg exits with `gates_green_at_exit == false` — an accurate
+///     report that the gate was never verified via `run_checks`, even though
+///     nudges fired.
+/// (c) A nudge is not evidence: `handle_finish_call` still requires the
+///     harness's own verification gate before any `Done` is constructed, so
+///     arming recovery generously cannot forge a leg of `Done`.
+fn stop_terminal_recovery_armed(max_nudges: u32, last_gate_green: bool, tree_dirty: bool) -> bool {
+    max_nudges > 0 && (last_gate_green || tree_dirty)
+}
+
 /// Stamp the run's compaction counters onto the record as
 /// [`CompactionFacts`] — the default-path durability seam: `RunStats` is
 /// never persisted, and without this a compacting run without
@@ -3355,8 +3402,14 @@ async fn run_loop_body(
     // The done-oracle is `last_gate_green`, driven ONLY by `run_checks`'s
     // `is_error` flag (never a model self-report). A successful mutating tool
     // call (`edit_file`/`bash` with `!is_error`) invalidates the green — this
-    // closes the stale-green false-trip window so a nudge's "gates are
-    // currently green" is always true at trip time. `iters_since_tree_change`
+    // closes the stale-green false-trip window. The "a nudge's 'gates are
+    // currently green' is always true at trip time" guarantee holds ONLY for
+    // the gate_green leg: the green-static site is gated on
+    // `last_gate_green`, and the stop-terminal site injects the green
+    // template only when `last_gate_green` armed it — a stop-terminal nudge
+    // armed by `tree_dirty` alone (gate never verified green in-loop)
+    // injects the unverified-work template instead, which makes no green
+    // claim. `iters_since_tree_change`
     // counts consecutive non-mutating iterations; reset wins over increment
     // when a mutation and the per-iteration tick collide. `nudges_fired`
     // bounds how many times the harness will nudge before force-terminating;
@@ -3809,30 +3862,35 @@ async fn run_loop_body(
                 return Ok(LoopOutcome::Finished(disposition));
             }
 
-            // Finish-recovery at the stop terminal: when the last in-loop gate
-            // was green, nudge the model toward finish before giving up.
-            // Guard: max_nudges > 0 AND last_gate_green.
-            // When false (red/never-green gate OR max_nudges == 0), falls
+            // Finish-recovery at the stop terminal: when the harness has
+            // OBSERVED a green gate OR observed work (tree_dirty latched),
+            // nudge the model toward finish before giving up.
+            // Guard: max_nudges > 0 AND (last_gate_green || tree_dirty).
+            // When false (neither arming leg holds OR max_nudges == 0), falls
             // through to the unchanged StoppedWithoutFinish path below.
-            if config.max_nudges > 0 && last_gate_green {
-                // AC4 — Telemetry capture inside the guard. The normal
-                // telemetry path (lines below the is_empty() return) is
-                // unreachable for a no-tool-call turn, so we capture here.
+            if stop_terminal_recovery_armed(config.max_nudges, last_gate_green, tree_dirty) {
+                // Telemetry capture inside the guard. The normal telemetry
+                // path (lines below the is_empty() return) is unreachable for
+                // a no-tool-call turn, so we capture here.
                 // Must be inside the guard: a mutate-after-nudge-then-stop
-                // case clears last_gate_green, intentionally fails the guard,
-                // and does NOT record the unverified stop text.
-                // AC4: if this stop follows a prior nudge, capture the model's
+                // case clears last_gate_green, but tree_dirty is LATCHED, so
+                // the case now ARMS via the tree_dirty leg (armed_by
+                // "work_observed"), records the post-nudge stop text, and
+                // injects the unverified-work nudge template — under the old
+                // `&& last_gate_green` guard this case intentionally failed
+                // the guard and did NOT record the unverified stop text.
+                // If this stop follows a prior nudge, capture the model's
                 // reply text. The `= false` clear is intentionally OMITTED here:
-                // the nudge branch (AC2) unconditionally sets it to `true`
+                // the nudge branch unconditionally sets it to `true`
                 // (avoiding a write-without-read that clippy flags as
-                // `unused_assignments`), and the exhaustion branch (AC3) returns
+                // `unused_assignments`), and the exhaustion branch returns
                 // immediately so the value is never read again.
                 if nudge_awaiting_status {
                     nudge_statuses.push(turn_text.clone());
                 }
 
                 if nudges_fired < config.max_nudges {
-                    // AC2 — Inject a FRESH user message (NOT last_mut append).
+                    // Inject a FRESH user message (NOT last_mut append).
                     // At this terminal the trailing message is the assistant
                     // stop turn (no tool calls), so the correct wire shape is
                     // assistant → fresh-user. Unlike the green-static site,
@@ -3841,7 +3899,17 @@ async fn run_loop_body(
                     // adjacent user turn, here pushing a new Message::User is
                     // correct: the sequence assistant → user is a valid
                     // alternating pair and does NOT trigger a 400.
-                    let nudge_text = prompt::render_nudge_prompt();
+                    // Source-conditional text: the green template when
+                    // last_gate_green armed the nudge (its "currently green"
+                    // claim is true at trip time); the unverified-work
+                    // template when only tree_dirty armed it (the gate was
+                    // never verified green in-loop, so that claim would be
+                    // false).
+                    let nudge_text = if last_gate_green {
+                        prompt::render_nudge_prompt()
+                    } else {
+                        prompt::render_nudge_prompt_unverified()
+                    };
                     messages.push(Message::User {
                         content: vec![UserBlock::Text(nudge_text.clone())],
                     });
@@ -3861,18 +3929,31 @@ async fn run_loop_body(
                                 "static_tree_k": config.static_tree_k,
                                 "nudge_number": nudges_fired,
                                 "max_nudges": config.max_nudges,
+                                "armed_by": if last_gate_green { "gate_green" } else { "work_observed" },
+                                "tree_dirty": tree_dirty,
                             }),
                         );
                     }
                     continue;
                 }
-                // AC3 — Exhaustion terminal: unified with the green-static
-                // exhaustion terminal (engine.rs:1344–1381). Same summary
-                // literal, same persistence discipline, same return type.
-                let summary = format!(
-                    "gates green but agent did not call finish after {} nudges",
-                    config.max_nudges
-                );
+                // Exhaustion terminal: unified with the green-static
+                // exhaustion terminal (engine.rs:1344–1381). Same persistence
+                // discipline, same return type. The summary is
+                // source-conditional: the green leg keeps the shared literal
+                // byte-identical; the tree_dirty-only leg (gate never
+                // verified green in-loop) uses the honest unverified literal.
+                let summary = if last_gate_green {
+                    format!(
+                        "gates green but agent did not call finish after {} nudges",
+                        config.max_nudges
+                    )
+                } else {
+                    format!(
+                        "agent produced work but did not call finish after {} nudges \
+                         (gate never verified green in-loop)",
+                        config.max_nudges
+                    )
+                };
                 let disposition = Disposition::Failed {
                     mode: FailureMode::FinishDiscipline,
                     summary,
@@ -3906,9 +3987,9 @@ async fn run_loop_body(
             }
 
             // Terminal path: StoppedWithoutFinish.
-            // Reached when: last_gate_green == false (never verified in-loop,
-            // or gate was invalidated by a later mutation) OR max_nudges == 0
-            // (finish-recovery disabled). All paths below are UNCHANGED.
+            // Reached when neither arming leg held: gate never green in-loop
+            // AND tree not dirty, OR max_nudges == 0 (finish-recovery
+            // disabled). All paths below are UNCHANGED.
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 // AC4 — masked-truncation tripwire: some backends report NO
                 // distinguishing stop signal for a truncation (GLM via Ollama
@@ -4280,6 +4361,8 @@ async fn run_loop_body(
                                 "static_tree_k": config.static_tree_k,
                                 "nudge_number": nudges_fired,
                                 "max_nudges": config.max_nudges,
+                                "armed_by": "gate_green",
+                                "tree_dirty": tree_dirty,
                             }),
                         );
                     }
@@ -5813,10 +5896,12 @@ mod tests {
         assert!(matches!(outcome, LoopOutcome::StoppedWithoutFinish));
         assert_eq!(backend.calls(), 1);
         assert_eq!(stats.iterations, 1);
-        // No run_checks ran, so the gate was never green in-loop: this is the
-        // "stopped before verifying" case, which finish-recovery correctly does
-        // NOT target (nudging toward finish on an unverified state would risk a
-        // false claim).
+        // No run_checks ran and no edit_file/bash succeeded, so BOTH arming
+        // legs are false in this fixture (last_gate_green == false and
+        // tree_dirty == false): this is the pure talking-only stop, which
+        // finish-recovery deliberately does not nudge — the harness nudges
+        // when it has observed a green gate OR observed work, never on a
+        // no-op stop.
         assert!(
             !stats.gates_green_at_exit,
             "gate never green in-loop -> gates_green_at_exit must be false"
@@ -10098,17 +10183,38 @@ mod tests {
         If they are not yet met, reply with a one-sentence status: \
         what remains, and why you are still working.";
 
-    /// Count how many `UserBlock::Text` blocks in `messages` carry the nudge
-    /// text — the harness injects the nudge by APPENDING onto the existing
-    /// tool-results `Message::User`, so this counts nudge injections (not new
-    /// messages).
+    /// The exact unverified-work nudge wording the harness injects at the
+    /// stop terminal when the nudge is armed by observed work (`tree_dirty`
+    /// latched) with a gate that was NEVER verified green in-loop — pinned so
+    /// a wording pass that drifts fails loudly. Must match
+    /// `crates/harness/templates/nudge_prompt_unverified.md` verbatim.
+    const UNVERIFIED_NUDGE_TEXT: &str = "The harness has observed work in the working tree \
+        but has NOT observed a green verification gate this run. \
+        If the acceptance criteria are met, run the project verification via \
+        the `run_checks` tool, then call `finish(done)` now. \
+        If nothing needed changing because the task was already complete, \
+        call `finish(already_satisfied)` with a `reason`. \
+        If they are not yet met, reply with a one-sentence status: \
+        what remains, and why you are still working.";
+
+    /// Count how many `UserBlock::Text` blocks in `messages` carry EITHER
+    /// nudge text — the green-gate template or the unverified-work template.
+    /// The green-static site injects the nudge by APPENDING onto the existing
+    /// tool-results `Message::User`, and the stop-terminal site pushes a fresh
+    /// `Message::User`, so this counts nudge injections of both variants (not
+    /// new messages).
     fn count_nudge_injections(messages: &[Message]) -> usize {
         messages
             .iter()
             .map(|m| match m {
                 Message::User { content } => content
                     .iter()
-                    .filter(|b| matches!(b, UserBlock::Text(t) if t == NUDGE_TEXT))
+                    .filter(|b| {
+                        matches!(
+                            b,
+                            UserBlock::Text(t) if t == NUDGE_TEXT || t == UNVERIFIED_NUDGE_TEXT
+                        )
+                    })
                     .count(),
                 Message::Assistant { .. } => 0,
             })
@@ -10912,9 +11018,10 @@ mod tests {
     }
 
     // AC7 — red/never-green stop with recovery ENABLED ⇒ StoppedWithoutFinish
-    // unchanged. The model never calls run_checks so last_gate_green stays
-    // false. The guard `&& last_gate_green` blocks the nudge even though
-    // max_nudges > 0.
+    // unchanged. The model never calls run_checks and never mutates, so BOTH
+    // arming legs are false in this fixture (last_gate_green == false and
+    // tree_dirty == false) and neither leg of the predicate holds, even
+    // though max_nudges > 0.
     #[tokio::test]
     async fn red_never_green_stop_with_recovery_enabled_stops_without_finish() {
         let runner = passing_runner();
@@ -10952,12 +11059,541 @@ mod tests {
             .await
             .expect("load")
             .expect("present");
-        // The && last_gate_green guard must block the nudge.
+        // The predicate blocks the nudge: neither arming leg held.
         assert_eq!(
             count_nudge_injections(&rec.messages),
             0,
             "no nudge must be injected when last_gate_green is false"
         );
+    }
+
+    // =====================================================================
+    // Stop-terminal recovery arming via the tree_dirty (work-observed) leg
+    // =====================================================================
+
+    /// Pure-predicate unit test — pins ALL EIGHT rows over
+    /// (`max_nudges`, `last_gate_green`, `tree_dirty`) ∈ {0,2}×{false,true}×
+    /// {false,true}, in nested-loop order, to exactly
+    /// [false, false, false, false, false, true, true, true]. The predicate
+    /// is `max_nudges > 0 && (last_gate_green || tree_dirty)`: `max_nudges`
+    /// == 0 disables finish-recovery entirely (including the `tree_dirty`
+    /// leg); either arming leg arms when nudges are enabled.
+    #[test]
+    fn stop_terminal_recovery_armed_pins_all_eight_rows() {
+        let mut expected = Vec::new();
+        for max_nudges in [0, 2] {
+            for last_gate_green in [false, true] {
+                for tree_dirty in [false, true] {
+                    expected.push(super::stop_terminal_recovery_armed(
+                        max_nudges,
+                        last_gate_green,
+                        tree_dirty,
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            expected,
+            vec![false, false, false, false, false, true, true, true],
+            "predicate truth table must be exactly max_nudges > 0 && (green || dirty)"
+        );
+    }
+
+    /// REGRESSION TEST for run b0ac3875's exact shape: the agent did the
+    /// whole job, mutated via `bash`, and then stopped with text-only turns
+    /// WITHOUT ever calling `run_checks` — the old `&& last_gate_green` guard
+    /// never saw a green gate, never nudged, and the finished run was
+    /// discarded as `StoppedWithoutFinish`. Under the new predicate the
+    /// latched `tree_dirty` arms the nudge (`armed_by` `"work_observed"`),
+    /// which injects the unverified-work template and can exhaust into the
+    /// `FinishDiscipline` terminal with honest telemetry
+    /// (`gates_green_at_exit == false` even though nudges fired).
+    ///
+    /// Trace (`max_nudges` stays at `DEFAULT_MAX_NUDGES` = 2, iteration cap 4
+    /// is a literal): exactly FOUR turns — three text-only stops are required
+    /// to exhaust `max_nudges` = 2 (stop→nudge1, stop→nudge2,
+    /// stop→exhaustion).
+    ///   iter 1: bash "true" (success) — latches `tree_dirty`, clears
+    ///           `last_gate_green`. `stats.gates_green_at_exit` = false.
+    ///   iter 2: text-only stop — arms via `tree_dirty`, injects nudge 1
+    ///           (unverified template), `nudge_awaiting_status` = true.
+    ///   iter 3: text-only stop — pushes "almost done here" into
+    ///           `nudge_statuses`, injects nudge 2.
+    ///   iter 4: text-only stop — pushes "wrapping up now" into
+    ///           `nudge_statuses`, exhausts → `FinishDiscipline` terminal.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bash_then_text_stops_arms_work_observed_nudges_and_exhausts() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_transcript(path.clone(), "t");
+        assert_eq!(
+            config.max_nudges,
+            super::DEFAULT_MAX_NUDGES,
+            "fixture premise: max_nudges stays at the DEFAULT_MAX_NUDGES = 2"
+        );
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "true"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("still working on it".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("almost done here".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("wrapping up now".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(
+                    *mode,
+                    FailureMode::FinishDiscipline,
+                    "work-observed stop-terminal exhaustion must take the recovery terminal; \
+                     got {mode:?}"
+                );
+                assert_eq!(
+                    summary,
+                    "agent produced work but did not call finish after 2 nudges \
+                     (gate never verified green in-loop)",
+                    "tree_dirty-only exhaustion must use the honest unverified literal"
+                );
+            }
+            other => panic!("expected Finished(Failed{{..}}), got {other:?}"),
+        }
+        assert_eq!(stats.nudges_fired, 2);
+        assert!(stats.tree_dirty, "bash latched tree_dirty");
+        // Telemetry stays honest: the gate was NEVER verified via run_checks,
+        // so gates_green_at_exit must be false even though nudges fired —
+        // this assertion mechanically enforces the oracle-purity invariant
+        // (arming on tree_dirty must not forge the done-oracle).
+        assert!(
+            !stats.gates_green_at_exit,
+            "arming via tree_dirty must NOT forge gates_green_at_exit"
+        );
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("FinishDiscipline terminal must write recovery_facts");
+        assert!(!facts.gates_green_at_exit);
+        assert!(facts.tree_dirty);
+        assert_eq!(
+            facts.nudge_statuses,
+            vec![
+                "almost done here".to_string(),
+                "wrapping up now".to_string()
+            ],
+            "both post-nudge stop texts must be captured in order"
+        );
+
+        // Direct scan (NOT count_nudge_injections): both injected
+        // UserBlock::Text blocks equal the unverified template.
+        let unverified = prompt::render_nudge_prompt_unverified();
+        let green_count: usize = rec
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content
+                    .iter()
+                    .filter(|b| matches!(b, UserBlock::Text(t) if *t == NUDGE_TEXT))
+                    .count(),
+                Message::Assistant { .. } => 0,
+            })
+            .sum();
+        let unverified_count: usize = rec
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content
+                    .iter()
+                    .filter(|b| matches!(b, UserBlock::Text(t) if *t == unverified))
+                    .count(),
+                Message::Assistant { .. } => 0,
+            })
+            .sum();
+        assert_eq!(
+            (green_count, unverified_count),
+            (0, 2),
+            "both stop-terminal nudges must carry the unverified-work template, \
+             and no green-template text may appear"
+        );
+        assert_no_adjacent_user_messages(&rec.messages);
+
+        // Transcript: both nudge events carry all nine pre-existing fields
+        // plus the additive armed_by/tree_dirty keys.
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+        let nudges: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message")
+            .collect();
+        assert_eq!(nudges.len(), 2, "exactly two nudge events");
+        for (i, nudge) in nudges.iter().enumerate() {
+            // The nine pre-existing fields, unchanged:
+            assert!(nudge["iteration"].is_u64(), "iteration present");
+            assert_eq!(nudge["kind"], "nudge");
+            assert_eq!(nudge["placement"], "new_user_message");
+            assert_eq!(nudge["text"].as_str().unwrap(), unverified);
+            assert_eq!(nudge["last_gate_green"], false);
+            assert!(nudge["iters_since_tree_change"].is_u64());
+            assert_eq!(nudge["static_tree_k"], config.static_tree_k);
+            assert_eq!(nudge["nudge_number"], i as u64 + 1);
+            assert_eq!(nudge["max_nudges"], 2);
+            // The two additive keys.
+            assert_eq!(nudge["armed_by"], "work_observed");
+            assert_eq!(nudge["tree_dirty"], true);
+        }
+    }
+
+    /// GREEN-ARMED stop nudge is byte-unchanged: when the gate was verified
+    /// green in-loop and the agent then stops with text-only turns, the
+    /// stop-terminal nudge still injects the GREEN template verbatim, reports
+    /// `armed_by` `"gate_green"`, and exhausts into the SAME summary literal as
+    /// before ("gates green but agent did not call finish after {} nudges").
+    ///
+    /// Same 4-turn shape as the work-observed regression above, and for the
+    /// same reason: three text-only stops are required to exhaust
+    /// `max_nudges` = 2 (stop→nudge1, stop→nudge2, stop→exhaustion).
+    /// Trace: iter1 `run_checks` greens; iters 2-4 inject nudge 1, inject
+    /// nudge 2, then exhaust.
+    #[tokio::test]
+    async fn green_gate_stop_nudge_keeps_green_template_and_literal() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_transcript(path.clone(), "t");
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("still working on it".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("almost done here".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("wrapping up now".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(*mode, FailureMode::FinishDiscipline);
+                assert_eq!(
+                    summary, "gates green but agent did not call finish after 2 nudges",
+                    "the green-armed exhaustion literal must be byte-unchanged"
+                );
+            }
+            other => panic!("expected Finished(Failed{{..}}), got {other:?}"),
+        }
+        assert_eq!(stats.nudges_fired, 2);
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            2,
+            "both nudges carry the green template"
+        );
+        assert_no_adjacent_user_messages(&rec.messages);
+
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+        let nudges: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message")
+            .collect();
+        assert_eq!(nudges.len(), 2);
+        for nudge in &nudges {
+            assert_eq!(nudge["placement"], "new_user_message");
+            assert_eq!(
+                nudge["text"].as_str().unwrap(),
+                prompt::render_nudge_prompt()
+            );
+            assert_eq!(nudge["last_gate_green"], true);
+            assert_eq!(nudge["armed_by"], "gate_green");
+            assert_eq!(nudge["tree_dirty"], false);
+        }
+    }
+
+    /// DISABLED PATH: with `max_nudges == 0` finish-recovery is disabled
+    /// entirely — including the new `tree_dirty` leg. A bash-then-stop script
+    /// that WOULD arm under the new predicate must still fall straight
+    /// through to `StoppedWithoutFinish` with zero nudges.
+    #[tokio::test]
+    async fn max_nudges_zero_disables_work_observed_arming_too() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 4)
+            .with_checks(runner)
+            .with_max_nudges(0);
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "true"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("still working on it".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert!(
+            matches!(outcome, LoopOutcome::StoppedWithoutFinish),
+            "max_nudges == 0 must disable finish-recovery entirely; got {outcome:?}"
+        );
+        assert_eq!(stats.nudges_fired, 0);
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            count_nudge_injections(&rec.messages),
+            0,
+            "no nudge of either template may be injected when max_nudges == 0"
+        );
+    }
+
+    /// TRUNCATED PRECEDENCE: the `Truncated` terminal sits at the TOP of the
+    /// no-tool-call block, BEFORE the stop-terminal nudge guard, and keys on
+    /// the STOP REASON — so a `MaxTokens` turn truncates even when
+    /// `tree_dirty` is latched and `max_nudges > 0` would arm the
+    /// work-observed nudge. Truncated is deliberately NOT a recovery
+    /// terminal: `recovery_facts` stays `None`.
+    #[tokio::test]
+    async fn truncated_terminal_precedes_work_observed_nudge_guard() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 4).with_checks(runner);
+
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "true"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            turn_with_usage(
+                vec![ContentBlock::Text("cut off mid-tur".to_string())],
+                StopReason::MaxTokens,
+                usage_with(0, 111),
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, .. }) => {
+                assert_eq!(
+                    *mode,
+                    FailureMode::Truncated,
+                    "a MaxTokens no-tool turn must truncate, not nudge; got {mode:?}"
+                );
+            }
+            other => panic!("expected Finished(Failed{{Truncated}}), got {other:?}"),
+        }
+        assert_eq!(stats.nudges_fired, 0, "truncation must preempt the nudge");
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            rec.recovery_facts, None,
+            "Truncated is deliberately NOT a recovery terminal"
+        );
+    }
+
+    /// MUTATE-AFTER-NUDGE-THEN-STOP now arms via the latched `tree_dirty` leg
+    /// (behavior change, pinned): under the old `&& last_gate_green` guard a
+    /// successful `edit_file` after a green stop-terminal nudge cleared the
+    /// green and intentionally failed the guard. Under the new predicate
+    /// `tree_dirty` is LATCHED, so a post-nudge stop still arms (`armed_by`
+    /// `"work_observed"`) and exhausts into the unverified exhaustion literal.
+    /// Trace (`max_nudges` = 1):
+    ///   iter 1: `run_checks` (green).
+    ///   iter 2: text-only stop "gates look fine" — green nudge 1
+    ///           (`armed_by` `"gate_green"`, green template), `nudges_fired`
+    ///           0→1.
+    ///   iter 3: `edit_file` success — latches `tree_dirty`, clears
+    ///           `last_gate_green`; the end-of-iteration status capture pushes
+    ///           the turn text (the tool-calls-only turn's text is empty).
+    ///   iter 4: text-only stop "still going" — arms via `tree_dirty`, but
+    ///           `nudges_fired(1)` is not < 1 → exhaustion terminal.
+    #[tokio::test]
+    async fn mutate_after_green_nudge_then_stop_arms_via_tree_dirty() {
+        let runner = passing_runner();
+        let tools = standard_registry(Some(runner.clone()));
+        // Fresh workspace: the edit_file CREATE (empty old_string) must
+        // succeed to latch tree_dirty.
+        let root = TempDir::new().expect("workspace tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let workspace = Workspace::new(&root_path, None).expect("workspace");
+        let ctx = ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink));
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let config = RunConfig::new("do the task", 10)
+            .with_checks(runner)
+            .with_max_nudges(1)
+            .with_transcript(path.clone(), "t");
+
+        let backend = MockBackend::from_turns(vec![
+            run_checks_turn("c1"),
+            turn_with(
+                vec![ContentBlock::Text("gates look fine".into())],
+                StopReason::EndTurn,
+            ),
+            turn_with(
+                vec![tool_call(
+                    "c2",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "flag",
+                        "old_string": "",
+                        "new_string": "planted\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            turn_with(
+                vec![ContentBlock::Text("still going".into())],
+                StopReason::EndTurn,
+            ),
+        ]);
+
+        let snap_store = Arc::new(SnapshotStore::new());
+        let pers = make_persistence(snap_store.clone());
+        let RunResult { outcome, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no error");
+
+        assert_eq!(stats.nudges_fired, 1);
+        assert!(
+            stats.tree_dirty,
+            "the successful edit_file latched tree_dirty"
+        );
+        assert!(
+            !stats.gates_green_at_exit,
+            "the edit_file cleared the green; telemetry stays honest"
+        );
+
+        match &outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(*mode, FailureMode::FinishDiscipline);
+                assert_eq!(
+                    summary,
+                    "agent produced work but did not call finish after 1 nudges \
+                     (gate never verified green in-loop)",
+                    "the post-mutation stop exhausts into the unverified literal"
+                );
+            }
+            other => panic!("expected Finished(Failed{{FinishDiscipline}}), got {other:?}"),
+        }
+
+        let rec = snap_store
+            .inner
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("present");
+        let facts = rec
+            .recovery_facts
+            .as_ref()
+            .expect("FinishDiscipline terminal must write recovery_facts");
+        assert!(!facts.gates_green_at_exit);
+        assert!(facts.tree_dirty);
+        // The tool-calls-only turn that followed nudge 1 contributed an empty
+        // status (its text is empty); the final stop text is NOT captured —
+        // the exhaustion branch returns before any further capture.
+        assert_eq!(facts.nudge_statuses, vec![String::new()]);
+
+        // Transcript: the single nudge event is the GREEN-armed one (iter 2);
+        // the iter-4 stop exhausted without injecting a second nudge.
+        let lines = read_transcript_lines(&path);
+        assert_reconstruction_matches(&lines, &backend);
+        let nudges: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "harness_message")
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert_eq!(nudges[0]["armed_by"], "gate_green");
+        assert_eq!(
+            nudges[0]["text"].as_str().unwrap(),
+            prompt::render_nudge_prompt()
+        );
+        assert_eq!(nudges[0]["last_gate_green"], true);
+        assert_eq!(nudges[0]["tree_dirty"], false);
+        assert_eq!(nudges[0]["nudge_number"], 1);
+        assert_eq!(nudges[0]["max_nudges"], 1);
     }
 
     // ---- retry / backoff tests ------------------------------------------
