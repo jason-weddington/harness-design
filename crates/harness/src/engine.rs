@@ -76,9 +76,12 @@
 //!   construction: the trigger is gated on [`model::ModelBackend::context_limit`],
 //!   which only the Ollama backend overrides (design 08).
 //!
-//! What does **not** live here yet (tracked separately): token / cost budget
+//! What does **not** live here yet (tracked separately): cost budget
 //! enforcement and loop / no-progress detection. Wall-clock budget
-//! enforcement, persistence / checkpointing, and — as of design 08 — in-run
+//! enforcement AND token budget enforcement (a cumulative run budget, in
+//! billed tokens, that terminates between turns — see
+//! [`RunConfig::token_budget`]), persistence / checkpointing, and — as of
+//! design 08 — in-run
 //! context compaction (Ollama-only: gated on the backend advertising a
 //! context limit as a number, which only [`model::ModelBackend::context_limit`]
 //! on Ollama ever does) are implemented. The hard `max_iterations` cap and
@@ -298,6 +301,49 @@ pub struct RunConfig {
     /// `BedrockBackend::new` sets no `TimeoutConfig` — so a hung model call
     /// is bounded only by the caller's outer timeout, not by this check.
     pub wall_clock_secs: u64,
+    /// Cumulative token budget for the WHOLE run, in billed tokens. `0`
+    /// means UNBOUNDED — the default (OFF by default, the deliberate
+    /// divergence from the armed wall-clock default). The budget is
+    /// CUMULATIVE over the run and terminates cleanly BETWEEN turns at turn
+    /// granularity: the loop consults the consumed total at the TOP of every
+    /// iteration (immediately after the wall-clock check, before the
+    /// per-iteration output-cap re-resolution and before this pass's
+    /// `backend.turn`) plus one post-loop evaluation, and self-terminates
+    /// with [`LoopOutcome::BudgetExhausted`] when the consumed total reaches
+    /// the limit. A turn already in flight completes — the same
+    /// consultative, turn-granular shape as the wall-clock budget; nothing
+    /// is ever truncated mid-flight.
+    ///
+    /// It is NOT the per-turn output cap: the per-turn cap is DERIVED each
+    /// iteration via [`model::ModelBackend::output_cap`], whose
+    /// no-information fallback is [`DEFAULT_MAX_TOKENS`] (32768,
+    /// [`model::MaxTokensSource::Fallback`]; the derivation ruling is
+    /// recorded in `docs/design/08-context-budget.md`). That fallback was
+    /// never removed — it survives as the per-turn cap's no-information
+    /// source. A cumulative run budget is a different mechanism entirely:
+    /// it terminates the run between turns exactly as the wall-clock budget
+    /// does, and must never be derived from or bounded by the
+    /// per-iteration `turn_cap` or observed throughput.
+    ///
+    /// Consumption (the expression [`budget_consumed_now`] ticks) is the
+    /// billed-token sum `initial_consumed.tokens + stats.input_tokens +
+    /// stats.output_tokens + stats.cache_read_tokens +
+    /// stats.cache_write_tokens` — each [`crate::model::Usage`] `Option`
+    /// cache field unwrapped to 0 at accumulation. It is NOT
+    /// [`crate::model::Usage::input_tokens`] alone (the uncached remainder)
+    /// and NOT the Anthropic wire sum `input + cache_creation + cache_read`
+    /// (which omits completions entirely).
+    ///
+    /// Enforcement reads the PER-INVOCATION `config.token_budget`, while
+    /// consumed tokens carry over across resumes via `budgets.consumed` —
+    /// whole-run accounting, per-invocation arm — so a resume caller MUST
+    /// re-arm by passing the same `token_budget`; a resume that fails to
+    /// re-arm runs UNBOUNDED. `resume` does NOT rewrite `budgets.limits`:
+    /// the record keeps the record-CREATING invocation's arm, and the live
+    /// arm of each invocation is observable via
+    /// `run_start.config.token_budget` and `budget_breach.armed_tokens`.
+    /// This mirrors `wall_clock_secs`'s existing resume semantics.
+    pub token_budget: u64,
     /// The clock implementation used to read "now" inside the loop. Inject a
     /// [`crate::time::FakeClock`] (test-only) for deterministic timing tests
     /// with zero real sleeping; production code uses the [`SystemClock`]
@@ -394,7 +440,8 @@ impl RunConfig {
     /// `checks` to `None`, `max_tokens` to `None` (resolve per backend per
     /// iteration — see [`RunConfig::max_tokens`]), `max_retries` to
     /// [`DEFAULT_MAX_RETRIES`], and `retry_backoff_base` to
-    /// [`DEFAULT_RETRY_BACKOFF_BASE`].
+    /// [`DEFAULT_RETRY_BACKOFF_BASE`]. `wall_clock_secs` and `token_budget`
+    /// both default to `0` (unbounded).
     #[must_use]
     pub fn new(task: impl Into<String>, max_iterations: u32) -> Self {
         Self {
@@ -407,6 +454,7 @@ impl RunConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
             wall_clock_secs: 0,
+            token_budget: 0,
             clock: Arc::new(SystemClock),
             change_observer: Arc::new(GitTreeObserver),
             transcript: None,
@@ -487,6 +535,18 @@ impl RunConfig {
     #[must_use]
     pub fn with_wall_clock_secs(mut self, secs: u64) -> Self {
         self.wall_clock_secs = secs;
+        self
+    }
+
+    /// Set the cumulative token budget, in billed tokens (`0` = unbounded,
+    /// the default). See [`RunConfig::token_budget`] — the CUMULATIVE
+    /// between-turns run budget over the billed-token sum (input + output +
+    /// `cache_read` + `cache_write`), never derived from the per-turn output
+    /// cap and never truncating a turn; a resume caller must re-arm by
+    /// passing the same value.
+    #[must_use]
+    pub fn with_token_budget(mut self, tokens: u64) -> Self {
+        self.token_budget = tokens;
         self
     }
 
@@ -1140,12 +1200,16 @@ pub enum LoopOutcome {
     /// disposition also end here; `RunStats::invalid_finish_calls > 0` tells
     /// that case apart from repeated red-verification `done` rejections.
     MaxIterations,
-    /// The wall-clock budget ([`RunConfig::wall_clock_secs`]) expired before
-    /// the agent finished. The summary is always
-    /// `"wall-clock budget exhausted"`. Recovery facts are written to the
-    /// persisted run record so the outer harness can decide whether to resume.
-    /// Distinct from [`LoopOutcome::MaxIterations`] so the outer harness can
-    /// recognise a time-bounded termination from an iteration-bounded one.
+    /// The wall-clock budget ([`RunConfig::wall_clock_secs`]) or the token
+    /// budget ([`RunConfig::token_budget`]) expired before the agent
+    /// finished. The summary is the emitting consult's pinned literal —
+    /// `"wall-clock budget exhausted"` from the wall-clock consults,
+    /// `"token budget exhausted"` from the token consults — which is the
+    /// terminal-side discriminator between the two `budget_breach` field-set
+    /// variants. Recovery facts are written to the persisted run record so
+    /// the outer harness can decide whether to resume. Distinct from
+    /// [`LoopOutcome::MaxIterations`] so the outer harness can recognise a
+    /// budget-bounded termination from an iteration-bounded one.
     BudgetExhausted { summary: String },
     /// The backend returned an error that exhausted the retry budget. Carries
     /// the **last** attempt's error. Retryable errors
@@ -1166,7 +1230,10 @@ impl LoopOutcome {
     /// - `MaxIterations` → `Failed { mode: BudgetExhausted, .. }` (summary:
     ///   `"iteration cap reached before the agent finished"`)
     /// - `BudgetExhausted { summary }` → `Failed { mode: BudgetExhausted,
-    ///   summary }` (summary: `"wall-clock budget exhausted"`)
+    ///   summary }` (summary: `"wall-clock budget exhausted"` from the
+    ///   wall-clock consults, `"token budget exhausted"` from the token
+    ///   consults — the literal is the terminal-side discriminator between
+    ///   the two `budget_breach` variants)
     /// - `StoppedWithoutFinish` → `Failed { mode: StoppedWithoutFinish, .. }`
     /// - `BackendError(e)` → `Failed { mode: TransientInfra }` if
     ///   `e.is_retryable()`, else `Failed { mode: PersistentToolError }`
@@ -3341,6 +3408,86 @@ fn stamp_compaction_facts(record: &mut RunRecord, stats: &RunStats) {
     });
 }
 
+/// The single non-test construction site for a `BudgetConsumed` TICK from
+/// the `(initial_consumed, stats)` pair: every place the loop records a
+/// cumulative budget snapshot goes through this helper, so the consumption
+/// expression exists in exactly one place.
+///
+/// Consumption is the BILLED-TOKEN sum
+/// `initial_consumed.tokens + stats.input_tokens + stats.output_tokens +
+/// stats.cache_read_tokens + stats.cache_write_tokens` (u64 saturating sum;
+/// the `RunStats` cache fields are already u64 counters with `None → 0`
+/// unwrapped at accumulation time, so no `Option` handling is needed here).
+/// It is deliberately NOT `Usage::input_tokens` alone (the uncached
+/// remainder) and NOT the Anthropic wire sum `input + cache_creation +
+/// cache_read` (which omits completions entirely). `cost_micros` passes
+/// through unchanged: no pricing source exists (see
+/// [`crate::run_record::BudgetLimits::cost_micros`]).
+fn budget_consumed_now(initial_consumed: &BudgetConsumed, stats: &RunStats) -> BudgetConsumed {
+    BudgetConsumed {
+        iterations: initial_consumed.iterations + stats.iterations,
+        tokens: initial_consumed
+            .tokens
+            .saturating_add(stats.input_tokens)
+            .saturating_add(stats.output_tokens)
+            .saturating_add(stats.cache_read_tokens)
+            .saturating_add(stats.cache_write_tokens),
+        cost_micros: initial_consumed.cost_micros,
+    }
+}
+
+/// The token-budget breach predicate, mirroring the wall-clock predicate:
+/// `limit != 0` is the sentinel short-circuit (`0` means UNBOUNDED — the
+/// same shape as `wall_clock_secs == 0` returning false), and `>=` mirrors
+/// the wall-clock breach condition (`elapsed_secs >= wall_clock_secs`) —
+/// consuming exactly the limit is a breach.
+fn token_budget_breached(consumed_tokens: u64, limit: u64) -> bool {
+    limit != 0 && consumed_tokens >= limit
+}
+
+/// Evaluate the token-budget breach predicate for the engine loop and, on
+/// breach, emit the `budget_breach` transcript event (token variant:
+/// `armed_tokens`/`consumed_tokens`/`iteration`) — the observability record
+/// of the decision's inputs — BEFORE the terminal persistence write.
+///
+/// Sentinel: `token_budget == 0` means UNBOUNDED — the consult short-circuits
+/// before computing anything when the budget is not armed.
+///
+/// `consumed_tokens` in the event is the loop's OWN decision input — the
+/// same `budget_consumed_now(...).tokens` value the predicate just compared,
+/// whole-run (carried-over `budgets.consumed` + this invocation's
+/// accumulation) — never a fresh writer timestamp. The event reuses the
+/// existing `budget_breach` tag; the variant is identified by its field set
+/// (`armed_tokens` vs `armed_secs`) and by `run_end.detail`.
+///
+/// Returns `true` when the budget is breached; the caller then performs the
+/// identical terminal write via [`write_budget_exhausted_terminal`] with the
+/// `"token budget exhausted"` summary and returns
+/// [`LoopOutcome::BudgetExhausted`].
+fn token_budget_breach_check(
+    config: &RunConfig,
+    initial_consumed: &BudgetConsumed,
+    stats: &RunStats,
+    writer: &mut TranscriptWriter,
+) -> bool {
+    if config.token_budget == 0 {
+        return false;
+    }
+    let consumed_tokens = budget_consumed_now(initial_consumed, stats).tokens;
+    if !token_budget_breached(consumed_tokens, config.token_budget) {
+        return false;
+    }
+    writer.emit(
+        "budget_breach",
+        json!({
+            "armed_tokens": config.token_budget,
+            "consumed_tokens": consumed_tokens,
+            "iteration": stats.iterations,
+        }),
+    );
+    true
+}
+
 /// Evaluate the wall-clock breach predicate for the engine loop and, on
 /// breach, emit the `budget_breach` transcript event — the observability
 /// record of the decision's inputs — BEFORE the terminal persistence write.
@@ -3387,14 +3534,21 @@ fn wall_clock_breach_check(
     true
 }
 
-/// The shared wall-clock breach terminal: identical from both breach sites
-/// (top-of-loop and post-loop). Writes the unconditional recovery facts,
-/// the `Failed { mode: BudgetExhausted, summary: "wall-clock budget
-/// exhausted" }` disposition plus its `DispositionSet` event, and a terminal
-/// checkpoint on the persisted path, then returns
-/// [`LoopOutcome::BudgetExhausted`] unconditionally — mirroring the
-/// `MaxIterations` pattern so the non-persistent path still terminates on
-/// breach.
+/// The shared budget breach terminal: identical from all four breach sites
+/// (the wall-clock top-of-loop and post-loop consults, and the token
+/// top-of-loop and post-loop consults). Writes the unconditional recovery
+/// facts, the `Failed { mode: BudgetExhausted, summary }` disposition plus
+/// its `DispositionSet` event, and a terminal checkpoint on the persisted
+/// path, then returns [`LoopOutcome::BudgetExhausted`] unconditionally —
+/// mirroring the `MaxIterations` pattern so the non-persistent path still
+/// terminates on breach.
+///
+/// `summary` is the pinned literal the emitting consult passes: the
+/// wall-clock consults pass `"wall-clock budget exhausted"`, the token
+/// consults pass `"token budget exhausted"`. Both literals are byte-stable
+/// — the summary is the `run_end.detail` discriminator between the two
+/// `budget_breach` field-set variants, so neither call site may pass
+/// anything else.
 #[allow(clippy::too_many_arguments)]
 async fn write_budget_exhausted_terminal(
     persist: Option<&mut RunPersist>,
@@ -3405,16 +3559,13 @@ async fn write_budget_exhausted_terminal(
     last_gate_green: bool,
     tree_dirty: bool,
     nudge_statuses: &[String],
+    summary: &str,
 ) -> Result<LoopOutcome, StoreError> {
-    let summary = "wall-clock budget exhausted".to_string();
+    let summary = summary.to_string();
     if let (Some(ctx), Some(p)) = (persist, persistence) {
         ctx.record.messages = messages.to_vec();
         stamp_compaction_facts(&mut ctx.record, stats);
-        ctx.record.budgets.consumed = BudgetConsumed {
-            iterations: initial_consumed.iterations + stats.iterations,
-            tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-            cost_micros: initial_consumed.cost_micros,
-        };
+        ctx.record.budgets.consumed = budget_consumed_now(initial_consumed, stats);
         // Recovery facts mirror the FinishDiscipline terminal exactly:
         // same `last_gate_green` / `tree_dirty` / `nudge_statuses`
         // loop-locals so the outer harness sees a consistent shape
@@ -3557,7 +3708,9 @@ async fn run_loop_body(
                 consumed: BudgetConsumed::default(),
                 limits: BudgetLimits {
                     iterations: config.max_iterations,
-                    tokens: 0,
+                    // The record-CREATING invocation's arm — `resume` does
+                    // NOT rewrite it (see `RunConfig::token_budget`).
+                    tokens: config.token_budget,
                     cost_micros: 0,
                     wall_clock_secs: config.wall_clock_secs,
                 },
@@ -3630,6 +3783,7 @@ async fn run_loop_body(
                     "checks": config.checks.as_ref().map(ChecksRunner::command_display),
                     "answer_schema": config.answer_schema.as_ref().map(AnswerSchema::source),
                     "wall_clock_secs": config.wall_clock_secs,
+                    "token_budget": config.token_budget,
                     "static_tree_k": config.static_tree_k,
                     "max_nudges": config.max_nudges,
                     "max_retries": config.max_retries,
@@ -3731,6 +3885,31 @@ async fn run_loop_body(
                 last_gate_green,
                 tree_dirty,
                 &nudge_statuses,
+                "wall-clock budget exhausted",
+            )
+            .await;
+        }
+
+        // Token budget breach check: immediately AFTER the wall-clock check
+        // (ORDER PINNED — a simultaneous dual breach deterministically emits
+        // the wall-clock `budget_breach` event and returns the
+        // `"wall-clock budget exhausted"` terminal; this consult never
+        // runs), before the per-iteration output-cap re-resolution and
+        // before this pass's `backend.turn`. Whole-run input:
+        // `budget_consumed_now(&initial_consumed, stats).tokens` carries the
+        // resumed consumed total over. When `config.token_budget == 0` the
+        // consult short-circuits before computing anything.
+        if token_budget_breach_check(config, &initial_consumed, stats, writer) {
+            return write_budget_exhausted_terminal(
+                persist.as_mut(),
+                persistence,
+                &messages,
+                stats,
+                &initial_consumed,
+                last_gate_green,
+                tree_dirty,
+                &nudge_statuses,
+                "token budget exhausted",
             )
             .await;
         }
@@ -3947,11 +4126,7 @@ async fn run_loop_body(
                         mode,
                         summary: format!("backend error: {err:?}"),
                     };
-                    ctx.record.budgets.consumed = BudgetConsumed {
-                        iterations: initial_consumed.iterations + stats.iterations,
-                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                        cost_micros: initial_consumed.cost_micros,
-                    };
+                    ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
                     ctx.record.messages.clone_from(&messages);
                     stamp_compaction_facts(&mut ctx.record, stats);
                     ctx.record.disposition = Some(disposition.clone());
@@ -4078,11 +4253,7 @@ async fn run_loop_body(
         // guarantees that a mid-iteration crash always leaves a snapshot whose
         // messages include the in-flight assistant turn.
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
-            let consumed = BudgetConsumed {
-                iterations: initial_consumed.iterations + stats.iterations,
-                tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                cost_micros: initial_consumed.cost_micros,
-            };
+            let consumed = budget_consumed_now(&initial_consumed, stats);
             p.store
                 .append_event(
                     &ctx.rid,
@@ -4244,11 +4415,7 @@ async fn run_loop_body(
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                     ctx.record.messages.clone_from(&messages);
                     stamp_compaction_facts(&mut ctx.record, stats);
-                    ctx.record.budgets.consumed = BudgetConsumed {
-                        iterations: initial_consumed.iterations + stats.iterations,
-                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                        cost_micros: initial_consumed.cost_micros,
-                    };
+                    ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
                     ctx.record.recovery_facts = Some(RecoveryFacts {
                         gates_green_at_exit: last_gate_green,
                         tree_dirty,
@@ -4619,11 +4786,7 @@ async fn run_loop_body(
             if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                 ctx.record.messages.clone_from(&messages);
                 stamp_compaction_facts(&mut ctx.record, stats);
-                ctx.record.budgets.consumed = BudgetConsumed {
-                    iterations: initial_consumed.iterations + stats.iterations,
-                    tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                    cost_micros: initial_consumed.cost_micros,
-                };
+                ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
                 ctx.record.disposition = Some(disposition.clone());
                 p.store
                     .append_event(
@@ -4721,11 +4884,7 @@ async fn run_loop_body(
                 if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
                     ctx.record.messages.clone_from(&messages);
                     stamp_compaction_facts(&mut ctx.record, stats);
-                    ctx.record.budgets.consumed = BudgetConsumed {
-                        iterations: initial_consumed.iterations + stats.iterations,
-                        tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                        cost_micros: initial_consumed.cost_micros,
-                    };
+                    ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
                     ctx.record.recovery_facts = Some(RecoveryFacts {
                         gates_green_at_exit: last_gate_green,
                         tree_dirty,
@@ -4778,11 +4937,7 @@ async fn run_loop_body(
         if let (Some(ctx), Some(p)) = (persist.as_mut(), persistence) {
             ctx.record.messages.clone_from(&messages);
             stamp_compaction_facts(&mut ctx.record, stats);
-            ctx.record.budgets.consumed = BudgetConsumed {
-                iterations: initial_consumed.iterations + stats.iterations,
-                tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-                cost_micros: initial_consumed.cost_micros,
-            };
+            ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
             p.store.checkpoint(&ctx.rid, &ctx.record).await?;
         }
     }
@@ -4805,6 +4960,28 @@ async fn run_loop_body(
             last_gate_green,
             tree_dirty,
             &nudge_statuses,
+            "wall-clock budget exhausted",
+        )
+        .await;
+    }
+
+    // Post-loop token budget breach check: the same ORDER PIN as the
+    // top-of-loop consult — AFTER the wall-clock check, so a dual breach
+    // deterministically reports the wall-clock terminal. A budget reached
+    // exactly during the final iteration has no top-of-loop pass left to
+    // catch it; without this re-evaluation the run would silently report
+    // `MaxIterations` instead of the token breach terminal.
+    if token_budget_breach_check(config, &initial_consumed, stats, writer) {
+        return write_budget_exhausted_terminal(
+            persist.as_mut(),
+            persistence,
+            &messages,
+            stats,
+            &initial_consumed,
+            last_gate_green,
+            tree_dirty,
+            &nudge_statuses,
+            "token budget exhausted",
         )
         .await;
     }
@@ -4817,11 +4994,7 @@ async fn run_loop_body(
         };
         ctx.record.messages.clone_from(&messages);
         stamp_compaction_facts(&mut ctx.record, stats);
-        ctx.record.budgets.consumed = BudgetConsumed {
-            iterations: initial_consumed.iterations + stats.iterations,
-            tokens: initial_consumed.tokens + stats.input_tokens + stats.output_tokens,
-            cost_micros: initial_consumed.cost_micros,
-        };
+        ctx.record.budgets.consumed = budget_consumed_now(&initial_consumed, stats);
         // Recovery facts: a GREEN-static MaxIterations (gates green, tree
         // static, model never called finish — and finish-recovery disabled via
         // `max_nudges == 0` OR the FinishDiscipline terminal simply did not
@@ -5205,12 +5378,12 @@ mod tests {
         COMPACT_REASONING_TAIL_CHARS, COMPACT_RETENTION_ASSISTANT_MSGS, COMPACT_THRESHOLD_PCT,
         FINISH_TOOL_NAME, FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence,
         ResumeError, ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
-        answer_schema_streak_resets, bound_raw_answer_payload, coerce_stringified_result,
-        compact_history, emit_run_end, inert_precondition_warning,
+        answer_schema_streak_resets, bound_raw_answer_payload, budget_consumed_now,
+        coerce_stringified_result, compact_history, emit_run_end, inert_precondition_warning,
         missing_reason_rejection_content, missing_result_rejection_content,
         modified_workspace_rejection_content, next_answer_schema_streak,
         no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
-        run, run_id, run_persisted, should_compact,
+        run, run_id, run_persisted, should_compact, token_budget_breached,
     };
     use crate::exec::{
         ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, TreeObservation,
@@ -5409,6 +5582,25 @@ mod tests {
             output_tokens,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// Like [`usage_with`], but with explicit cache fields (`None` = the
+    /// provider didn't report it, contributing 0 at accumulation) — for
+    /// tests that pin the BILLED-TOKEN sum the budget consumes
+    /// (`input + output + cache_read + cache_write`).
+    fn usage_with_cache(
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read: Option<u32>,
+        cache_write: Option<u32>,
+    ) -> Usage {
+        Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
             reasoning_tokens: None,
         }
     }
@@ -7308,6 +7500,572 @@ mod tests {
             backend.calls(),
             2,
             "both scripted turns must have been drawn before the post-loop breach"
+        );
+    }
+
+    // =====================================================================
+    // Token budget tests — the cumulative, between-turns billed-token run
+    // budget ([`RunConfig::token_budget`]). The pure-helper units pin the
+    // consumption expression and the breach predicate; the MockBackend loop
+    // tests pin the top-of-loop consult, the post-loop consult, the
+    // terminal/event payloads, the resume re-arm rule, and the cache-token
+    // accounting.
+    // =====================================================================
+
+    #[test]
+    fn budget_consumed_now_sums_billed_tokens_including_cache() {
+        let initial = BudgetConsumed {
+            tokens: 100,
+            ..BudgetConsumed::default()
+        };
+        let mut stats = zero_stats();
+        stats.input_tokens = 40;
+        stats.output_tokens = 60;
+        stats.cache_read_tokens = 25;
+        stats.cache_write_tokens = 5;
+        let tick = budget_consumed_now(&initial, &stats);
+        assert_eq!(
+            tick.tokens, 230,
+            "billed-token sum must include the cache counters: 100 + 40 + 60 \
+             + 25 + 5"
+        );
+        assert_eq!(
+            tick.iterations,
+            initial.iterations + stats.iterations,
+            "iterations must accumulate exactly as the inline ticks did"
+        );
+    }
+
+    #[test]
+    fn budget_consumed_now_cache_zero_case_and_cost_passthrough() {
+        let initial = BudgetConsumed {
+            tokens: 100,
+            cost_micros: 100,
+            ..BudgetConsumed::default()
+        };
+        let mut stats = zero_stats();
+        stats.input_tokens = 40;
+        stats.output_tokens = 60;
+        let tick = budget_consumed_now(&initial, &stats);
+        assert_eq!(tick.tokens, 200, "cache-zero case: 100 + 40 + 60");
+        assert_eq!(
+            tick.cost_micros, 100,
+            "cost_micros passes through unchanged — no pricing source exists"
+        );
+    }
+
+    #[test]
+    fn token_budget_breached_pins_the_boundary() {
+        assert!(
+            !token_budget_breached(99, 100),
+            "below the limit: no breach"
+        );
+        assert!(
+            token_budget_breached(100, 100),
+            "consuming exactly the limit is a breach (>= mirrors the \
+             wall-clock predicate)"
+        );
+        assert!(token_budget_breached(101, 100));
+        assert!(
+            !token_budget_breached(100, 0),
+            "limit 0 is the unbounded sentinel"
+        );
+        assert!(!token_budget_breached(0, 0));
+    }
+
+    /// POSITIVE TEST (non-persisted path): the token budget breaches at the
+    /// TOP of iteration 2 — after turn 1's 100 billed tokens, before turn 2
+    /// is drawn — and the terminal summary is the pinned
+    /// `"token budget exhausted"` literal (exact equality, not `contains`).
+    #[tokio::test]
+    async fn token_budget_breach_non_persistent_path_returns_budget_exhausted() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10)
+            .with_token_budget(100)
+            .with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => assert_eq!(
+                summary, "token budget exhausted",
+                "the token consult's pinned summary literal"
+            ),
+            other => panic!("expected BudgetExhausted; got {other:?}"),
+        }
+        assert_eq!(
+            backend.calls(),
+            1,
+            "the breaching turn's successor never started — termination is \
+             BETWEEN turns"
+        );
+
+        let lines = read_transcript_lines(&path);
+        let breaches: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "budget_breach")
+            .collect();
+        assert_eq!(breaches.len(), 1, "the breach is terminal: one line only");
+        assert_eq!(breaches[0]["armed_tokens"], 100);
+        assert_eq!(breaches[0]["consumed_tokens"], 100);
+        assert_eq!(
+            breaches[0]["iteration"], 1,
+            "a top-of-loop breach reports the completed-iteration count"
+        );
+    }
+
+    /// POSITIVE TEST (persisted path): the token breach terminal writes the
+    /// same recovery-facts shape as the wall-clock terminal, and the record
+    /// is SELF-DESCRIBING — `limits.tokens` carries the arm so a reviewer
+    /// can verify the terminal from `limits.tokens` vs `consumed.tokens`
+    /// without the transcript.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn token_budget_breach_persisted_path_writes_recovery_facts_and_self_describing_arm() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+            // The THIRD turn must never start: the top-of-iteration-3
+            // consult breaches at consumed == 200 == the armed limit.
+            turn_with_usage(
+                vec![tool_call("c3", "echo", serde_json::json!({ "i": 3 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10)
+            .with_token_budget(200)
+            .with_transcript(path.clone(), "t");
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(Arc::clone(&store));
+
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no store error");
+
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert_eq!(summary, "token budget exhausted");
+            }
+            other => panic!("expected BudgetExhausted; got {other:?}"),
+        }
+        assert_eq!(
+            backend.calls(),
+            2,
+            "the breaching turn's successor never started — termination is \
+             BETWEEN turns"
+        );
+
+        // into_disposition must yield the exact token-breach disposition.
+        let disp = outcome.into_disposition();
+        assert!(
+            matches!(
+                &disp,
+                Disposition::Failed {
+                    mode: FailureMode::BudgetExhausted,
+                    summary
+                }
+                if summary == "token budget exhausted"
+            ),
+            "into_disposition must yield Failed{{BudgetExhausted, \"token \
+             budget exhausted\"}}; got {disp:?}"
+        );
+
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("record must exist");
+        // Recovery facts: the same loop-locals the wall-clock terminal writes.
+        let rf = record
+            .recovery_facts
+            .expect("recovery_facts must be Some on the token breach terminal");
+        assert!(!rf.tree_dirty, "no edit_file/bash ran");
+        assert!(!rf.gates_green_at_exit, "no run_checks ran");
+        assert!(rf.nudge_statuses.is_empty(), "no nudges fired");
+        // The exact scripted sum, and the self-describing arm.
+        assert_eq!(
+            record.budgets.consumed.tokens, 200,
+            "consumed.tokens must be the exact scripted sum"
+        );
+        assert_eq!(
+            record.budgets.limits.tokens, 200,
+            "limits.tokens must record the record-CREATING invocation's arm"
+        );
+        assert_eq!(
+            record.budgets.limits.wall_clock_secs, 0,
+            "the wall-clock budget stays unarmed on a token-only breach"
+        );
+        assert!(
+            record.disposition.is_some(),
+            "the terminal checkpoint carries the disposition"
+        );
+
+        // A DispositionSet event and a terminal checkpoint exist in the log.
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DispositionSet { .. })),
+            "the terminal must append a DispositionSet event"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, Event::BudgetTick { .. })),
+            "the breaching turns must have ticked the budget"
+        );
+
+        // Exactly one budget_breach line, with the payload pinned.
+        let lines = read_transcript_lines(&path);
+        let breaches: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "budget_breach")
+            .collect();
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0]["armed_tokens"], 200);
+        assert_eq!(
+            breaches[0]["consumed_tokens"], 200,
+            "the event's consumed_tokens must equal budgets.consumed.tokens"
+        );
+        assert_eq!(
+            breaches[0]["iteration"], 2,
+            "completed-iteration count at the top-of-loop breach site"
+        );
+    }
+
+    /// FINAL-ITERATION breach (the post-loop consult's breach arm): the
+    /// limit is reached DURING the final iteration, with no top-of-loop pass
+    /// left to catch it. Arithmetic: two turns of `usage_with(3, 2)` = 5
+    /// billed tokens each — after turn 1 consumed 5 < 10 (no top-of-loop
+    /// breach on iteration 2), after turn 2 consumed exactly 10 == the armed
+    /// limit, so only the POST-LOOP consult can catch it. (Scripting each
+    /// turn at `(5, 5)` would cross the limit after turn 1 — a different
+    /// seam, covered by the top-of-loop tests above.)
+    #[tokio::test]
+    async fn token_budget_breach_on_final_iteration_returns_budget_exhausted() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(3, 2),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with(3, 2),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 2).with_token_budget(10);
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert_eq!(summary, "token budget exhausted");
+            }
+            LoopOutcome::MaxIterations => panic!(
+                "a budget reached during the final iteration must yield \
+                 BudgetExhausted, not MaxIterations"
+            ),
+            other => panic!("expected BudgetExhausted; got {other:?}"),
+        }
+        assert_eq!(
+            backend.calls(),
+            2,
+            "both scripted turns must have been drawn before the post-loop breach"
+        );
+    }
+
+    /// SENTINEL: an UNARMED run (`token_budget == 0`) emits ZERO
+    /// `budget_breach` events — the consult short-circuits before computing
+    /// anything.
+    #[tokio::test]
+    async fn token_budget_unarmed_emits_zero_budget_breach_events() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with(40, 60),
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({ "disposition": "done", "summary": "s" }),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10).with_transcript(path.clone(), "t");
+
+        let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "an unarmed run must complete normally; got {outcome:?}"
+        );
+        let lines = read_transcript_lines(&path);
+        assert!(
+            !lines.iter().any(|l| l["event"] == "budget_breach"),
+            "an unarmed run must emit zero budget_breach events"
+        );
+    }
+
+    /// RESUME CARRY-OVER (breach arm): consumed tokens carry over across
+    /// resumes via `budgets.consumed`, while enforcement reads the
+    /// per-invocation `config.token_budget`. A resume caller that re-arms at
+    /// the consumed total breaches at the FIRST top-of-loop check, before
+    /// any `backend.turn`.
+    #[tokio::test]
+    async fn token_budget_resume_re_armed_at_consumed_breaches_before_any_turn() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+
+        // Leg 1: one scripted (40, 60) turn under max_iterations 1 leaves
+        // record.budgets.consumed.tokens == 100.
+        let leg1_backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+            StopReason::ToolUse,
+            usage_with(40, 60),
+        )]);
+        let config_p1 = RunConfig::new("task", 1).with_token_budget(200);
+        let pers = make_persistence(Arc::clone(&store));
+        run_persisted(&leg1_backend, &tools, &ctx, &config_p1, &pers)
+            .await
+            .expect("leg 1 ok");
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("record must exist");
+        assert_eq!(
+            record.budgets.consumed.tokens, 100,
+            "leg 1 must leave exactly 100 consumed tokens carried over"
+        );
+
+        // Leg 2: resume armed at the consumed total (100) — the FIRST
+        // top-of-loop check breaches before any backend.turn.
+        let leg2_backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+            StopReason::ToolUse,
+            usage_with(40, 60),
+        )]);
+        let config_p2 = RunConfig::new("task", 10).with_token_budget(100);
+        let RunResult { outcome, .. } = resume(
+            &leg2_backend,
+            &tools,
+            &ctx,
+            &config_p2,
+            Arc::clone(&store),
+            FIXTURE_RID,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume ok");
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert_eq!(summary, "token budget exhausted");
+            }
+            other => panic!("expected BudgetExhausted on the carried-over breach; got {other:?}"),
+        }
+        assert_eq!(
+            leg2_backend.calls(),
+            0,
+            "the breach must fire at the FIRST top-of-loop check, before any \
+             backend.turn"
+        );
+
+        // PINNED DESIGN RULE: resume does NOT rewrite budgets.limits — the
+        // record keeps the record-CREATING invocation's arm (200), while the
+        // live arm rode config.token_budget (100).
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("record must exist");
+        assert_eq!(
+            record.budgets.limits.tokens, 200,
+            "resume must not rewrite budgets.limits.tokens"
+        );
+        assert_eq!(
+            record.budgets.consumed.tokens, 100,
+            "no turn was drawn, so consumed stays at the carried-over total"
+        );
+    }
+
+    /// RESUME CARRY-OVER (below-limit arm): the same loaded record resumed
+    /// with a LARGER token budget draws its scripted turns normally.
+    #[tokio::test]
+    async fn token_budget_resume_below_limit_draws_turns_normally() {
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+
+        let leg1_backend = MockBackend::from_turns(vec![turn_with_usage(
+            vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+            StopReason::ToolUse,
+            usage_with(40, 60),
+        )]);
+        let config_p1 = RunConfig::new("task", 1).with_token_budget(200);
+        let pers = make_persistence(Arc::clone(&store));
+        run_persisted(&leg1_backend, &tools, &ctx, &config_p1, &pers)
+            .await
+            .expect("leg 1 ok");
+
+        let leg2_backend = MockBackend::from_turns(vec![finish_call(
+            "c2",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config_p2 = RunConfig::new("task", 10).with_token_budget(200);
+        let RunResult { outcome, .. } = resume(
+            &leg2_backend,
+            &tools,
+            &ctx,
+            &config_p2,
+            Arc::clone(&store),
+            FIXTURE_RID,
+            ResumeMode::Crash,
+        )
+        .await
+        .expect("resume ok");
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Done { .. })),
+            "a resume armed above the carried-over total must draw its turns \
+             normally; got {outcome:?}"
+        );
+        assert_eq!(
+            leg2_backend.calls(),
+            1,
+            "the scripted turn must have been drawn — 100 carried over < 200 armed"
+        );
+    }
+
+    /// CACHE-TOKEN ACCOUNTING: consumption is the BILLED-TOKEN sum —
+    /// `(input + output + cache_read + cache_write)` per turn. Two turns of
+    /// `usage_with_cache(40, 60, Some(25), Some(5))` = 130 billed tokens per
+    /// turn, so consumed.tokens == 260 — NOT 200 (input + output only).
+    #[tokio::test]
+    async fn token_budget_consumption_counts_cache_tokens_as_billed() {
+        let backend = MockBackend::from_turns(vec![
+            turn_with_usage(
+                vec![tool_call("c1", "echo", serde_json::json!({ "i": 1 }))],
+                StopReason::ToolUse,
+                usage_with_cache(40, 60, Some(25), Some(5)),
+            ),
+            turn_with_usage(
+                vec![tool_call("c2", "echo", serde_json::json!({ "i": 2 }))],
+                StopReason::ToolUse,
+                usage_with_cache(40, 60, Some(25), Some(5)),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("task", 10).with_token_budget(260);
+
+        let store: Arc<dyn RunStore> = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(Arc::clone(&store));
+        let RunResult { outcome, .. } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("no store error");
+        match &outcome {
+            LoopOutcome::BudgetExhausted { summary } => {
+                assert_eq!(summary, "token budget exhausted");
+            }
+            other => panic!(
+                "the cache-counting breach must fire at the top of iteration \
+                 3 (260 == 260); got {other:?}"
+            ),
+        }
+        assert_eq!(backend.calls(), 2);
+
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("record must exist");
+        assert_eq!(
+            record.budgets.consumed.tokens, 260,
+            "consumed.tokens must be (40 + 60 + 25 + 5) × 2 = 260, NOT 200"
+        );
+        assert_eq!(record.budgets.consumed.cost_micros, 0);
+
+        // The BudgetTick events carry the cache-including sums too.
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+        let ticks: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::BudgetTick { consumed, .. } => Some(consumed.tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ticks,
+            vec![130, 260],
+            "each turn's BudgetTick must carry the billed-token sum including cache"
+        );
+    }
+
+    /// The `run_start` `config` object records the per-invocation arm — the
+    /// evidence a reviewer uses on resumes too (`run_start` is emitted once
+    /// per invocation, `resume: true` blocks included).
+    #[tokio::test]
+    async fn run_start_records_the_per_invocation_token_budget_arm() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let armed_t = root_path.join("armed_start.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config = RunConfig::new("t", 1)
+            .with_token_budget(200)
+            .with_transcript(armed_t.clone(), "armed");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&armed_t);
+        assert_eq!(lines[0]["config"]["token_budget"], 200);
+
+        let unarmed_t = root_path.join("unarmed_start.jsonl");
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-done",
+            serde_json::json!({ "disposition": "done", "summary": "s" }),
+        )]);
+        let config = RunConfig::new("t", 1).with_transcript(unarmed_t.clone(), "unarmed");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&unarmed_t);
+        assert_eq!(
+            lines[0]["config"]["token_budget"], 0,
+            "an unarmed run records the 0 (unbounded) default"
         );
     }
 

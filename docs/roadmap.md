@@ -130,11 +130,15 @@ and ergonomics, not the core contract.
 - **Dispatch-scale fixture tier** — to reproduce the *pass-rate* harness gap in-eval. Session 9 shipped the harness-vs-model benchmark and two "hard" fixtures (tokenbucket withheld-test + eventbus multi-file), but glm saturates them under *both* harnesses (`kb-03078`): the gap lives only at genuine dispatch scale (the 18-AC/5-file item), and a withheld-test spec precise enough to grade unambiguously is also easy to implement (precision-to-grade removes the difficulty). Reproducing the gap needs many-file, high-navigation fixtures — a real authoring effort, and the design challenge is difficulty-without-ambiguity.
 - **The cost-gap finding** — Talos vs Claude Code token efficiency at equal quality: **~17× on glm** (`kb-03078`, uncached ollama endpoint) and **~8× raw / ~7.6× billed on sonnet** (`kb-03102`, both harnesses caching the real Anthropic API). A strong, cheap-to-tell result worth a blog writeup — the sharpened story is "harness overhead is real *and survives caching*, but the headline multiple is iteration-sensitive."
 - **Unify runner fixture discovery** — `coding_eval` discovers all 10 fixture dirs (the 4 legacy ones without `task.json` run but without holdout, shown `-`) while `claude_code_eval` runs only the 6 with `task.json`. Either give the 4 legacy fixtures `task.json` + holdout or exclude them from `coding_eval` so the two runners cover the same set.
-- **Token + cost budget caps** — deferred from 0.4.0 (which shipped wall-clock only).
-  Token caps are inscrutable (no human-legible right value per task); cost caps are
-  blocked on a token→price table that doesn't exist (`consumed.cost_micros` is never
-  incremented). Revisit token caps only with a concrete reason; cost caps once pricing
-  is wired.
+- **Token + cost budget caps** — tokens SHIPPED (the cumulative billed-token
+  run budget armed in `RunConfig::token_budget` / `--token-budget`, OFF by
+  default with consumption pinned to `input + output + cache_read +
+  cache_write`; see `docs/design/03-bounded-autonomy.md`'s addendum and the
+  superseded 2026-07-11 "token caps are inscrutable" deferral — a concrete
+  metered consumer supplied the reason the revisit condition asked for). Cost
+  caps are still deferred: blocked on a token→price table that doesn't exist
+  (`consumed.cost_micros` is never incremented), and a compiled rate table's
+  failure mode is going stale silently. Cost caps once pricing is wired.
 - **Streaming/SSE** — cost/latency, not capability; when the live-run volume
   justifies it. (Prompt caching shipped in v0.6.0 — `98fe789`, `kb-03102`.)
 - **The context budget: resolved output cap + in-run compaction — ✅ decided

@@ -63,7 +63,10 @@
 //!   schema — `checks` — the check command display string, or `null` —
 //!   `answer_schema` (the compiled answer-mode result schema VERBATIM, so a
 //!   reader can re-verify any `finish(answer)` verdict off the record; `null`
-//!   in build mode), `wall_clock_secs`, `static_tree_k`, `max_nudges`,
+//!   in build mode), `wall_clock_secs`, `token_budget` (the per-invocation
+//!   token arm, in billed tokens; `0` = unbounded — the per-invocation-arm
+//!   evidence on resumes too, since `run_start` is emitted once per
+//!   invocation), `static_tree_k`, `max_nudges`,
 //!   `max_retries`, `compact_threshold_pct` (the RESOLVED in-run compaction
 //!   trigger threshold in force for the run — the percent of the advertised
 //!   context window at which the previous turn's raw prompt triggers
@@ -82,7 +85,7 @@
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":128000,"max_tokens_source":"table","mode":"build",
 //!              "checks":"cargo test","answer_schema":null,
-//!              "wall_clock_secs":0,"static_tree_k":3,"max_nudges":2,"max_retries":3,
+//!              "wall_clock_secs":0,"token_budget":0,"static_tree_k":3,"max_nudges":2,"max_retries":3,
 //!              "compact_threshold_pct":90}}
 //!   ```
 //!
@@ -363,19 +366,38 @@
 //!   loop iteration, or the post-loop evaluation) BEFORE the terminal
 //!   persistence write, exactly once per breach, on the persisted and
 //!   non-persisted paths alike. Records the decision's inputs so a breach is
-//!   queryable from the transcript alone. Fields: `armed_secs` (the run's
-//!   `config.wall_clock_secs` — the sentinel `0` never reaches this event,
-//!   since an unbounded budget never breaches), `elapsed_secs` (the SAME
-//!   `duration_since(loop_start).as_secs()` value the breach predicate just
-//!   compared — the loop's own decision input, never a fresh writer
-//!   timestamp), `iteration` (`stats.iterations` at the breach site — the
-//!   number of COMPLETED iterations; a top-of-iteration breach therefore
-//!   reports the count before the pass that would have started). A run
-//!   carries at most one `budget_breach` line: the breach is terminal.
+//!   queryable from the transcript alone. The event carries BOTH budget
+//!   variants under the same tag, identified by its field set and by
+//!   `run_end.detail` (no `budget` discriminator key is added):
+//!
+//!   - **wall-clock variant** — fields: `armed_secs` (the run's
+//!     `config.wall_clock_secs` — the sentinel `0` never reaches this event,
+//!     since an unbounded budget never breaches), `elapsed_secs` (the SAME
+//!     `duration_since(loop_start).as_secs()` value the breach predicate
+//!     just compared — the loop's own decision input, never a fresh writer
+//!     timestamp), `iteration` (`stats.iterations` at the breach site — the
+//!     number of COMPLETED iterations; a top-of-iteration breach therefore
+//!     reports the count before the pass that would have started).
+//!   - **token variant** — emitted from the token breach consults (the same
+//!     top-of-loop and post-loop placements, immediately AFTER the
+//!     wall-clock consult). Fields: `armed_tokens` (the run's
+//!     `config.token_budget` — the sentinel `0` never reaches this event
+//!     either, since an unbounded budget never breaches),
+//!     `consumed_tokens` (the SAME whole-run `budget_consumed_now(...).tokens`
+//!     value the breach predicate just compared — carried-over
+//!     `budgets.consumed` plus this invocation's accumulation, never a fresh
+//!     writer timestamp), `iteration` (the same completed-iteration count).
+//!
+//!   A run carries at most one `budget_breach` line: the breach is terminal
+//!   for EITHER variant. When both budgets breach simultaneously the
+//!   wall-clock consult runs first, so the emitted line is the wall-clock
+//!   variant — the token consult never runs.
 //!
 //!   ```json
 //!   {"event":"budget_breach","ts":"2026-09-15T02:25:00Z","elapsed_ms":1500000,
 //!    "armed_secs":1500,"elapsed_secs":1500,"iteration":41}
+//!   {"event":"budget_breach","ts":"2026-09-15T02:25:00Z","elapsed_ms":1500000,
+//!    "armed_tokens":200000,"consumed_tokens":200000,"iteration":41}
 //!   ```
 //!
 //! ## Nested shapes (externally tagged serde)
@@ -467,7 +489,14 @@ use serde_json::{Map, Value};
 /// and `answer_schema_rejection_streak_resets`, plus the `finish_answer.raw`
 /// key on `tool_result`) is ADDITIVE — new keys only, no existing key's
 /// shape changed — so no bump was written for it (the same additive
-/// convention as `run_record.rs`'s `SCHEMA_VERSION`).
+/// convention as `run_record.rs`'s `SCHEMA_VERSION`). The token budget
+/// (the `budget_breach` token variant's `armed_tokens`/`consumed_tokens`/
+/// `iteration` field set, and the `run_start.config.token_budget` key) is
+/// the same additive shape — new keys only, no existing key's shape changed
+/// — so NO bump was written for it either: `budget_breach` already exists
+/// (the token variant is discriminated by field set plus `run_end.detail`,
+/// not by a new tag) and `EVENT_KINDS` is unchanged. [`TRANSCRIPT_VERSION`]
+/// stays 3.
 pub const TRANSCRIPT_VERSION: u32 = 3;
 
 /// The complete, closed set of `"event"` tag values a transcript line can

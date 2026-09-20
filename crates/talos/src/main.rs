@@ -198,6 +198,16 @@
 //! - `TALOS_STATE_RETENTION_DAYS` — optional `u64` days of age-based
 //!   retention for talos's own XDG state dir (`run.sqlite`, `offload/`, and
 //!   opt-in transcripts under `${XDG_STATE_HOME:-$HOME/.local/state}/talos/`).
+//! - `TALOS_TOKEN_BUDGET` — optional `u64` tokens; default `0` (OFF —
+//!   unbounded; the deliberate divergence from the armed
+//!   `TALOS_WALL_CLOCK_SECS` default). Precedence: the `--token-budget`
+//!   flag, then the `TALOS_TOKEN_BUDGET` env, then the compiled default of
+//!   `0`. The budget is CUMULATIVE for the whole run (and across resumes,
+//!   carried over in `budgets.consumed`): the run terminates cleanly
+//!   BETWEEN turns when the billed-token total reaches the limit, and the
+//!   resume caller must re-arm by passing the same value. A non-numeric env
+//!   value falls through silently to `0` (unbounded) — harmless here because
+//!   `0` IS the intended default.
 //!   Precedence: `--state-retention-days` flag > `TALOS_STATE_RETENTION_DAYS`
 //!   env > the compiled default of `30`. `0` disables pruning entirely. This
 //!   is a `talos run` flag only — `talos ralph` does not prune (see
@@ -277,6 +287,19 @@ const DEFAULT_STATE_RETENTION_DAYS: u64 = 30;
 /// exit 20 — under the worst-case worker timeout; a hard kill from outside
 /// loses the work entirely, which is strictly worse.
 const DEFAULT_WALL_CLOCK_SECS: u64 = 1500;
+
+/// Default token budget, in billed tokens, for `talos run`. Precedence:
+/// `--token-budget` flag > `TALOS_TOKEN_BUDGET` env > this default (`0` =
+/// unbounded). See [`resolve_token_budget`].
+///
+/// DELIBERATELY `0` — OFF by default, the mirror-image of the armed
+/// [`DEFAULT_WALL_CLOCK_SECS`]. A prepaid open-weights pool (the production
+/// talos lane) cannot have a cost ceiling: an unspent monthly credit is
+/// wasted, so arming a token budget there only truncates legitimate work. A
+/// metered lane is the opposite — an unattended retry storm at 3am is
+/// precisely the failure a prepaid lane cannot have — so the knob is OFF by
+/// default and armed per-invocation by the caller that needs it.
+const DEFAULT_TOKEN_BUDGET: u64 = 0;
 
 /// Seconds per day, used to convert a retention day-count into a
 /// [`Duration`] for [`prune_state_root`].
@@ -458,6 +481,22 @@ struct RunArgs {
     /// is resolved manually in `main()` via the `env_accessor` closure.
     #[arg(long)]
     wall_clock_secs: Option<u64>,
+
+    /// Token budget for the whole run, in tokens. `0` (the compiled default)
+    /// disables (unbounded).
+    ///
+    /// Consumption is cumulative across the run and across resumes (carried
+    /// over in `budgets.consumed`); the run terminates cleanly between turns
+    /// when the billed-token total reaches the limit, and the resume caller
+    /// must re-arm by passing the same value. Can also be set via the
+    /// environment variable `TALOS_TOKEN_BUDGET` (flag takes precedence over
+    /// env; a non-numeric env value falls through to 0).
+    ///
+    /// Note: the `env` feature is NOT enabled for this project's clap
+    /// dependency, so `#[arg(env = ...)]` cannot be used — the env fallback
+    /// is resolved manually in `main()` via the `env_accessor` closure.
+    #[arg(long)]
+    token_budget: Option<u64>,
 
     /// Opt-in JSONL transcript of every model request/turn, tool call, and
     /// tool result — see [`harness::transcript`]. Default off (no flag = no
@@ -1056,6 +1095,19 @@ fn build_ralph_summary(
 fn resolve_wall_clock_secs(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
     flag.or_else(|| env("TALOS_WALL_CLOCK_SECS").and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(DEFAULT_WALL_CLOCK_SECS)
+}
+
+/// Resolve the `run` token budget: `--token-budget` flag >
+/// `TALOS_TOKEN_BUDGET` env > [`DEFAULT_TOKEN_BUDGET`] (0 = unbounded; OFF
+/// by default — the deliberate divergence from the armed wall-clock
+/// default). The clap `env` feature is NOT enabled, so the env fallback is
+/// resolved manually. Mirrors [`resolve_wall_clock_secs`]'s silent
+/// fall-through: a NON-NUMERIC env value lands on 0 (unbounded) without
+/// erroring — harmless here because 0 IS the intended default, whereas the
+/// wall-clock resolver's silent fall-through lands on an armed 1500 s.
+fn resolve_token_budget(flag: Option<u64>, env: &impl Fn(&str) -> Option<String>) -> u64 {
+    flag.or_else(|| env("TALOS_TOKEN_BUDGET").and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(DEFAULT_TOKEN_BUDGET)
 }
 
 /// Resolve the ralph wall-clock budget: `flag > TALOS_RALPH_WALL_CLOCK_SECS
@@ -1824,6 +1876,12 @@ async fn run_cmd(args: RunArgs) {
     // fallback is resolved here via the env_accessor closure.
     let wall_clock_secs = resolve_wall_clock_secs(args.wall_clock_secs, &env_accessor);
 
+    // Resolve the token budget: flag > TALOS_TOKEN_BUDGET env >
+    // DEFAULT_TOKEN_BUDGET (0 = unbounded; OFF by default). The `env` clap
+    // feature is NOT enabled, so the env fallback is resolved here via the
+    // env_accessor closure.
+    let token_budget = resolve_token_budget(args.token_budget, &env_accessor);
+
     // Resolve the compaction trigger threshold: flag > TALOS_COMPACT_THRESHOLD_PCT
     // env > the compiled default. A non-numeric env value is a hard construction
     // error — never a silent fallback (see `resolve_compact_threshold_pct`).
@@ -1855,7 +1913,8 @@ async fn run_cmd(args: RunArgs) {
             let config = with_flagged_max_tokens(
                 RunConfig::new(seed, args.max_iterations)
                     .with_answer_schema(compiled)
-                    .with_wall_clock_secs(wall_clock_secs),
+                    .with_wall_clock_secs(wall_clock_secs)
+                    .with_token_budget(token_budget),
                 args.max_tokens,
             )
             .with_max_nudges(0);
@@ -1874,12 +1933,15 @@ async fn run_cmd(args: RunArgs) {
                 with_flagged_max_tokens(
                     RunConfig::new(seed, args.max_iterations)
                         .with_checks(runner)
-                        .with_wall_clock_secs(wall_clock_secs),
+                        .with_wall_clock_secs(wall_clock_secs)
+                        .with_token_budget(token_budget),
                     args.max_tokens,
                 )
             } else {
                 with_flagged_max_tokens(
-                    RunConfig::new(seed, args.max_iterations).with_wall_clock_secs(wall_clock_secs),
+                    RunConfig::new(seed, args.max_iterations)
+                        .with_wall_clock_secs(wall_clock_secs)
+                        .with_token_budget(token_budget),
                     args.max_tokens,
                 )
             };
@@ -2099,14 +2161,15 @@ async fn run_ralph_cmd(args: RalphArgs) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, DEFAULT_WALL_CLOCK_SECS, MAX_REPORT_NAMES, PruneReport, RalphSummary, RunConfig,
-        RunMode, RunSummary, SECS_PER_DAY, backend_from_env, build_checks_runner,
-        build_ralph_summary, build_run_summary, exit_code, load_answer_schema, make_run_seed,
-        num_ctx_source_for_record, num_ctx_stderr_line, outcome_str, prune_report_json,
-        prune_state_root, ralph_exit_code, ralph_terminal_str, resolve_compact_threshold_pct,
-        resolve_ralph_wall_clock_secs, resolve_state_retention_days, resolve_transcript_path,
-        resolve_wall_clock_secs, stamp_max_tokens, touch_dir_mtime, transcript_label,
-        validate_mode_flags, with_flagged_max_tokens, write_ralph_error_detail,
+        Backend, DEFAULT_TOKEN_BUDGET, DEFAULT_WALL_CLOCK_SECS, MAX_REPORT_NAMES, PruneReport,
+        RalphSummary, RunConfig, RunMode, RunSummary, SECS_PER_DAY, backend_from_env,
+        build_checks_runner, build_ralph_summary, build_run_summary, exit_code, load_answer_schema,
+        make_run_seed, num_ctx_source_for_record, num_ctx_stderr_line, outcome_str,
+        prune_report_json, prune_state_root, ralph_exit_code, ralph_terminal_str,
+        resolve_compact_threshold_pct, resolve_ralph_wall_clock_secs, resolve_state_retention_days,
+        resolve_token_budget, resolve_transcript_path, resolve_wall_clock_secs, stamp_max_tokens,
+        touch_dir_mtime, transcript_label, validate_mode_flags, with_flagged_max_tokens,
+        write_ralph_error_detail,
     };
     use harness::anthropic::AnthropicBackend;
     use harness::bedrock::BedrockBackend;
@@ -3646,6 +3709,52 @@ mod tests {
             resolve_wall_clock_secs(Some(0), &env),
             0,
             "an explicit `--wall-clock-secs 0` disable must beat a numeric env"
+        );
+    }
+
+    // ---- token_budget: flag > TALOS_TOKEN_BUDGET env >
+    // DEFAULT_TOKEN_BUDGET (0 = unbounded; OFF by default) ----------------
+
+    #[test]
+    fn token_budget_flag_beats_env() {
+        let env = env_with(&[("TALOS_TOKEN_BUDGET", "999")]);
+        assert_eq!(
+            resolve_token_budget(Some(42), &env),
+            42,
+            "explicit flag must take precedence over env"
+        );
+    }
+
+    #[test]
+    fn token_budget_env_beats_default() {
+        let env = env_with(&[("TALOS_TOKEN_BUDGET", "200")]);
+        assert_eq!(
+            resolve_token_budget(None, &env),
+            200,
+            "env must beat the compiled default 0"
+        );
+    }
+
+    #[test]
+    fn token_budget_non_numeric_env_falls_through_to_zero() {
+        // A non-u64 env value must not panic — it falls through silently to
+        // 0 (unbounded), harmless here because 0 IS the intended default
+        // (the deliberate divergence from the armed wall-clock default).
+        let env = env_with(&[("TALOS_TOKEN_BUDGET", "not-a-number")]);
+        assert_eq!(
+            resolve_token_budget(None, &env),
+            DEFAULT_TOKEN_BUDGET,
+            "invalid env value must fall through to the unbounded default 0"
+        );
+    }
+
+    #[test]
+    fn token_budget_both_unset_yields_zero() {
+        let env = env_with(&[]);
+        assert_eq!(
+            resolve_token_budget(None, &env),
+            0,
+            "both-unset must yield the OFF default 0 (unbounded)"
         );
     }
 

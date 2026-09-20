@@ -390,7 +390,31 @@ pub struct BudgetConsumed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetLimits {
     pub iterations: u32,
+    /// Cumulative token budget for the whole run, in billed tokens. `0` =
+    /// unbounded. Consumption is the BILLED-TOKEN SUM
+    /// `input_tokens + output_tokens + cache_read_tokens +
+    /// cache_write_tokens` (each `Usage` `Option` cache field unwrapped to 0
+    /// at accumulation) — NOT `Usage::input_tokens` alone (the UNCACHED
+    /// REMAINDER: a fully-cached prompt reads near zero) and NOT the
+    /// Anthropic wire sum `input + cache_creation + cache_read` (which omits
+    /// completions entirely). It is a cumulative run budget that terminates
+    /// between turns, never a per-turn output cap. The field records the arm
+    /// of the RECORD-CREATING invocation — resume does not refresh it (the
+    /// per-invocation arm rides `run_start.config.token_budget` and
+    /// `budget_breach.armed_tokens`) — so a reviewer can verify the terminal
+    /// from `limits.tokens` vs `consumed.tokens` without the transcript. No
+    /// `#[serde(default)]` is needed: `tokens` predates `wall_clock_secs` in
+    /// the schema; [`SCHEMA_VERSION`] stays 2, no migration.
     pub tokens: u64,
+    /// Cost in micro-dollars — NEVER incremented: every consumption site
+    /// passes `initial_consumed.cost_micros` through unchanged, and no site
+    /// increments it anywhere. Arming a cost ceiling is DEFERRED: no
+    /// token→price source exists anywhere in this repo, a compiled
+    /// per-model rate table's failure mode is going stale silently (a stale
+    /// rate under-charges a metered lane with no error), and caller-supplied
+    /// rates are a separate config surface. Cost is out of scope until a
+    /// pricing source lands; this field stays hardcoded `0` at the engine's
+    /// construction site.
     pub cost_micros: u64,
     /// Wall-clock budget in seconds. `0` means unbounded. The harness
     /// self-terminates gracefully when elapsed seconds ≥ this value, writing
