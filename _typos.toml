@@ -1,12 +1,15 @@
 # Project vocabulary for the `typos` spell checker. Add real domain terms /
 # proper nouns under extend-words so legitimate identifiers aren't flagged.
 [default]
-# 8-hex-character tokens are the ids we cite constantly in docs: git short SHAs
-# and the leading segment of a GTD item UUID (e.g. `050252ba`, whose trailing
-# `ba` typos reads as a misspelling of `by`/`be`). No English word is eight
-# letters drawn only from a-f, so this ignores ids without weakening prose
-# checking. Shorter SHA prefixes still need an extend-words entry (see `caf`).
-extend-ignore-re = ["\\b[0-9a-f]{8}\\b"]
+# Git short SHAs and GTD item-id prefixes are cited constantly in these docs,
+# and typos reads their trailing letters as misspellings (`050252ba` and
+# `31a07ba` both trip `ba` -> `by`/`be`). Ignore any all-hex token that
+# contains AT LEAST ONE DIGIT: that covers every SHA and id we write at any
+# length, while still spell-checking pure-letter words made of a-f such as
+# `defaced` or `decade`, which a bare `[0-9a-f]{7,}` would silently skip.
+# The digit requirement is expressed positionally because the regex engine
+# has no lookahead.
+extend-ignore-re = ["\\b[0-9a-f]*[0-9][0-9a-f]*\\b"]
 
 [default.extend-words]
 aci = "aci"   # agent-computer interface (Anthropic's term), not a typo of ACPI

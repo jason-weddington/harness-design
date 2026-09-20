@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running `target/release/examples/mined_eval`
+running mined_eval across 1 task(s) (k=1, spec_level=S2, max_iterations=120, agent_gate=on(timeout=900s), test_first=on, wall_clock=unbounded, transcripts=on, compact_threshold_pct=0, state_root=/home/jason/.local/state) against ollama `glm-5.3-flash:cloud` @ https://ollama.com (num_ctx=131072 (explicit OLLAMA_NUM_CTX), think=high)
+
+=== task: agent-gtd-rollout-deadlock (rung_guess=hard) ===
+  dir: /home/jason/git/talos-evals/tasks/agent-gtd-rollout-deadlock
+  agent_gate: uv run --frozen ruff check . && uv run --frozen mypy src/ && uv run --frozen pytest -q
+
+  trial 1: Resolved | claimed=Done | 60 iters | 1161s | fr_armed=true | green_at_exit=true | nudges=0 | tree_dirty=true | static_iters=1 | peak_static=3 | mut_iters=50 | bash_ok=33 | edits_ok=17 | invalid_finish=0 | tests_added=0 | tests_modified=3 | sections=1 | dropped_outside=5 | count_check=on | agent_gate=on(timeout=900s) | gate_post=green | gate_output: /home/jason/.local/state/talos/mined-eval/1789863532-1007361/agent-gtd-rollout-deadlock/trial-0/gate-output.txt | agent_gate_output: /home/jason/.local/state/talos/mined-eval/1789863532-1007361/agent-gtd-rollout-deadlock/trial-0/agent-gate-output.txt | transcript: /home/jason/.local/state/talos/mined-eval/1789863532-1007361/agent-gtd-rollout-deadlock/trial-0/transcript.jsonl
+
+  task summary: resolved 1/1 valid (invalid: 0), false_dones=0
+
+=== SUMMARY (backend=ollama `glm-5.3-flash:cloud` @ https://ollama.com (num_ctx=131072 (explicit OLLAMA_NUM_CTX), think=high), spec_level=S2, max_iterations=120, k=1, static_tree_k=3, max_nudges=2, agent_gate=on(timeout=900s), test_first=on, wall_clock=unbounded) ===
+task                        resolved/val   res_rate  invalid   false_dn   grn_stop  res_unclm   mut_rate  peak_stat  tdd_wrote  claimed_D  mean_iter  cln_nudge      cln_D       ship    res_red    alr_sat  no_chg_rj    cnt_off
+agent-gtd-rollout-deadlock           1/1      1.000        0          0          0          0      0.833          3        0/1          1      60.00          0          0          1          0          0          0          0

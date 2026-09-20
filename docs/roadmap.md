@@ -10,7 +10,21 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.11.0 (2026-09-19)
+## Where we are — v0.12.0 (2026-09-19)
+
+**The context budget is the theme of this release, and the capability it claims is that a turn can no longer be cut short by an arbitrary number.** The per-turn output cap is resolved from the backend and model rather than a compiled 32,768 (`f5a9f60`): Ollama derives it from the context window it was pinned with, Anthropic and Bedrock answer from a published per-model cap, and `--max-tokens` survives as an operator override whose provenance lands on the run record. That constant had killed two dispatch runs mid-plan with 98% of the window still free.
+
+**In-run compaction** ships enabled at a 90% window-fill threshold, Ollama-only, with a knob (`11e8133`, `aacef15`, `ac2cfc3`). Tier 1 tail-truncates reasoning outside a ten-message retention window; tier 2 reversibly elides older tool-result payloads to offload files the agent can read back; the system prompt and the task spec are never touched. Design of record and full measurements: [`docs/design/08-context-budget.md`](./design/08-context-budget.md).
+
+Compaction is **insurance rather than a live need, and that is measured**: replaying the trigger across 54 fleet runs and 3,061 turn transitions, the highest window fill ever observed is 80.1%, so the shipped threshold has never been reachable. The dose-response says occasional compaction is harmless and arguably slightly positive (one firing reclaimed 16,011 tokens and resolved a task in 56 iterations against a control's 60) while continuous compaction is harmful (109 firings, never converged). The harm is compacting *continuously*, which 90% makes unreachable.
+
+**The most useful result was negative and it shapes what to build next.** Every disorientation counter read healthy while the over-forced arm failed, because the counters detect *repetition* and the harm was a *worse path* — the agent probed differently after losing bash results it was still reasoning from. In-run telemetry cannot substitute for a paired arm. Two consequences are live: the elision exclusion list protects only the most recent `run_checks` result while agents routinely run their gate through `bash`, and any future claim that compaction is harmless must come from an A/B.
+
+Three blocking bugs were caught before any of this reached the fleet, each by a different adversarial pass — a trigger that telescoped to a constant (from prose in the design record, implemented faithfully), tier 2 destroying its payload on a failed offload write, and tier 2 never firing at all on Ollama because tool-call ids repeat per turn. The last was found only by an eval-design workflow reasoning about what the backend actually emits; a 13-agent branch review had verified the algorithm and passed it, correctly, because the algorithm was never the problem.
+
+Also this release: the system prompt now states that **the harness owns the commit** (`31a07ba`), closing a failure that destroyed two verified gate-green runs when agents committed their own work and the dispatch worker's redundant commit failed before pushing.
+
+## Previously — v0.11.0 (2026-09-19)
 
 Talos now has **three model backends** — Anthropic, Ollama, and **AWS Bedrock** (`886aa2f`) — so it runs where the Anthropic API isn't reachable (e.g. a work machine). The Bedrock backend drives `aws-sdk-bedrockruntime`'s non-streaming Converse API over the standard AWS credential chain (no keys in code), gated by `TALOS_BEDROCK` (a non-empty value wins over any Anthropic/Ollama env), restricted to haiku-4-5/sonnet-5/opus-4-8. It is **live-verified** against real Bedrock Haiku (`gritmile-bedrock-test`). Also this release: the canonical Sonnet moved to **Sonnet 5** (`ddba2d3`).
 
