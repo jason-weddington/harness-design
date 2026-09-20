@@ -2,6 +2,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.13.0 - 2026-09-20
+#### Features
+- (**engine**) cap consecutive identical answer-schema rejections - (e312f8e) - Jason Weddington, *Claude Opus 5*
+- (**engine**) arm the wall-clock budget by default so a long run terminates cleanly - (ac5d9e3) - Jason Weddington, *Claude Opus 5*
+- (**engine**) let a library consumer supply its own leg-3 change evidence - (046b1f9) - Jason Weddington, *Claude Opus 5*
+- (**publish**) add follower publisher for the macOS talos binary - (2289db3) - Jason Weddington, *Claude Sonnet 5*
+- (**publish**) publish every workspace binary at one token, verify per-file before advancing latest - (cc26f3c) - Jason Weddington, *Claude Opus 5*
+#### Bug Fixes
+- (**engine**) arm finish recovery on observed work, not only on a green in-loop gate - (fd6ebf5) - Jason Weddington, *Claude Opus 5*
+- (**exec**) observe each child repo so leg 3 works on workspace-mode dispatch - (4afb690) - Jason Weddington, *Claude Opus 5*
+#### Documentation
+- a hardcoded fleet host list fails in the quiet direction - (f0a15fa) - Jason Weddington, *Claude Opus 5*
+
+- - -
+
 ## 0.12.0 - 2026-09-20
 #### Features
 - (**engine**) make the compaction trigger threshold a configurable knob - (aacef15) - Jason Weddington, *Claude Opus 5*
