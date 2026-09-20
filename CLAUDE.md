@@ -135,6 +135,12 @@ cargo nextest run --workspace     # fast test runner (the gate)
 cargo test --doc --workspace      # doctests — nextest does NOT run these
 ```
 
+**This workspace ships BINARIES, and a green gate does not prove a binary does anything. Run it.** Before reporting that work on `talos` or `somnus` is done, invoke the actual command a user would invoke and read what comes back. `cargo run -p somnus -- run --project <ref>`, `talos run --help`, whatever the change claims to deliver.
+
+This is not belt-and-braces. On 2026-09-20 a somnus branch merged with the full gate green — 1,189 tests, coverage over the 98% line, a grep confirming no leaked constants, a dropped-server failure test passing — and was reported complete to another session about to write a systemd unit for it. The binary was a deliberate loud stub that exited 1 without doing anything, because one contract was still unpinned. Every check performed was real and every one passed; not one of them touched whether the binary ran. The build agent had done nothing wrong — it made the gap loud on purpose. The reporting was wrong.
+
+The general shape: **a test suite proves the library works, and only running the binary proves the product does.** Those are different claims and the gate can only make the first one. A crate can be fully wired as library code, exhaustively tested, and have a `main` that is a stub — which is often the CORRECT intermediate state, deliberately chosen so an unfinished path fails loudly instead of silently. Read `main.rs` and execute the entry point before you call it shipped.
+
 ## Quality gates (let agents run wild)
 
 Toolchain pinned in `rust-toolchain.toml`. Hooks orchestrated by **lefthook** —
