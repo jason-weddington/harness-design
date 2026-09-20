@@ -105,10 +105,28 @@ pub fn rung1_messages(project_ref: &str, filtered: &LoopInput) -> Vec<Message> {
 }
 
 /// The rung-2 instruction for one cluster, byte-pinned.
+///
+/// The purity sentence is not style advice — it is the cheapest place to
+/// prevent a gate rejection. The map-lint is grammar-agnostic (six purity
+/// regexes plus a length budget; it never parses our section headings or
+/// bullet shapes), so the ONLY thing this model can write that fails the gate
+/// is the CONTENT of a gloss or the orientation prose.
+///
+/// The non-obvious member of that list is `e.g.` — the dotted-identifier rule
+/// is `\b[A-Za-z_]\w*\.[A-Za-z_]\w*`, which is meant to catch dotted code
+/// identifiers and matches any `word.word`, so `e.g.` and `i.e.` trip it. A
+/// model writing prose reaches for those constantly. Probed against the live
+/// lint on 2026-09-20: bare integers pass, `Lives in packages/kb-core` passes
+/// (the path rule requires a leading `/` or `~/`), and backticks, double
+/// quotes, `SCREAMING_SNAKE` tokens and absolute paths all fail.
+///
+/// Rung 2 is one inference per cluster, so a rejected body costs a whole
+/// re-inference against a metered lane. One sentence here is far cheaper than
+/// a 422 round trip per gloss.
 #[must_use]
 pub fn render_rung2_instruction(cluster: &Cluster) -> String {
     format!(
-        "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster {} covering {}. Do not write a map body; code composes bodies.",
+        "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster {} covering {}. Do not write a map body; code composes bodies. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
         cluster.label,
         cluster.member_entry_ids.join(", ")
     )
@@ -488,7 +506,20 @@ mod tests {
         };
         assert_eq!(
             render_rung2_instruction(&cluster),
-            "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster wireguard-and-dns covering kb-10001, kb-10002. Do not write a map body; code composes bodies."
+            "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster wireguard-and-dns covering kb-10001, kb-10002. Do not write a map body; code composes bodies. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'."
+        );
+
+        // The purity sentence is load-bearing, not decorative: it is the only
+        // guard against the model writing a gloss the map-lint rejects, and
+        // `e.g.` is the member of the list nobody predicts — the
+        // dotted-identifier rule matches any `word.word`. Assert the two
+        // highest-traffic tokens explicitly so a future edit that "tightens"
+        // the wording cannot silently drop them.
+        let rendered = render_rung2_instruction(&cluster);
+        assert!(rendered.contains("e.g."), "the e.g. warning must survive");
+        assert!(
+            rendered.contains("no backticks"),
+            "the backtick warning must survive"
         );
     }
 
