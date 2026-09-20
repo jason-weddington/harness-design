@@ -14849,6 +14849,149 @@ mod tests {
         assert_eq!(stats.modified_workspace_rejections, 0);
     }
 
+    // ---- workspace mode: multi-repo root restores leg 3 -------------------
+
+    /// The workspace-mode fixture: a bare (NOT `git init`'d) root containing
+    /// two seeded child repos. `git_ctx` cannot be used here — it `git init`s
+    /// the root, which would make this a single-repo fixture — so the ctx is
+    /// built exactly as `unobservable_baseline_warns_and_still_records_the_
+    /// baseline_in_run_start` builds it, and `git_in` seeds only the children.
+    fn workspace_mode_ctx(root: &std::path::Path) -> ToolCtx {
+        for name in ["a-repo", "b-repo"] {
+            let child = root.join(name);
+            std::fs::create_dir(&child).expect("child dir");
+            git_in(&child, &["init", "-q"]);
+            std::fs::write(child.join("seed.txt"), "seed\n").expect("write seed");
+            git_in(&child, &["add", "."]);
+            git_in(&child, &["commit", "-qm", "seed"]);
+        }
+        let workspace = Workspace::new(root, None).expect("workspace");
+        ToolCtx::new(Arc::new(workspace), Arc::new(crate::tool::StubOffloadSink))
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_multi_repo_edit_is_accepted_with_tree_changed() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        // Pin the workspace-mode precondition: the root really is NOT a git
+        // work tree — the tree was Unobservable here before the child scan.
+        let probe = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&root_path)
+            .output()
+            .expect("git runs");
+        assert!(
+            !probe.status.success(),
+            "the workspace-mode fixture requires a non-git root"
+        );
+
+        let ctx = workspace_mode_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("t.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "a-repo/new.txt",
+                        "old_string": "",
+                        "new_string": "added\n"
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-done",
+                serde_json::json!({ "disposition": "done", "summary": "added a-repo/new.txt" }),
+            ),
+        ]);
+        let config =
+            RunConfig::new("add the file", 5).with_transcript(transcript.clone(), "ws-leg3");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Done { change, .. }) => {
+                assert_eq!(
+                    change,
+                    ChangeEvidence::TreeChanged,
+                    "the child-scan observation must restore leg 3 in workspace mode"
+                );
+            }
+            other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
+        }
+        assert!(!stats.tree_baseline_unobservable);
+        assert_eq!(stats.no_change_rejections, 0);
+
+        let lines = read_transcript_lines(&transcript);
+        assert_eq!(lines[0]["event"], "run_start");
+        assert!(
+            lines[0]["tree_baseline"]["Observed"].is_object(),
+            "run_start must carry the combined OBSERVED baseline, not Unobservable: {}",
+            lines[0]
+        );
+        let tool_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert_eq!(tool_result["finish_accepted"], true);
+        assert_eq!(
+            tool_result["finish_change"],
+            serde_json::json!("TreeChanged")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_no_op_run_is_rejected_no_change_not_fail_open() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = workspace_mode_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("t.jsonl");
+        // A SINGLE finish turn: a second draw would over-draw MockBackend
+        // into a terminal BackendError (see test_support.rs).
+        let backend = MockBackend::from_turns(vec![finish_call(
+            "c-bare",
+            serde_json::json!({ "disposition": "done", "summary": "nothing" }),
+        )]);
+        let config =
+            RunConfig::new("do the work", 1).with_transcript(transcript.clone(), "ws-leg3-noop");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::MaxIterations),
+            "a workspace-mode no-op run that today passes leg 3 by fail-open must \
+             now fail it loudly; got {outcome:?}"
+        );
+        assert_eq!(stats.no_change_rejections, 1);
+        assert!(!stats.tree_baseline_unobservable);
+
+        let lines = read_transcript_lines(&transcript);
+        let tool_result = lines
+            .iter()
+            .rfind(|l| l["event"] == "tool_result")
+            .expect("a tool_result event");
+        assert_eq!(tool_result["is_error"], true);
+        assert_eq!(
+            tool_result["content"],
+            serde_json::json!(no_change_rejection_content()),
+            "the fed-back result is the pinned no-change rejection — with \
+             `max_iterations == 1` there is no further `turn` call, so the \
+             transcript (not `last_messages`) carries it"
+        );
+        assert_eq!(tool_result["finish_accepted"], false);
+        assert_eq!(
+            tool_result["finish_change"],
+            serde_json::json!("TreeUnchanged"),
+            "the rejected no-op classifies TreeUnchanged, NOT TreeChanged"
+        );
+        assert_eq!(tool_result["finish_rejection"], "no_change");
+        assert!(
+            tool_result["tree_current"]["Observed"].is_object(),
+            "the rejection must be queryable from the transcript alone: {tool_result}"
+        );
+    }
+
     /// AC-22. The tripwire names the invariant that actually went inert —
     /// the two modes enforce OPPOSITE things off the same observation.
     #[test]

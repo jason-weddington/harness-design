@@ -395,19 +395,6 @@ impl ChangeObserver for GitTreeObserver {
     }
 }
 
-/// Observe the git work tree rooted at `root`, bounded by `timeout`.
-///
-/// The result is `Unobservable` **iff** the `git status --porcelain`
-/// invocation did not exit 0 (non-zero, spawn failure, or timeout).
-///
-/// `head` is `None` for **both** an unborn `HEAD` and a failed or timed-out
-/// `git rev-parse HEAD` — deliberately indistinguishable, because the
-/// resulting `None` ↔ `Some` transition reads as
-/// [`ChangeEvidence::TreeChanged`] in [`classify_change`] and therefore fails
-/// **open** rather than producing a spurious rejection.
-///
-/// `timeout` is a parameter rather than a read of [`TREE_OBSERVE_TIMEOUT`] so
-/// `ralph` can keep its own, longer git bound while sharing this primitive.
 /// Build the [`TreeObservation::Unobservable`] reason for a failed
 /// `git status --porcelain`, truncated to [`TREE_REASON_CAP`] characters.
 ///
@@ -433,6 +420,43 @@ fn unobservable_reason(status: &ExecOutcome, timeout: Duration) -> String {
     reason.chars().take(TREE_REASON_CAP).collect()
 }
 
+/// Observe the tree rooted at `root`, bounded by `timeout`.
+///
+/// The FIRST action is always the root `git status --porcelain`, which picks
+/// the branch:
+///
+/// - **exit 0** — the root is a work tree. The result is the single-repo
+///   [`TreeObservation::Observed`]: trimmed porcelain, plus
+///   `git rev-parse HEAD`. `head` is `None` for **both** an unborn `HEAD`
+///   and a failed or timed-out `git rev-parse HEAD` — deliberately
+///   indistinguishable, because the `None` ↔ `Some` transition reads as
+///   [`ChangeEvidence::TreeChanged`] in [`classify_change`] and therefore
+///   fails **open** rather than producing a spurious rejection. Children are
+///   NEVER scanned (this is also the behavior when a PARENT of `root` is a
+///   repo and `root`'s own status exits 0).
+/// - **non-zero AND a `.git` entry at `root`** (file or directory) — the
+///   root is repo-shaped but unreadable (broken `gitdir:` file, `git`
+///   missing, timeout): today's [`TreeObservation::Unobservable`] with
+///   [`unobservable_reason`]. The child scan NEVER runs.
+/// - **non-zero AND no `.git` entry at `root`** — a multi-repo workspace
+///   root. The immediate (depth-1) child directories that each carry a
+///   `.git` entry are observed through [`observe_single_repo`] with the SAME
+///   `timeout`, sorted by file name, and combined by
+///   [`combine_child_observations`]: any unobservable child makes the
+///   combination [`TreeObservation::Unobservable`], otherwise the porcelain
+///   is per-child `<name>/`-prefixed lines and the head is per-child
+///   `<name> <head|none>` lines. When at least one child qualifies, exactly
+///   one stderr warning names the discarded root reason and the child list,
+///   so the branch taken is observable even when the combined result looks
+///   clean.
+/// - **non-zero and NO qualifying child** — byte-identical fallback to
+///   [`unobservable_reason`]: genuinely nothing was observable, the same
+///   fail-open as ever.
+///
+/// `timeout` is a parameter rather than a read of [`TREE_OBSERVE_TIMEOUT`]
+/// so `ralph` can keep its own, longer git bound while sharing this
+/// primitive; it applies **per repository**, so a multi-repo workspace costs
+/// at most one timeout per child, never per workspace.
 pub async fn observe_tree(root: &Path, timeout: Duration) -> TreeObservation {
     let status = run(&ExecSpec {
         program: "git".to_string(),
@@ -443,16 +467,114 @@ pub async fn observe_tree(root: &Path, timeout: Duration) -> TreeObservation {
     })
     .await;
 
-    if status.exit_code != Some(0) {
+    if status.exit_code == Some(0) {
+        return observe_head(root, timeout, status).await;
+    }
+
+    // Repo-shaped root (has a `.git` entry, so worktree and submodule
+    // checkouts count too) whose status failed: this is a single-repo
+    // failure, not a workspace to decompose — never scan children.
+    if has_git_entry(root) {
         return TreeObservation::Unobservable {
             reason: unobservable_reason(&status, timeout),
         };
     }
 
+    // Non-repo root: a multi-repo workspace. Observe each depth-1 child
+    // that is itself a repository.
+    let names = discover_child_repos(root);
+    if names.is_empty() {
+        return TreeObservation::Unobservable {
+            reason: unobservable_reason(&status, timeout),
+        };
+    }
+
+    let mut children = Vec::with_capacity(names.len());
+    for name in &names {
+        let observation = observe_single_repo(&root.join(name), timeout).await;
+        children.push((name.clone(), observation));
+    }
+    eprintln!(
+        "{}",
+        child_scan_warning(&unobservable_reason(&status, timeout), &names)
+    );
+    combine_child_observations(&children)
+}
+
+/// Whether `dir` directly contains a `.git` entry — file or directory, the
+/// same pure check that qualifies a child (worktrees and submodules carry a
+/// `gitdir:` FILE).
+fn has_git_entry(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// The stderr warning printed when a non-repo root's failed
+/// `git status --porcelain` is replaced by a depth-1 child scan: the branch
+/// taken, the discarded root reason, and the discovered child list stay
+/// observable even when the combined result is a clean-looking
+/// [`TreeObservation::Observed`]. Pure so the exact wording is unit-pinned.
+fn child_scan_warning(reason: &str, names: &[String]) -> String {
+    format!(
+        "warning: root git status failed ({reason}); observing {} child repos: {}",
+        names.len(),
+        names.join(", ")
+    )
+}
+
+/// The immediate (depth-1) child directories of `root` that are git
+/// repositories or worktrees, sorted by file name in byte order.
+///
+/// A child qualifies iff `Path::is_dir()` is true (symlinks to directories
+/// count) AND it directly contains an entry named `.git` — file or
+/// directory, so `git worktree add` checkouts and submodule checkouts
+/// qualify alongside plain clones. No recursion: grandchildren are never
+/// considered.
+fn discover_child_repos(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && has_git_entry(&path) {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Observe ONE child repository: the status + rev-parse body shared with a
+/// successful [`observe_tree`] root observation, factored out so
+/// [`observe_tree`]'s multi-repo branch can invoke it per child. A child
+/// whose status fails is simply [`TreeObservation::Unobservable`] — it is
+/// never re-scanned one level deeper.
+async fn observe_single_repo(dir: &Path, timeout: Duration) -> TreeObservation {
+    let status = run(&ExecSpec {
+        program: "git".to_string(),
+        args: vec!["status".to_string(), "--porcelain".to_string()],
+        cwd: dir.to_path_buf(),
+        timeout,
+        extra_env: Vec::new(),
+    })
+    .await;
+
+    if status.exit_code != Some(0) {
+        return TreeObservation::Unobservable {
+            reason: unobservable_reason(&status, timeout),
+        };
+    }
+    observe_head(dir, timeout, status).await
+}
+
+/// The rev-parse half of a successful single-repo observation: `head` is
+/// `None` for both an unborn `HEAD` and a failed or timed-out
+/// `git rev-parse HEAD`, and the porcelain is the status stdout trimmed.
+async fn observe_head(dir: &Path, timeout: Duration, status: ExecOutcome) -> TreeObservation {
     let head_outcome = run(&ExecSpec {
         program: "git".to_string(),
         args: vec!["rev-parse".to_string(), "HEAD".to_string()],
-        cwd: root.to_path_buf(),
+        cwd: dir.to_path_buf(),
         timeout,
         extra_env: Vec::new(),
     })
@@ -466,6 +588,66 @@ pub async fn observe_tree(root: &Path, timeout: Duration) -> TreeObservation {
     TreeObservation::Observed {
         porcelain: status.stdout.trim().to_string(),
         head,
+    }
+}
+
+/// Combine the sorted `(name, observation)` pairs of a multi-repo workspace
+/// into ONE [`TreeObservation`], the shape [`classify_change`] already
+/// understands.
+///
+/// - **any child `Unobservable`** — the combination is
+///   [`TreeObservation::Unobservable`] with the FIRST failing child in
+///   sorted order, reason `"<name>: <child reason>"`, truncated to
+///   [`TREE_REASON_CAP`] characters **after** prefixing. An unreadable repo
+///   must never let an uncertain workspace read clean.
+/// - **all children `Observed`** — the porcelain is each child's porcelain
+///   lines prefixed with `"<name>/"`, joined with `'\n'` and trimmed (an
+///   all-clean set yields the empty string, matching a clean single repo);
+///   `head` is `Some` with one `"<name> <head|none>"` line per child. Heads
+///   MUST be encoded — `git status --porcelain` does not show commits, so
+///   only the head line catches committed-only work in a child.
+fn combine_child_observations(children: &[(String, TreeObservation)]) -> TreeObservation {
+    if let Some((name, TreeObservation::Unobservable { reason })) = children
+        .iter()
+        .find(|(_, o)| matches!(o, TreeObservation::Unobservable { .. }))
+    {
+        debug_assert!(
+            children
+                .iter()
+                .take_while(|(child_name, _)| child_name != name)
+                .all(|(_, o)| matches!(o, TreeObservation::Observed { .. })),
+            "the named child must be the FIRST Unobservable in sorted order"
+        );
+        let prefixed = format!("{name}: {reason}");
+        return TreeObservation::Unobservable {
+            reason: prefixed.chars().take(TREE_REASON_CAP).collect(),
+        };
+    }
+
+    debug_assert!(
+        children
+            .iter()
+            .all(|(_, o)| matches!(o, TreeObservation::Observed { .. })),
+        "the Observed branch must only run when no child was Unobservable"
+    );
+    let mut porcelain_lines = Vec::new();
+    let mut head_lines = Vec::new();
+    for (name, observation) in children {
+        let TreeObservation::Observed { porcelain, head } = observation else {
+            continue;
+        };
+        // A clean child contributes NO porcelain lines — an empty porcelain
+        // must not degenerate into a bare `"<name>/"` line.
+        if !porcelain.is_empty() {
+            for line in porcelain.split('\n') {
+                porcelain_lines.push(format!("{name}/{line}"));
+            }
+        }
+        head_lines.push(format!("{name} {}", head.as_deref().unwrap_or("none")));
+    }
+    TreeObservation::Observed {
+        porcelain: porcelain_lines.join("\n").trim().to_string(),
+        head: Some(head_lines.join("\n")),
     }
 }
 
@@ -968,6 +1150,22 @@ mod tests {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            // Git exports these into every hook process, so a test that shells
+            // out to `git` inherits them when the suite runs from a pre-commit
+            // hook and not when it runs directly. That difference is invisible
+            // until it bites: `GIT_INDEX_FILE` arrives as the RELATIVE path
+            // `.git/index`, `git worktree add` then resolves it inside the new
+            // worktree — whose `.git` is a FILE, not a directory — and the
+            // command dies with `index file open failed: Not a directory`.
+            // The suite passed the dispatch host's `gate_command` (run
+            // directly) and failed the identical command under `lefthook`.
+            // Clear the ambient repo pointers so these fixtures always describe
+            // their own temp repos.
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_PREFIX")
+            .env_remove("GIT_COMMON_DIR")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1210,5 +1408,505 @@ mod tests {
 
         assert_eq!(GitTreeObserver.label(), "git");
         assert_eq!(Unlabeled.label(), "custom");
+    }
+
+    // ---- multi-repo workspace observation (combined child repos) ----------
+
+    #[test]
+    fn combine_children_prefixes_porcelain_lines_and_joins_heads() {
+        let children = vec![
+            ("cleanr".to_string(), observed("?? c.txt", Some("cafe"))),
+            ("photoqueue".to_string(), observed(" M src/x.py", None)),
+        ];
+        let combined = super::combine_child_observations(&children);
+        assert_eq!(
+            combined,
+            observed(
+                "cleanr/?? c.txt\nphotoqueue/ M src/x.py",
+                Some("cleanr cafe\nphotoqueue none"),
+            ),
+            "porcelain lines carry a `{{name}}/` prefix (the leading space of a \
+             modified entry survives) and heads are encoded `{{name}} <head|none>` \
+             because `git status --porcelain` does not show commits"
+        );
+    }
+
+    #[test]
+    fn combine_children_all_clean_yields_empty_porcelain_but_joined_head() {
+        let children = vec![
+            ("a".to_string(), observed("", Some("aa"))),
+            ("b".to_string(), observed("", Some("bb"))),
+        ];
+        let combined = super::combine_child_observations(&children);
+        assert_eq!(
+            combined,
+            observed("", Some("a aa\nb bb")),
+            "EMPTY porcelain but NON-EMPTY joined head — the joined head is the \
+             only signal a committed-only change can ride on"
+        );
+    }
+
+    #[test]
+    fn combine_children_first_unobservable_is_prefixed_then_capped() {
+        let long_reason = "r".repeat(300);
+        let children = vec![
+            ("observed".to_string(), observed("?? x", Some("h"))),
+            ("longchild".to_string(), unobservable(&long_reason)),
+        ];
+        let combined = super::combine_child_observations(&children);
+        match combined {
+            TreeObservation::Unobservable { reason } => {
+                assert_eq!(reason.chars().count(), super::TREE_REASON_CAP);
+                assert!(
+                    reason.starts_with("longchild: "),
+                    "the cap applies to the FINAL prefixed string; got {reason:?}"
+                );
+            }
+            other @ TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn combine_children_mixed_observability_is_unobservable_in_sorted_order() {
+        // `a` sorts first and IS observed-and-changed; `b` could not be
+        // observed. The first FAILING child in sorted order names the reason —
+        // an unreadable repo must not let an uncertain workspace read clean.
+        let children = vec![
+            ("a".to_string(), observed("?? new", Some("a"))),
+            ("b".to_string(), unobservable("r")),
+        ];
+        let combined = super::combine_child_observations(&children);
+        assert_eq!(combined, unobservable("b: r"));
+        assert_eq!(
+            classify_change(&combined, &combined),
+            ChangeEvidence::Unobservable {
+                reason: "b: r".to_string()
+            },
+            "an uncertain workspace must never classify TreeChanged or TreeUnchanged"
+        );
+    }
+
+    #[test]
+    fn combined_children_cancel_pre_existing_dirt_baseline_relatively() {
+        // Child `b` carries the SAME untracked entry at baseline and at exit
+        // (pre-existing dirt cancels); the two runs differ only in child `a`.
+        let baseline_children = vec![
+            ("a".to_string(), observed("", Some("a"))),
+            ("b".to_string(), observed("?? pre-existing", Some("b"))),
+        ];
+        let baseline = super::combine_child_observations(&baseline_children);
+
+        // (i) a run that adds a NEW untracked file only in `a` changed.
+        let changed_children = vec![
+            ("a".to_string(), observed("?? new", Some("a"))),
+            ("b".to_string(), observed("?? pre-existing", Some("b"))),
+        ];
+        let changed = super::combine_child_observations(&changed_children);
+        assert_eq!(
+            classify_change(&baseline, &changed),
+            ChangeEvidence::TreeChanged
+        );
+
+        // (ii) a run that touches nothing in any child did not.
+        assert_eq!(
+            classify_change(&baseline, &baseline),
+            ChangeEvidence::TreeUnchanged
+        );
+    }
+
+    /// Pins the exit-128 reason branch deterministically, the same way
+    /// [`unobservable_reason_timed_out_branch_says_timed_out`] pins the
+    /// timeout branch. The stderr tail is git-version-dependent, which is
+    /// why the live-git tests only assert contains-style.
+    #[test]
+    fn unobservable_reason_exit_128_says_exited_with_trimmed_stderr() {
+        let reason = super::unobservable_reason(
+            &ExecOutcome {
+                exit_code: Some(128),
+                stdout: String::new(),
+                stderr: "fatal: not a git repository (or any of the parent directories): .git\n"
+                    .to_string(),
+                duration: Duration::from_secs(30),
+                timed_out: false,
+            },
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            reason,
+            "git status --porcelain exited Some(128): fatal: not a git \
+             repository (or any of the parent directories): .git"
+        );
+    }
+
+    /// Live-git fallback on a bare non-repo directory: contains-style, the
+    /// same assertion shape as
+    /// [`observe_tree_non_work_tree_is_unobservable`] (the exact stderr tail
+    /// is git-version-dependent).
+    #[tokio::test]
+    async fn observe_tree_bare_non_repo_root_reason_names_the_failed_status() {
+        let dir = tempdir().expect("tempdir");
+        match observe_tree(dir.path(), Duration::from_secs(30)).await {
+            TreeObservation::Unobservable { reason } => {
+                assert!(
+                    reason.contains("git status --porcelain exited"),
+                    "reason was {reason}"
+                );
+                assert!(
+                    reason.contains("fatal: not a git repository"),
+                    "reason was {reason}"
+                );
+            }
+            other @ TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable, got {other:?}")
+            }
+        }
+    }
+
+    /// A repo-shaped root (its OWN status exits 0) keeps today's
+    /// single-repo observation even when it CONTAINS a `.git`-bearing child
+    /// repo: the porcelain is exactly the root's own `git status --porcelain`
+    /// output (no `<child>/`-prefixed child lines) and the head is the
+    /// root's own.
+    #[tokio::test]
+    async fn observe_tree_repo_root_with_child_repo_observes_only_the_root() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "seed"]);
+        let child = root.join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        git(&child, &["init", "-q"]);
+        std::fs::write(child.join("u.txt"), "untracked\n").expect("write");
+
+        // The root's own status, straight from git: the untracked child
+        // directory shows up as `?? child/` — a ROOT line, not a prefixed
+        // child line.
+        let own_status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .expect("git status runs");
+        assert!(own_status.status.success());
+        let own_porcelain = String::from_utf8(own_status.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let own_head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8 sha")
+                .trim()
+                .to_string()
+        };
+
+        match observe_tree(root, Duration::from_secs(30)).await {
+            TreeObservation::Observed { porcelain, head } => {
+                assert_eq!(
+                    porcelain, own_porcelain,
+                    "porcelain must be the root's OWN status: {porcelain:?}"
+                );
+                assert!(
+                    !porcelain.contains("child/?? u.txt"),
+                    "the child's own lines are never merged into a repo-shaped \
+                     root's observation: {porcelain:?}"
+                );
+                assert_eq!(head, Some(own_head), "head is the root's own commit");
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+    }
+
+    /// A repo-shaped root whose git is BROKEN (here: a `.git` file pointing
+    /// at a nonexistent gitdir, exit 128) returns today's `Unobservable`
+    /// with today's reason — the child scan NEVER runs for a repo-shaped
+    /// root, even when a valid child repo sits right there.
+    #[tokio::test]
+    async fn observe_tree_repo_shaped_root_with_broken_git_never_scans_children() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".git"), "gitdir: /nonexistent\n").expect("write .git file");
+        let child = root.join("child");
+        std::fs::create_dir(&child).expect("child dir");
+        git(&child, &["init", "-q"]);
+        std::fs::write(child.join("u.txt"), "untracked\n").expect("write");
+
+        match observe_tree(root, Duration::from_secs(30)).await {
+            TreeObservation::Unobservable { reason } => {
+                assert!(
+                    reason.contains("git status --porcelain exited Some(128)"),
+                    "reason was {reason}"
+                );
+                assert!(
+                    !reason.starts_with("child:"),
+                    "the child scan must not run for a repo-shaped root: {reason:?}"
+                );
+            }
+            other @ TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable, got {other:?}")
+            }
+        }
+    }
+
+    /// A qualifying child that is itself broken is reported with a
+    /// `<name>:`-prefixed reason and is NEVER re-scanned one level deeper:
+    /// `broken/inner/` (a real repo) must not rescue `broken/`'s
+    /// unobservable status.
+    #[tokio::test]
+    async fn observe_tree_broken_child_is_prefixed_and_never_re_scanned_deeper() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let broken = root.join("broken");
+        std::fs::create_dir(&broken).expect("broken dir");
+        std::fs::write(broken.join(".git"), "gitdir: /nonexistent\n").expect("write .git file");
+        let inner = broken.join("inner");
+        std::fs::create_dir(&inner).expect("inner dir");
+        git(&inner, &["init", "-q"]);
+
+        match observe_tree(root, Duration::from_secs(30)).await {
+            TreeObservation::Unobservable { reason } => {
+                assert!(
+                    reason.starts_with("broken: git status --porcelain exited"),
+                    "reason was {reason}"
+                );
+            }
+            other @ TreeObservation::Observed { .. } => {
+                panic!("expected Unobservable, got {other:?}")
+            }
+        }
+    }
+
+    /// The depth-1 scan does not recurse: `outer/` qualifies (its own
+    /// `.git`), `outer/inner/` (also a real repo) is never reached, so the
+    /// combined porcelain has exactly one line and the head is exactly
+    /// `outer <outer's sha>`. Sorting is visible in the same output.
+    #[tokio::test]
+    async fn observe_tree_depth_one_scan_does_not_recurse_into_grandchildren() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let outer = root.join("outer");
+        std::fs::create_dir(&outer).expect("outer dir");
+        git(&outer, &["init", "-q"]);
+        std::fs::write(outer.join("seed.txt"), "seed\n").expect("write");
+        git(&outer, &["add", "."]);
+        git(&outer, &["commit", "-qm", "seed"]);
+        std::fs::write(outer.join("u.txt"), "untracked\n").expect("write");
+        let inner = outer.join("inner");
+        std::fs::create_dir(&inner).expect("inner dir");
+        git(&inner, &["init", "-q"]);
+        std::fs::write(inner.join("v.txt"), "untracked\n").expect("write");
+        // `inner/` must not appear in `outer`'s own porcelain (git would list
+        // the untracked directory), or the exact one-line pin below would
+        // carry a second line mentioning `inner`. Ignore it from `outer`.
+        std::fs::write(outer.join(".gitignore"), "inner/\n").expect("write gitignore");
+        git(&outer, &["add", ".gitignore"]);
+        git(&outer, &["commit", "-qm", "ignore inner"]);
+
+        let outer_head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&outer)
+                .output()
+                .expect("rev-parse runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8 sha")
+                .trim()
+                .to_string()
+        };
+
+        match observe_tree(root, Duration::from_secs(30)).await {
+            TreeObservation::Observed { porcelain, head } => {
+                assert_eq!(
+                    porcelain,
+                    format!("outer/?? u.txt"),
+                    "exactly one depth-1 line; `inner` never scanned"
+                );
+                assert_eq!(
+                    head,
+                    Some(format!("outer {outer_head}")),
+                    "head lines are `<name> <sha>` per observed child"
+                );
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+    }
+
+    /// Committed-only work in one child repo of a multi-repo workspace: BOTH
+    /// porcelains stay empty (each child is clean), so the moved `a <sha>`
+    /// HEAD line alone carries the signal — exactly what `head` catches in a
+    /// single repo today.
+    #[tokio::test]
+    async fn observe_tree_commit_only_change_in_a_child_repo_reads_as_changed() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        for name in ["a", "b"] {
+            let child = root.join(name);
+            std::fs::create_dir(&child).expect("child dir");
+            git(&child, &["init", "-q"]);
+            std::fs::write(child.join("seed.txt"), "seed\n").expect("write");
+            git(&child, &["add", "."]);
+            git(&child, &["commit", "-qm", "seed"]);
+        }
+
+        let baseline = observe_tree(root, Duration::from_secs(30)).await;
+        match &baseline {
+            TreeObservation::Observed { porcelain, head } => {
+                assert!(porcelain.is_empty(), "both children clean: {porcelain:?}");
+                assert!(head.is_some(), "heads must be encoded even when clean");
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+
+        // Commit-ONLY change in `a`: edit the tracked file, `git add .`,
+        // commit. `b` untouched. A throwaway tempdir fixture, never a git
+        // command against the repository working tree.
+        let a_head_before = match &baseline {
+            TreeObservation::Observed { head, .. } => head.clone().expect("baseline head"),
+            TreeObservation::Unobservable { .. } => unreachable!("baseline was observed"),
+        };
+        let child_a = root.join("a");
+        std::fs::write(child_a.join("seed.txt"), "seed\nmore\n").expect("write");
+        git(&child_a, &["add", "."]);
+        git(&child_a, &["commit", "-qm", "work"]);
+
+        let current = observe_tree(root, Duration::from_secs(30)).await;
+        match (&baseline, &current) {
+            (
+                TreeObservation::Observed { porcelain: bp, .. },
+                TreeObservation::Observed {
+                    porcelain: cp,
+                    head,
+                    ..
+                },
+            ) => {
+                assert_eq!(bp, cp, "both porcelains stay empty — heads carry it");
+                assert_ne!(
+                    head,
+                    &Some(a_head_before),
+                    "the `a <sha>` head line must move"
+                );
+            }
+            _ => panic!("expected both sides Observed"),
+        }
+        assert_eq!(
+            classify_change(&baseline, &current),
+            ChangeEvidence::TreeChanged,
+            "the joined-head encoding catches committed work in multi-repo workspaces"
+        );
+    }
+
+    /// The two discovery branches a cheaper implementation most easily
+    /// misses: (i) a SYMLINK to a repo directory outside the root qualifies
+    /// (`Path::is_dir` follows symlinks and the target is never scanned as
+    /// a root child), and (ii) a `git worktree add` checkout qualifies via
+    /// its `.git` FILE while its source repo at depth ≥ 2 does not (depth-1
+    /// only). Combined porcelain and heads are pinned in sorted order.
+    #[tokio::test]
+    async fn observe_tree_discovers_symlink_children_and_worktree_children() {
+        let outside = tempdir().expect("outside tempdir");
+        let target = outside.path().join("real-repo-target");
+        std::fs::create_dir(&target).expect("target dir");
+        git(&target, &["init", "-q"]);
+        std::fs::write(target.join("u.txt"), "untracked\n").expect("write");
+
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::os::unix::fs::symlink(&target, root.join("link")).expect("symlink child");
+
+        // Source repo at depth 2 (`outer/src`): neither `outer` nor anything
+        // else at depth 1 exposes a direct `.git` entry.
+        let src = root.join("outer").join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        git(&src, &["init", "-q"]);
+        std::fs::write(src.join("s.txt"), "seed\n").expect("write");
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-qm", "seed"]);
+        git(
+            &src,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                root.join("wt").to_str().expect("utf8"),
+            ],
+        );
+        std::fs::write(root.join("wt").join("w.txt"), "untracked\n").expect("write");
+        let wt_meta = std::fs::metadata(root.join("wt").join(".git")).expect("worktree .git");
+        assert!(
+            wt_meta.is_file(),
+            "`git worktree add` produces a `gitdir:` FILE, not a directory"
+        );
+
+        match observe_tree(root, Duration::from_secs(30)).await {
+            TreeObservation::Observed { porcelain, head } => {
+                assert_eq!(
+                    porcelain, "link/?? u.txt\nwt/?? w.txt",
+                    "sorted (`link` before `wt`), each line `{{name}}/`-prefixed; \
+                     `outer` (no depth-1 `.git`) never qualifies"
+                );
+                let head = head.expect("heads are encoded");
+                assert!(
+                    head.starts_with("link none\nwt "),
+                    "`link` has no commits (head `none`), `wt` shares the source \
+                     repo's HEAD: {head:?}"
+                );
+            }
+            other @ TreeObservation::Unobservable { .. } => {
+                panic!("expected Observed, got {other:?}")
+            }
+        }
+    }
+
+    /// The depth-1 discovery rule itself, pinned without subprocesses beyond
+    /// the fixture setup: a child qualifies iff it is a directory (symlinks
+    /// to directories count) AND directly contains a `.git` entry (file or
+    /// directory); the result is sorted by file name in byte order.
+    #[test]
+    fn discover_child_repos_is_sorted_and_qualifies_dirs_with_a_git_entry() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::create_dir(root.join("zz-repo")).expect("dir");
+        std::fs::create_dir(root.join("zz-repo").join(".git")).expect("git dir entry");
+        std::fs::create_dir(root.join("aa-repo")).expect("dir");
+        std::fs::write(root.join("aa-repo").join(".git"), "gitdir: elsewhere\n")
+            .expect("git file entry");
+        std::fs::create_dir(root.join("plain")).expect("plain dir, no .git");
+        std::fs::write(root.join("afile"), "not a dir\n").expect("file entry");
+        // A `.git`-bearing child that is itself a FILE does not qualify.
+        std::fs::write(root.join("not-a-dir-with-git"), "x\n").expect("file");
+        // A symlink to a directory counts as a directory.
+        std::os::unix::fs::symlink(root.join("zz-repo"), root.join("mm-link")).expect("symlink");
+
+        let names = super::discover_child_repos(root);
+        assert_eq!(names, vec!["aa-repo", "mm-link", "zz-repo"]);
+    }
+
+    #[test]
+    fn child_scan_warning_names_reason_count_and_sorted_names() {
+        let warning = super::child_scan_warning(
+            "git status --porcelain exited Some(128): fatal: not a git repository",
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(
+            warning,
+            "warning: root git status failed (git status --porcelain exited Some(128): \
+             fatal: not a git repository); observing 2 child repos: a, b"
+        );
     }
 }
