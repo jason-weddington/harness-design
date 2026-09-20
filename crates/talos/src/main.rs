@@ -14,7 +14,7 @@
 //! |------|---------|
 //! | 0    | Task verified Done |
 //! | 10   | Task Blocked |
-//! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` — including `FailureMode::Truncated` (a `max_tokens` cutoff), which rides 20 under `Finished(Failed{..})` |
+//! | 20   | Task Failed, `StoppedWithoutFinish`, `MaxIterations`, or `BudgetExhausted` — including `FailureMode::Truncated` (a `max_tokens` cutoff) and `FailureMode::AnswerSchemaExhausted` (consecutive identical answer-schema rejections), which ride 20 under `Finished(Failed{..})` |
 //! | 30   | Task was already satisfied — gates green, nothing changed; NOT pushable |
 //! | 40   | Task produced a schema-validated Answer; NOT pushable |
 //! | 1    | Harness/infra error (bad spec, `BackendError`, store error, clap error) |
@@ -688,7 +688,7 @@ fn with_flagged_max_tokens(config: RunConfig, v: Option<u32>) -> RunConfig {
 /// |---------|------|
 /// | `Finished(Done{..})` | 0 |
 /// | `Finished(Blocked{..})` | 10 |
-/// | `Finished(Failed{..})` (incl. `FailureMode::Truncated`) | 20 |
+/// | `Finished(Failed{..})` (incl. `FailureMode::Truncated`, `FailureMode::AnswerSchemaExhausted`) | 20 |
 /// | `StoppedWithoutFinish` | 20 |
 /// | `MaxIterations` | 20 |
 /// | `BudgetExhausted` | 20 |
@@ -2521,6 +2521,23 @@ mod tests {
             exit_code(&outcome),
             20,
             "Truncated must ride 20 under Finished(Failed{{..}})"
+        );
+    }
+
+    /// `AnswerSchemaExhausted` rides exit 20 exactly as `Truncated` does —
+    /// through the existing `Finished(Failed{..})` arm; NO new arm exists
+    /// (the map is keyed by `LoopOutcome`, and `AnswerSchemaExhausted` is a
+    /// `FailureMode`).
+    #[test]
+    fn exit_code_answer_schema_exhausted_is_20() {
+        let outcome = LoopOutcome::Finished(Disposition::Failed {
+            mode: FailureMode::AnswerSchemaExhausted,
+            summary: "x".into(),
+        });
+        assert_eq!(
+            exit_code(&outcome),
+            20,
+            "AnswerSchemaExhausted must ride 20 under Finished(Failed{{..}})"
         );
     }
 

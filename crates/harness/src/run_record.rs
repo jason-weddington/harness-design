@@ -560,6 +560,15 @@ pub enum FailureMode {
     /// call; the task is NOT the problem — a config change (raise the cap)
     /// plausibly fixes the retry.
     Truncated,
+    /// The model could not satisfy the configured answer schema across
+    /// `ANSWER_SCHEMA_REJECTION_STREAK_CAP` consecutive rejections with
+    /// identical shown error lists — a broken transport (e.g. a backend
+    /// flattening object tool parameters to JSON text, the kb-03340 incident
+    /// class) or an unsatisfiable schema, NOT a task failure. The run's last
+    /// bounded rejection payload and streak telemetry are on the transcript
+    /// (`run_end.stats`) so the schema or the backend lane can be fixed
+    /// before retrying.
+    AnswerSchemaExhausted,
 }
 
 /// Structured report attached to a disposition — also the eval-case seed
@@ -965,6 +974,7 @@ mod tests {
             FailureMode::StoppedWithoutFinish,
             FailureMode::FinishDiscipline,
             FailureMode::Truncated,
+            FailureMode::AnswerSchemaExhausted,
         ] {
             round_trip(&Disposition::Failed {
                 mode,

@@ -215,7 +215,7 @@
 //!   `finish_answer` is `null` for every non-`answer` claim — INCLUDING a
 //!   build-mode `finish(answer)`, which parses as an unrecognized disposition
 //!   and never reaches the answer path. On an `answer` claim it is
-//!   `{"branch": ..., "errors": [..]}`, where `branch` is one of
+//!   `{"branch": ..., "errors": [..], "raw": ...}`, where `branch` is one of
 //!   `"missing_result"` (no `result` key was supplied), `"invalid"` (a
 //!   `result` was supplied and failed schema validation) or `"valid"` (it
 //!   validated) — or `"invalid_coerced"` / `"valid_coerced"` when the
@@ -226,6 +226,12 @@
 //!   case `finish_accepted` is `false` and `finish_rejection` is
 //!   `"modified_workspace"`. `errors` holds the SAME bounded error list the
 //!   model was shown and is empty on every branch but `"invalid"`.
+//!   `raw` is `null` on `"missing_result"` / `"valid"` / `"valid_coerced"`
+//!   and the bounded PRE-COERCION payload string — the `result` exactly as
+//!   delivered by the backend, serialized and truncated to the same 4,000-char
+//!   bound as the fed-back error content — on `"invalid"` /
+//!   `"invalid_coerced"`, so a reader can tell WHAT ARRIVED (`raw`) from
+//!   WHAT THE COERCER DID (`branch`).
 //!
 //!   ```json
 //!   {"event":"tool_result","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
@@ -293,7 +299,10 @@
 //!   `peak_iters_since_tree_change`, `mutating_iters`, `bash_calls_ok`,
 //!   `edit_file_calls_ok`, `no_change_rejections`,
 //!   `already_satisfied_check_rejections`, `answer_schema_rejections`,
-//!   `modified_workspace_rejections`, `tree_baseline_unobservable`,
+//!   `modified_workspace_rejections`, `last_answer_schema_rejection_raw`,
+//!   `answer_schema_rejection_streak_peak`,
+//!   `answer_schema_rejection_streak_resets`,
+//!   `tree_baseline_unobservable`,
 //!   `compactions`, `highest_compaction_tier`, `compaction_tokens_reclaimed`,
 //!   `tool_results_elided`, `compaction_elided_rereads`,
 //!   `compaction_repeated_calls`, `compaction_orphan_tool_results`,
@@ -321,7 +330,11 @@
 //!             "peak_iters_since_tree_change":0,"mutating_iters":0,"bash_calls_ok":0,
 //!             "edit_file_calls_ok":0,"no_change_rejections":0,
 //!             "already_satisfied_check_rejections":0,"answer_schema_rejections":0,
-//!             "modified_workspace_rejections":0,"tree_baseline_unobservable":false,
+//!             "modified_workspace_rejections":0,
+//!             "last_answer_schema_rejection_raw":null,
+//!             "answer_schema_rejection_streak_peak":0,
+//!             "answer_schema_rejection_streak_resets":0,
+//!             "tree_baseline_unobservable":false,
 //!             "compactions":0,"highest_compaction_tier":0,"compaction_tokens_reclaimed":0,
 //!             "tool_results_elided":0,"compaction_elided_rereads":0,
 //!             "compaction_repeated_calls":0,"compaction_orphan_tool_results":0,
@@ -448,7 +461,13 @@ use serde_json::{Map, Value};
 /// `docs/design/08-context-budget.md`). 3 adds the `budget_breach` event —
 /// emitted from the relocated wall-clock breach sites (top-of-loop and
 /// post-loop) so the breach decision's inputs (`armed_secs`, `elapsed_secs`,
-/// `iteration`) are queryable from the transcript.
+/// `iteration`) are queryable from the transcript. The answer-schema
+/// rejection-streak telemetry (the `run_end.stats` keys
+/// `last_answer_schema_rejection_raw`, `answer_schema_rejection_streak_peak`
+/// and `answer_schema_rejection_streak_resets`, plus the `finish_answer.raw`
+/// key on `tool_result`) is ADDITIVE — new keys only, no existing key's
+/// shape changed — so no bump was written for it (the same additive
+/// convention as `run_record.rs`'s `SCHEMA_VERSION`).
 pub const TRANSCRIPT_VERSION: u32 = 3;
 
 /// The complete, closed set of `"event"` tag values a transcript line can

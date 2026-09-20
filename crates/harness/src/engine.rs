@@ -996,6 +996,33 @@ pub struct RunStats {
     /// answer run bumps NOTHING; it is steering, not evidence. Counted since
     /// THIS loop invocation — a resumed run (`resume`) starts from zero.
     pub modified_workspace_rejections: u32,
+    /// The bounded serialization of the LAST rejected `finish(answer)`
+    /// payload as delivered by the backend (pre-coercion — see
+    /// [`bound_raw_answer_payload`]), via [`AnswerVerdict::raw`]. OVERWRITTEN
+    /// on every `FinishRejection::AnswerSchema` rejection — LAST, not first,
+    /// unlike [`Self::first_invalid_finish_raw`] which latches — so a run
+    /// that died on the schema carries the payload that killed it. NEVER fed
+    /// from `outcome.invalid_raw` (that block bumps
+    /// [`Self::invalid_finish_calls`], and a schema rejection is not a
+    /// malformed call). Counted since THIS loop invocation — a resumed run
+    /// (`resume`, engine.rs:1808) starts from zero.
+    pub last_answer_schema_rejection_raw: Option<String>,
+    /// The maximum consecutive-identical-errors answer-schema rejection
+    /// streak EVER reached this loop invocation (see
+    /// [`ANSWER_SCHEMA_REJECTION_STREAK_CAP`] and
+    /// [`next_answer_schema_streak`]); `0` when the run had no schema
+    /// rejections. This is the tuning datum for the cap's "starting guess"
+    /// doc comment. Counted since THIS loop invocation — a resumed run
+    /// (`resume`, engine.rs:1808) starts from zero.
+    pub answer_schema_rejection_streak_peak: u32,
+    /// Count of VALIDATED-payload streak clears: a `valid`/`valid_coerced`
+    /// [`AnswerVerdict`] branch observed while the streak was non-zero (see
+    /// [`answer_schema_streak_resets`]). Different-error-list restarts are
+    /// deliberately NOT counted here — they are visible on the transcript as
+    /// differing consecutive `finish_answer.errors` entries. Counted since
+    /// THIS loop invocation — a resumed run (`resume`, engine.rs:1808) starts
+    /// from zero.
+    pub answer_schema_rejection_streak_resets: u32,
     /// Whether the run-start tree observation failed, making the leg-3
     /// precondition INERT for this run (it fails open). The inert-detector:
     /// a precondition that silently disabled itself in production would
@@ -1466,6 +1493,20 @@ const ANSWER_SCHEMA_ERRORS_CAP: usize = 4_000;
 /// actually are.
 const ANSWER_SCHEMA_ERRORS_MAX_LINES: usize = 20;
 
+/// Cap on CONSECUTIVE `FinishRejection::AnswerSchema` rejections whose SHOWN
+/// bounded error lists are byte-identical: the same schema errors, fed back
+/// unchanged, more than this many times in a row means the model is not
+/// making progress on the schema, and the loop terminates as
+/// [`FailureMode::AnswerSchemaExhausted`] instead of running to the
+/// iteration cap (the kb-03340 incident: one agent burned 57 iterations and
+/// 6.83M input tokens on identical rejections). `4` is a starting guess, to
+/// be tuned against run data (mirroring [`DEFAULT_STATIC_TREE_K`]'s
+/// honesty); the streak is counted per loop invocation — a resumed run
+/// starts from zero — and a DIFFERENT error list or a validated payload
+/// resets it, so a model revising its answer is never killed by an
+/// accumulated total.
+const ANSWER_SCHEMA_REJECTION_STREAK_CAP: u32 = 4;
+
 /// The `is_error=true` fed-back content for a `finish(answer)` whose `result`
 /// did not validate: the pinned header line plus the (bounded) error lines,
 /// one per line.
@@ -1498,6 +1539,64 @@ fn answer_schema_rejection_content(errors: &[String]) -> String {
         content = format!("{head}…[truncated at {ANSWER_SCHEMA_ERRORS_CAP} chars]");
     }
     content
+}
+
+/// The NEXT value of the answer-schema rejection streak, given the previous
+/// rejection's shown bounded error list (`prev`, `None` on the first
+/// rejection this loop invocation), the current one, and the current streak.
+///
+/// Returns `streak + 1` when `prev` is `Some` and byte-identical to
+/// `current` (same length, element-for-element equal); returns `1` when
+/// `prev` is `None` or the lists differ — a differing list is PROGRESS (the
+/// model changed its payload in response to the fed-back errors), so the
+/// streak restarts rather than accumulating. The comparison uses the SHOWN
+/// bounded list (`AnswerVerdict.errors`, at most
+/// [`ANSWER_SCHEMA_ERRORS_MAX_LINES`] entries) — two payloads whose shown
+/// lists are identical count as identical even if their raw error lists
+/// differ beyond the shown bound.
+fn next_answer_schema_streak(prev: Option<&[String]>, current: &[String], streak: u32) -> u32 {
+    match prev {
+        Some(p) if p.len() == current.len() && p.iter().zip(current).all(|(a, b)| a == b) => {
+            streak + 1
+        }
+        _ => 1,
+    }
+}
+
+/// Whether an `AnswerVerdict` branch CLEARS the answer-schema rejection
+/// streak. Exactly the validated branches: `"valid"` and `"valid_coerced"`.
+///
+/// A `finish(answer)` whose payload VALIDATED clears the streak — this
+/// includes the modified-workspace rejection (`FinishRejection::ModifiedWorkspace`
+/// carries branch `"valid"`/`"valid_coerced"` with an empty error list), and
+/// an accepted `finish(answer)` ends the run and trivially ends the streak.
+/// So a long run that legitimately revises its answer across many iterations
+/// is never killed by an accumulated total. The `"missing_result"`,
+/// `"invalid"`, and `"invalid_coerced"` branches do NOT reset — an
+/// `invalid`/`invalid_coerced` branch ADVANCES the streak (see
+/// [`next_answer_schema_streak`]) and `missing_result` is a malformed call
+/// that touches the streak not at all.
+fn answer_schema_streak_resets(branch: &str) -> bool {
+    matches!(branch, "valid" | "valid_coerced")
+}
+
+/// The bounded serialization of a `finish(answer)` `result` AS DELIVERED by
+/// the backend — captured before [`coerce_stringified_result`] can parse a
+/// stringified payload, so telemetry records what the model actually sent.
+///
+/// `serde_json::to_string` (falling back to `Value`'s `Display`, which cannot
+/// fail, when serialization somehow does), truncated to
+/// [`ANSWER_SCHEMA_ERRORS_CAP`] characters with the same interpolated marker
+/// [`answer_schema_rejection_content`] uses, so one constant governs every
+/// model-facing/telemetry-facing bound on this path.
+fn bound_raw_answer_payload(value: &Value) -> String {
+    let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    if serialized.chars().count() > ANSWER_SCHEMA_ERRORS_CAP {
+        let head: String = serialized.chars().take(ANSWER_SCHEMA_ERRORS_CAP).collect();
+        format!("{head}…[truncated at {ANSWER_SCHEMA_ERRORS_CAP} chars]")
+    } else {
+        serialized
+    }
 }
 
 /// Which rejection a well-formed-but-unaccepted `finish` call produced. Read
@@ -1560,8 +1659,17 @@ struct AnswerVerdict {
     /// before validation (see [`coerce_stringified_result`]).
     branch: &'static str,
     /// The SAME bounded error list the model was shown — empty on every
-    /// branch except `"invalid"`.
+    /// branch except `"invalid"`/`"invalid_coerced"`.
     errors: Vec<String>,
+    /// The bounded serialization of the `result` AS DELIVERED by the backend,
+    /// captured BEFORE [`coerce_stringified_result`] can parse a stringified
+    /// payload — `Some` exactly on the schema-rejected
+    /// `"invalid"`/`"invalid_coerced"` branches, `None` on
+    /// `"missing_result"`/`"valid"`/`"valid_coerced"`. Feeds
+    /// [`RunStats::last_answer_schema_rejection_raw`] and the transcript's
+    /// `finish_answer.raw` (distinguishing what ARRIVED from what the
+    /// coercer did).
+    raw: Option<String>,
 }
 
 /// Recover a `finish(answer)` `result` that a backend delivered as JSON TEXT.
@@ -1923,9 +2031,15 @@ async fn handle_finish_call(
                 outcome.answer = Some(AnswerVerdict {
                     branch: "missing_result",
                     errors: Vec::new(),
+                    raw: None,
                 });
                 return outcome;
             };
+            // Capture the as-delivered payload BEFORE the coercer takes
+            // `result` by value — the only point where what the backend
+            // actually sent is still observable. Bounded here so an enormous
+            // payload cannot blow up the stats field or the transcript.
+            let raw_payload = bound_raw_answer_payload(&result);
             // Ordering is load-bearing: the SCHEMA is answer mode's
             // mechanical verifier, so it runs first and an invalid answer
             // never pays for a gate run.
@@ -1950,6 +2064,7 @@ async fn handle_finish_call(
                         "invalid"
                     },
                     errors: shown,
+                    raw: Some(raw_payload),
                 });
                 return outcome;
             }
@@ -2006,6 +2121,7 @@ async fn handle_finish_call(
                     answer: Some(AnswerVerdict {
                         branch: valid_branch,
                         errors: Vec::new(),
+                        raw: None,
                     }),
                 };
             }
@@ -2024,6 +2140,7 @@ async fn handle_finish_call(
                 answer: Some(AnswerVerdict {
                     branch: valid_branch,
                     errors: Vec::new(),
+                    raw: None,
                 }),
             }
         }
@@ -2170,6 +2287,9 @@ pub async fn run(
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
+        last_answer_schema_rejection_raw: None,
+        answer_schema_rejection_streak_peak: 0,
+        answer_schema_rejection_streak_resets: 0,
         tree_baseline_unobservable: false,
         compactions: 0,
         highest_compaction_tier: 0,
@@ -2254,6 +2374,9 @@ pub async fn run_persisted(
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
+        last_answer_schema_rejection_raw: None,
+        answer_schema_rejection_streak_peak: 0,
+        answer_schema_rejection_streak_resets: 0,
         tree_baseline_unobservable: false,
         compactions: 0,
         highest_compaction_tier: 0,
@@ -2498,6 +2621,9 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "already_satisfied_check_rejections": stats.already_satisfied_check_rejections,
         "answer_schema_rejections": stats.answer_schema_rejections,
         "modified_workspace_rejections": stats.modified_workspace_rejections,
+        "last_answer_schema_rejection_raw": stats.last_answer_schema_rejection_raw,
+        "answer_schema_rejection_streak_peak": stats.answer_schema_rejection_streak_peak,
+        "answer_schema_rejection_streak_resets": stats.answer_schema_rejection_streak_resets,
         "tree_baseline_unobservable": stats.tree_baseline_unobservable,
         "compactions": stats.compactions,
         "highest_compaction_tier": stats.highest_compaction_tier,
@@ -3541,6 +3667,16 @@ async fn run_loop_body(
     let mut nudges_fired: u32 = 0;
     let mut nudge_awaiting_status: bool = false;
     let mut nudge_statuses: Vec<String> = Vec::new();
+    // Consecutive-identical answer-schema rejection streak (see
+    // [`ANSWER_SCHEMA_REJECTION_STREAK_CAP`]). Counted since THIS loop
+    // invocation — a resumed run starts from zero. Cross-iteration BY
+    // CONSTRUCTION: declared here, not beside the per-iteration
+    // `let mut finish` binding, which is re-declared every batch. The
+    // `Option<Vec<String>>` carries the PREVIOUS rejection's shown bounded
+    // error list so [`next_answer_schema_streak`] can compare it against the
+    // current one.
+    let mut answer_schema_streak: u32 = 0;
+    let mut prev_answer_schema_errors: Option<Vec<String>> = None;
 
     // Total prompt tokens of the PREVIOUS turn
     // (`usage.input_tokens + usage.cache_read_tokens.unwrap_or(0)`), or `None`
@@ -4302,6 +4438,53 @@ async fn run_loop_body(
                         stats.first_invalid_finish_raw = Some(raw);
                     }
                 }
+                // ---- answer-schema rejection streak ----
+                // Runs AFTER `finish = outcome.finish;` (which is `None` on
+                // every rejection), so assigning `finish` here on a cap hit
+                // is not clobbered. Uses `outcome.answer` / `outcome.rejection`
+                // — both still readable after the partial moves of
+                // `outcome.result` and `outcome.finish`. The two branches are
+                // mutually exclusive by construction: an `AnswerSchema`
+                // rejection always carries branch `invalid`/`invalid_coerced`
+                // (never a resetting one).
+                if let Some(verdict) = &outcome.answer
+                    && answer_schema_streak_resets(verdict.branch)
+                {
+                    if answer_schema_streak > 0 {
+                        stats.answer_schema_rejection_streak_resets += 1;
+                    }
+                    answer_schema_streak = 0;
+                    prev_answer_schema_errors = None;
+                }
+                if outcome.rejection == Some(FinishRejection::AnswerSchema) {
+                    let verdict = outcome
+                        .answer
+                        .as_ref()
+                        .expect("an AnswerSchema rejection always carries an AnswerVerdict");
+                    stats
+                        .last_answer_schema_rejection_raw
+                        .clone_from(&verdict.raw);
+                    answer_schema_streak = next_answer_schema_streak(
+                        prev_answer_schema_errors.as_deref(),
+                        &verdict.errors,
+                        answer_schema_streak,
+                    );
+                    prev_answer_schema_errors = Some(verdict.errors.clone());
+                    stats.answer_schema_rejection_streak_peak = stats
+                        .answer_schema_rejection_streak_peak
+                        .max(answer_schema_streak);
+                    if answer_schema_streak >= ANSWER_SCHEMA_REJECTION_STREAK_CAP {
+                        finish = Some(Disposition::Failed {
+                            mode: FailureMode::AnswerSchemaExhausted,
+                            summary: format!(
+                                "answer schema rejected {answer_schema_streak} consecutive \
+                                 times with identical errors: {}",
+                                answer_schema_rejection_content(&verdict.errors),
+                            ),
+                        });
+                    }
+                }
+                debug_assert!(answer_schema_streak <= ANSWER_SCHEMA_REJECTION_STREAK_CAP);
             } else {
                 // Non-finish tool call: append ToolCallStarted before invoke,
                 // ToolCallResult after invoke (log-then-snapshot discipline).
@@ -4893,6 +5076,9 @@ pub async fn resume(
         already_satisfied_check_rejections: 0,
         answer_schema_rejections: 0,
         modified_workspace_rejections: 0,
+        last_answer_schema_rejection_raw: None,
+        answer_schema_rejection_streak_peak: 0,
+        answer_schema_rejection_streak_resets: 0,
         tree_baseline_unobservable: false,
         compactions: 0,
         highest_compaction_tier: 0,
@@ -5019,10 +5205,12 @@ mod tests {
         COMPACT_REASONING_TAIL_CHARS, COMPACT_RETENTION_ASSISTANT_MSGS, COMPACT_THRESHOLD_PCT,
         FINISH_TOOL_NAME, FinishClaim, FinishRejection, FinishTool, LoopOutcome, Persistence,
         ResumeError, ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
-        coerce_stringified_result, compact_history, emit_run_end, inert_precondition_warning,
+        answer_schema_streak_resets, bound_raw_answer_payload, coerce_stringified_result,
+        compact_history, emit_run_end, inert_precondition_warning,
         missing_reason_rejection_content, missing_result_rejection_content,
-        modified_workspace_rejection_content, no_change_rejection_content, rejection_content,
-        render_tool_result, resume, retry_delay, run, run_id, run_persisted, should_compact,
+        modified_workspace_rejection_content, next_answer_schema_streak,
+        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
+        run, run_id, run_persisted, should_compact,
     };
     use crate::exec::{
         ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, TreeObservation,
@@ -6594,6 +6782,9 @@ mod tests {
             already_satisfied_check_rejections: 0,
             answer_schema_rejections: 0,
             modified_workspace_rejections: 0,
+            last_answer_schema_rejection_raw: None,
+            answer_schema_rejection_streak_peak: 0,
+            answer_schema_rejection_streak_resets: 0,
             tree_baseline_unobservable: false,
             compactions: 0,
             highest_compaction_tier: 0,
@@ -13177,6 +13368,9 @@ mod tests {
             already_satisfied_check_rejections: 0,
             answer_schema_rejections: 0,
             modified_workspace_rejections: 0,
+            last_answer_schema_rejection_raw: None,
+            answer_schema_rejection_streak_peak: 0,
+            answer_schema_rejection_streak_resets: 0,
             tree_baseline_unobservable: false,
             compactions: 0,
             highest_compaction_tier: 0,
@@ -13950,6 +14144,81 @@ mod tests {
         .expect("the verdict schema compiles")
     }
 
+    // ---- answer-schema rejection streak: pure helpers -------------------
+
+    #[test]
+    fn next_answer_schema_streak_covers_the_four_transitions() {
+        let a = vec!["e1".to_string(), "e2".to_string()];
+        let b = vec!["e1".to_string(), "different".to_string()];
+
+        // First rejection this invocation: prev None → 1, whatever the streak
+        // was before (the loop starts it at 0 every invocation).
+        assert_eq!(next_answer_schema_streak(None, &a, 0), 1);
+        // Same-list increment: byte-identical shown lists → streak + 1.
+        assert_eq!(next_answer_schema_streak(Some(&a), &a, 2), 3);
+        // Different-list restart: the model made progress → 1.
+        assert_eq!(next_answer_schema_streak(Some(&a), &b, 2), 1);
+        // Same-list-from-zero: the first same-list rejection still counts 1.
+        assert_eq!(next_answer_schema_streak(Some(&a), &a, 0), 1);
+    }
+
+    #[test]
+    fn next_answer_schema_streak_compares_the_shown_bounded_list() {
+        // Two payloads whose first ANSWER_SCHEMA_ERRORS_MAX_LINES shown
+        // errors are identical count as identical even if the raw error
+        // lists differ beyond the shown bound — the comparison is over
+        // `AnswerVerdict.errors`, the list the model was shown.
+        let shown: Vec<String> = (0..ANSWER_SCHEMA_ERRORS_MAX_LINES)
+            .map(|i| format!("error {i}"))
+            .collect();
+        assert_eq!(
+            next_answer_schema_streak(Some(&shown), &shown, 3),
+            4,
+            "identical shown lists increment regardless of what was truncated away"
+        );
+        // Length mismatch is a difference even when the common prefix is
+        // byte-identical.
+        let shorter = &shown[..ANSWER_SCHEMA_ERRORS_MAX_LINES - 1];
+        assert_eq!(next_answer_schema_streak(Some(&shown), shorter, 3), 1);
+    }
+
+    #[test]
+    fn answer_schema_streak_resets_enumerates_all_five_branches() {
+        assert!(answer_schema_streak_resets("valid"));
+        assert!(answer_schema_streak_resets("valid_coerced"));
+        assert!(!answer_schema_streak_resets("missing_result"));
+        assert!(!answer_schema_streak_resets("invalid"));
+        assert!(!answer_schema_streak_resets("invalid_coerced"));
+    }
+
+    #[test]
+    fn bound_raw_answer_payload_serializes_short_values_verbatim() {
+        let value = serde_json::json!({ "verdict": "nope" });
+        let expected = serde_json::to_string(&value).expect("serializes");
+        assert_eq!(bound_raw_answer_payload(&value), expected);
+        // A stringified payload is the serialization of the STRING the
+        // backend delivered — the JSON text the model sent, not the parsed
+        // object.
+        let text = serde_json::json!("{\"verdict\": 3}");
+        let expected = serde_json::to_string(&text).expect("serializes");
+        assert_eq!(bound_raw_answer_payload(&text), expected);
+    }
+
+    #[test]
+    fn bound_raw_answer_payload_truncates_at_the_cap_with_the_marker() {
+        let huge = serde_json::json!({ "pad": "x".repeat(ANSWER_SCHEMA_ERRORS_CAP * 2) });
+        let bound = bound_raw_answer_payload(&huge);
+        let head: String = bound.chars().take(ANSWER_SCHEMA_ERRORS_CAP).collect();
+        assert_eq!(
+            bound,
+            format!("{head}…[truncated at {ANSWER_SCHEMA_ERRORS_CAP} chars]")
+        );
+        assert_eq!(
+            bound.chars().count(),
+            ANSWER_SCHEMA_ERRORS_CAP + "…[truncated at 4000 chars]".chars().count()
+        );
+    }
+
     #[test]
     fn answer_schema_compile_rejects_a_non_schema() {
         let err = AnswerSchema::compile(&serde_json::json!({ "type": 12345 }))
@@ -14165,6 +14434,16 @@ mod tests {
         assert_eq!(stats.invalid_finish_calls, 0);
         assert_eq!(stats.no_change_rejections, 0);
         assert_eq!(stats.already_satisfied_check_rejections, 0);
+        // Streak telemetry: the two rejections had DIFFERENT error lists (a
+        // wrong enum value, then a wrong type), so the streak restarted
+        // rather than accumulating — peak 1, never reaching the cap. The
+        // accepted answer then cleared a non-zero streak: one reset.
+        assert_eq!(stats.answer_schema_rejection_streak_peak, 1);
+        assert_eq!(stats.answer_schema_rejection_streak_resets, 1);
+        assert_eq!(
+            stats.last_answer_schema_rejection_raw,
+            Some(serde_json::to_string(&serde_json::json!(7)).expect("serializes"))
+        );
 
         // The counter must reach the DURABLE record, not just RunStats.
         let lines = read_transcript_lines(&transcript);
@@ -14322,6 +14601,397 @@ mod tests {
 
     /// The coercion is narrow: a schema that WANTS a string never sees its
     /// result re-parsed, even when that string happens to be valid JSON.
+    /// AC (a). Four consecutive `finish(answer)` rejections with
+    /// BYTE-IDENTICAL shown error lists terminate the run as
+    /// `Failed { mode: AnswerSchemaExhausted }` on the 4th — the 5th scripted
+    /// turn is never drawn — instead of running to the iteration cap (the
+    /// kb-03340 incident class).
+    #[tokio::test]
+    async fn four_identical_schema_rejections_terminate_as_answer_schema_exhausted() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let bad_answer = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            )
+        };
+        let backend = MockBackend::from_turns(vec![
+            bad_answer("c-b1"),
+            bad_answer("c-b2"),
+            bad_answer("c-b3"),
+            bad_answer("c-b4"),
+            // Never drawn — the cap fires first.
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 10).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Failed { mode, summary }) => {
+                assert_eq!(mode, FailureMode::AnswerSchemaExhausted);
+                assert!(
+                    summary.starts_with(
+                        "answer schema rejected 4 consecutive times with identical errors: "
+                    ),
+                    "the summary carries the streak and the shown error list; got {summary:?}"
+                );
+                assert!(
+                    summary.contains("/verdict"),
+                    "the summary embeds the rendered rejection content; got {summary:?}"
+                );
+            }
+            other => panic!("expected Finished(Failed{{AnswerSchemaExhausted}}); got {other:?}"),
+        }
+        assert_eq!(stats.answer_schema_rejections, 4);
+        // The raw capture does NOT route through `invalid_raw` — a schema
+        // rejection is a well-formed call, not a malformed one.
+        assert_eq!(stats.invalid_finish_calls, 0);
+        assert_eq!(stats.answer_schema_rejection_streak_peak, 4);
+        assert_eq!(stats.answer_schema_rejection_streak_resets, 0);
+        assert_eq!(
+            stats.last_answer_schema_rejection_raw,
+            Some(
+                serde_json::to_string(&serde_json::json!({ "verdict": "nope" }))
+                    .expect("serializes")
+            ),
+            "the LAST rejected `result` as delivered, not the validated shape"
+        );
+        assert_eq!(backend.calls(), 4, "the 5th scripted turn is never drawn");
+    }
+
+    /// AC (b). A DIFFERENT error list restarts the streak — the model is
+    /// making progress — so the identical-error cap never fires across a
+    /// longer rejection history, and a final valid answer still terminates
+    /// the run normally.
+    #[tokio::test]
+    async fn a_different_error_list_restarts_the_streak_and_the_run_survives() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        // A: a payload MISSING `verdict`; B: an out-of-enum `verdict` —
+        // different shown error lists against `verdict_schema()`.
+        let missing = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": {} }),
+            )
+        };
+        let out_of_enum = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "bogus" } }),
+            )
+        };
+        let backend = MockBackend::from_turns(vec![
+            missing("c-a1"),
+            missing("c-a2"),
+            missing("c-a3"),
+            out_of_enum("c-b1"),
+            missing("c-a4"),
+            missing("c-a5"),
+            missing("c-a6"),
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 10).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Answer { .. })),
+            "no early termination; got {outcome:?}"
+        );
+        assert_eq!(stats.answer_schema_rejections, 7);
+        assert_eq!(
+            stats.answer_schema_rejection_streak_peak, 3,
+            "the A,A,A runs never reach the cap; each B restarts the streak"
+        );
+        assert_eq!(
+            stats.answer_schema_rejection_streak_resets, 1,
+            "the final validated answer clears the last non-zero streak"
+        );
+        assert_eq!(backend.calls(), 8, "every scripted turn is drawn");
+    }
+
+    /// AC (c). A VALIDATED payload clears a non-zero streak — a healthy run
+    /// that legitimately revises its answer is never killed by an accumulated
+    /// total.
+    #[tokio::test]
+    async fn a_validated_payload_clears_a_nonzero_streak() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let bad_answer = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            )
+        };
+        let backend = MockBackend::from_turns(vec![
+            bad_answer("c-b1"),
+            bad_answer("c-b2"),
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 5).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Answer { .. })),
+            "got {outcome:?}"
+        );
+        assert_eq!(stats.answer_schema_rejections, 2);
+        assert_eq!(stats.answer_schema_rejection_streak_peak, 2);
+        assert_eq!(stats.answer_schema_rejection_streak_resets, 1);
+        assert_eq!(backend.calls(), 3);
+    }
+
+    /// AC (d). The modified-workspace rejection carries a VALID branch
+    /// (`"valid"`/`"valid_coerced"`), so it RESETS the streak — the only
+    /// rejection kind that does. Identical rejections before and after it
+    /// therefore never accumulate past the cap.
+    #[tokio::test]
+    async fn a_modified_workspace_rejection_resets_the_streak() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        // The transcript lives OUTSIDE the workspace — writing it inside
+        // would itself dirty the tree and confound the rejection.
+        let out = TempDir::new().expect("tempdir");
+        let transcript = out.path().join("t.jsonl");
+
+        let bad_answer = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            )
+        };
+        let backend = MockBackend::from_turns(vec![
+            bad_answer("c-b1"),
+            bad_answer("c-b2"),
+            bad_answer("c-b3"),
+            // Mutates the tree, so the next valid-payload answer is rejected
+            // as ModifiedWorkspace (branch "valid" → streak reset).
+            turn_with(
+                vec![tool_call(
+                    "c-edit",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "scratch.txt",
+                        "old_string": "",
+                        "new_string": "oops\n",
+                    }),
+                )],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c-valid-but-changed",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+            bad_answer("c-b4"),
+            bad_answer("c-b5"),
+            bad_answer("c-b6"),
+            // Accepted: a model-declared failure, NOT the streak cap.
+            finish_call(
+                "c-failed",
+                serde_json::json!({ "disposition": "failed", "summary": "gave up" }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 20)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "streak-reset");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        assert!(
+            matches!(
+                outcome,
+                LoopOutcome::Finished(Disposition::Failed {
+                    mode: FailureMode::Loop,
+                    ..
+                })
+            ),
+            "the modified-workspace reset must prevent AnswerSchemaExhausted; got {outcome:?}"
+        );
+        assert_eq!(stats.answer_schema_rejections, 6);
+        assert_eq!(stats.modified_workspace_rejections, 1);
+        assert_eq!(
+            stats.answer_schema_rejection_streak_peak, 3,
+            "3 before the reset + 3 after; never 6"
+        );
+        assert_eq!(stats.answer_schema_rejection_streak_resets, 1);
+        assert_eq!(
+            backend.calls(),
+            9,
+            "every scripted turn is drawn — no early termination"
+        );
+    }
+
+    /// AC (e). `last_answer_schema_rejection_raw` holds the PRE-COERCION
+    /// payload — the JSON text the model sent, not the parsed object — and
+    /// the transcript's `finish_answer.raw` carries the same string while
+    /// `finish_answer.branch` is `"invalid_coerced"`.
+    #[tokio::test]
+    async fn last_answer_schema_rejection_raw_is_the_pre_coercion_payload() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("raw.jsonl");
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad-text",
+                serde_json::json!({ "disposition": "answer", "result": "{\"verdict\": 3}" }),
+            ),
+            finish_call(
+                "c-ok-text",
+                serde_json::json!({ "disposition": "answer", "result": "{\"verdict\": \"ok\"}" }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 5)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "raw");
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+        assert!(
+            matches!(outcome, LoopOutcome::Finished(Disposition::Answer { .. })),
+            "got {outcome:?}"
+        );
+
+        // The as-delivered `Value::String("{\"verdict\": 3}")` serialized —
+        // short enough not to truncate.
+        let delivered = serde_json::json!("{\"verdict\": 3}");
+        let expected = serde_json::to_string(&delivered).expect("serializes");
+        assert_eq!(
+            stats.last_answer_schema_rejection_raw,
+            Some(expected.clone())
+        );
+        assert_ne!(
+            expected,
+            serde_json::to_string(&serde_json::json!({ "verdict": 3 })).expect("serializes"),
+            "the raw capture is the STRING the backend sent, not the parsed object"
+        );
+
+        let lines = read_transcript_lines(&transcript);
+        let bad = lines
+            .iter()
+            .find(|l| l["event"] == "tool_result" && l["call_id"] == "c-bad-text")
+            .expect("a tool_result for c-bad-text");
+        assert_eq!(bad["finish_answer"]["branch"], "invalid_coerced");
+        assert_eq!(
+            bad["finish_answer"]["raw"],
+            serde_json::Value::String(expected)
+        );
+    }
+
+    /// AC (persisted). The `AnswerSchemaExhausted` terminal is DURABLE: the
+    /// run record's `disposition`, the `DispositionSet` event, the terminal
+    /// checkpoint, the transcript `run_end` disposition, and the new
+    /// `run_end.stats` keys all carry the rejection-streak evidence.
+    #[tokio::test]
+    async fn run_persisted_records_the_answer_schema_exhausted_terminal() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = ToolCtx::stub();
+        let tools = registry_with_finish_and_edit();
+        let transcript = root_path.join("persisted.jsonl");
+
+        let bad_answer = |id: &str| {
+            finish_call(
+                id,
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "nope" } }),
+            )
+        };
+        let backend = MockBackend::from_turns(vec![
+            bad_answer("c-b1"),
+            bad_answer("c-b2"),
+            bad_answer("c-b3"),
+            bad_answer("c-b4"),
+            // Never drawn.
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 10)
+            .with_answer_schema(verdict_schema())
+            .with_transcript(transcript.clone(), "persisted");
+        let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+        let pers = make_persistence(store.clone());
+        let RunResult { outcome: _, stats } = run_persisted(&backend, &tools, &ctx, &config, &pers)
+            .await
+            .expect("run_persisted must succeed");
+        assert_eq!(backend.calls(), 4);
+
+        // The terminal checkpoint carries the disposition.
+        let record = store
+            .load(FIXTURE_RID)
+            .await
+            .expect("load")
+            .expect("a checkpoint");
+        assert!(matches!(
+            record.disposition,
+            Some(Disposition::Failed {
+                mode: FailureMode::AnswerSchemaExhausted,
+                ..
+            })
+        ));
+        // The DispositionSet event was appended to the event log.
+        let events = store.list_events(FIXTURE_RID).await.expect("list events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DispositionSet { disposition, .. }
+                if matches!(disposition, Disposition::Failed {
+                    mode: FailureMode::AnswerSchemaExhausted, ..
+                }))),
+            "a DispositionSet event for the exhausted terminal must be in the log"
+        );
+
+        // The transcript's run_end: outcome Finished, the externally tagged
+        // disposition, and the new stats keys.
+        let lines = read_transcript_lines(&transcript);
+        let run_end = lines
+            .iter()
+            .rfind(|l| l["event"] == "run_end")
+            .expect("a run_end line");
+        assert_eq!(run_end["outcome"], "Finished");
+        assert_eq!(
+            run_end["disposition"]["Failed"]["mode"], "AnswerSchemaExhausted",
+            "the externally tagged serde wire form every other FailureMode uses"
+        );
+        assert!(
+            run_end["disposition"]["Failed"]["summary"]
+                .as_str()
+                .expect("a summary")
+                .starts_with("answer schema rejected 4 consecutive times with identical errors: ")
+        );
+        assert_eq!(run_end["stats"]["answer_schema_rejections"], 4);
+        let delivered =
+            serde_json::to_string(&serde_json::json!({ "verdict": "nope" })).expect("serializes");
+        assert_eq!(
+            run_end["stats"]["last_answer_schema_rejection_raw"],
+            serde_json::Value::String(delivered)
+        );
+        assert_eq!(run_end["stats"]["answer_schema_rejection_streak_peak"], 4);
+        assert_eq!(run_end["stats"]["answer_schema_rejection_streak_resets"], 0);
+        assert_eq!(stats.answer_schema_rejections, 4);
+    }
+
     #[test]
     fn coercion_leaves_a_schema_valid_string_alone() {
         let schema =
