@@ -191,6 +191,23 @@ Two consequences, both load-bearing.
 
 **In-run telemetry cannot substitute for a paired arm.** Compaction's cost is an outcome-level property (did it converge, in how many iterations) and is only visible against a control. A production run has no control, so self-reported counters will always read healthy. Any future claim that compaction is harmless must come from an A/B, not from the counters.
 
+### The dose-response, which is the actual verdict
+
+A third arm at a moderate threshold settles what the first two left ambiguous. Same task, same window, only the trigger moved:
+
+| Threshold | When it fires | Compactions | Resolved | Iterations |
+|---|---|---|---|---|
+| 0 (disabled) | never | 0 | 1/1 | 60 |
+| 25% | once, at iteration 24 | 1 | 1/1 | **56** |
+| 4% | every turn from iteration 12 | 109 | 0/1 | 120 (cap) |
+| 90% (shipped) | never, in all fleet history | — | — | — |
+
+The moderate arm reclaimed 16,011 tokens in a single compaction that elided 13 tool results, and resolved the task in slightly *fewer* iterations than the control — comfortably inside noise, but certainly not harm.
+
+So the harm is not compaction; it is compacting **continuously**. Eliding a result the agent is still actively reasoning from costs it the evidence; eliding a batch of genuinely stale results once, mid-run, costs nothing measurable and buys back real context. The shipped 90% threshold sits so far above the observed ceiling of 80.1% that the pathological regime is not merely avoided, it is unreachable — and the knob means anyone who wants to reach it has to ask for it explicitly.
+
+That is the verdict: **safe as shipped, beneficial when it fires occasionally, harmful only under a setting nothing in production can produce.**
+
 ### Scope of these claims
 
 One trial per arm on one task, and tier-2 deltas under about three trials are noise (`kb-03240`). The forced 4% threshold is also pathological: it compacts from iteration 12 onward on essentially every turn. Production ships at 90%, and the replay over 54 fleet runs and 3,061 turn transitions says that has never once been reachable — peak fill ever observed is 80.1%. So the shipped configuration is inert, and what is measured here is the stress case, not the default.
