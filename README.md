@@ -159,3 +159,22 @@ to the homelab artifact host (`pi-04`); the fleet's `talos-update.sh`
   `.cargo/config.toml`.
 - **Target override.** `TALOS_PUBLISH_HOST` (default `jason@pi-04`) and
   `TALOS_PUBLISH_DIR` (default `/srv/talos`).
+
+### macOS binary
+
+`publish-talos.sh` cannot build for macOS (cross-compiling needs an Apple SDK
+plus a C cross toolchain, and `ring` adds one), so the Mac builds its own. Run
+this ON THE MAC after a Linux publish:
+
+```bash
+./scripts/publish-talos-mac.sh    # build the commit `latest` names -> pi-04:/srv/talos/<TOKEN>/aarch64-apple-darwin/talos
+```
+
+It is a **follower**: it reads `latest`, builds exactly that commit in a
+detached worktree (persistent target dir, so rebuilds are incremental), asserts
+`talos --version` equals the token, and uploads without overwriting. It never
+touches `latest`, and the `latest` invariant stays "both Linux arches present",
+so a Mac that lags never blocks the fleet. `talos-update.sh` ignores the extra
+directory. Interactive machines (the Mac, jason-desktop) install with
+`~/scripts/pull_talos.sh`, which reads the same artifact tree and places the
+binary at `~/.local/bin/talos`.

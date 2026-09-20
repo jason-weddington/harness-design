@@ -183,3 +183,4 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   echo "==> Published $TOKEN to $PUBLISH_DIR: ${BINS[*]} (x86_64 + aarch64)."
 fi
+echo "==> macOS artifact is NOT built here. On the Mac, run: scripts/publish-talos-mac.sh"
