@@ -158,6 +158,43 @@ Concretely: the compaction path is gated on the backend exposing a context limit
 
 The **output cap** is not scoped this way and still covers all three backends, because it is a correctness matter rather than an optimization: the Anthropic API requires `max_tokens` on every request and rejects a value above the model's published ceiling, so removing the shared constant without giving Anthropic and Bedrock a per-model value would break them outright. A small per-model table is enough there.
 
+## Measured (2026-09-19 evening): it is correct, and the telemetry is blind to the harm it was built to find
+
+First real runs, `glm-5.3-flash` on Ollama Cloud, window pinned at 131,072 in every arm so the derived output cap is identical and only the trigger moves.
+
+### What works, and is now evidenced rather than argued
+
+A 120-iteration tier-2 run at a forced 4% threshold produced **109 compactions**, every one reaching tier 2. Across all 109: **zero orphaned tool calls and zero orphaned tool results**, and the message count and block count were unchanged on every single one, so the transcript replay invariant held throughout. That is the strongest available evidence that the adjacency pairing is correct, since id-keyed pairing is precisely what would have mangled this case. 109 tool results were elided and 30,157 tokens reclaimed.
+
+Tier 2 fires at all only because of the call-id fix. Before it, elision was dead code on Ollama.
+
+### The re-derivation risk did not materialise
+
+The worry was that dropping reasoning would make the model re-derive its plan. Measured on the same run: reasoning averaged 590 characters per turn before any compaction and 489 after, a ratio of **0.83**, with 56 of 93 post-compaction turns producing no reasoning at all. It went down, not up.
+
+### But the run got materially worse, and nothing in the telemetry said so
+
+Paired against a control on the same task at the same window with compaction disabled:
+
+| Arm | resolved | iterations | compactions |
+|---|---|---|---|
+| OFF | 1/1 | 60 | 0 |
+| ON, forced 4% | 0/1 | 120 (cap) | 109 |
+
+The control solved the task in 60 iterations. The forced arm never converged. **Every disorientation counter read healthy while that happened**: zero elided re-reads, zero repeated tool calls, reasoning down rather than up.
+
+The mechanism is legible in the tool mix. The forced arm made **one** `edit_file` call across 120 iterations against 112 `bash` calls, and 103 of the 109 elisions were bash results. On a debugging task the accumulated bash output *is* the agent's evidence; eliding it ten assistant messages later destroys its working memory of what it has already established. It then probes *differently* rather than repeating itself — which is why `compaction_repeated_calls` stayed at zero. The counters detect **repetition**; the harm was a **worse path**, and those are not the same thing.
+
+Two consequences, both load-bearing.
+
+**The exclusion list is too narrow.** Only the most recent `run_checks` result is protected. But agents routinely run the gate and their tests through `bash` — that is exactly what caused the finish-recovery disarm found the same evening — so the single most load-bearing evidence in a run is often sitting in a `bash` result with no protection at all.
+
+**In-run telemetry cannot substitute for a paired arm.** Compaction's cost is an outcome-level property (did it converge, in how many iterations) and is only visible against a control. A production run has no control, so self-reported counters will always read healthy. Any future claim that compaction is harmless must come from an A/B, not from the counters.
+
+### Scope of these claims
+
+One trial per arm on one task, and tier-2 deltas under about three trials are noise (`kb-03240`). The forced 4% threshold is also pathological: it compacts from iteration 12 onward on essentially every turn. Production ships at 90%, and the replay over 54 fleet runs and 3,061 turn transitions says that has never once been reachable — peak fill ever observed is 80.1%. So the shipped configuration is inert, and what is measured here is the stress case, not the default.
+
 ## Out of scope
 
 Not built here, and named so nobody re-derives them. Cross-window handoff, which our research notes are emphatic should not lean on compaction — durable artifacts (a progress file, descriptive commits, a checklist with pass flags) are the mechanism, and ralph's fresh-context restart is the pattern-level answer for long objectives. The memory tool. Server-side compaction on the Anthropic backend, which exists as a beta primitive and would give one backend a different shape from the other two. Streaming, which is a separate roadmap item; all three backends are non-streaming today and Anthropic and Ollama set no HTTP timeout at all (`anthropic.rs:84`, `ollama.rs:190`), so large non-streaming responses are slow rather than broken.
