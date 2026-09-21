@@ -76,6 +76,32 @@ pub struct LoopInputEntry {
     /// does NOT constrain the owning map's `project_ref`, so `false` does not
     /// imply an owning map appears in `maps`.
     pub unpointed: bool,
+    /// Coarse directory tokens the server extracted from this entry's FULL
+    /// body, ranked by occurrence, most frequent first.
+    ///
+    /// The server does the extraction because it holds the full text while
+    /// `excerpt` is only `excerpt_chars` long and would miss most mentions.
+    /// It is per ENTRY rather than per cluster of necessity: loop-input is
+    /// assembled once per project and rung 1 invents the clusters afterwards,
+    /// so at assembly time no cluster exists to key anything by.
+    ///
+    /// Counts, not a single token, so code can tell a real plurality from a
+    /// three-way tie and REFUSE the tie — see
+    /// [`crate::materialize::lives_in_value`]. Every token already satisfies
+    /// the map-lint (at most two segments, no dot in a segment, no leading
+    /// slash), so somnus never sanitises one.
+    #[serde(default)]
+    pub directory_tokens: Vec<DirectoryToken>,
+}
+
+/// One coarse directory token from an entry's body, with its occurrence
+/// count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryToken {
+    /// The directory, at most two path segments.
+    pub token: String,
+    /// How many times it occurred in the entry's full body.
+    pub hits: u64,
 }
 
 /// One existing map in the loop-input payload. `body` is the FULL
@@ -146,6 +172,15 @@ pub struct Cluster {
     pub member_entry_ids: Vec<String>,
     /// The existing map that already covers this cluster, if one does.
     pub owning_map_id: Option<String>,
+    /// Why rung 1 ranked this cluster where it did — required of the first
+    /// cluster, optional elsewhere, and never acted on.
+    ///
+    /// Recorded rather than used: the admission rules are mechanical and the
+    /// merit ORDER is what code consumes. This is the model's account of its
+    /// own ranking, kept so that when a night's map turns out to be the wrong
+    /// one, the run report says what the model thought made it the best pick.
+    #[serde(default)]
+    pub merit_reason: Option<String>,
 }
 
 // ===== Pure consumers of the payload ======================================

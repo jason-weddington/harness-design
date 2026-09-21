@@ -43,7 +43,36 @@ pub const SOMNUS_MAX_TOKENS: u32 = 128_000;
 /// plain JSON text (the registry has NO emit-clusters tool, by the same
 /// closed-vocabulary rule that forbids a model-written map body), and code
 /// parses it strictly.
-pub const RUNG1_INSTRUCTION: &str = "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment.";
+///
+/// **The carving rules here came from an 18-agent adversarial review of the
+/// first real run's 14 clusters against the actual entries**, and each one
+/// names a failure that review found. They are ordered by the reviewer's own
+/// merit order, and every one of them is a CONTEXT failure — a thing a
+/// competent model cannot know from the payload alone:
+///
+/// - *One subject per label.* A label joining nouns with an ampersand, slash
+///   or comma is the model reporting its own failed carve: it named the union
+///   instead of re-splitting. Code refuses such a cluster mechanically (see
+///   [`crate::admission::label_names_one_subject`]), so this sentence is the
+///   cheap half of a rule that is enforced either way.
+/// - *Merit order.* Rung 2 is one call per cluster and the write cap is one
+///   new map per project, so SOMETHING has to decide which cluster becomes
+///   tonight's map. Ranking is judgement no rule can compute; admission is
+///   mechanical. This is where the judgement half is asked for.
+/// - *A contiguous run of entry ids is authoring provenance, not a subject.*
+///   The reviewer's sharpest finding: one cluster was exactly a thirty-id
+///   range minus two, which is one planning wave sliced by id — and it is how
+///   a GPU inference pipeline ended up filed under security. Ids correlate
+///   with when things were written, never with what they are about.
+/// - *Never silently dissolve an input pocket.* A mechanical pocket vanished
+///   into a larger cluster with no account given.
+/// - *A cited source is not a subject.* One cluster was named after a code
+///   sample three different clusters cite.
+/// - *Carve by consequence, not only similarity.* Privacy was the project's
+///   only high-concern area by its own entries, with three documented
+///   location-leak vectors, and all of it sat buried in a sixteen-entry
+///   catch-all with no privacy node anywhere in the output.
+pub const RUNG1_INSTRUCTION: &str = "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null, \"merit_reason\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment. How to carve, in order of importance. (1) One subject per label: if you find yourself joining two nouns with an ampersand, a slash or a comma, you have found two clusters, so split them instead of naming the union. (2) Emit the clusters in merit order, the one most worth a new map first, and give that first cluster a merit_reason of one sentence saying why it leads; later clusters may leave merit_reason null. (3) A run of consecutive entry ids is authoring provenance, not a subject area: ids tell you when entries were written, never what they are about, so never let an id range hold a cluster together. (4) If a candidate pocket does not survive as a cluster, say so in the merit_reason of the cluster that absorbed it rather than letting it disappear without account. (5) Do not name a cluster after a source its entries merely cite, because several unrelated clusters may cite the same source. (6) Carve by consequence as well as similarity: a subject the entries treat as high risk or high concern deserves its own cluster even when its entries would otherwise scatter into larger ones.";
 
 /// The synthetic tool-call id that pairs the injected loop-input with its
 /// tool result.
@@ -300,10 +329,15 @@ fn parse_cluster(item: &Value) -> Result<Cluster, String> {
                 .to_string(),
         ),
     };
+    let merit_reason = item
+        .get("merit_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(Cluster {
         label: label.to_string(),
         member_entry_ids,
         owning_map_id,
+        merit_reason,
     })
 }
 
@@ -418,7 +452,7 @@ mod tests {
     fn the_rung1_instruction_is_pinned_in_full() {
         assert_eq!(
             RUNG1_INSTRUCTION,
-            "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment."
+            "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null, \"merit_reason\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment. How to carve, in order of importance. (1) One subject per label: if you find yourself joining two nouns with an ampersand, a slash or a comma, you have found two clusters, so split them instead of naming the union. (2) Emit the clusters in merit order, the one most worth a new map first, and give that first cluster a merit_reason of one sentence saying why it leads; later clusters may leave merit_reason null. (3) A run of consecutive entry ids is authoring provenance, not a subject area: ids tell you when entries were written, never what they are about, so never let an id range hold a cluster together. (4) If a candidate pocket does not survive as a cluster, say so in the merit_reason of the cluster that absorbed it rather than letting it disappear without account. (5) Do not name a cluster after a source its entries merely cite, because several unrelated clusters may cite the same source. (6) Carve by consequence as well as similarity: a subject the entries treat as high risk or high concern deserves its own cluster even when its entries would otherwise scatter into larger ones."
         );
     }
 
@@ -598,6 +632,7 @@ mod tests {
             label: "wireguard-and-dns".to_string(),
             member_entry_ids: vec!["kb-10001".to_string(), "kb-10002".to_string()],
             owning_map_id: Some("kb-20001".to_string()),
+            merit_reason: None,
         };
         assert_eq!(
             render_rung2_instruction(&cluster),
@@ -625,6 +660,7 @@ mod tests {
             label: "backup-drills".to_string(),
             member_entry_ids: vec!["kb-10006".to_string(), "kb-10007".to_string()],
             owning_map_id: None,
+            merit_reason: None,
         };
         let messages = rung2_messages("demo-project", &filtered, &cluster);
         assert_eq!(messages.len(), 3);
@@ -645,11 +681,13 @@ mod tests {
                 label: "a".to_string(),
                 member_entry_ids: vec!["kb-10001".to_string()],
                 owning_map_id: None,
+                merit_reason: None,
             },
             Cluster {
                 label: "b".to_string(),
                 member_entry_ids: vec!["kb-10002".to_string()],
                 owning_map_id: Some("kb-20001".to_string()),
+                merit_reason: None,
             },
         ];
         let backend = MockBackend::from_turns(vec![

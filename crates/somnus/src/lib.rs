@@ -38,6 +38,7 @@
 //! machinery to configure. `SOMNUS_MAX_ITERATIONS` survived and was
 //! repurposed as the per-unit inference budget instead.
 
+pub mod admission;
 pub mod gate;
 pub mod ledger;
 pub mod loop_input;

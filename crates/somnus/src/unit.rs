@@ -201,6 +201,18 @@ pub struct ClusterRecord {
     pub rung2: Rung2Outcome,
     /// Where the cluster's raw turn text was offloaded on a parse error.
     pub raw_path: Option<PathBuf>,
+    /// True when this cluster was FIT to mint but lost tonight's single slot
+    /// to a higher-ranked one.
+    ///
+    /// Load-bearing, not bookkeeping: the pipeline treats an empty op set as
+    /// a decline, and a deferred cluster's op set is empty because CODE
+    /// emptied it. Recording that as a decline would suppress exactly the
+    /// good clusters that were waiting their turn, while the junk that failed
+    /// admission got declined correctly — a bug that would have looked like
+    /// the system working.
+    pub minting_deferred: bool,
+    /// Rung 1's own account of why it ranked this cluster where it did.
+    pub merit_reason: Option<String>,
 }
 
 impl ClusterRecord {
@@ -212,6 +224,7 @@ impl ClusterRecord {
             label: self.label.clone(),
             member_entry_ids: self.member_entry_ids.clone(),
             owning_map_id: self.owning_map_id.clone(),
+            merit_reason: self.merit_reason.clone(),
         }
     }
 }
@@ -756,6 +769,12 @@ async fn run_unit_inner(
     // (7)+(8) Rung 2: one single-shot inference per cluster, budget-checked
     // BEFORE each turn, with a per-cluster parse error skipping that
     // cluster and the run continuing.
+    // Which cluster becomes tonight's one map is decided HERE, before any
+    // rung-2 call, from rung 1's merit order and the mechanical admission
+    // rules. Left to chance it is whichever `create_map` reaches the server
+    // first, and the cap is enforced as a 409 — so array order would pick the
+    // map, in a project that may have no other map to contradict it.
+    let verdicts = crate::admission::judge(&clusters);
     let mut budget_reason: Option<String> = None;
     for (index, cluster) in clusters.iter().enumerate() {
         if report.backend_calls >= u64::from(crate::SOMNUS_MAX_ITERATIONS) {
@@ -779,6 +798,8 @@ async fn run_unit_inner(
             ops: Vec::new(),
             rung2: Rung2Outcome::Parsed,
             raw_path: None,
+            minting_deferred: false,
+            merit_reason: cluster.merit_reason.clone(),
         };
         let rung2_started = std::time::Instant::now();
         let turn = match rung2_turn(deps.backend, project_ref, &filtered, cluster).await {
@@ -807,10 +828,14 @@ async fn run_unit_inner(
                 }
             }
         }
-        // The size floor substitutes a gap for a map the cluster is too thin
-        // to justify, BEFORE the guard below sees the op set — a bad map
-        // cannot be withdrawn, a gap can be acted on.
-        let ops = crate::materialize::enforce_min_cluster_size(cluster, ops);
+        // Admission is applied BEFORE the guard below sees the op set: a bad
+        // map cannot be withdrawn, a gap can be acted on, and a deferral
+        // leaves the cluster free to win tomorrow.
+        let verdict = verdicts
+            .get(index)
+            .cloned()
+            .unwrap_or(crate::admission::Verdict::Deferred);
+        let ops = crate::materialize::apply_verdict(&verdict, ops);
         // The lead-disposition guard rejects the whole op set BEFORE any
         // op is applied: an owned cluster must converge, never re-propose.
         let reason = parse_error
@@ -828,6 +853,8 @@ async fn run_unit_inner(
             report.clusters.push(record);
             continue;
         }
+        record.minting_deferred = matches!(verdict, crate::admission::Verdict::Deferred);
+        record.merit_reason = cluster.merit_reason.clone();
         record.ops = ops;
         report.clusters.push(record);
     }
@@ -840,6 +867,12 @@ async fn run_unit_inner(
     // match on night two.
     for record in &report.clusters {
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
+            continue;
+        }
+        // A DEFERRED cluster emitted nothing because code took its slot, not
+        // because the model declined it. Recording that as a decline would
+        // suppress a good grouping that was merely waiting its turn.
+        if record.minting_deferred && record.ops.is_empty() {
             continue;
         }
         let declined = record.ops.is_empty()
@@ -1636,7 +1669,7 @@ mod tests {
             "short_title": "Wireguard and DNS",
             "long_title": "Wireguard and DNS orientation map",
             "pointers": ["kb-10001", "kb-10002"],
-            "body": "Lives in knowledge/linux/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2",
+            "body": "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2",
             "contributor": "somnus",
             "updated_by": "somnus"
         }));
@@ -1801,7 +1834,7 @@ mod tests {
                     "demo-project",
                     "somnus-new-c1"
                 ),
-                body: "Lives in knowledge/linux/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
+                body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
             }
         );
         assert_eq!(
@@ -1845,7 +1878,7 @@ mod tests {
                 project_ref: "demo-project".to_string(),
                 short_title: "Wireguard and DNS".to_string(),
                 long_title: "Wireguard and DNS".to_string(),
-                body: "Lives in knowledge/linux/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
+                body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
             },
             "short_title and long_title are the create op's title verbatim"
         );
