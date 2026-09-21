@@ -190,6 +190,14 @@ pub fn pinned_cluster_id(cluster_index: usize) -> String {
 /// bullet shapes), so the ONLY thing this model can write that fails the gate
 /// is the CONTENT of a gloss or the orientation prose.
 ///
+/// `config_numeral` is the second trap of the same family, and it rejected
+/// two bodies on run 7. A map exists so an agent knows WHERE to look; a
+/// number that reads like configuration is precisely the retrievable value
+/// the map is there to avoid duplicating, and duplicating it is how a map
+/// goes stale. The model cannot infer that from "write orientation prose",
+/// so it is stated: name the threshold, point at the entry, never carry the
+/// value. Bare small integers used as counts still pass.
+///
 /// The non-obvious member of that list is `e.g.` — the dotted-identifier rule
 /// is `\b[A-Za-z_]\w*\.[A-Za-z_]\w*`, which is meant to catch dotted code
 /// identifiers and matches any `word.word`, so `e.g.` and `i.e.` trip it. A
@@ -211,7 +219,7 @@ pub fn render_rung2_instruction(cluster: &Cluster, cluster_index: usize) -> Stri
         ),
     };
     format!(
-        "You are given one cluster and the project's loop-input as tool results. The cluster is labelled {} and covers {members}. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap, no_change) as tool calls. Do not write a map body; code composes bodies. {disposition} Be brief: keep the orientation prose under 600 characters and each gloss under 120 characters. A map is a directory card, not a summary, and a body that runs long is rejected outright rather than trimmed. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
+        "You are given one cluster and the project's loop-input as tool results. The cluster is labelled {} and covers {members}. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap, no_change) as tool calls. Do not write a map body; code composes bodies. {disposition} Be brief: keep the orientation prose under 600 characters and each gloss under 120 characters. A map is a directory card, not a summary, and a body that runs long is rejected outright rather than trimmed. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Never write a configuration value: no version numbers, thresholds, ports, sizes, timeouts or percentages. Say that a threshold exists and point at the entry that holds it; the number itself belongs in that entry, not in a map. Small whole numbers used as counts are fine, as in three stages. Spell out 'for example' and 'that is'.",
         cluster.label
     )
 }

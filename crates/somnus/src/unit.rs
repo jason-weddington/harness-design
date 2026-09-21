@@ -1078,12 +1078,18 @@ async fn run_unit_inner(
         edits_by_map,
     )
     .await;
-    if let Some(first_red) = application.first_red_body
-        && !matches!(report.outcome, UnitOutcome::Aborted { .. })
-    {
-        report.outcome = UnitOutcome::Aborted {
-            reason: render_gate_rejected_line(&first_red),
-        };
+    // A REJECTED body is a per-map outcome, not a verdict on the project.
+    // It is announced and recorded — `gate_reports` carries the red flag and
+    // the lint's findings, and the body is never applied — but it does not
+    // abort. Aborting here let two bad bodies take a whole project down, and
+    // in a nightly an `Aborted` unit STOPS the remaining projects, so one
+    // over-long map body could cost two other projects their night.
+    //
+    // This is deliberately NOT the same as a gate that could not be
+    // EVALUATED, which still aborts: that one is an infrastructure fault and
+    // says nothing about any body.
+    if let Some(first_red) = application.first_red_body {
+        eprintln!("{}", render_gate_rejected_line(&first_red));
     }
     if let Some(outcome) = application.outcome_override {
         report.outcome = outcome;
@@ -2275,28 +2281,25 @@ mod tests {
         assert_eq!(report.gate_reports.len(), 1);
         assert!(!report.gate_reports[0].passed, "`curl -f` maps 422 to red");
         assert_eq!(report.gate_reports[0].exit_code, Some(1));
-        // GATE-THEN-APPLY: a red gate body is NOT applied, and the unit
-        // aborts with the pinned first-red-body reason.
+        // GATE-THEN-APPLY: a red gate body is NOT applied, but a rejected
+        // body is a per-MAP outcome and does not abort the project. Aborting
+        // here let two bad bodies take a whole project down, and in a
+        // nightly an aborted unit stops the remaining projects too.
+        assert_eq!(report.outcome, UnitOutcome::Ready);
         assert_eq!(
-            report.outcome,
-            UnitOutcome::Aborted {
-                reason: render_gate_rejected_line("kb-20001"),
-            }
+            render_gate_rejected_line("kb-20001"),
+            "somnus: map-lint gate rejected the body for kb-20001".to_string()
         );
-        assert_eq!(
-            report.outcome,
-            UnitOutcome::Aborted {
-                reason: "somnus: map-lint gate rejected the body for kb-20001".to_string()
-            }
-        );
-        assert_eq!(exit_code_for_outcome(&report.outcome), 2);
+        // A quiet night with one rejected body is still a successful night.
+        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
     }
 
     #[tokio::test]
     async fn a_red_gate_body_is_not_applied_while_gate_green_siblings_still_are() {
         // Two bodies: the first (the fresh map) is gate-red, the second
-        // (kb-20001) gate-green. EXACTLY the green body's POST goes out,
-        // and the outcome aborts naming the FIRST red body.
+        // (kb-20001) gate-green. EXACTLY the green body's POST goes out, and
+        // the unit stays Ready — one rejected body is not a verdict on the
+        // project.
         let backend = MockBackend::from_turns(vec![
             text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
@@ -2367,17 +2370,15 @@ mod tests {
             }
         );
         assert_eq!(report.applied.len(), 1);
-        assert_eq!(
-            report.outcome,
-            UnitOutcome::Aborted {
-                reason: "somnus: map-lint gate rejected the body for somnus-new-0-c1".to_string(),
-            }
-        );
-        assert_eq!(exit_code_for_outcome(&report.outcome), 2);
+        // The green sibling landed and the unit stays Ready: one rejected
+        // body is recorded, never a verdict on the project.
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
+        assert!(!report.gate_reports[0].passed);
     }
 
     #[tokio::test]
-    async fn two_red_gate_bodies_abort_naming_the_first() {
+    async fn two_red_gate_bodies_apply_nothing_and_still_leave_the_unit_ready() {
         let backend = MockBackend::from_turns(vec![
             text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
@@ -2420,13 +2421,12 @@ mod tests {
         assert_eq!(report.gate_reports.len(), 2);
         assert!(!report.gate_reports.iter().any(|gate| gate.passed));
         assert!(map_ops.requests().is_empty(), "zero map-op POSTs");
-        assert_eq!(
-            report.outcome,
-            UnitOutcome::Aborted {
-                reason: "somnus: map-lint gate rejected the body for somnus-new-0-c1".to_string(),
-            },
-            "the reason names the FIRST red body in composed_bodies order"
-        );
+        // Both bodies rejected, nothing applied — and the unit is still
+        // Ready. Two bad bodies are two bad bodies; they are not a verdict on
+        // the project, and in a nightly an aborted unit would have stopped
+        // the remaining projects as well.
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
     }
 
     #[tokio::test]
