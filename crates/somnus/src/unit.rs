@@ -1869,7 +1869,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}, {"entry_id": "kb-10002", "gloss": "GLOSS-2"}]}),
+                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}, {"entry_id": "kb-10002", "gloss": "GLOSS-2"}]}),
                     ),
                     (
                         "add_pointer",
@@ -2194,7 +2194,7 @@ mod tests {
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"title": "t", "orientation_prose": "PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                    json!({"title": "t", "orientation_prose": "PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
                 )],
                 usage(1, 1, None, None),
             ),
@@ -2293,7 +2293,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                     ),
                     (
                         "add_pointer",
@@ -2371,7 +2371,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"title": "t", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                        json!({"title": "t", "orientation_prose": "ORIENTATION-PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                     ),
                     (
                         "add_pointer",
@@ -2781,7 +2781,7 @@ mod tests {
                     &[
                         (
                             "create_map",
-                            json!({"title": "t", "orientation_prose": "PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                            json!({"title": "t", "orientation_prose": "PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                         ),
                         (
                             "add_pointer",
@@ -3474,7 +3474,7 @@ mod tests {
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                    json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
                 )],
                 usage(1, 1, None, None),
             ),
@@ -3521,14 +3521,14 @@ mod tests {
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"title": "t1", "orientation_prose": "PROSE-1", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                    json!({"title": "t1", "orientation_prose": "PROSE-1", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                 )],
                 usage(1, 1, None, None),
             ),
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"title": "t2", "orientation_prose": "PROSE-2", "pointers": [{"entry_id": "kb-10004", "gloss": "GLOSS-2"}]}),
+                    json!({"title": "t2", "orientation_prose": "PROSE-2", "gaps": [], "pointers": [{"entry_id": "kb-10004", "gloss": "GLOSS-2"}]}),
                 )],
                 usage(1, 1, None, None),
             ),
@@ -3678,7 +3678,7 @@ mod tests {
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                    json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
                 )],
                 usage(1, 1, None, None),
             ),

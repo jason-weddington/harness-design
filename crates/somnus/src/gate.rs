@@ -343,7 +343,10 @@ mod tests {
         );
         let pinned = [
             ("add_pointer", vec!["map_id", "entry_id", "gloss"]),
-            ("create_map", vec!["title", "orientation_prose", "pointers"]),
+            (
+                "create_map",
+                vec!["title", "orientation_prose", "pointers", "gaps"],
+            ),
             ("strike_gap", vec!["map_id", "gap_text", "closing_entry_id"]),
             ("propose_gap", vec!["cluster_id", "reason"]),
         ];

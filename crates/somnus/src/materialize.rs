@@ -188,10 +188,16 @@ pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Option<String> {
         .then(|| format!("{first} and {second}"))
 }
 
-/// Compose a FRESH map body: the first three sections ONLY (a new map has
-/// no recorded gaps — the gap section appears only when a body already
-/// carries it), with one `Detail entries:` line per pointer the
-/// `create_map` op carries, in the order the model listed them.
+/// Compose a FRESH map body from the op's own strings: one `Detail entries:`
+/// line per pointer, in the order the model listed them, and a
+/// `Not yet documented:` section when it named any gaps.
+///
+/// A new map could not carry gaps at all until 2026-09-21. `propose_gap`
+/// only ever wrote a ledger decline, never a body line, so the canonical
+/// four-part form had a section nothing could produce — zero of the first
+/// nineteen maps had one. That section is the only part of a map addressed
+/// to a HUMAN: everything else routes a reader to knowledge that exists,
+/// while a gap line says where knowledge is missing.
 ///
 /// Infallible now, and that is the point. It used to return an
 /// `EmptyPointerList` error because the pointers arrived as SEPARATE ops
@@ -207,6 +213,7 @@ pub fn compose_new_map_body(
     cluster: &Cluster,
     orientation_prose: &str,
     pointers: &[crate::ops::NewPointer],
+    gaps: &[String],
     input: &LoopInput,
 ) -> String {
     let mut sections = Vec::with_capacity(3);
@@ -222,6 +229,13 @@ pub fn compose_new_map_body(
         "{DETAIL_ENTRIES_HEADER}\n{}",
         detail_lines.join("\n")
     ));
+    // The fourth section, and the only one that speaks to a human: what this
+    // subject area is MISSING. Omitted entirely when the model reported no
+    // gaps, because an empty heading claims completeness it cannot know.
+    if !gaps.is_empty() {
+        let gap_lines: Vec<String> = gaps.iter().map(|gap| gap_line(gap)).collect();
+        sections.push(format!("{NOT_YET_HEADER}\n{}", gap_lines.join("\n")));
+    }
     sections.join(SECTION_SEPARATOR)
 }
 
@@ -463,12 +477,13 @@ pub fn materialize_cluster(
         if let Op::CreateMap {
             orientation_prose,
             pointers,
+            gaps,
             ..
         } = op
         {
             out.bodies.push(ComposedBody {
                 map_id: fresh_map_id(cluster_index),
-                body: compose_new_map_body(cluster, orientation_prose, pointers, input),
+                body: compose_new_map_body(cluster, orientation_prose, pointers, gaps, input),
             });
         }
     }
@@ -698,6 +713,7 @@ mod tests {
                     gloss: (*gloss).to_string(),
                 })
                 .collect(),
+            gaps: Vec::new(),
         }
     }
 
@@ -846,7 +862,7 @@ mod tests {
             create_map("c1", "PROSE"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
         ];
-        let body = compose_new_map_body(&unowned, "PROSE", &pointers_of(&ops), &input);
+        let body = compose_new_map_body(&unowned, "PROSE", &pointers_of(&ops), &[], &input);
         assert_eq!(body, "PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1");
         assert!(
             !body.contains("Lives in"),
@@ -899,6 +915,48 @@ mod tests {
     /// "compose refuses it" test is gone with the state it tested. What
     /// remains worth pinning is that the create's own pointers are inlined
     /// into the body and never also become edits.
+    /// The fourth section, which no map could carry until today: zero of
+    /// the first nineteen maps had one, because `propose_gap` only ever
+    /// wrote a ledger decline and never a body line.
+    #[test]
+    fn a_named_gap_reaches_the_composed_body() {
+        let input = fixture();
+        let owned = cluster("home-network", &["kb-10001"], None);
+        let body = compose_new_map_body(
+            &owned,
+            "PROSE",
+            &pointers_of(&[create_map_with("PROSE", &[("kb-10001", "G1")])]),
+            &[
+                "no entry documents the retry backoff".to_string(),
+                "nothing covers the eviction path".to_string(),
+            ],
+            &input,
+        );
+        assert!(body.contains("Not yet documented:"), "{body}");
+        assert!(
+            body.ends_with(
+                "Not yet documented:\n- no entry documents the retry backoff\n- nothing covers the eviction path"
+            ),
+            "the gap section is LAST and follows the pinned line shape: {body}"
+        );
+    }
+
+    /// An empty list omits the heading entirely. An empty
+    /// `Not yet documented:` claims a completeness the loop cannot know.
+    #[test]
+    fn no_gaps_means_no_heading() {
+        let input = fixture();
+        let owned = cluster("home-network", &["kb-10001"], None);
+        let body = compose_new_map_body(
+            &owned,
+            "PROSE",
+            &pointers_of(&[create_map_with("PROSE", &[("kb-10001", "G1")])]),
+            &[],
+            &input,
+        );
+        assert!(!body.contains("Not yet documented"), "{body}");
+    }
+
     #[test]
     fn a_creates_pointers_are_inlined_and_never_become_edits() {
         let input = fixture();
@@ -928,7 +986,7 @@ mod tests {
             create_map("c1", "PROSE"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
         ];
-        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &input);
+        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &[], &input);
         assert_eq!(
             body,
             "Lives in knowledge/network\n\nPROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1"
@@ -944,7 +1002,7 @@ mod tests {
             "PROSE",
             &[("kb-10002", "GLOSS-B"), ("kb-10001", "GLOSS-A")],
         )];
-        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &input);
+        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &[], &input);
         assert!(
             body.ends_with("Detail entries:\n- kb-10002 — GLOSS-B\n- kb-10001 — GLOSS-A"),
             "op order, not id order: {body}"
@@ -1233,6 +1291,7 @@ mod verdict_tests {
                 entry_id: "kb-10001".to_string(),
                 gloss: "GLOSS".to_string(),
             }],
+            gaps: Vec::new(),
         }
     }
 

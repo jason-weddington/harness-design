@@ -69,6 +69,21 @@ pub enum Op {
         orientation_prose: String,
         /// The pointers the map is born with — NEVER empty.
         pointers: Vec<NewPointer>,
+        /// Seams the model noticed have no entry yet. Required on the wire
+        /// and allowed to be EMPTY.
+        ///
+        /// Required-but-may-be-empty is the shape, and the distinction is
+        /// the one lesson of this crate's whole build. An OPTIONAL field
+        /// gets omitted: a map with no gaps is valid, so a model that leaves
+        /// the field out is never wrong — which is exactly how `create_map`
+        /// went three prompt iterations without pointers. Requiring the
+        /// field converts an omission into a DECISION: the model has to say
+        /// either what is missing or, explicitly, that nothing is.
+        ///
+        /// This is the only part of the loop that speaks to a human rather
+        /// than an agent. Every other line routes a reader to knowledge that
+        /// exists; a gap line says where knowledge is missing.
+        gaps: Vec<String>,
     },
     /// Strike a gap, citing the entry that closed it.
     StrikeGap {
@@ -246,6 +261,7 @@ fn parse_op_fields(kind: OpKind, input: &Value) -> Result<Op, String> {
             title: req_str(input, "title")?,
             orientation_prose: req_str(input, "orientation_prose")?,
             pointers: req_pointers(input)?,
+            gaps: req_gaps(input)?,
         }),
         OpKind::StrikeGap => Ok(Op::StrikeGap {
             map_id: req_str(input, "map_id")?,
@@ -281,6 +297,25 @@ fn req_pointers(input: &Value) -> Result<Vec<NewPointer>, String> {
                 entry_id: req_str(item, "entry_id")?,
                 gloss: req_str(item, "gloss")?,
             })
+        })
+        .collect()
+}
+
+/// Read `create_map`'s `gaps` array, which must be PRESENT and may be empty.
+///
+/// The presence check is the whole mechanism: an absent array would let the
+/// model decline to think about gaps without ever being wrong, and that is
+/// the failure mode `pointers` already cost three prompt iterations to.
+fn req_gaps(input: &Value) -> Result<Vec<String>, String> {
+    let array = input.get("gaps").and_then(Value::as_array).ok_or_else(|| {
+        "somnus: create_map is missing the array field `gaps` — it may be empty, but it must be present: name the seams with no entry yet, or say explicitly that there are none".to_string()
+    })?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "somnus: create_map `gaps` holds a non-string".to_string())
         })
         .collect()
 }
@@ -331,7 +366,7 @@ impl Tool for OpTool {
                 &["map_id", "entry_id", "gloss"],
             ),
             OpKind::CreateMap => (
-                "Create a new map for this cluster, with the pointers it is born with. A map IS its pointers: one entry per pointer, each with a short gloss saying why a reader would open it. Do not describe the entries in the orientation prose instead of pointing at them.",
+                "Create a new map for this cluster, with the pointers it is born with. A map IS its pointers: one entry per pointer, each with a short gloss saying why a reader would open it. Do not describe the entries in the orientation prose instead of pointing at them. The gaps array names seams in this subject area that have no entry yet: an empty array is a normal and correct answer, so name only a gap whose absence you actually noticed while reading these entries, and never invent one to look thorough. A gap must be something a future entry could close, such as a named part of the system nothing here documents; never a wish such as wanting more detail, because nothing can ever close that and the line stays in the map forever.",
                 json!({
                     "title": { "type": "string" },
                     "orientation_prose": { "type": "string" },
@@ -346,9 +381,13 @@ impl Tool for OpTool {
                             },
                             "required": ["entry_id", "gloss"]
                         }
+                    },
+                    "gaps": {
+                        "type": "array",
+                        "items": { "type": "string" }
                     }
                 }),
-                &["title", "orientation_prose", "pointers"],
+                &["title", "orientation_prose", "pointers", "gaps"],
             ),
             OpKind::StrikeGap => (
                 "Strike a gap, citing the entry that closed it.",
@@ -846,7 +885,7 @@ mod tests {
             ),
             (
                 "create_map",
-                serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
+                serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}], "gaps": []}),
                 Op::CreateMap {
                     title: "t".to_string(),
                     orientation_prose: "p".to_string(),
@@ -854,6 +893,7 @@ mod tests {
                         entry_id: "kb-1".to_string(),
                         gloss: "g".to_string(),
                     }],
+                    gaps: Vec::new(),
                 },
             ),
             (
@@ -953,7 +993,7 @@ mod tests {
         );
         let op = op_from_call(
             "create_map",
-            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}], "gaps": []}),
         )
         .expect("create_map parses");
         assert_eq!(
@@ -965,6 +1005,7 @@ mod tests {
                     entry_id: "kb-1".to_string(),
                     gloss: "g".to_string(),
                 }],
+                gaps: Vec::new(),
             }
         );
         // A missing field inside a KNOWN op is a named field error.
@@ -1047,7 +1088,7 @@ mod pointer_tests {
     fn an_empty_pointers_array_is_refused_by_name() {
         let error = op_from_call(
             "create_map",
-            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": []}),
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": []}),
         )
         .expect_err("an empty array is not one pointer");
         assert!(error.contains("EMPTY `pointers` array"), "{error}");
@@ -1057,7 +1098,7 @@ mod pointer_tests {
     fn a_pointer_missing_its_gloss_is_refused_by_name() {
         let error = op_from_call(
             "create_map",
-            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1"}]}),
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": [{"entry_id": "kb-1"}]}),
         )
         .expect_err("a pointer with no gloss says nothing");
         assert!(error.contains("gloss"), "{error}");
@@ -1068,7 +1109,7 @@ mod pointer_tests {
     fn the_pointers_keep_the_order_the_model_listed_them_in() {
         let op = op_from_call(
             "create_map",
-            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": [
                 {"entry_id": "kb-2", "gloss": "second"},
                 {"entry_id": "kb-1", "gloss": "first"}
             ]}),
@@ -1079,5 +1120,54 @@ mod pointer_tests {
         };
         assert_eq!(pointers[0].entry_id, "kb-2");
         assert_eq!(pointers[1].entry_id, "kb-1");
+    }
+
+    /// The whole reason `gaps` is required rather than optional: an optional
+    /// field gets omitted, because a map with no gaps is valid and a model
+    /// that leaves it out is never wrong. Requiring it turns an omission
+    /// into a decision.
+    #[test]
+    fn a_create_map_without_a_gaps_array_never_becomes_an_op() {
+        let error = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
+        )
+        .expect_err("gaps must be present even when empty");
+        assert!(error.contains("missing the array field `gaps`"), "{error}");
+        assert!(
+            error.contains("it may be empty, but it must be present"),
+            "{error}"
+        );
+    }
+
+    /// An EMPTY array is a correct answer and must parse — the model saying
+    /// "I looked and there are none" is the point.
+    #[test]
+    fn an_empty_gaps_array_is_a_valid_answer() {
+        let op = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "gaps": [], "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
+        )
+        .expect("an empty gaps array parses");
+        let Op::CreateMap { gaps, .. } = op else {
+            panic!("expected a create_map");
+        };
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_are_carried_in_the_order_the_model_named_them() {
+        let op = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p",
+                "gaps": ["no entry documents the retry backoff", "nothing covers the eviction path"],
+                "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
+        )
+        .expect("parses");
+        let Op::CreateMap { gaps, .. } = op else {
+            panic!("expected a create_map");
+        };
+        assert_eq!(gaps[0], "no entry documents the retry backoff");
+        assert_eq!(gaps[1], "nothing covers the eviction path");
     }
 }
