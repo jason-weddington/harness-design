@@ -1694,7 +1694,13 @@ mod tests {
             .expect("seed the decline");
 
         let backend = MockBackend::from_turns(vec![
-            text_turn(&e2e_clusters_json(), usage(1000, 50, Some(200), None)),
+            // Fenced on purpose. The first live run aborted on exactly this
+            // framing, so the full-night path — not just `parse_clusters` —
+            // is what has to tolerate it.
+            text_turn(
+                &format!("```json\n{}\n```", e2e_clusters_json()),
+                usage(1000, 50, Some(200), None),
+            ),
             calls_turn(
                 &[
                     (

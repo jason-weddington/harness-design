@@ -43,7 +43,7 @@ pub const SOMNUS_MAX_TOKENS: u32 = 128_000;
 /// plain JSON text (the registry has NO emit-clusters tool, by the same
 /// closed-vocabulary rule that forbids a model-written map body), and code
 /// parses it strictly.
-pub const RUNG1_INSTRUCTION: &str = "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. An entry may appear in no cluster or in several clusters; do not force an assignment.";
+pub const RUNG1_INSTRUCTION: &str = "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment.";
 
 /// The synthetic tool-call id that pairs the injected loop-input with its
 /// tool result.
@@ -203,16 +203,59 @@ pub fn rung2_raw_path(root: &Path, project_ref: &str, cluster_index: usize) -> P
         .join(format!("rung2-{cluster_index}-raw.txt"))
 }
 
-/// Parse a rung-1 turn's text as a JSON array of clusters. Strict: malformed
-/// JSON, a non-array top level, or a missing field is a named `Err` naming
-/// the parse failure and the missing field — never a panic, never a guess.
+/// Strip one markdown code fence wrapping `text`, info string and all.
+/// `None` unless the text both opens and closes with a fence, so prose that
+/// merely mentions a fence is left alone for the next candidate to handle.
+fn strip_code_fence(text: &str) -> Option<&str> {
+    let body = text.trim().strip_prefix("```")?;
+    // The opening fence may carry an info string on the same line (```json).
+    let (_info, body) = body.split_once('\n')?;
+    Some(body.trim_end().strip_suffix("```")?.trim())
+}
+
+/// The slice from the first `[` to the last `]`, for a model that wrote the
+/// array correctly and then framed it in prose. Both delimiters are ASCII, so
+/// the byte range is always a char boundary.
+fn bracketed_slice(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    (end > start).then(|| &text[start..=end])
+}
+
+/// Parse a rung-1 turn's text as a JSON array of clusters. Strict about
+/// SHAPE — a non-array top level or a missing field is a named `Err` naming
+/// the failure and the field, never a panic and never a guess — but tolerant
+/// about FRAMING: a model that fences its JSON, or wraps it in a sentence,
+/// still gets parsed.
+///
+/// That tolerance is not politeness. Rung 1 is single-shot against a metered
+/// lane and the loop runs unattended, so a framing quirk costs a silently
+/// wasted night plus one paid inference. [`RUNG1_INSTRUCTION`] asks for a
+/// bare array, and a fence is the single most common thing a model does to
+/// JSON anyway; instructing alone leaves the most likely failure the one we
+/// did nothing about. Belt and braces — this fired on the first live run
+/// against photoqueue on 2026-09-21, where line 1 of the offloaded raw text
+/// was a fence and the 14 clusters inside it were perfectly good.
+///
+/// The candidates are tried in order of how much they assume, and each one
+/// still has to parse as an array of well-formed cluster objects, so a wrong
+/// guess fails exactly as loudly as no guess. The reported error is always
+/// the STRICT one, since the later candidates' complaints are about text the
+/// model never meant as JSON.
 ///
 /// # Errors
 /// `Err` naming why the text could not be parsed into clusters.
 pub fn parse_clusters(turn: &AssistantTurn) -> Result<Vec<Cluster>, String> {
     let text = turn.text();
-    let value: Value = serde_json::from_str(text.trim())
-        .map_err(|err| format!("somnus: rung-1 parse failed ({err})"))?;
+    let trimmed = text.trim();
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(err) => [strip_code_fence(trimmed), bracketed_slice(trimmed)]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| serde_json::from_str(candidate).ok())
+            .ok_or_else(|| format!("somnus: rung-1 parse failed ({err})"))?,
+    };
     let array = value
         .as_array()
         .ok_or_else(|| "somnus: rung-1 parse failed (expected a JSON array)".to_string())?;
@@ -375,8 +418,60 @@ mod tests {
     fn the_rung1_instruction_is_pinned_in_full() {
         assert_eq!(
             RUNG1_INSTRUCTION,
-            "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. An entry may appear in no cluster or in several clusters; do not force an assignment."
+            "You are given the project's entries, existing mental maps, and candidate pockets as a tool result. Group the entries into subject-area clusters. Reply with ONLY a JSON array of objects, each {\"label\": string, \"member_entry_ids\": [string], \"owning_map_id\": string | null}. Do not wrap the array in a markdown code fence and do not write any prose around it. An entry may appear in no cluster or in several clusters; do not force an assignment."
         );
+    }
+
+    /// The exact shape that aborted the first live run: a fence with a `json`
+    /// info string, the array inside it perfectly well-formed.
+    #[test]
+    fn parse_clusters_tolerates_a_json_info_string_fence() {
+        let turn = text_turn(
+            "```json\n[{\"label\":\"a\",\"member_entry_ids\":[\"kb-10001\"],\"owning_map_id\":null}]\n```",
+        );
+        let clusters = parse_clusters(&turn).expect("a fenced array is still an array");
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].label, "a");
+    }
+
+    #[test]
+    fn parse_clusters_tolerates_a_bare_fence() {
+        let turn = text_turn(
+            "```\n[{\"label\":\"b\",\"member_entry_ids\":[],\"owning_map_id\":null}]\n```",
+        );
+        let clusters = parse_clusters(&turn).expect("an info string is not required");
+        assert_eq!(clusters[0].label, "b");
+    }
+
+    #[test]
+    fn parse_clusters_tolerates_prose_around_the_array() {
+        let turn = text_turn(
+            "Here are the clusters:\n[{\"label\":\"c\",\"member_entry_ids\":[],\"owning_map_id\":null}]\nLet me know if you want them merged.",
+        );
+        let clusters = parse_clusters(&turn).expect("a framed array is still an array");
+        assert_eq!(clusters[0].label, "c");
+    }
+
+    /// Tolerance about framing must not become tolerance about shape: a fence
+    /// around something that is not an array of clusters fails exactly as
+    /// loudly as it did before, and reports the STRICT error rather than the
+    /// candidate's complaint.
+    #[test]
+    fn parse_clusters_rejects_a_fence_around_garbage_with_the_strict_error() {
+        let error = parse_clusters(&text_turn("```json\nnot json at all\n```"))
+            .expect_err("a fence does not make garbage parseable");
+        assert!(error.contains("rung-1 parse failed"), "error was {error}");
+        assert!(
+            error.contains("expected value at line 1 column 1"),
+            "the strict error is the one reported, not the candidate's; got {error}"
+        );
+    }
+
+    #[test]
+    fn parse_clusters_rejects_a_fenced_non_array_top_level() {
+        let error = parse_clusters(&text_turn("```json\n{\"label\":\"a\"}\n```"))
+            .expect_err("a fenced object is still not an array");
+        assert!(error.contains("expected a JSON array"), "error was {error}");
     }
 
     #[tokio::test]
