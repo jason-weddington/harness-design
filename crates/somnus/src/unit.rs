@@ -334,6 +334,17 @@ pub struct UnitReport {
     pub change: ChangeEvidence,
     /// How many `ModelBackend::turn` calls the unit made.
     pub backend_calls: u64,
+    /// How many clusters rung 1 EMITTED, which is not the same as how many
+    /// appear in `clusters`.
+    ///
+    /// `clusters` holds one record per cluster rung 2 actually ran on, so a
+    /// cluster truncated by the per-unit cap leaves no record at all. Without
+    /// this field the two counts are indistinguishable in the report, and a
+    /// reader who assumes they are equal concludes that rung 1 made several
+    /// backend calls — which it never does; it is one inference per project,
+    /// counted once. That misreading cost a diagnosis on 2026-09-21, and the
+    /// field exists so it cannot recur.
+    pub clusters_emitted: usize,
     /// Rung-1 cost telemetry.
     pub usage_rung1: UsageTotals,
     /// Rung-2 cost telemetry.
@@ -376,6 +387,7 @@ impl UnitReport {
             apply_audit: Vec::new(),
             change: ChangeEvidence::default(),
             backend_calls: 0,
+            clusters_emitted: 0,
             usage_rung1: UsageTotals::default(),
             usage_rung2: UsageTotals::default(),
             wall_rung1_ms: 0,
@@ -795,6 +807,7 @@ async fn run_unit_inner(
     // rules. Left to chance it is whichever `create_map` reaches the server
     // first, and the cap is enforced as a 409 — so array order would pick the
     // map, in a project that may have no other map to contradict it.
+    report.clusters_emitted = clusters.len();
     let verdicts = crate::admission::judge(&clusters);
     let mut budget_reason: Option<String> = None;
     for (index, cluster) in clusters.iter().enumerate() {
@@ -3587,10 +3600,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hard_compose_refusal_is_recorded_without_a_body() {
-        // A create_map with no pointers targeting the new map: the
-        // EmptyPointerList refusal lands in the report and nothing is
-        // composed or gated.
+    async fn a_create_map_with_no_pointers_is_a_rung2_error_with_its_raw_text_offloaded() {
+        // A create_map with no pointers targeting the new map. It never
+        // reaches compose: the rung-2 validator refuses the op set, so the
+        // cluster carries a named error and its raw model text lands on
+        // disk — the evidence that tells an omission from a pointer aimed
+        // at the wrong map. Nothing is composed, gated or declined.
         let clusters = json!([
             {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
         ])
@@ -3618,14 +3633,19 @@ mod tests {
             "demo-project",
         )
         .await;
-        assert!(report.composed_bodies.is_empty());
-        assert_eq!(report.compose_refusals.len(), 1);
-        assert!(
-            report.compose_refusals[0].contains("no pointers"),
-            "{}",
-            report.compose_refusals[0]
-        );
         assert!(report.gate_reports.is_empty());
+        assert!(report.composed_bodies.is_empty());
+        assert!(report.compose_refusals.is_empty());
+        let Rung2Outcome::ParseError { reason } = &report.clusters[0].rung2 else {
+            panic!("got {:?}", report.clusters[0].rung2);
+        };
+        assert!(reason.contains("carries no add_pointer op"), "{reason}");
+        let raw = report.clusters[0]
+            .raw_path
+            .as_ref()
+            .expect("the raw model text is offloaded for forensics");
+        assert!(raw.exists(), "{raw:?}");
+        assert!(report.declines_recorded.is_empty());
     }
 
     // ======================================================================

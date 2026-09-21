@@ -355,6 +355,32 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
             cluster.label
         ));
     }
+    // A map is created together with its pointers in ONE write, so a
+    // `create_map` carrying none is not a thin map — it is an op set that
+    // cannot produce a map at all. The rung-2 instruction says so in as many
+    // words, and the model ignored it on 8 of 19 clusters, on clusters of 3
+    // to 8 documented members. One instruction the model has demonstrably
+    // not followed is an instruction that has to become a rule.
+    //
+    // Refused at the RUNG-2 boundary rather than left to die at compose:
+    // this way the cluster is recorded as a rung-2 error with its raw model
+    // text offloaded, which is the evidence that distinguishes "the model
+    // omitted the pointers" from "the pointers named the wrong map".
+    for op in ops {
+        let Op::CreateMap { cluster_id, .. } = op else {
+            continue;
+        };
+        let minted = new_map_id(cluster_id);
+        if !ops
+            .iter()
+            .any(|other| matches!(other, Op::AddPointer { map_id, .. } if map_id == &minted))
+        {
+            return Err(format!(
+                "somnus: create_map for cluster {} carries no add_pointer op targeting {minted} — a map is created together with its pointers in one write, so a create_map without them cannot produce a map",
+                cluster.label
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1174,12 +1200,48 @@ mod tests {
                 "permitted ops must validate: {permitted:?}"
             );
         }
-        // And a cluster with NO owning map may create.
+        // And a cluster with NO owning map may create — WITH its pointers,
+        // which is the only shape that can produce a map.
         let unowned = cluster("backup-drills", &["kb-10006"], None);
         assert_eq!(
-            validate_ops_for_cluster(&unowned, &[create_map("c1", "PROSE")]),
+            validate_ops_for_cluster(
+                &unowned,
+                &[
+                    create_map("c1", "PROSE"),
+                    add_pointer("somnus-new-c1", "kb-10006", "GLOSS"),
+                ]
+            ),
             Ok(())
         );
+    }
+
+    /// The model emitted a bare `create_map` on 8 of 19 clusters across two
+    /// runs, on clusters of 3 to 8 documented members, after being told in
+    /// as many words to emit one `add_pointer` per member. An instruction it
+    /// has demonstrably not followed has to become a rule.
+    #[test]
+    fn a_create_map_carrying_no_pointers_is_a_rung2_error() {
+        let unowned = cluster("flickr-quota", &["kb-10001", "kb-10002"], None);
+        let error = validate_ops_for_cluster(&unowned, &[create_map("c1", "PROSE")])
+            .expect_err("a create_map without pointers cannot produce a map");
+        assert!(error.contains("carries no add_pointer op"), "{error}");
+        assert!(error.contains("somnus-new-c1"), "{error}");
+    }
+
+    /// The pointer has to target THIS map. One aimed somewhere else is the
+    /// other half of the same failure and must not satisfy the rule.
+    #[test]
+    fn a_pointer_at_a_different_map_does_not_satisfy_the_rule() {
+        let unowned = cluster("flickr-quota", &["kb-10001"], None);
+        let error = validate_ops_for_cluster(
+            &unowned,
+            &[
+                create_map("c1", "PROSE"),
+                add_pointer("kb-20001", "kb-10001", "GLOSS"),
+            ],
+        )
+        .expect_err("a pointer at another map does not populate this one");
+        assert!(error.contains("carries no add_pointer op"), "{error}");
     }
 
     // --- the disk paths ---------------------------------------------------
