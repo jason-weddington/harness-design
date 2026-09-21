@@ -33,7 +33,7 @@ use crate::loop_input::{
 };
 use crate::map_op::{MapOpClient, MapOpRequest, MapOpResult};
 use crate::materialize::{
-    ComposedBody, MapEdit, Materialized, materialize_cluster, new_map_id, run_report_path,
+    ComposedBody, MapEdit, Materialized, fresh_map_id, materialize_cluster, run_report_path,
     write_composed_body,
 };
 use crate::observer::MapPointerObserver;
@@ -201,16 +201,6 @@ pub struct ClusterRecord {
     pub rung2: Rung2Outcome,
     /// Where the cluster's raw turn text was offloaded on a parse error.
     pub raw_path: Option<PathBuf>,
-    /// True when this cluster was FIT to mint but lost tonight's single slot
-    /// to a higher-ranked one.
-    ///
-    /// Load-bearing, not bookkeeping: the pipeline treats an empty op set as
-    /// a decline, and a deferred cluster's op set is empty because CODE
-    /// emptied it. Recording that as a decline would suppress exactly the
-    /// good clusters that were waiting their turn, while the junk that failed
-    /// admission got declined correctly — a bug that would have looked like
-    /// the system working.
-    pub minting_deferred: bool,
     /// Rung 1's own account of why it ranked this cluster where it did.
     pub merit_reason: Option<String>,
 }
@@ -798,7 +788,6 @@ async fn run_unit_inner(
             ops: Vec::new(),
             rung2: Rung2Outcome::Parsed,
             raw_path: None,
-            minting_deferred: false,
             merit_reason: cluster.merit_reason.clone(),
         };
         let rung2_started = std::time::Instant::now();
@@ -831,10 +820,11 @@ async fn run_unit_inner(
         // Admission is applied BEFORE the guard below sees the op set: a bad
         // map cannot be withdrawn, a gap can be acted on, and a deferral
         // leaves the cluster free to win tomorrow.
-        let verdict = verdicts
-            .get(index)
-            .cloned()
-            .unwrap_or(crate::admission::Verdict::Deferred);
+        let verdict = verdicts.get(index).cloned().unwrap_or_else(|| {
+            crate::admission::Verdict::Refused {
+                reason: "The cluster has no admission verdict, so it is recorded as a gap rather than mapped.".to_string(),
+            }
+        });
         let ops = crate::materialize::apply_verdict(&verdict, ops);
         // The lead-disposition guard rejects the whole op set BEFORE any
         // op is applied: an owned cluster must converge, never re-propose.
@@ -853,8 +843,6 @@ async fn run_unit_inner(
             report.clusters.push(record);
             continue;
         }
-        record.minting_deferred = matches!(verdict, crate::admission::Verdict::Deferred);
-        record.merit_reason = cluster.merit_reason.clone();
         record.ops = ops;
         report.clusters.push(record);
     }
@@ -867,12 +855,6 @@ async fn run_unit_inner(
     // match on night two.
     for record in &report.clusters {
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
-            continue;
-        }
-        // A DEFERRED cluster emitted nothing because code took its slot, not
-        // because the model declined it. Recording that as a decline would
-        // suppress a good grouping that was merely waiting its turn.
-        if record.minting_deferred && record.ops.is_empty() {
             continue;
         }
         let declined = record.ops.is_empty()
@@ -923,7 +905,7 @@ async fn run_unit_inner(
     // The per-edit chains, grouped by map in collection order, consumed by
     // the application step below.
     let mut edits_by_map: Vec<(String, Vec<MapEdit>)> = Vec::new();
-    for record in &report.clusters {
+    for (cluster_index, record) in report.clusters.iter().enumerate() {
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
             continue;
         }
@@ -932,7 +914,7 @@ async fn run_unit_inner(
             authorship_refusals,
             compose_refusals,
             edits,
-        } = materialize_cluster(&record.cluster(), &record.ops, &input);
+        } = materialize_cluster(&record.cluster(), cluster_index, &record.ops, &input);
         report.authorship_refusals.extend(authorship_refusals);
         report.compose_refusals.extend(compose_refusals);
         for edit in edits {
@@ -1056,7 +1038,9 @@ async fn apply_map_ops(
 ) -> ApplicationResult {
     // The fresh maps and their titles, from the parsed ops.
     let mut fresh: Vec<(String, String)> = Vec::new();
-    for record in &report.clusters {
+    // Indexed the SAME way the composition loop indexed it, so a body and
+    // its title agree on which cluster they came from.
+    for (cluster_index, record) in report.clusters.iter().enumerate() {
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
             continue;
         }
@@ -1065,7 +1049,7 @@ async fn apply_map_ops(
                 cluster_id, title, ..
             } = op
             {
-                fresh.push((new_map_id(cluster_id), title.clone()));
+                fresh.push((fresh_map_id(cluster_index, cluster_id), title.clone()));
             }
         }
     }
@@ -1079,7 +1063,6 @@ async fn apply_map_ops(
         .collect();
 
     let mut first_red_body: Option<String> = None;
-    let mut admission_latch: Option<String> = None;
     for (body_record, passed) in plan {
         if !passed {
             if first_red_body.is_none() {
@@ -1089,14 +1072,14 @@ async fn apply_map_ops(
         }
         if let Some((_, title)) = fresh.iter().find(|(id, _)| *id == body_record.map_id) {
             // A fresh map: exactly ONE create_map POST.
-            if admission_latch.is_some() {
-                report.skipped.push(SkippedOpRecord {
-                    op_kind: "create_map",
-                    map_id: body_record.map_id.clone(),
-                    reason: render_create_skipped_after_admission(&body_record.map_id),
-                });
-                continue;
-            }
+            //
+            // Every create is submitted independently. This loop used to
+            // LATCH on the first 409 and skip every remaining create, which
+            // was right while a 409 meant "the project's one map for tonight
+            // is spent" — a fact about the night, not about this map. With
+            // the per-night caps removed server-side, a 409 is a fact about
+            // ONE submission, and latching on it would discard a dozen good
+            // maps because of one bad one.
             let request = MapOpRequest::CreateMap {
                 project_ref: project_ref.to_string(),
                 short_title: title.clone(),
@@ -1121,7 +1104,6 @@ async fn apply_map_ops(
                     });
                 }
                 MapOpResult::CapAdmission { reason_body } => {
-                    admission_latch = Some(reason_body.clone());
                     report.cap_admissions.push(AppliedOpRecord {
                         op_kind: "create_map",
                         chain_index: 0,
@@ -1665,7 +1647,7 @@ mod tests {
             .expect("pointers")
             .push(json!("kb-10005"));
         value["maps"].as_array_mut().expect("maps").push(json!({
-            "id": "somnus-new-c1",
+            "id": "somnus-new-0-c1",
             "short_title": "Wireguard and DNS",
             "long_title": "Wireguard and DNS orientation map",
             "pointers": ["kb-10001", "kb-10002"],
@@ -1828,11 +1810,11 @@ mod tests {
         assert_eq!(
             report.composed_bodies[0],
             ComposedBodyRecord {
-                map_id: "somnus-new-c1".to_string(),
+                map_id: "somnus-new-0-c1".to_string(),
                 body_path: crate::materialize::map_body_path(
                     body_root.path(),
                     "demo-project",
-                    "somnus-new-c1"
+                    "somnus-new-0-c1"
                 ),
                 body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
             }
@@ -1894,7 +1876,7 @@ mod tests {
         assert_eq!(report.applied.len(), 2);
         assert_eq!(report.applied[0].op_kind, "create_map");
         assert_eq!(report.applied[0].chain_index, 0);
-        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-c1");
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c1");
         assert_eq!(
             report.applied[0].server_map_id.as_deref(),
             Some("kb-30001"),
@@ -2135,7 +2117,7 @@ mod tests {
         // (The gate factory receives the body path; the scripted fake
         // below distinguishes by path.)
         let gate = |body_path: &Path| {
-            let script = if body_path.to_string_lossy().contains("somnus-new-c1") {
+            let script = if body_path.to_string_lossy().contains("somnus-new-0-c1") {
                 "exit 22"
             } else {
                 "exit 0"
@@ -2175,7 +2157,7 @@ mod tests {
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: map-lint gate rejected the body for somnus-new-c1".to_string(),
+                reason: "somnus: map-lint gate rejected the body for somnus-new-0-c1".to_string(),
             }
         );
         assert_eq!(exit_code_for_outcome(&report.outcome), 2);
@@ -2228,7 +2210,7 @@ mod tests {
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: map-lint gate rejected the body for somnus-new-c1".to_string(),
+                reason: "somnus: map-lint gate rejected the body for somnus-new-0-c1".to_string(),
             },
             "the reason names the FIRST red body in composed_bodies order"
         );
@@ -3405,14 +3387,14 @@ mod tests {
         // admitted — the latch then holds for any FURTHER fresh map.
         assert_eq!(map_ops.requests().len(), 2);
         assert_eq!(report.applied.len(), 1);
-        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-c1");
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c1");
         assert_eq!(report.cap_admissions.len(), 1);
         assert_eq!(
             report.cap_admissions[0],
             AppliedOpRecord {
                 op_kind: "create_map",
                 chain_index: 0,
-                submitted_map_id: "somnus-new-c2".to_string(),
+                submitted_map_id: "somnus-new-0-c2".to_string(),
                 server_map_id: None,
                 version: None,
                 pointer_count: None,
@@ -3440,12 +3422,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cap_admission_latch_skips_a_later_fresh_map_and_stays_ready() {
-        // Two fresh maps from DIFFERENT clusters: the first create_map
-        // meets the server's cap admission, the latch turns create_map
-        // application off, and the second fresh map's create is SKIPPED
-        // (recorded) with zero POSTs for it — while the outcome stays
-        // Ready and the exit stays 0.
+    async fn a_rejected_create_does_not_stop_the_next_one() {
+        // Two fresh maps: the first create_map meets a 409, and the second
+        // is submitted ANYWAY. This loop used to latch on the first
+        // admission, which was right while a 409 meant the project's one map
+        // for the night was spent — a fact about the night. With the caps
+        // gone a 409 is a fact about one submission, and latching would
+        // discard every later map because of one earlier refusal.
         let clusters = json!([
             {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
             {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null},
@@ -3484,9 +3467,6 @@ mod tests {
             MapOpResult::CapAdmission {
                 reason_body: reason.to_string(),
             },
-            // Anything after the latch would be a defect: the script
-            // repeats the admission, so a second POST would record another
-            // admission and the count assertion below would catch it.
             MapOpResult::CapAdmission {
                 reason_body: reason.to_string(),
             },
@@ -3502,21 +3482,14 @@ mod tests {
         )
         .await;
         assert_eq!(report.composed_bodies.len(), 2);
-        // EXACTLY one POST: the second fresh map's create is latched off,
-        // and neither fresh map's add_pointers were ever candidates.
-        assert_eq!(map_ops.requests().len(), 1);
-        assert_eq!(report.cap_admissions.len(), 1);
-        assert_eq!(
-            report.skipped,
-            vec![SkippedOpRecord {
-                op_kind: "create_map",
-                map_id: "somnus-new-c2".to_string(),
-                reason: render_create_skipped_after_admission("somnus-new-c2"),
-            }]
-        );
-        assert_eq!(
-            report.skipped[0].reason,
-            "somnus: create_map for somnus-new-c2 skipped: a create_map cap admission was already recorded this invocation"
+        // BOTH creates are POSTed; neither fresh map's add_pointers were
+        // ever candidates (they are inlined into the create body).
+        assert_eq!(map_ops.requests().len(), 2);
+        assert_eq!(report.cap_admissions.len(), 2);
+        assert!(
+            report.skipped.is_empty(),
+            "one rejection must not skip the next map: {:?}",
+            report.skipped
         );
         assert_eq!(report.outcome, UnitOutcome::Ready);
         assert_eq!(exit_code_for_outcome(&report.outcome), 0);
@@ -3896,14 +3869,14 @@ mod tests {
     #[test]
     fn the_apply_audit_catches_an_add_pointer_on_a_fresh_map() {
         let request = MapOpRequest::AddPointer {
-            map_id: "somnus-new-c1".to_string(),
+            map_id: "somnus-new-0-c1".to_string(),
             body: "body".to_string(),
             added_entry_id: "kb-10001".to_string(),
         };
         assert_eq!(
-            apply_audit(Some("previous body"), &request, &["somnus-new-c1".to_string()]),
+            apply_audit(Some("previous body"), &request, &["somnus-new-0-c1".to_string()]),
             Some(
-                "somnus: apply audit: add_pointer on fresh map somnus-new-c1 not absorbed by the create body"
+                "somnus: apply audit: add_pointer on fresh map somnus-new-0-c1 not absorbed by the create body"
                     .to_string()
             )
         );
@@ -3923,7 +3896,7 @@ mod tests {
             apply_audit(
                 Some(&previous),
                 &request,
-                &["somnus-new-c1".to_string()],
+                &["somnus-new-0-c1".to_string()],
             ),
             Some(
                 "somnus: apply audit: add_pointer delta for kb-20001 was [\"kb-10002\", \"kb-10003\", \"kb-00042\"], expected kb-10002"

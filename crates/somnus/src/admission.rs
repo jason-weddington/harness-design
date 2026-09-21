@@ -1,16 +1,23 @@
-//! Which cluster becomes tonight's one map.
+//! Which clusters are fit to become maps.
 //!
-//! The write cap is one new map per project, enforced server-side as a 409.
-//! Rung 2 is one inference per cluster, so before this module existed the map
-//! that landed was simply whichever `create_map` was submitted first — array
-//! order, which is to say chance. On the first live run that put a sixteen
-//! entry catch-all at index 0 into a project with no other map to contradict
-//! it and no way to withdraw it.
+//! These rules discriminate QUALITY. They once also arbitrated scarcity —
+//! the server capped a project at one new map per night, so something had to
+//! choose which cluster spent it, and left to itself that was whichever
+//! `create_map` was submitted first. Array order, which is to say chance.
 //!
-//! The split follows the rung discipline. **The model ranks** clusters by
-//! merit, most map-worthy first, because that is judgement no rule can
-//! compute. **Code admits**, applying three mechanical rules and taking the
-//! first survivor, because which rules bind is not the model's to decide.
+//! **The cap is gone** (server-side, 2026-09-21). Jason's reasoning: a cap
+//! only ever bounded IRREVERSIBLE damage, and maps are deletable, so it
+//! protected nothing — while costing plenty, since rung 2 already pays for
+//! one inference per cluster and a capped run discarded all but one of them.
+//! A project needing fourteen maps would have taken fourteen nights to become
+//! navigable, and rationing maps rations exactly the agent orientation they
+//! exist to provide.
+//!
+//! So every cluster passing these rules now mints. What survives from the
+//! scarcity era is the ranking — rung 1 still emits in merit order — but that
+//! is a spend-ordering concern now rather than a correctness one, and these
+//! rules stayed because they never had anything to do with the cap: they
+//! judge whether a cluster is a subject, not whether there is room for it.
 //!
 //! Layering (pinned): this module references [`crate::loop_input`] only.
 
@@ -39,20 +46,23 @@ pub const MIN_CLUSTER_MEMBERS_FOR_NEW_MAP: usize = 3;
 /// subject. An ampersand or slash joins two nouns; a comma lists them.
 const UNION_MARKERS: [char; 3] = ['&', '/', ','];
 
-/// What may happen to a cluster's `create_map`.
+/// Whether a cluster may mint a map.
 ///
-/// The distinction between the two negative cases is load-bearing and would
-/// be silently wrong if collapsed. A [`Verdict::Refused`] cluster is
-/// structurally unfit, so its grouping becomes a `propose_gap` and the
-/// pipeline records a decline — it stops being re-proposed every night, and
-/// because the ledger keys on the exact member set, a later re-split of the
-/// same entries is a different set and is NOT suppressed. A
-/// [`Verdict::Deferred`] cluster is perfectly fit and merely lost tonight's
-/// single slot to a better one; it must record nothing at all, or the loop
-/// would suppress precisely the good clusters that were waiting their turn.
+/// A [`Verdict::Refused`] cluster is structurally unfit, so its grouping
+/// becomes a `propose_gap` and the pipeline records a decline — it stops
+/// being re-proposed every night, and because the ledger keys on the exact
+/// member set, a later re-split of the same entries is a different set and is
+/// NOT suppressed.
+///
+/// There is deliberately no third "fit but not this time" verdict. One
+/// existed while the cap did, and the distinction was load-bearing then: a
+/// cluster that merely lost the night's single slot had to record NOTHING,
+/// because declining it would have suppressed precisely the good clusters
+/// that were waiting their turn while the junk got declined correctly. With
+/// the cap gone there is no queue to wait in, so the case cannot arise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// This cluster may mint tonight's map.
+    /// This cluster may mint a map.
     Admitted,
     /// Structurally unfit to mint: decline it and record it.
     Refused {
@@ -60,9 +70,6 @@ pub enum Verdict {
         /// wire as model-written prose, so it obeys the map-lint's rules.
         reason: String,
     },
-    /// Fit, but another cluster won the slot. Emit nothing, record nothing,
-    /// and let it return tomorrow night.
-    Deferred,
 }
 
 /// Rule 1 — the size floor.
@@ -138,30 +145,27 @@ fn refusal(cluster: &Cluster) -> Option<String> {
 
 /// Judge every cluster, returning one verdict per cluster in the same order.
 ///
-/// Rung 1 emits clusters in ITS merit order, so the first cluster surviving
-/// all three rules is both the model's best judgement and mechanically
-/// admissible. Everything after it is deferred rather than refused; anything
-/// failing a rule is refused wherever it sits.
+/// Every cluster that survives all three rules is admitted. Rung 1's merit
+/// order still matters — it decides which maps are composed and submitted
+/// first, so a run that runs out of token budget part-way spends what it had
+/// on the clusters most worth mapping — but it no longer decides which single
+/// cluster is allowed to exist.
 #[must_use]
 pub fn judge(clusters: &[Cluster]) -> Vec<Verdict> {
-    let mut admitted = false;
     clusters
         .iter()
         .map(|cluster| {
             if let Some(reason) = refusal(cluster) {
                 return Verdict::Refused { reason };
             }
-            if !has_native_majority(cluster, clusters) {
-                return Verdict::Refused {
+            if has_native_majority(cluster, clusters) {
+                Verdict::Admitted
+            } else {
+                Verdict::Refused {
                     reason: "Most of the entries in this cluster belong to another cluster too, so it has no subject of its own and the grouping is recorded as a gap rather than mapped."
                         .to_string(),
-                };
+                }
             }
-            if admitted {
-                return Verdict::Deferred;
-            }
-            admitted = true;
-            Verdict::Admitted
         })
         .collect()
 }
@@ -179,23 +183,23 @@ mod tests {
         }
     }
 
+    /// The cap is gone: a project needing many maps gets many maps in one
+    /// run, rather than one a night for as many nights as it has subjects.
     #[test]
-    fn the_first_survivor_in_merit_order_is_admitted_and_the_rest_deferred() {
+    fn every_fit_cluster_is_admitted() {
         let clusters = vec![
             cluster("Wireguard", &["kb-1", "kb-2", "kb-3"]),
             cluster("Lightroom", &["kb-4", "kb-5", "kb-6"]),
+            cluster("Flickr", &["kb-7", "kb-8", "kb-9"]),
         ];
         assert_eq!(
             judge(&clusters),
-            vec![Verdict::Admitted, Verdict::Deferred],
-            "one map a night, and rung 1's order decides which"
+            vec![Verdict::Admitted, Verdict::Admitted, Verdict::Admitted]
         );
     }
 
-    /// A refused cluster at index 0 must not consume the slot — the next fit
-    /// cluster is admitted instead.
     #[test]
-    fn a_refusal_at_the_front_does_not_burn_the_slot() {
+    fn a_refusal_does_not_affect_its_neighbours() {
         let clusters = vec![
             cluster("Backend & Frontend", &["kb-1", "kb-2", "kb-3"]),
             cluster("Lightroom", &["kb-4", "kb-5", "kb-6"]),

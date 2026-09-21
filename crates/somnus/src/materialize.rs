@@ -64,11 +64,6 @@ pub enum ComposeError {
         /// The fresh map that cannot exist pointerless.
         map_id: String,
     },
-    /// The cluster's members name no directory with a plurality behind it.
-    LivesInUnavailable {
-        /// The cluster whose map cannot be placed.
-        cluster_id: String,
-    },
     /// The op targets a map that is neither in the loop-input maps nor the
     /// fresh map this run composes.
     UnknownMap {
@@ -100,10 +95,6 @@ impl std::fmt::Display for ComposeError {
                 f,
                 "somnus: refusing to compose map {map_id}: the create_map op set lists no pointers"
             ),
-            Self::LivesInUnavailable { cluster_id } => write!(
-                f,
-                "somnus: refusing to compose a map for cluster {cluster_id}: no `Lives in` value is available"
-            ),
             Self::UnknownMap { map_id } => {
                 write!(f, "somnus: op targets unknown map {map_id}")
             }
@@ -129,11 +120,33 @@ pub fn is_loop_owned(map: &LoopInputMap) -> bool {
         || map.updated_by.as_deref() == Some(SOMNUS_WRITER_ID)
 }
 
-/// The map id a fresh map for `cluster_id` gets. Deterministic so the op set
-/// can target it (its own `add_pointer` ops) without a server round-trip.
+/// The map id the MODEL targets when pointing at the map its own op set is
+/// creating. Deterministic so a cluster's `add_pointer` ops can name their
+/// fresh map without a server round-trip.
+///
+/// Scoped to one cluster's op set and nothing wider: `cluster_id` is a string
+/// the model invents, and rung 2 is one inference per cluster with no
+/// knowledge of the others, so nothing stops every cluster in a run calling
+/// its cluster `c1`.
 #[must_use]
 pub fn new_map_id(cluster_id: &str) -> String {
     format!("somnus-new-{cluster_id}")
+}
+
+/// The run-unique local id a fresh map is recorded under, before the server
+/// assigns the real one.
+///
+/// The cluster INDEX is what makes it unique, and code owns that. This
+/// mattered the moment the one-map-per-project cap was lifted: with several
+/// maps composed in a run, ids derived from the model's `cluster_id` alone
+/// collide as soon as two blind rung-2 calls both pick `c1` — and the
+/// collision is silent, because the pairing of body to title is a lookup by
+/// id, so the second map would have been created carrying the first map's
+/// title. Under the cap only one create ever reached the server, so nothing
+/// could expose it.
+#[must_use]
+pub fn fresh_map_id(cluster_index: usize, cluster_id: &str) -> String {
+    format!("somnus-new-{cluster_index}-{cluster_id}")
 }
 
 /// How many members must share a directory before it may be named, when the
@@ -141,7 +154,8 @@ pub fn new_map_id(cluster_id: &str) -> String {
 const MIN_MEMBERS_PER_NAMED_DIRECTORY: usize = 2;
 
 /// Derive the `Lives in` value for a cluster's fresh map from the cluster's
-/// OWN members.
+/// OWN members, or `None` when its members name no directory with a
+/// plurality behind it.
 ///
 /// `Lives in` is per-cluster, not per-project: the canonical line is
 /// directory-level orientation for *that subject area*, so a project-level
@@ -153,25 +167,22 @@ const MIN_MEMBERS_PER_NAMED_DIRECTORY: usize = 2;
 /// 2. else a majority share one of the top two homes AND each of those two is
 ///    home to at least [`MIN_MEMBERS_PER_NAMED_DIRECTORY`] members — name
 ///    both, joined by the word `and`, which the map-lint accepts;
-/// 3. else refuse.
+/// 3. else `None`.
 ///
-/// **The refusal is the point, not a shortfall.** A cluster whose members
-/// scatter across three directories with no plurality is rung 1 telling you
-/// it carved badly, and composing a confident line from an arbitrary
-/// three-way tie would convert that signal into a map that reads as
-/// authoritative and cannot be withdrawn. Refusing costs one `propose_gap` a
-/// human can act on.
+/// **`None` means OMIT the line, not refuse the map** — a reversal of this
+/// function's first behaviour, forced by measurement rather than taste. Run
+/// against the real bodies, 9 of the 10 members of the cluster an adversarial
+/// review picked as the best first map cite no repo directory at all: they
+/// document a third-party SDK, not our code. Clusters like that are the ones
+/// most worth mapping, so refusing them inverted the intent. The property
+/// that mattered survives untouched — code still never invents a directory —
+/// and a map that orients without naming one beats no map at all.
 ///
 /// Members with no tokens still count toward the total, because an entry that
 /// mentions no directory is evidence of nothing and should dilute a claim
 /// rather than be quietly excluded from it.
-///
-/// # Errors
-/// [`ComposeError::LivesInUnavailable`] when no plurality exists.
-pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Result<String, ComposeError> {
-    let refused = || ComposeError::LivesInUnavailable {
-        cluster_id: cluster.label.clone(),
-    };
+#[must_use]
+pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Option<String> {
     let mut homes: Vec<(String, usize)> = Vec::new();
     for id in &cluster.member_entry_ids {
         let Some(home) = input
@@ -190,16 +201,13 @@ pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Result<String, Co
     // Most-claimed first, ties broken by token so the answer is stable.
     homes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let members = cluster.member_entry_ids.len();
-    let (first, first_count) = homes.first().cloned().ok_or_else(refused)?;
+    let (first, first_count) = homes.first().cloned()?;
     if first_count * 2 > members {
-        return Ok(first);
+        return Some(first);
     }
-    let (second, second_count) = homes.get(1).cloned().ok_or_else(refused)?;
-    if (first_count + second_count) * 2 > members && second_count >= MIN_MEMBERS_PER_NAMED_DIRECTORY
-    {
-        return Ok(format!("{first} and {second}"));
-    }
-    Err(refused())
+    let (second, second_count) = homes.get(1).cloned()?;
+    ((first_count + second_count) * 2 > members && second_count >= MIN_MEMBERS_PER_NAMED_DIRECTORY)
+        .then(|| format!("{first} and {second}"))
 }
 
 /// Compose a FRESH map body: the first three sections ONLY (a new map has
@@ -207,18 +215,24 @@ pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Result<String, Co
 /// carries it), with one `Detail entries:` line per `add_pointer` op in
 /// `ops` that targets [`new_map_id(cluster_id)`], in op order.
 ///
+/// The `Lives in` line is OMITTED when the cluster's members name no
+/// directory with a plurality behind it — the commonest case for a cluster
+/// documenting somebody else's code, and not a reason to withhold a map.
+///
 /// # Errors
-/// [`ComposeError::LivesInUnavailable`] when no `Lives in` value exists;
 /// [`ComposeError::EmptyPointerList`] when no op in `ops` points at the new
 /// map — a map with no pointers is not a map.
 pub fn compose_new_map_body(
     cluster: &Cluster,
+    cluster_index: usize,
     cluster_id: &str,
     orientation_prose: &str,
     ops: &[Op],
     input: &LoopInput,
 ) -> Result<String, ComposeError> {
-    let lives_in = lives_in_value(cluster, input)?;
+    let lives_in = lives_in_value(cluster, input);
+    // Pointers are matched on the id the MODEL used; the map is RECORDED
+    // under the run-unique one.
     let fresh_id = new_map_id(cluster_id);
     let mut detail_lines = Vec::new();
     for op in ops {
@@ -233,14 +247,20 @@ pub fn compose_new_map_body(
         }
     }
     if detail_lines.is_empty() {
-        return Err(ComposeError::EmptyPointerList { map_id: fresh_id });
+        return Err(ComposeError::EmptyPointerList {
+            map_id: fresh_map_id(cluster_index, cluster_id),
+        });
     }
-    Ok([
-        format!("{LIVES_IN_PREFIX}{lives_in}"),
-        orientation_prose.to_string(),
-        format!("{DETAIL_ENTRIES_HEADER}\n{}", detail_lines.join("\n")),
-    ]
-    .join(SECTION_SEPARATOR))
+    let mut sections = Vec::with_capacity(3);
+    if let Some(lives_in) = lives_in {
+        sections.push(format!("{LIVES_IN_PREFIX}{lives_in}"));
+    }
+    sections.push(orientation_prose.to_string());
+    sections.push(format!(
+        "{DETAIL_ENTRIES_HEADER}\n{}",
+        detail_lines.join("\n")
+    ));
+    Ok(sections.join(SECTION_SEPARATOR))
 }
 
 /// The pinned pointer-line shape: `- {entry_id} — {gloss}`.
@@ -332,29 +352,21 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
 ///
 /// A floor, a union label and a phantom cluster are structural invariants, so
 /// they live here rather than in the rung-2 instruction: a prompt makes a bad
-/// map unlikely, and code makes it impossible. The KB's own cardinal-rule
-/// check is at least ONE pointer, so nothing downstream would refuse the maps
-/// this prevents.
+/// map unlikely, and code makes it impossible.
 ///
 /// Only the MINTING is affected. Pointers into maps that already exist, and
-/// struck gaps, survive every verdict untouched: adding to an existing map is
-/// not the thing admission guards against.
+/// struck gaps, survive untouched: adding to an existing map is not the thing
+/// admission guards against.
 ///
-/// - [`Verdict::Admitted`] — the op set passes through unchanged.
-/// - [`Verdict::Refused`] — the `create_map` and its pointers are replaced by
-///   a single `propose_gap`, which is what the pipeline records as a decline,
-///   so the observation survives instead of being re-proposed every night. A
-///   `no_change` is dropped alongside, because leaving one would make the set
-///   not-all-`propose_gap` and silently skip the decline write.
-/// - [`Verdict::Deferred`] — the `create_map` and its pointers are dropped
-///   and NOTHING is substituted. A deferred cluster is fit and merely lost
-///   tonight's slot; recording anything would suppress it tomorrow.
+/// On a refusal the `create_map` and its pointers are replaced by a single
+/// `propose_gap`, which is what the pipeline records as a decline, so the
+/// observation survives instead of being re-proposed every night. A
+/// `no_change` is dropped alongside, because leaving one would make the set
+/// not-all-`propose_gap` and silently skip the decline write.
 #[must_use]
 pub fn apply_verdict(verdict: &Verdict, ops: Vec<Op>) -> Vec<Op> {
-    let reason = match verdict {
-        Verdict::Admitted => return ops,
-        Verdict::Refused { reason } => Some(reason.clone()),
-        Verdict::Deferred => None,
+    let Verdict::Refused { reason } = verdict else {
+        return ops;
     };
     let Some(cluster_id) = ops.iter().find_map(|op| match op {
         Op::CreateMap { cluster_id, .. } => Some(cluster_id.clone()),
@@ -366,16 +378,16 @@ pub fn apply_verdict(verdict: &Verdict, ops: Vec<Op>) -> Vec<Op> {
     let mut kept: Vec<Op> = ops
         .into_iter()
         .filter(|op| match op {
-            Op::CreateMap { .. } => false,
-            Op::NoChange { .. } => reason.is_none(),
+            Op::CreateMap { .. } | Op::NoChange { .. } => false,
             Op::AddPointer { map_id, .. } => map_id != &minted,
             Op::StrikeGap { .. } | Op::ProposeGap { .. } => true,
         })
         .collect();
-    if let Some(reason) = reason
-        && !kept.iter().any(|op| matches!(op, Op::ProposeGap { .. }))
-    {
-        kept.push(Op::ProposeGap { reason, cluster_id });
+    if !kept.iter().any(|op| matches!(op, Op::ProposeGap { .. })) {
+        kept.push(Op::ProposeGap {
+            reason: reason.clone(),
+            cluster_id,
+        });
     }
     kept
 }
@@ -451,7 +463,12 @@ pub struct Materialized {
 // one op set, one linear pass: splitting it
 // would scatter the read-modify-write chain across helpers.
 #[must_use]
-pub fn materialize_cluster(cluster: &Cluster, ops: &[Op], input: &LoopInput) -> Materialized {
+pub fn materialize_cluster(
+    cluster: &Cluster,
+    cluster_index: usize,
+    ops: &[Op],
+    input: &LoopInput,
+) -> Materialized {
     let mut out = Materialized::default();
 
     // Every `create_map` op in the set composes (no client-side cap: the
@@ -463,10 +480,17 @@ pub fn materialize_cluster(cluster: &Cluster, ops: &[Op], input: &LoopInput) -> 
             ..
         } = op
         {
-            match compose_new_map_body(cluster, cluster_id, orientation_prose, ops, input) {
+            match compose_new_map_body(
+                cluster,
+                cluster_index,
+                cluster_id,
+                orientation_prose,
+                ops,
+                input,
+            ) {
                 Ok(body) => {
                     out.bodies.push(ComposedBody {
-                        map_id: new_map_id(cluster_id),
+                        map_id: fresh_map_id(cluster_index, cluster_id),
                         body,
                     });
                 }
@@ -717,7 +741,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("services", &["kb-10005"], None);
         let ops = vec![add_pointer("kb-20002", "kb-10005", "gloss")];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.authorship_refusals.len(), 1);
         assert!(
@@ -740,7 +764,7 @@ mod tests {
         let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
         assert_eq!(
             lives_in_value(&owned, &input),
-            Ok("knowledge/network".to_string())
+            Some("knowledge/network".to_string())
         );
     }
 
@@ -768,16 +792,16 @@ mod tests {
         );
         assert_eq!(
             lives_in_value(&spread, &input),
-            Ok("apps/web and packages/core".to_string()),
+            Some("apps/web and packages/core".to_string()),
             "an even split is ordered by token so the answer is stable"
         );
     }
 
-    /// The tie that must refuse. Three members, three homes, no plurality —
-    /// rung 1 reporting a bad carve. Composing here would turn that signal
-    /// into an authoritative map nobody can withdraw.
+    /// The tie that must NOT be resolved. Three members, three homes, no
+    /// plurality — rung 1 reporting a bad carve. Naming one of them would
+    /// pass off an arbitrary pick as orientation.
     #[test]
-    fn a_three_way_tie_refuses_rather_than_picking_one() {
+    fn a_three_way_tie_names_no_directory() {
         let mut input = fixture();
         for (index, entry) in input.entries.iter_mut().enumerate() {
             entry.directory_tokens = vec![crate::loop_input::DirectoryToken {
@@ -786,12 +810,7 @@ mod tests {
             }];
         }
         let scattered = cluster("scattered", &["kb-10001", "kb-10002", "kb-10003"], None);
-        assert_eq!(
-            lives_in_value(&scattered, &input),
-            Err(ComposeError::LivesInUnavailable {
-                cluster_id: "scattered".to_string(),
-            })
-        );
+        assert_eq!(lives_in_value(&scattered, &input), None);
     }
 
     /// A member with no tokens is evidence of nothing, so it dilutes the
@@ -807,31 +826,35 @@ mod tests {
             hits: 9,
         }];
         let thin = cluster("thin-evidence", &["kb-10001", "kb-10002", "kb-10003"], None);
-        assert!(
-            lives_in_value(&thin, &input).is_err(),
+        assert_eq!(
+            lives_in_value(&thin, &input),
+            None,
             "one member in nine directories is still one member"
         );
     }
 
+    /// The case measurement forced: a cluster documenting somebody else's
+    /// code names no directory of ours, and those are among the clusters most
+    /// worth mapping. The body composes WITHOUT the line rather than the map
+    /// being withheld.
     #[test]
-    fn a_cluster_with_no_directory_tokens_refuses_to_compose() {
+    fn a_cluster_naming_no_directory_still_gets_a_body() {
         let mut input = fixture();
         for entry in &mut input.entries {
             entry.directory_tokens.clear();
         }
-        let unowned = cluster("services", &["kb-10005"], None);
-        assert_eq!(
-            lives_in_value(&unowned, &input),
-            Err(ComposeError::LivesInUnavailable {
-                cluster_id: "services".to_string(),
-            })
-        );
-        assert_eq!(
-            ComposeError::LivesInUnavailable {
-                cluster_id: "services".to_string(),
-            }
-            .to_string(),
-            "somnus: refusing to compose a map for cluster services: no `Lives in` value is available"
+        let unowned = cluster("third-party-sdk", &["kb-10001"], None);
+        assert_eq!(lives_in_value(&unowned, &input), None);
+        let ops = vec![
+            create_map("c1", "PROSE"),
+            add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
+        ];
+        let body = compose_new_map_body(&unowned, 0, "c1", "PROSE", &ops, &input)
+            .expect("no directory is not a reason to withhold a map");
+        assert_eq!(body, "PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1");
+        assert!(
+            !body.contains("Lives in"),
+            "the line is omitted, never invented: {body}"
         );
     }
 
@@ -851,7 +874,7 @@ mod tests {
             add_pointer("somnus-new-c1", "kb-10002", "GLOSS-2"),
             add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
         ];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
 
         assert_eq!(materialized.bodies.len(), 2);
         // Every byte outside ORIENTATION-PROSE and the two glosses is
@@ -859,7 +882,7 @@ mod tests {
         assert_eq!(
             materialized.bodies[0],
             ComposedBody {
-                map_id: "somnus-new-c1".to_string(),
+                map_id: "somnus-new-0-c1".to_string(),
                 body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2"
                     .to_string(),
             }
@@ -880,7 +903,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
         let ops = vec![create_map("c1", "ORIENTATION-PROSE")];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -907,7 +930,7 @@ mod tests {
             create_map("c1", "PROSE"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
         ];
-        let body = compose_new_map_body(&owned, "c1", "PROSE", &ops, &input)
+        let body = compose_new_map_body(&owned, 0, "c1", "PROSE", &ops, &input)
             .expect("composed with pointers");
         assert_eq!(
             body,
@@ -925,7 +948,7 @@ mod tests {
             add_pointer("somnus-new-c1", "kb-10002", "GLOSS-B"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-A"),
         ];
-        let body = compose_new_map_body(&owned, "c1", "PROSE", &ops, &input)
+        let body = compose_new_map_body(&owned, 0, "c1", "PROSE", &ops, &input)
             .expect("composed with pointers");
         assert!(
             body.ends_with("Detail entries:\n- kb-10002 — GLOSS-B\n- kb-10001 — GLOSS-A"),
@@ -940,7 +963,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-20001", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1);
         assert_eq!(
             materialized.bodies[0].body,
@@ -956,7 +979,7 @@ mod tests {
             add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
             add_pointer("kb-20001", "kb-10006", "GLOSS-6"),
         ];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1, "one body per map");
         assert!(materialized.bodies[0].body.contains(
             "- kb-10004 — DHCP lease hygiene\n- kb-10005 — GLOSS-5\n- kb-10006 — GLOSS-6"
@@ -968,7 +991,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-99999", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -984,7 +1007,7 @@ mod tests {
         input.maps[0].body = "Lives in knowledge/linux/network\n\nProse only.".to_string();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-20001", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -1005,7 +1028,7 @@ mod tests {
             gap_text: "Site-to-site wireguard topology".to_string(),
             closing_entry_id: "kb-10003".to_string(),
         }];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1);
         assert_eq!(
             materialized.bodies[0].body,
@@ -1022,7 +1045,7 @@ mod tests {
             gap_text: "a gap nobody recorded".to_string(),
             closing_entry_id: "kb-10003".to_string(),
         }];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -1047,10 +1070,10 @@ mod tests {
             create_map("c2", "PROSE-2"),
             add_pointer("somnus-new-c2", "kb-10001", "GLOSS-1"),
         ];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert_eq!(materialized.bodies.len(), 2);
-        assert_eq!(materialized.bodies[0].map_id, "somnus-new-c1");
-        assert_eq!(materialized.bodies[1].map_id, "somnus-new-c2");
+        assert_eq!(materialized.bodies[0].map_id, "somnus-new-0-c1");
+        assert_eq!(materialized.bodies[1].map_id, "somnus-new-0-c2");
         assert_eq!(materialized.compose_refusals, Vec::<String>::new());
         // A fresh map's add_pointers are inlined into the create body: no
         // edits for either fresh map.
@@ -1069,7 +1092,7 @@ mod tests {
                 closing_entry_id: "kb-10003".to_string(),
             },
         ];
-        let materialized = materialize_cluster(&owned, &ops, &input);
+        let materialized = materialize_cluster(&owned, 0, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1);
         assert_eq!(materialized.edits.len(), 2, "one edit per op, in op order");
         assert_eq!(
@@ -1275,45 +1298,12 @@ mod verdict_tests {
         );
     }
 
-    /// The distinction that would be silently wrong if collapsed: a deferred
-    /// cluster is FIT and merely lost tonight's slot, so it must leave no
-    /// trace at all. Substituting a gap here would decline a good grouping
-    /// and suppress it tomorrow.
+    /// Admission guards MINTING, not contributing: a refusal leaves pointers
+    /// into maps that already exist alone.
     #[test]
-    fn a_deferred_cluster_records_nothing() {
-        let ops = apply_verdict(
-            &Verdict::Deferred,
-            vec![create_map(), pointer("somnus-new-c1", "kb-10001")],
-        );
-        assert!(ops.is_empty(), "a deferral is not a decline; got {ops:?}");
-    }
-
-    /// A deferred cluster keeps its own `no_change`, because that one is the
-    /// model's word rather than ours.
-    #[test]
-    fn a_deferred_cluster_keeps_the_models_own_no_change() {
-        let ops = apply_verdict(
-            &Verdict::Deferred,
-            vec![
-                create_map(),
-                Op::NoChange {
-                    cluster_id: "c1".to_string(),
-                },
-            ],
-        );
-        assert_eq!(
-            ops,
-            vec![Op::NoChange {
-                cluster_id: "c1".to_string()
-            }]
-        );
-    }
-
-    /// Admission guards MINTING, not contributing. Both negative verdicts
-    /// leave pointers into maps that already exist alone.
-    #[test]
-    fn pointers_into_an_existing_map_survive_every_verdict() {
-        for verdict in [refused(), Verdict::Deferred] {
+    fn pointers_into_an_existing_map_survive_a_refusal() {
+        {
+            let verdict = refused();
             let ops = apply_verdict(
                 &verdict,
                 vec![
