@@ -48,6 +48,31 @@ The canonical map form has four parts and **code emits three of them**: a coarse
 
 This is why the map is **born lint-clean by construction**: every token class the purity lint rejects (file paths, `ENV_VAR` tokens, dotted identifiers, quoted literals, slash-joined paths) can only appear in the three code-composed parts. It also fixes the length budget — the budget is compositional (`900 + 175 × pointer_count`, validated against all 27 live maps), so it scales with pointer count instead of punishing the best-covered maps.
 
+## The write path — `POST /api/kb/map-op`
+
+**One endpoint, machine-principal only, and every op is verified by a set comparison over `kb-XXXXX` refs — never by parsing the map grammar.** This is the contract the run body was blocked on; it was the one seam we specified in neither direction, because loop-input, the cluster ledger and the lint were each obviously read-or-gate and this one is the only genuine write.
+
+The request carries the **whole composed body**, because Rung 3 says somnus's code composes it and the server must not become a second renderer. A server-side composer would have to parse an existing map body to re-render it on `add_pointer`, which contradicts the deliberate grammar-agnosticism of the lint and would mangle the 27 hand-written maps that predate any grammar. So the server never reads the body's structure. It reads the body's **`kb-` refs**, with kb-core's own pointer regex, and that single primitive is enough to verify all four ops.
+
+**Why not just `POST /api/kb/store` with `update_entry_id`, which already works and already hard-lints the machine principal?** Because the design's additive-only invariant is *non-negotiable and substitutes for the revert that a live Postgres cannot offer*, and on the `/store` path nothing enforces it: a body that silently drops half a map's pointers is a valid store. The same goes for the per-night structural caps, which exist to turn a clustering mistake into a one-map event. Both are currently prompt instructions and both become machine-checked here. That is the whole reason this endpoint exists rather than reusing `/store` — not the ergonomics of an op-shaped API.
+
+**403 for any caller who is not the configured machine principal.** The invariants below (exactly one pointer added per call, no pointer ever removed) are correct for an unattended loop and hostile to a human editing a map in the SPA, so humans keep `/store`, where the lint stays advisory.
+
+Every op takes `body` (the full composed map body) and returns the same envelope: `{map_id, version, pointer_count, budget}`. Optional `base_version` on the three update ops: when present and stale, **409**. That is the cheap guard for the one race the design deferred a lease over — a manual run against the timer — and it costs nothing when omitted.
+
+- **`create_map`** — `{op, project_ref, short_title, long_title, body}`. Server asserts ≥1 `kb-` ref (the cardinal rule, already enforced for `mental_map` on `/store`), lints, checks the per-night caps, stores. **201.**
+- **`add_pointer`** — `{op, map_id, body, added_entry_id}`. Let `old` and `new` be the ref sets of the stored and submitted bodies. Server asserts `new ⊇ old` (additive-only), `new \ old == {added_entry_id}` (exactly one pointer per call — the closed-op discipline made structural rather than prompted), and that `added_entry_id` resolves to an active entry in the map's own `project_ref`. **200.**
+- **`strike_gap`** — `{op, map_id, body, gap_text, closing_entry_id}`. Server asserts `new == old` — a gap op must not move pointers — and that `closing_entry_id` is in `old`, since the spec requires citing the entry that closed the gap and that entry is by definition already pointed at. **200.**
+- **`propose_gap`** — `{op, map_id, body, gap_text}`. Server asserts `new == old`. **200.**
+- **Both gap ops also assert the op did what it claims, by plain substring and not by parse:** `strike_gap` requires `gap_text` present in the stored body and absent from the submitted one, `propose_gap` the reverse. A substring test is grammar-agnostic in exactly the way the ref-set test is, so this catches a renderer that dropped the gap silently without the server ever learning what a gap line looks like.
+- **`no_change`** — never reaches HTTP. No endpoint, no row, no request.
+
+**The per-night caps are enforced here, in SQL, not in the prompt:** one new map per `project_ref` and three per KB, counted as `mental_map` entries created by the machine principal since **UTC midnight**. UTC rather than host-local because three Pis in one fleet must agree on where a night ends, and a rolling 24-hour window is wrong in the one case that matters — a retry just after midnight would inherit yesterday's count. Exceeding either cap is **409** with a machine-readable reason, which somnus treats as an ordinary admission outcome for the rest of the night rather than a fault to retry.
+
+**Status semantics, flat and terminal:** 403 not the machine principal · 404 unknown `map_id` · 409 invariant violation, stale `base_version`, or cap exceeded · 422 lint findings · 200/201 success. Nothing here is retryable, which matches the ledger and loop-input endpoints so somnus keeps one rule for the whole KB surface.
+
+**The one kb-core addition:** a public `map_pointer_ids(text) -> set[str]` beside `count_map_pointers`, so the ref extraction the invariants rest on is the same regex the lint and the budget already use. A second copy of that pattern in the service is exactly the silent drift this pair has now been bitten by twice.
+
 ## The gate — leg 2
 
 `POST /api/kb/map-lint`. Shell out as `/bin/sh -c 'curl -sf -X POST ...'`; **the HTTP status is the verdict** — 422 on a failing body, 200 on a clean one, deliberately not a 200 carrying `valid:false`, which `curl -f` would read as green.
@@ -105,6 +130,10 @@ Never `deactivate` a map (on the HTTP path that path deletes the map's outbound 
 ## Structural caps, per night
 
 One new map per project, three per KB, three eligible projects. Plus the dollar ceiling. The caps convert a clustering mistake into a one-map event rather than a corpus-wide one; the ceiling catches a retry storm at 3am.
+
+**The first two caps are enforced server-side** (`POST /api/kb/map-op`, counted since UTC midnight), so a somnus bug cannot exceed them and somnus need not track them across a crash. The third — three eligible projects per night — is somnus's worklist policy and has no server analogue, since the server sees one request at a time and cannot tell a night's third project from its thirtieth.
+
+**The ceiling is a single harness budget field counting the billed sum** — input + output + cache-read + cache-write, not a split. Measured nightly is 33k in / 3k out = 36k tokens at $0.15. **Nightly: 550,000.** ~15× expected, so tripping it is unambiguously a bug signal rather than a throttle, and it bounds a runaway night at roughly $2. **Backfill: 1,100,000** (~$7, against a measured $3.40 for all 16 projects), which has to be a distinct value on a distinct subcommand: a nightly ceiling loose enough to admit the backfill is not a ceiling, and a backfill run under the nightly ceiling trips on its first night. The measured figures are the $0.15, the 36k and the $3.40; the 15× and 2× headroom multipliers are a judgement call recorded here so a later reader can retune them against real spend rather than re-derive them.
 
 ## How we know it worked
 
