@@ -290,6 +290,50 @@ pub async fn rung2_turn(
     backend.turn(&request).await
 }
 
+/// Render a turn for the forensic offload: every block, not just the text.
+///
+/// **`AssistantTurn::text()` concatenates only `Text` blocks, so a rung-2
+/// turn — which emits tool calls and usually no prose at all — offloaded a
+/// ZERO-BYTE file.** The one artifact that distinguishes "the model omitted
+/// the pointers" from "the pointers named a different map" captured nothing,
+/// on exactly the failure it exists to explain. A forensic record that is
+/// empty precisely when something went wrong is worse than none, because it
+/// reads as evidence of absence rather than absence of evidence.
+///
+/// So every block is rendered: text verbatim, and each tool call as its name
+/// and its arguments, which for rung 2 IS the model's answer.
+#[must_use]
+pub fn render_turn_for_offload(turn: &AssistantTurn) -> String {
+    let mut out = String::new();
+    for block in &turn.content {
+        match block {
+            ContentBlock::Text(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            ContentBlock::Reasoning { text, .. } => {
+                out.push_str("[reasoning] ");
+                out.push_str(text);
+                out.push('\n');
+            }
+            ContentBlock::ToolCall(call) => {
+                out.push_str("[tool_call] ");
+                out.push_str(&call.name);
+                out.push(' ');
+                out.push_str(
+                    &serde_json::to_string(&call.input)
+                        .unwrap_or_else(|_| "<arguments did not serialize>".to_string()),
+                );
+                out.push('\n');
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("<the turn carried no content blocks>\n");
+    }
+    out
+}
+
 /// Where a failed rung-1 parse offloads its raw model text.
 #[must_use]
 pub fn rung1_raw_path(root: &Path, project_ref: &str) -> PathBuf {

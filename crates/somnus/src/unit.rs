@@ -879,6 +879,10 @@ async fn run_unit_inner(
                 }
             }
         }
+        // The fresh map's id is code-owned: whichever of the two spellings
+        // the prompt offered the model reached for, the op set now names the
+        // canonical one, so a create and its pointers cannot disagree.
+        let ops = crate::materialize::canonicalize_fresh_map_ids(ops, index);
         // Admission is applied BEFORE the guard below sees the op set: a bad
         // map cannot be withdrawn, a gap can be acted on, and a deferral
         // leaves the cluster free to win tomorrow.
@@ -900,7 +904,10 @@ async fn run_unit_inner(
             .or_else(|| crate::materialize::validate_ops_for_cluster(cluster, &ops).err());
         if let Some(reason) = reason {
             let path = rung2_raw_path(&deps.body_root, project_ref, index);
-            if let Err(err) = write_text(&path, &turn.text()) {
+            // The WHOLE turn, not `turn.text()`: a rung-2 answer is tool
+            // calls, and text() skips them, so this file was always empty on
+            // exactly the failures it exists to explain.
+            if let Err(err) = write_text(&path, &crate::rungs::render_turn_for_offload(&turn)) {
                 eprintln!(
                     "somnus: could not offload the rung-2 raw text to {}: {err}",
                     path.display()
@@ -1792,7 +1799,7 @@ mod tests {
             .expect("pointers")
             .push(json!("kb-10005"));
         value["maps"].as_array_mut().expect("maps").push(json!({
-            "id": "somnus-new-0-c1",
+            "id": "somnus-new-0-c0",
             "short_title": "Wireguard and DNS",
             "long_title": "Wireguard and DNS orientation map",
             "pointers": ["kb-10001", "kb-10002"],
@@ -1955,11 +1962,11 @@ mod tests {
         assert_eq!(
             report.composed_bodies[0],
             ComposedBodyRecord {
-                map_id: "somnus-new-0-c1".to_string(),
+                map_id: "somnus-new-0-c0".to_string(),
                 body_path: crate::materialize::map_body_path(
                     body_root.path(),
                     "demo-project",
-                    "somnus-new-0-c1"
+                    "somnus-new-0-c0"
                 ),
                 body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
             }
@@ -2021,7 +2028,7 @@ mod tests {
         assert_eq!(report.applied.len(), 2);
         assert_eq!(report.applied[0].op_kind, "create_map");
         assert_eq!(report.applied[0].chain_index, 0);
-        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c1");
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c0");
         assert_eq!(
             report.applied[0].server_map_id.as_deref(),
             Some("kb-30001"),
@@ -2333,7 +2340,7 @@ mod tests {
         // (The gate factory receives the body path; the scripted fake
         // below distinguishes by path.)
         let gate = |body_path: &Path| {
-            let script = if body_path.to_string_lossy().contains("somnus-new-0-c1") {
+            let script = if body_path.to_string_lossy().contains("somnus-new-0-c0") {
                 "exit 1"
             } else {
                 "exit 0"
@@ -2374,7 +2381,10 @@ mod tests {
         // body is recorded, never a verdict on the project.
         assert_eq!(report.outcome, UnitOutcome::Ready);
         assert_eq!(exit_code_for_outcome(&report.outcome), 0);
-        assert!(!report.gate_reports[0].passed);
+        assert!(
+            report.gate_reports.iter().any(|gate| !gate.passed),
+            "the red body is still recorded as red"
+        );
     }
 
     #[tokio::test]
@@ -3754,7 +3764,15 @@ mod tests {
             .raw_path
             .as_ref()
             .expect("the raw model text is offloaded for forensics");
-        assert!(raw.exists(), "{raw:?}");
+        // NON-EMPTY, and carrying the tool calls. A rung-2 answer is tool
+        // calls and `AssistantTurn::text()` skips them, so this file was
+        // zero bytes on exactly the failures it exists to explain — a
+        // forensic record that is empty precisely when something went wrong
+        // reads as evidence of absence rather than absence of evidence.
+        let raw_text = std::fs::read_to_string(raw).expect("the offload is readable");
+        assert!(!raw_text.is_empty(), "the offload must not be empty");
+        assert!(raw_text.contains("[tool_call] create_map"), "{raw_text}");
+        assert!(raw_text.contains("cluster_id"), "{raw_text}");
         assert!(report.declines_recorded.is_empty());
     }
 
@@ -4090,14 +4108,14 @@ mod tests {
     #[test]
     fn the_apply_audit_catches_an_add_pointer_on_a_fresh_map() {
         let request = MapOpRequest::AddPointer {
-            map_id: "somnus-new-0-c1".to_string(),
+            map_id: "somnus-new-0-c0".to_string(),
             body: "body".to_string(),
             added_entry_id: "kb-10001".to_string(),
         };
         assert_eq!(
-            apply_audit(Some("previous body"), &request, &["somnus-new-0-c1".to_string()]),
+            apply_audit(Some("previous body"), &request, &["somnus-new-0-c0".to_string()]),
             Some(
-                "somnus: apply audit: add_pointer on fresh map somnus-new-0-c1 not absorbed by the create body"
+                "somnus: apply audit: add_pointer on fresh map somnus-new-0-c0 not absorbed by the create body"
                     .to_string()
             )
         );
@@ -4117,7 +4135,7 @@ mod tests {
             apply_audit(
                 Some(&previous),
                 &request,
-                &["somnus-new-0-c1".to_string()],
+                &["somnus-new-0-c0".to_string()],
             ),
             Some(
                 "somnus: apply audit: add_pointer delta for kb-20001 was [\"kb-10002\", \"kb-10003\", \"kb-00042\"], expected kb-10002"

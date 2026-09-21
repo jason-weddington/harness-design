@@ -375,13 +375,106 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
             .iter()
             .any(|other| matches!(other, Op::AddPointer { map_id, .. } if map_id == &minted))
         {
+            // Name what the model DID aim at. "No pointer targeting X" is
+            // compatible with two very different failures — the model emitted
+            // no pointers at all, or it emitted them at a different id — and
+            // the fixes are a prompt change and a code change respectively.
+            // Carrying the aimed-at ids in the error makes the message
+            // self-diagnosing, so the answer does not depend on a separate
+            // forensic file being present and non-empty.
+            let aimed: Vec<&str> = ops
+                .iter()
+                .filter_map(|other| match other {
+                    Op::AddPointer { map_id, .. } => Some(map_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let saw = if aimed.is_empty() {
+                "the op set carries no add_pointer op at all".to_string()
+            } else {
+                format!("the add_pointer ops target {}", aimed.join(", "))
+            };
             return Err(format!(
-                "somnus: create_map for cluster {} carries no add_pointer op targeting {minted} — a map is created together with its pointers in one write, so a create_map without them cannot produce a map",
+                "somnus: create_map for cluster {} carries no add_pointer op targeting {minted} ({saw}) — a map is created together with its pointers in one write, so a create_map without them cannot produce a map",
                 cluster.label
             ));
         }
     }
     Ok(())
+}
+
+/// Rewrite a cluster's op set so every reference to the map it is creating
+/// uses the CODE-OWNED id, whichever spelling the model reached for.
+///
+/// The rung-2 prompt hands the model two strings that must agree: a
+/// `cluster_id` to put on `create_map`, and the `map_id` its `add_pointer`
+/// ops must carry. Nothing stopped it taking one and inventing the other,
+/// and a create whose pointers name a different map is indistinguishable, at
+/// the validator, from a create with no pointers at all — which is what
+/// rejected six of sixteen clusters on run 7, including the one an
+/// adversarial review had picked as the project's best first map.
+///
+/// The model's `cluster_id` was never load-bearing: code owns the index, the
+/// server assigns the real id, and this string exists only to let a cluster's
+/// pointers find their own map. Giving the model a say in it bought nothing
+/// and cost a way for it to disagree with itself. So the canonical id is
+/// derived from the index, and a pointer aimed at EITHER spelling — the
+/// model's or the pinned one — is accepted and rewritten to the canonical.
+///
+/// Tolerant about spelling, strict about shape: a create still needs a
+/// pointer, and a pointer aimed at some unrelated map is still untouched and
+/// still fails.
+#[must_use]
+pub fn canonicalize_fresh_map_ids(ops: Vec<Op>, cluster_index: usize) -> Vec<Op> {
+    let pinned = crate::rungs::pinned_cluster_id(cluster_index);
+    let canonical = new_map_id(&pinned);
+    // Only the ONE-create shape the prompt asks for. An op set carrying two
+    // creates has two distinct maps in it, and collapsing both onto one
+    // code-owned id would merge them — the very collision this id scheme
+    // exists to prevent. Such a set keeps the model's own ids and behaves
+    // exactly as before.
+    let creates: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::CreateMap { cluster_id, .. } => Some(cluster_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let [model_id] = creates[..] else {
+        return ops;
+    };
+    let model_id = model_id.to_string();
+    let model_map_id = new_map_id(&model_id);
+    ops.into_iter()
+        .map(|op| match op {
+            Op::CreateMap {
+                title,
+                orientation_prose,
+                ..
+            } => Op::CreateMap {
+                cluster_id: pinned.clone(),
+                title,
+                orientation_prose,
+            },
+            Op::AddPointer {
+                map_id,
+                entry_id,
+                gloss,
+            } => {
+                let map_id = if map_id == model_map_id || map_id == canonical {
+                    canonical.clone()
+                } else {
+                    map_id
+                };
+                Op::AddPointer {
+                    map_id,
+                    entry_id,
+                    gloss,
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Apply an admission [`Verdict`] to one cluster's op set, returning the ops
@@ -1321,6 +1414,137 @@ mod verdict_tests {
         Verdict::Refused {
             reason: "REASON".to_string(),
         }
+    }
+
+    /// The failure this exists for: the model took the pinned `cluster_id`
+    /// for its create and aimed the pointers at a DIFFERENT spelling. At the
+    /// validator that is indistinguishable from emitting no pointers at all,
+    /// and it rejected six of sixteen clusters on run 7.
+    #[test]
+    fn a_pointer_at_the_models_own_spelling_is_accepted_and_rewritten() {
+        let ops = canonicalize_fresh_map_ids(
+            vec![
+                Op::CreateMap {
+                    cluster_id: "c1".to_string(),
+                    title: "T".to_string(),
+                    orientation_prose: "PROSE".to_string(),
+                },
+                pointer("somnus-new-c1", "kb-10001"),
+            ],
+            5,
+        );
+        assert_eq!(
+            ops,
+            vec![
+                Op::CreateMap {
+                    cluster_id: "c5".to_string(),
+                    title: "T".to_string(),
+                    orientation_prose: "PROSE".to_string(),
+                },
+                pointer("somnus-new-c5", "kb-10001"),
+            ],
+            "the code-owned id wins, and the pointer comes with it"
+        );
+    }
+
+    /// The other spelling: pointers already at the pinned id, create still
+    /// carrying the model's invention.
+    #[test]
+    fn a_pointer_already_at_the_pinned_id_survives() {
+        let ops = canonicalize_fresh_map_ids(
+            vec![
+                Op::CreateMap {
+                    cluster_id: "flickr".to_string(),
+                    title: "T".to_string(),
+                    orientation_prose: "PROSE".to_string(),
+                },
+                pointer("somnus-new-c2", "kb-10001"),
+            ],
+            2,
+        );
+        assert!(ops.contains(&pointer("somnus-new-c2", "kb-10001")));
+    }
+
+    /// Tolerant about spelling, strict about shape: a pointer aimed at an
+    /// unrelated map is left exactly where it is, so it still cannot satisfy
+    /// the create-needs-pointers rule.
+    #[test]
+    fn a_pointer_at_an_unrelated_map_is_not_captured() {
+        let ops = canonicalize_fresh_map_ids(
+            vec![
+                Op::CreateMap {
+                    cluster_id: "c1".to_string(),
+                    title: "T".to_string(),
+                    orientation_prose: "PROSE".to_string(),
+                },
+                pointer("kb-20001", "kb-10001"),
+            ],
+            1,
+        );
+        assert!(ops.contains(&pointer("kb-20001", "kb-10001")));
+        let cluster = Cluster {
+            label: "thin".to_string(),
+            member_entry_ids: vec!["kb-10001".to_string()],
+            owning_map_id: None,
+            merit_reason: None,
+        };
+        assert!(validate_ops_for_cluster(&cluster, &ops).is_err());
+    }
+
+    /// Two creates in one op set are two distinct maps; collapsing them onto
+    /// one code-owned id would merge them, which is the collision this id
+    /// scheme exists to prevent.
+    #[test]
+    fn a_two_create_op_set_keeps_the_models_ids() {
+        let ops = vec![
+            Op::CreateMap {
+                cluster_id: "c1".to_string(),
+                title: "A".to_string(),
+                orientation_prose: "P".to_string(),
+            },
+            Op::CreateMap {
+                cluster_id: "c2".to_string(),
+                title: "B".to_string(),
+                orientation_prose: "P".to_string(),
+            },
+        ];
+        assert_eq!(canonicalize_fresh_map_ids(ops.clone(), 7), ops);
+    }
+
+    /// The validator now says what the model DID aim at, so the two failures
+    /// it used to conflate are distinguishable from the message alone.
+    #[test]
+    fn the_refusal_names_the_ids_the_pointers_actually_targeted() {
+        let cluster = Cluster {
+            label: "flickr".to_string(),
+            member_entry_ids: vec!["kb-10001".to_string(), "kb-10002".to_string()],
+            owning_map_id: None,
+            merit_reason: None,
+        };
+        let bare = validate_ops_for_cluster(
+            &cluster,
+            &[Op::CreateMap {
+                cluster_id: "c1".to_string(),
+                title: "T".to_string(),
+                orientation_prose: "P".to_string(),
+            }],
+        )
+        .expect_err("no pointers at all");
+        assert!(bare.contains("no add_pointer op at all"), "{bare}");
+
+        let aimed = validate_ops_for_cluster(
+            &cluster,
+            &[
+                Op::CreateMap {
+                    cluster_id: "c1".to_string(),
+                    title: "T".to_string(),
+                    orientation_prose: "P".to_string(),
+                },
+                pointer("kb-20001", "kb-10001"),
+            ],
+        )
+        .expect_err("pointers aimed elsewhere");
+        assert!(aimed.contains("target kb-20001"), "{aimed}");
     }
 
     #[test]
