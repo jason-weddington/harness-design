@@ -214,8 +214,7 @@ pub fn render_rung2_instruction(cluster: &Cluster, cluster_index: usize) -> Stri
             "This cluster is already covered by map {owning}. Do not create a second map for it. Add pointers to {owning} for entries it does not yet point at, strike any gap in it that these entries now close, or propose a gap on it. If nothing applies, emit no_change with cluster_id {cluster_id}."
         ),
         None => format!(
-            "This cluster has no map. If it is worth mapping, emit exactly one create_map with cluster_id set to the literal {cluster_id}, and one add_pointer for every entry the map should point at, each with map_id set to the literal {}. A map is created together with its pointers in a single write, so there is no way to add a pointer to this map afterwards, and a create_map carrying no add_pointer ops is refused outright. If it is not worth mapping, emit no_change with cluster_id {cluster_id} and nothing else. Do not emit propose_gap for this cluster: a gap is a line inside an existing map, and this cluster has none.",
-            crate::materialize::new_map_id(&cluster_id)
+            "This cluster has no map. If it is worth mapping, emit exactly one create_map, listing in its pointers array every entry the map should point at, each with a short gloss saying why a reader would open it. A map IS its pointers: do not describe the entries in the orientation prose instead of listing them. If it is not worth mapping, emit no_change with cluster_id {cluster_id} and nothing else. Do not emit propose_gap for this cluster: a gap is a line inside an existing map, and this cluster has none."
         ),
     };
     format!(
@@ -742,8 +741,11 @@ mod tests {
 
     // --- rung 2 -----------------------------------------------------------
 
+    /// The unmapped cluster is told to list its pointers INSIDE the create.
+    /// It is no longer told any map id at all — with the pointers inline,
+    /// the model never names one, so it cannot name it inconsistently.
     #[test]
-    fn the_rung2_instruction_names_the_exact_map_id_for_an_unmapped_cluster() {
+    fn an_unmapped_cluster_is_told_to_list_its_pointers_inside_the_create() {
         let cluster = Cluster {
             label: "wireguard-and-dns".to_string(),
             member_entry_ids: vec!["kb-10001".to_string(), "kb-10002".to_string()],
@@ -751,22 +753,20 @@ mod tests {
             merit_reason: None,
         };
         let rendered = render_rung2_instruction(&cluster, 3);
-        // The exact id, because the model has to name it to point at its own
-        // map and guessing our convention is what wrote nothing for 3 runs.
         assert!(
-            rendered.contains("cluster_id set to the literal c3"),
+            rendered.contains("listing in its pointers array every entry"),
+            "{rendered}"
+        );
+        // The failure this replaced: prose that NARRATES the entries instead
+        // of pointing at them.
+        assert!(
+            rendered.contains("do not describe the entries in the orientation prose"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("map_id set to the literal somnus-new-c3"),
-            "{rendered}"
+            !rendered.contains("somnus-new-"),
+            "the model is never told a map id now: {rendered}"
         );
-        // A create with no pointers is refused, so say so up front.
-        assert!(
-            rendered.contains("carrying no add_pointer ops is refused"),
-            "{rendered}"
-        );
-        // And a gap has nothing to attach to here.
         assert!(
             rendered.contains("Do not emit propose_gap for this cluster"),
             "{rendered}"

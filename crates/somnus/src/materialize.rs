@@ -59,11 +59,6 @@ pub enum ComposeError {
         /// The refused map.
         map_id: String,
     },
-    /// A fresh map was requested with no pointers to list.
-    EmptyPointerList {
-        /// The fresh map that cannot exist pointerless.
-        map_id: String,
-    },
     /// The op targets a map that is neither in the loop-input maps nor the
     /// fresh map this run composes.
     UnknownMap {
@@ -91,10 +86,6 @@ impl std::fmt::Display for ComposeError {
                 f,
                 "somnus: refusing to edit map {map_id}: not loop-owned (authorship tier; somnus only edits maps it wrote)"
             ),
-            Self::EmptyPointerList { map_id } => write!(
-                f,
-                "somnus: refusing to compose map {map_id}: the create_map op set lists no pointers"
-            ),
             Self::UnknownMap { map_id } => {
                 write!(f, "somnus: op targets unknown map {map_id}")
             }
@@ -120,33 +111,20 @@ pub fn is_loop_owned(map: &LoopInputMap) -> bool {
         || map.updated_by.as_deref() == Some(SOMNUS_WRITER_ID)
 }
 
-/// The map id the MODEL targets when pointing at the map its own op set is
-/// creating. Deterministic so a cluster's `add_pointer` ops can name their
-/// fresh map without a server round-trip.
-///
-/// Scoped to one cluster's op set and nothing wider: `cluster_id` is a string
-/// the model invents, and rung 2 is one inference per cluster with no
-/// knowledge of the others, so nothing stops every cluster in a run calling
-/// its cluster `c1`.
-#[must_use]
-pub fn new_map_id(cluster_id: &str) -> String {
-    format!("somnus-new-{cluster_id}")
-}
-
 /// The run-unique local id a fresh map is recorded under, before the server
 /// assigns the real one.
 ///
-/// The cluster INDEX is what makes it unique, and code owns that. This
-/// mattered the moment the one-map-per-project cap was lifted: with several
-/// maps composed in a run, ids derived from the model's `cluster_id` alone
-/// collide as soon as two blind rung-2 calls both pick `c1` — and the
-/// collision is silent, because the pairing of body to title is a lookup by
-/// id, so the second map would have been created carrying the first map's
-/// title. Under the cap only one create ever reached the server, so nothing
-/// could expose it.
+/// Derived from the cluster INDEX and nothing else, because code owns the
+/// index. It used to be built from a `cluster_id` string the MODEL invented,
+/// which was wrong twice over: rung 2 is one blind inference per cluster, so
+/// nothing stopped every cluster in a run calling itself `c1` and two maps
+/// colliding on one id; and the model had to reproduce the id a second time
+/// to point at its own map, which is a chance to disagree with itself that
+/// bought nothing. With the pointers now inline on `create_map`, the model
+/// never names a map id at all.
 #[must_use]
-pub fn fresh_map_id(cluster_index: usize, cluster_id: &str) -> String {
-    format!("somnus-new-{cluster_index}-{cluster_id}")
+pub fn fresh_map_id(cluster_index: usize) -> String {
+    format!("somnus-new-{cluster_index}")
 }
 
 /// How many members must share a directory before it may be named, when the
@@ -212,55 +190,39 @@ pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Option<String> {
 
 /// Compose a FRESH map body: the first three sections ONLY (a new map has
 /// no recorded gaps — the gap section appears only when a body already
-/// carries it), with one `Detail entries:` line per `add_pointer` op in
-/// `ops` that targets [`new_map_id(cluster_id)`], in op order.
+/// carries it), with one `Detail entries:` line per pointer the
+/// `create_map` op carries, in the order the model listed them.
+///
+/// Infallible now, and that is the point. It used to return an
+/// `EmptyPointerList` error because the pointers arrived as SEPARATE ops
+/// that might not be there; carrying them inside `create_map` — required,
+/// non-empty, enforced at parse — means a pointerless map cannot reach this
+/// function at all.
 ///
 /// The `Lives in` line is OMITTED when the cluster's members name no
 /// directory with a plurality behind it — the commonest case for a cluster
 /// documenting somebody else's code, and not a reason to withhold a map.
-///
-/// # Errors
-/// [`ComposeError::EmptyPointerList`] when no op in `ops` points at the new
-/// map — a map with no pointers is not a map.
+#[must_use]
 pub fn compose_new_map_body(
     cluster: &Cluster,
-    cluster_index: usize,
-    cluster_id: &str,
     orientation_prose: &str,
-    ops: &[Op],
+    pointers: &[crate::ops::NewPointer],
     input: &LoopInput,
-) -> Result<String, ComposeError> {
-    let lives_in = lives_in_value(cluster, input);
-    // Pointers are matched on the id the MODEL used; the map is RECORDED
-    // under the run-unique one.
-    let fresh_id = new_map_id(cluster_id);
-    let mut detail_lines = Vec::new();
-    for op in ops {
-        if let Op::AddPointer {
-            map_id,
-            entry_id,
-            gloss,
-        } = op
-            && map_id == &fresh_id
-        {
-            detail_lines.push(pointer_line(entry_id, gloss));
-        }
-    }
-    if detail_lines.is_empty() {
-        return Err(ComposeError::EmptyPointerList {
-            map_id: fresh_map_id(cluster_index, cluster_id),
-        });
-    }
+) -> String {
     let mut sections = Vec::with_capacity(3);
-    if let Some(lives_in) = lives_in {
+    if let Some(lives_in) = lives_in_value(cluster, input) {
         sections.push(format!("{LIVES_IN_PREFIX}{lives_in}"));
     }
     sections.push(orientation_prose.to_string());
+    let detail_lines: Vec<String> = pointers
+        .iter()
+        .map(|pointer| pointer_line(&pointer.entry_id, &pointer.gloss))
+        .collect();
     sections.push(format!(
         "{DETAIL_ENTRIES_HEADER}\n{}",
         detail_lines.join("\n")
     ));
-    Ok(sections.join(SECTION_SEPARATOR))
+    sections.join(SECTION_SEPARATOR)
 }
 
 /// The pinned pointer-line shape: `- {entry_id} — {gloss}`.
@@ -355,126 +317,28 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
             cluster.label
         ));
     }
-    // A map is created together with its pointers in ONE write, so a
-    // `create_map` carrying none is not a thin map — it is an op set that
-    // cannot produce a map at all. The rung-2 instruction says so in as many
-    // words, and the model ignored it on 8 of 19 clusters, on clusters of 3
-    // to 8 documented members. One instruction the model has demonstrably
-    // not followed is an instruction that has to become a rule.
-    //
-    // Refused at the RUNG-2 boundary rather than left to die at compose:
-    // this way the cluster is recorded as a rung-2 error with its raw model
-    // text offloaded, which is the evidence that distinguishes "the model
-    // omitted the pointers" from "the pointers named the wrong map".
-    for op in ops {
-        let Op::CreateMap { cluster_id, .. } = op else {
-            continue;
-        };
-        let minted = new_map_id(cluster_id);
-        if !ops
-            .iter()
-            .any(|other| matches!(other, Op::AddPointer { map_id, .. } if map_id == &minted))
-        {
-            // Name what the model DID aim at. "No pointer targeting X" is
-            // compatible with two very different failures — the model emitted
-            // no pointers at all, or it emitted them at a different id — and
-            // the fixes are a prompt change and a code change respectively.
-            // Carrying the aimed-at ids in the error makes the message
-            // self-diagnosing, so the answer does not depend on a separate
-            // forensic file being present and non-empty.
-            let aimed: Vec<&str> = ops
-                .iter()
-                .filter_map(|other| match other {
-                    Op::AddPointer { map_id, .. } => Some(map_id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let saw = if aimed.is_empty() {
-                "the op set carries no add_pointer op at all".to_string()
-            } else {
-                format!("the add_pointer ops target {}", aimed.join(", "))
-            };
-            return Err(format!(
-                "somnus: create_map for cluster {} carries no add_pointer op targeting {minted} ({saw}) — a map is created together with its pointers in one write, so a create_map without them cannot produce a map",
-                cluster.label
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Rewrite a cluster's op set so every reference to the map it is creating
-/// uses the CODE-OWNED id, whichever spelling the model reached for.
-///
-/// The rung-2 prompt hands the model two strings that must agree: a
-/// `cluster_id` to put on `create_map`, and the `map_id` its `add_pointer`
-/// ops must carry. Nothing stopped it taking one and inventing the other,
-/// and a create whose pointers name a different map is indistinguishable, at
-/// the validator, from a create with no pointers at all — which is what
-/// rejected six of sixteen clusters on run 7, including the one an
-/// adversarial review had picked as the project's best first map.
-///
-/// The model's `cluster_id` was never load-bearing: code owns the index, the
-/// server assigns the real id, and this string exists only to let a cluster's
-/// pointers find their own map. Giving the model a say in it bought nothing
-/// and cost a way for it to disagree with itself. So the canonical id is
-/// derived from the index, and a pointer aimed at EITHER spelling — the
-/// model's or the pinned one — is accepted and rewritten to the canonical.
-///
-/// Tolerant about spelling, strict about shape: a create still needs a
-/// pointer, and a pointer aimed at some unrelated map is still untouched and
-/// still fails.
-#[must_use]
-pub fn canonicalize_fresh_map_ids(ops: Vec<Op>, cluster_index: usize) -> Vec<Op> {
-    let pinned = crate::rungs::pinned_cluster_id(cluster_index);
-    let canonical = new_map_id(&pinned);
-    // Only the ONE-create shape the prompt asks for. An op set carrying two
-    // creates has two distinct maps in it, and collapsing both onto one
-    // code-owned id would merge them — the very collision this id scheme
-    // exists to prevent. Such a set keeps the model's own ids and behaves
-    // exactly as before.
-    let creates: Vec<&str> = ops
+    // ONE cluster, ONE map. With the pointers inline and no model-supplied
+    // id, two creates in a single op set are indistinguishable — both would
+    // be recorded under the same code-owned id and the second would carry
+    // the first's title. The prompt asks for exactly one; this makes it a
+    // rule, and the ambiguity disappears rather than being arbitrated.
+    let creates = ops
         .iter()
-        .filter_map(|op| match op {
-            Op::CreateMap { cluster_id, .. } => Some(cluster_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let [model_id] = creates[..] else {
-        return ops;
-    };
-    let model_id = model_id.to_string();
-    let model_map_id = new_map_id(&model_id);
-    ops.into_iter()
-        .map(|op| match op {
-            Op::CreateMap {
-                title,
-                orientation_prose,
-                ..
-            } => Op::CreateMap {
-                cluster_id: pinned.clone(),
-                title,
-                orientation_prose,
-            },
-            Op::AddPointer {
-                map_id,
-                entry_id,
-                gloss,
-            } => {
-                let map_id = if map_id == model_map_id || map_id == canonical {
-                    canonical.clone()
-                } else {
-                    map_id
-                };
-                Op::AddPointer {
-                    map_id,
-                    entry_id,
-                    gloss,
-                }
-            }
-            other => other,
-        })
-        .collect()
+        .filter(|op| matches!(op, Op::CreateMap { .. }))
+        .count();
+    if creates > 1 {
+        return Err(format!(
+            "somnus: cluster {} emitted {creates} create_map ops — one cluster is one map, and a second create has no id of its own to be recorded under",
+            cluster.label
+        ));
+    }
+    // NOTE: there is no longer a "create_map carries no pointers" rule here.
+    // The pointers live INSIDE the op, required and non-empty, checked when
+    // the tool call is parsed — so a pointerless map is unrepresentable
+    // rather than refusable. Three prompt iterations failed to teach the
+    // model a rule its own tool signature contradicted; moving the pointers
+    // into the signature ended it.
+    Ok(())
 }
 
 /// Apply an admission [`Verdict`] to one cluster's op set, returning the ops
@@ -505,19 +369,11 @@ pub fn apply_verdict(verdict: &Verdict, ops: Vec<Op>) -> Vec<Op> {
     if matches!(verdict, Verdict::Admitted) {
         return ops;
     }
-    let Some(cluster_id) = ops.iter().find_map(|op| match op {
-        Op::CreateMap { cluster_id, .. } => Some(cluster_id.clone()),
-        _ => None,
-    }) else {
-        return ops;
-    };
-    let minted = new_map_id(&cluster_id);
+    // Only the create is dropped, and its pointers go with it because they
+    // live inside it. Pointers at maps that ALREADY exist are separate ops
+    // and survive untouched: admission guards minting, not contributing.
     ops.into_iter()
-        .filter(|op| match op {
-            Op::CreateMap { .. } => false,
-            Op::AddPointer { map_id, .. } => map_id != &minted,
-            Op::StrikeGap { .. } | Op::ProposeGap { .. } | Op::NoChange { .. } => true,
-        })
+        .filter(|op| !matches!(op, Op::CreateMap { .. }))
         .collect()
 }
 
@@ -600,31 +456,20 @@ pub fn materialize_cluster(
 ) -> Materialized {
     let mut out = Materialized::default();
 
-    // Every `create_map` op in the set composes (no client-side cap: the
-    // server's per-night 409 is the ordinary admission outcome).
-    for op in ops.iter().filter(|op| matches!(op, Op::CreateMap { .. })) {
+    // Every `create_map` op in the set composes. Composition is infallible
+    // now: the pointers arrive inside the op, required and non-empty, so
+    // there is no op set that reaches here and cannot produce a body.
+    for op in ops {
         if let Op::CreateMap {
-            cluster_id,
             orientation_prose,
+            pointers,
             ..
         } = op
         {
-            match compose_new_map_body(
-                cluster,
-                cluster_index,
-                cluster_id,
-                orientation_prose,
-                ops,
-                input,
-            ) {
-                Ok(body) => {
-                    out.bodies.push(ComposedBody {
-                        map_id: fresh_map_id(cluster_index, cluster_id),
-                        body,
-                    });
-                }
-                Err(err) => out.compose_refusals.push(err.to_string()),
-            }
+            out.bodies.push(ComposedBody {
+                map_id: fresh_map_id(cluster_index),
+                body: compose_new_map_body(cluster, orientation_prose, pointers, input),
+            });
         }
     }
 
@@ -635,12 +480,12 @@ pub fn materialize_cluster(
     let mut working: Vec<ComposedBody> = Vec::new();
     let mut working_edits: Vec<Vec<MapEdit>> = Vec::new();
     let mut failed_maps: Vec<String> = Vec::new();
+    // The fresh map's id, for the edit loop to skip: its pointers are
+    // inlined into the create body and must never also become edits.
     let fresh_ids: Vec<String> = ops
         .iter()
-        .filter_map(|op| match op {
-            Op::CreateMap { cluster_id, .. } => Some(new_map_id(cluster_id)),
-            _ => None,
-        })
+        .filter(|op| matches!(op, Op::CreateMap { .. }))
+        .map(|_| fresh_map_id(cluster_index))
         .collect();
 
     for op in ops {
@@ -825,11 +670,34 @@ mod tests {
         }
     }
 
-    fn create_map(cluster_id: &str, orientation_prose: &str) -> Op {
+    /// A create carrying ONE pointer at `kb-10001`, which is the minimum a
+    /// map can be born with.
+    fn create_map(_cluster_id: &str, orientation_prose: &str) -> Op {
+        create_map_with(orientation_prose, &[("kb-10001", "GLOSS-1")])
+    }
+
+    /// The pointers carried by the op set's create, for a test that composes
+    /// a body directly.
+    fn pointers_of(ops: &[Op]) -> Vec<crate::ops::NewPointer> {
+        ops.iter()
+            .find_map(|op| match op {
+                Op::CreateMap { pointers, .. } => Some(pointers.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn create_map_with(orientation_prose: &str, pointers: &[(&str, &str)]) -> Op {
         Op::CreateMap {
-            cluster_id: cluster_id.to_string(),
             title: "the title is not part of the body grammar".to_string(),
             orientation_prose: orientation_prose.to_string(),
+            pointers: pointers
+                .iter()
+                .map(|(entry_id, gloss)| crate::ops::NewPointer {
+                    entry_id: (*entry_id).to_string(),
+                    gloss: (*gloss).to_string(),
+                })
+                .collect(),
         }
     }
 
@@ -839,7 +707,7 @@ mod tests {
     fn the_structural_caps_and_writer_id_are_pinned() {
         assert_eq!(SOMNUS_WRITER_ID, "somnus");
         assert_eq!(SOMNUS_MAX_PROJECTS_PER_NIGHT, 3);
-        assert_eq!(new_map_id("c1"), "somnus-new-c1");
+        assert_eq!(fresh_map_id(7), "somnus-new-7");
     }
 
     // --- the authorship tier ---------------------------------------------
@@ -978,8 +846,7 @@ mod tests {
             create_map("c1", "PROSE"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
         ];
-        let body = compose_new_map_body(&unowned, 0, "c1", "PROSE", &ops, &input)
-            .expect("no directory is not a reason to withhold a map");
+        let body = compose_new_map_body(&unowned, "PROSE", &pointers_of(&ops), &input);
         assert_eq!(body, "PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1");
         assert!(
             !body.contains("Lives in"),
@@ -998,9 +865,10 @@ mod tests {
             Some("kb-20001"),
         );
         let ops = vec![
-            create_map("c1", "ORIENTATION-PROSE"),
-            add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
-            add_pointer("somnus-new-c1", "kb-10002", "GLOSS-2"),
+            create_map_with(
+                "ORIENTATION-PROSE",
+                &[("kb-10001", "GLOSS-1"), ("kb-10002", "GLOSS-2")],
+            ),
             add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
         ];
         let materialized = materialize_cluster(&owned, 0, &ops, &input);
@@ -1011,7 +879,7 @@ mod tests {
         assert_eq!(
             materialized.bodies[0],
             ComposedBody {
-                map_id: "somnus-new-0-c1".to_string(),
+                map_id: "somnus-new-0".to_string(),
                 body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2"
                     .to_string(),
             }
@@ -1027,26 +895,27 @@ mod tests {
         );
     }
 
+    /// A pointerless create can no longer be CONSTRUCTED, so the old
+    /// "compose refuses it" test is gone with the state it tested. What
+    /// remains worth pinning is that the create's own pointers are inlined
+    /// into the body and never also become edits.
     #[test]
-    fn a_fresh_map_with_no_pointers_is_refused() {
+    fn a_creates_pointers_are_inlined_and_never_become_edits() {
         let input = fixture();
-        let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
-        let ops = vec![create_map("c1", "ORIENTATION-PROSE")];
+        let owned = cluster("home-network", &["kb-10001"], None);
+        let ops = vec![create_map_with(
+            "ORIENTATION-PROSE",
+            &[("kb-10001", "G1"), ("kb-10002", "G2")],
+        )];
         let materialized = materialize_cluster(&owned, 0, &ops, &input);
-        assert!(materialized.bodies.is_empty());
-        assert_eq!(materialized.compose_refusals.len(), 1);
+        assert_eq!(materialized.bodies.len(), 1);
+        assert!(materialized.compose_refusals.is_empty());
         assert!(
-            materialized.compose_refusals[0].contains("no pointers"),
-            "{}",
-            materialized.compose_refusals[0]
+            materialized.edits.is_empty(),
+            "a fresh map's pointers are part of its create body"
         );
-        assert_eq!(
-            ComposeError::EmptyPointerList {
-                map_id: "somnus-new-c1".to_string(),
-            }
-            .to_string(),
-            "somnus: refusing to compose map somnus-new-c1: the create_map op set lists no pointers"
-        );
+        assert!(materialized.bodies[0].body.contains("- kb-10001 — G1"));
+        assert!(materialized.bodies[0].body.contains("- kb-10002 — G2"));
     }
 
     #[test]
@@ -1059,8 +928,7 @@ mod tests {
             create_map("c1", "PROSE"),
             add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
         ];
-        let body = compose_new_map_body(&owned, 0, "c1", "PROSE", &ops, &input)
-            .expect("composed with pointers");
+        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &input);
         assert_eq!(
             body,
             "Lives in knowledge/network\n\nPROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1"
@@ -1072,13 +940,11 @@ mod tests {
     fn detail_lines_follow_op_order_exactly() {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10001", "kb-10002"], Some("kb-20001"));
-        let ops = vec![
-            create_map("c1", "PROSE"),
-            add_pointer("somnus-new-c1", "kb-10002", "GLOSS-B"),
-            add_pointer("somnus-new-c1", "kb-10001", "GLOSS-A"),
-        ];
-        let body = compose_new_map_body(&owned, 0, "c1", "PROSE", &ops, &input)
-            .expect("composed with pointers");
+        let ops = vec![create_map_with(
+            "PROSE",
+            &[("kb-10002", "GLOSS-B"), ("kb-10001", "GLOSS-A")],
+        )];
+        let body = compose_new_map_body(&owned, "PROSE", &pointers_of(&ops), &input);
         assert!(
             body.ends_with("Detail entries:\n- kb-10002 — GLOSS-B\n- kb-10001 — GLOSS-A"),
             "op order, not id order: {body}"
@@ -1186,27 +1052,21 @@ mod tests {
 
     // --- the caps are SERVER-side: both create_map ops compose here ------
 
+    /// One cluster is one map. Two creates in a single op set used to be
+    /// distinguishable by the model's own `cluster_id`; with the id now
+    /// derived from the cluster index there is nothing to tell them apart,
+    /// so the second is refused rather than silently merged into the first.
     #[test]
-    fn two_create_maps_in_one_op_set_both_compose_and_both_gate() {
-        // No client-side cap survives: the per-project and per-KB caps are
-        // server-side at POST /api/kb/map-op, so both fresh bodies compose
-        // and the second's application meets the ordinary 409 admission.
-        let input = fixture();
-        let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
+    fn two_create_maps_in_one_op_set_are_refused() {
+        let owned = cluster("home-network", &["kb-10001", "kb-10002", "kb-10003"], None);
         let ops = vec![
-            create_map("c1", "PROSE-1"),
-            add_pointer("somnus-new-c1", "kb-10001", "GLOSS-1"),
-            create_map("c2", "PROSE-2"),
-            add_pointer("somnus-new-c2", "kb-10001", "GLOSS-1"),
+            create_map_with("PROSE-1", &[("kb-10001", "G1")]),
+            create_map_with("PROSE-2", &[("kb-10002", "G2")]),
         ];
-        let materialized = materialize_cluster(&owned, 0, &ops, &input);
-        assert_eq!(materialized.bodies.len(), 2);
-        assert_eq!(materialized.bodies[0].map_id, "somnus-new-0-c1");
-        assert_eq!(materialized.bodies[1].map_id, "somnus-new-0-c2");
-        assert_eq!(materialized.compose_refusals, Vec::<String>::new());
-        // A fresh map's add_pointers are inlined into the create body: no
-        // edits for either fresh map.
-        assert!(materialized.edits.is_empty());
+        let error = validate_ops_for_cluster(&owned, &ops)
+            .expect_err("two maps for one cluster have one id between them");
+        assert!(error.contains("emitted 2 create_map ops"), "{error}");
+        assert!(error.contains("one cluster is one map"), "{error}");
     }
 
     #[test]
@@ -1308,35 +1168,6 @@ mod tests {
         );
     }
 
-    /// The model emitted a bare `create_map` on 8 of 19 clusters across two
-    /// runs, on clusters of 3 to 8 documented members, after being told in
-    /// as many words to emit one `add_pointer` per member. An instruction it
-    /// has demonstrably not followed has to become a rule.
-    #[test]
-    fn a_create_map_carrying_no_pointers_is_a_rung2_error() {
-        let unowned = cluster("flickr-quota", &["kb-10001", "kb-10002"], None);
-        let error = validate_ops_for_cluster(&unowned, &[create_map("c1", "PROSE")])
-            .expect_err("a create_map without pointers cannot produce a map");
-        assert!(error.contains("carries no add_pointer op"), "{error}");
-        assert!(error.contains("somnus-new-c1"), "{error}");
-    }
-
-    /// The pointer has to target THIS map. One aimed somewhere else is the
-    /// other half of the same failure and must not satisfy the rule.
-    #[test]
-    fn a_pointer_at_a_different_map_does_not_satisfy_the_rule() {
-        let unowned = cluster("flickr-quota", &["kb-10001"], None);
-        let error = validate_ops_for_cluster(
-            &unowned,
-            &[
-                create_map("c1", "PROSE"),
-                add_pointer("kb-20001", "kb-10001", "GLOSS"),
-            ],
-        )
-        .expect_err("a pointer at another map does not populate this one");
-        assert!(error.contains("carries no add_pointer op"), "{error}");
-    }
-
     // --- the disk paths ---------------------------------------------------
 
     #[test]
@@ -1396,9 +1227,12 @@ mod verdict_tests {
 
     fn create_map() -> Op {
         Op::CreateMap {
-            cluster_id: "c1".to_string(),
             title: "Thin Cluster".to_string(),
             orientation_prose: "PROSE".to_string(),
+            pointers: vec![crate::ops::NewPointer {
+                entry_id: "kb-10001".to_string(),
+                gloss: "GLOSS".to_string(),
+            }],
         }
     }
 
@@ -1416,137 +1250,6 @@ mod verdict_tests {
         }
     }
 
-    /// The failure this exists for: the model took the pinned `cluster_id`
-    /// for its create and aimed the pointers at a DIFFERENT spelling. At the
-    /// validator that is indistinguishable from emitting no pointers at all,
-    /// and it rejected six of sixteen clusters on run 7.
-    #[test]
-    fn a_pointer_at_the_models_own_spelling_is_accepted_and_rewritten() {
-        let ops = canonicalize_fresh_map_ids(
-            vec![
-                Op::CreateMap {
-                    cluster_id: "c1".to_string(),
-                    title: "T".to_string(),
-                    orientation_prose: "PROSE".to_string(),
-                },
-                pointer("somnus-new-c1", "kb-10001"),
-            ],
-            5,
-        );
-        assert_eq!(
-            ops,
-            vec![
-                Op::CreateMap {
-                    cluster_id: "c5".to_string(),
-                    title: "T".to_string(),
-                    orientation_prose: "PROSE".to_string(),
-                },
-                pointer("somnus-new-c5", "kb-10001"),
-            ],
-            "the code-owned id wins, and the pointer comes with it"
-        );
-    }
-
-    /// The other spelling: pointers already at the pinned id, create still
-    /// carrying the model's invention.
-    #[test]
-    fn a_pointer_already_at_the_pinned_id_survives() {
-        let ops = canonicalize_fresh_map_ids(
-            vec![
-                Op::CreateMap {
-                    cluster_id: "flickr".to_string(),
-                    title: "T".to_string(),
-                    orientation_prose: "PROSE".to_string(),
-                },
-                pointer("somnus-new-c2", "kb-10001"),
-            ],
-            2,
-        );
-        assert!(ops.contains(&pointer("somnus-new-c2", "kb-10001")));
-    }
-
-    /// Tolerant about spelling, strict about shape: a pointer aimed at an
-    /// unrelated map is left exactly where it is, so it still cannot satisfy
-    /// the create-needs-pointers rule.
-    #[test]
-    fn a_pointer_at_an_unrelated_map_is_not_captured() {
-        let ops = canonicalize_fresh_map_ids(
-            vec![
-                Op::CreateMap {
-                    cluster_id: "c1".to_string(),
-                    title: "T".to_string(),
-                    orientation_prose: "PROSE".to_string(),
-                },
-                pointer("kb-20001", "kb-10001"),
-            ],
-            1,
-        );
-        assert!(ops.contains(&pointer("kb-20001", "kb-10001")));
-        let cluster = Cluster {
-            label: "thin".to_string(),
-            member_entry_ids: vec!["kb-10001".to_string()],
-            owning_map_id: None,
-            merit_reason: None,
-        };
-        assert!(validate_ops_for_cluster(&cluster, &ops).is_err());
-    }
-
-    /// Two creates in one op set are two distinct maps; collapsing them onto
-    /// one code-owned id would merge them, which is the collision this id
-    /// scheme exists to prevent.
-    #[test]
-    fn a_two_create_op_set_keeps_the_models_ids() {
-        let ops = vec![
-            Op::CreateMap {
-                cluster_id: "c1".to_string(),
-                title: "A".to_string(),
-                orientation_prose: "P".to_string(),
-            },
-            Op::CreateMap {
-                cluster_id: "c2".to_string(),
-                title: "B".to_string(),
-                orientation_prose: "P".to_string(),
-            },
-        ];
-        assert_eq!(canonicalize_fresh_map_ids(ops.clone(), 7), ops);
-    }
-
-    /// The validator now says what the model DID aim at, so the two failures
-    /// it used to conflate are distinguishable from the message alone.
-    #[test]
-    fn the_refusal_names_the_ids_the_pointers_actually_targeted() {
-        let cluster = Cluster {
-            label: "flickr".to_string(),
-            member_entry_ids: vec!["kb-10001".to_string(), "kb-10002".to_string()],
-            owning_map_id: None,
-            merit_reason: None,
-        };
-        let bare = validate_ops_for_cluster(
-            &cluster,
-            &[Op::CreateMap {
-                cluster_id: "c1".to_string(),
-                title: "T".to_string(),
-                orientation_prose: "P".to_string(),
-            }],
-        )
-        .expect_err("no pointers at all");
-        assert!(bare.contains("no add_pointer op at all"), "{bare}");
-
-        let aimed = validate_ops_for_cluster(
-            &cluster,
-            &[
-                Op::CreateMap {
-                    cluster_id: "c1".to_string(),
-                    title: "T".to_string(),
-                    orientation_prose: "P".to_string(),
-                },
-                pointer("kb-20001", "kb-10001"),
-            ],
-        )
-        .expect_err("pointers aimed elsewhere");
-        assert!(aimed.contains("target kb-20001"), "{aimed}");
-    }
-
     #[test]
     fn an_admitted_cluster_passes_through_untouched() {
         let ops = vec![create_map(), pointer("somnus-new-c1", "kb-10001")];
@@ -1560,14 +1263,9 @@ mod verdict_tests {
     /// that only ever judged the CARVE.
     #[test]
     fn a_refused_cluster_records_nothing_at_all() {
-        let ops = apply_verdict(
-            &refused(),
-            vec![
-                create_map(),
-                pointer("somnus-new-c1", "kb-10001"),
-                pointer("somnus-new-c1", "kb-10002"),
-            ],
-        );
+        // The create carries its pointers inside it, so dropping the create
+        // drops them with it.
+        let ops = apply_verdict(&refused(), vec![create_map()]);
         assert!(
             ops.is_empty(),
             "a refusal is not a decline and must leave no trace: {ops:?}"

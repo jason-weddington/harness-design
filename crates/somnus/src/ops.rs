@@ -46,15 +46,29 @@ pub enum Op {
         /// The pointer gloss (model-written prose).
         gloss: String,
     },
-    /// Create a new map for a cluster.
+    /// Create a new map for a cluster, WITH the pointers it is born with.
+    ///
+    /// **The pointers are part of the op because a map without them is not a
+    /// map, and three prompt iterations failed to teach that.** The op used
+    /// to carry only a title and prose, which looks finished — so a model
+    /// that filled every field had no signal it was half done, and reliably
+    /// emitted a lone `create_map` whose prose NARRATED the entries it should
+    /// have pointed at ("read the architecture entry first, then the
+    /// workaround"). It was not disobeying; the schema told it the op was
+    /// complete and the instruction said otherwise.
+    ///
+    /// There is also no `cluster_id`: code owns the cluster index, the server
+    /// assigns the real map id, and with the pointers inline there is nothing
+    /// left for the model to address. Every string it does not supply is a
+    /// string it cannot get wrong.
     CreateMap {
-        /// The cluster the map covers.
-        cluster_id: String,
         /// The map title.
         title: String,
-        /// The model-written orientation prose (the ONLY prose the model
-        /// writes on a map).
+        /// The model-written orientation prose (one of only two prose fields
+        /// the model writes on a map; the other is a pointer gloss).
         orientation_prose: String,
+        /// The pointers the map is born with — NEVER empty.
+        pointers: Vec<NewPointer>,
     },
     /// Strike a gap, citing the entry that closed it.
     StrikeGap {
@@ -78,6 +92,16 @@ pub enum Op {
         /// The declined cluster.
         cluster_id: String,
     },
+}
+
+/// One pointer on a map being created: which entry, and the model-written
+/// gloss for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NewPointer {
+    /// The entry the map points at.
+    pub entry_id: String,
+    /// The pointer gloss (model-written prose).
+    pub gloss: String,
 }
 
 /// What the model claimed at the finish terminal, pre-parse into the harness
@@ -219,9 +243,9 @@ fn parse_op_fields(kind: OpKind, input: &Value) -> Result<Op, String> {
             gloss: req_str(input, "gloss")?,
         }),
         OpKind::CreateMap => Ok(Op::CreateMap {
-            cluster_id: req_str(input, "cluster_id")?,
             title: req_str(input, "title")?,
             orientation_prose: req_str(input, "orientation_prose")?,
+            pointers: req_pointers(input)?,
         }),
         OpKind::StrikeGap => Ok(Op::StrikeGap {
             map_id: req_str(input, "map_id")?,
@@ -233,6 +257,32 @@ fn parse_op_fields(kind: OpKind, input: &Value) -> Result<Op, String> {
             reason: req_str(input, "reason")?,
         }),
     }
+}
+
+/// Read `create_map`'s `pointers` array, refusing an absent or empty one.
+///
+/// The schema marks it required with `minItems` 1, but a schema is a request
+/// and this is the enforcement: a map with no pointers is not a map, and
+/// this is the last place it could still be represented.
+fn req_pointers(input: &Value) -> Result<Vec<NewPointer>, String> {
+    let array = input
+        .get("pointers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "somnus: create_map is missing the array field `pointers` — a map is created together with its pointers, so one entry per pointer is required".to_string()
+        })?;
+    if array.is_empty() {
+        return Err("somnus: create_map carries an EMPTY `pointers` array — a map with no pointers is not a map".to_string());
+    }
+    array
+        .iter()
+        .map(|item| {
+            Ok(NewPointer {
+                entry_id: req_str(item, "entry_id")?,
+                gloss: req_str(item, "gloss")?,
+            })
+        })
+        .collect()
 }
 
 /// Parse a rung-2 tool call (`name`, `input`) into an [`Op`], routing the
@@ -281,13 +331,24 @@ impl Tool for OpTool {
                 &["map_id", "entry_id", "gloss"],
             ),
             OpKind::CreateMap => (
-                "Create a new map for a cluster.",
+                "Create a new map for this cluster, with the pointers it is born with. A map IS its pointers: one entry per pointer, each with a short gloss saying why a reader would open it. Do not describe the entries in the orientation prose instead of pointing at them.",
                 json!({
-                    "cluster_id": { "type": "string" },
                     "title": { "type": "string" },
-                    "orientation_prose": { "type": "string" }
+                    "orientation_prose": { "type": "string" },
+                    "pointers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entry_id": { "type": "string" },
+                                "gloss": { "type": "string" }
+                            },
+                            "required": ["entry_id", "gloss"]
+                        }
+                    }
                 }),
-                &["cluster_id", "title", "orientation_prose"],
+                &["title", "orientation_prose", "pointers"],
             ),
             OpKind::StrikeGap => (
                 "Strike a gap, citing the entry that closed it.",
@@ -785,11 +846,14 @@ mod tests {
             ),
             (
                 "create_map",
-                serde_json::json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
+                serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
                 Op::CreateMap {
-                    cluster_id: "c1".to_string(),
                     title: "t".to_string(),
                     orientation_prose: "p".to_string(),
+                    pointers: vec![NewPointer {
+                        entry_id: "kb-1".to_string(),
+                        gloss: "g".to_string(),
+                    }],
                 },
             ),
             (
@@ -889,15 +953,18 @@ mod tests {
         );
         let op = op_from_call(
             "create_map",
-            &serde_json::json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1", "gloss": "g"}]}),
         )
         .expect("create_map parses");
         assert_eq!(
             op,
             Op::CreateMap {
-                cluster_id: "c1".to_string(),
                 title: "t".to_string(),
                 orientation_prose: "p".to_string(),
+                pointers: vec![NewPointer {
+                    entry_id: "kb-1".to_string(),
+                    gloss: "g".to_string(),
+                }],
             }
         );
         // A missing field inside a KNOWN op is a named field error.
@@ -952,5 +1019,65 @@ mod tests {
             let tool = registry.get(name).expect("registered in the registry");
             assert_eq!(tool.schema(), *schema, "{name} must be byte-identical");
         }
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::{Op, op_from_call};
+
+    /// The whole point of moving the pointers into the signature: a map
+    /// without them cannot be CONSTRUCTED, so nothing downstream has to
+    /// refuse it. Three prompt iterations failed to teach a rule the tool
+    /// signature contradicted.
+    #[test]
+    fn a_create_map_without_pointers_never_becomes_an_op() {
+        let error = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "read the architecture entry first, then the workaround"}),
+        )
+        .expect_err("a map with no pointers is not a map");
+        assert!(
+            error.contains("missing the array field `pointers`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pointers_array_is_refused_by_name() {
+        let error = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": []}),
+        )
+        .expect_err("an empty array is not one pointer");
+        assert!(error.contains("EMPTY `pointers` array"), "{error}");
+    }
+
+    #[test]
+    fn a_pointer_missing_its_gloss_is_refused_by_name() {
+        let error = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-1"}]}),
+        )
+        .expect_err("a pointer with no gloss says nothing");
+        assert!(error.contains("gloss"), "{error}");
+    }
+
+    /// Order is the model's, and the composed body follows it.
+    #[test]
+    fn the_pointers_keep_the_order_the_model_listed_them_in() {
+        let op = op_from_call(
+            "create_map",
+            &serde_json::json!({"title": "t", "orientation_prose": "p", "pointers": [
+                {"entry_id": "kb-2", "gloss": "second"},
+                {"entry_id": "kb-1", "gloss": "first"}
+            ]}),
+        )
+        .expect("parses");
+        let Op::CreateMap { pointers, .. } = op else {
+            panic!("expected a create_map");
+        };
+        assert_eq!(pointers[0].entry_id, "kb-2");
+        assert_eq!(pointers[1].entry_id, "kb-1");
     }
 }

@@ -879,10 +879,6 @@ async fn run_unit_inner(
                 }
             }
         }
-        // The fresh map's id is code-owned: whichever of the two spellings
-        // the prompt offered the model reached for, the op set now names the
-        // canonical one, so a create and its pointers cannot disagree.
-        let ops = crate::materialize::canonicalize_fresh_map_ids(ops, index);
         // Admission is applied BEFORE the guard below sees the op set: a bad
         // map cannot be withdrawn, a gap can be acted on, and a deferral
         // leaves the cluster free to win tomorrow.
@@ -1159,11 +1155,8 @@ async fn apply_map_ops(
             continue;
         }
         for op in &record.ops {
-            if let Op::CreateMap {
-                cluster_id, title, ..
-            } = op
-            {
-                fresh.push((fresh_map_id(cluster_index, cluster_id), title.clone()));
+            if let Op::CreateMap { title, .. } = op {
+                fresh.push((fresh_map_id(cluster_index), title.clone()));
             }
         }
     }
@@ -1799,7 +1792,7 @@ mod tests {
             .expect("pointers")
             .push(json!("kb-10005"));
         value["maps"].as_array_mut().expect("maps").push(json!({
-            "id": "somnus-new-0-c0",
+            "id": "somnus-new-0",
             "short_title": "Wireguard and DNS",
             "long_title": "Wireguard and DNS orientation map",
             "pointers": ["kb-10001", "kb-10002"],
@@ -1876,15 +1869,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"cluster_id": "c1", "title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10002", "gloss": "GLOSS-2"}),
+                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}, {"entry_id": "kb-10002", "gloss": "GLOSS-2"}]}),
                     ),
                     (
                         "add_pointer",
@@ -1962,11 +1947,11 @@ mod tests {
         assert_eq!(
             report.composed_bodies[0],
             ComposedBodyRecord {
-                map_id: "somnus-new-0-c0".to_string(),
+                map_id: "somnus-new-0".to_string(),
                 body_path: crate::materialize::map_body_path(
                     body_root.path(),
                     "demo-project",
-                    "somnus-new-0-c0"
+                    "somnus-new-0"
                 ),
                 body: "Lives in knowledge/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
             }
@@ -2028,7 +2013,7 @@ mod tests {
         assert_eq!(report.applied.len(), 2);
         assert_eq!(report.applied[0].op_kind, "create_map");
         assert_eq!(report.applied[0].chain_index, 0);
-        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c0");
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0");
         assert_eq!(
             report.applied[0].server_map_id.as_deref(),
             Some("kb-30001"),
@@ -2175,7 +2160,8 @@ mod tests {
         assert_eq!(report.clusters.len(), 2);
         assert_eq!(report.clusters[0].label, "wireguard-and-dns");
         assert_eq!(report.clusters[0].rung2, Rung2Outcome::Parsed);
-        assert_eq!(report.clusters[0].ops.len(), 4);
+        // create (pointers inline) + one pointer at an existing map.
+        assert_eq!(report.clusters[0].ops.len(), 2);
         assert_eq!(report.clusters[1].label, "backup-drills");
         // The second cluster has no map, so its `propose_gap` is a rung-2
         // ERROR rather than a disposition — and critically not a decline. A
@@ -2206,16 +2192,10 @@ mod tests {
         let backend = MockBackend::from_turns(vec![
             text_turn(&clusters, usage(1, 1, None, None)),
             calls_turn(
-                &[
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c0", "title": "t", "orientation_prose": "PROSE"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c0", "entry_id": "kb-10001", "gloss": "g"}),
-                    ),
-                ],
+                &[(
+                    "create_map",
+                    json!({"title": "t", "orientation_prose": "PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                )],
                 usage(1, 1, None, None),
             ),
         ]);
@@ -2313,11 +2293,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"cluster_id": "c1", "title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                        json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                     ),
                     (
                         "add_pointer",
@@ -2340,7 +2316,7 @@ mod tests {
         // (The gate factory receives the body path; the scripted fake
         // below distinguishes by path.)
         let gate = |body_path: &Path| {
-            let script = if body_path.to_string_lossy().contains("somnus-new-0-c0") {
+            let script = if body_path.to_string_lossy().contains("somnus-new-0") {
                 "exit 1"
             } else {
                 "exit 0"
@@ -2395,11 +2371,7 @@ mod tests {
                 &[
                     (
                         "create_map",
-                        json!({"cluster_id": "c1", "title": "t", "orientation_prose": "ORIENTATION-PROSE"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                        json!({"title": "t", "orientation_prose": "ORIENTATION-PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                     ),
                     (
                         "add_pointer",
@@ -2809,11 +2781,7 @@ mod tests {
                     &[
                         (
                             "create_map",
-                            json!({"cluster_id": "c1", "title": "t", "orientation_prose": "PROSE"}),
-                        ),
-                        (
-                            "add_pointer",
-                            json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                            json!({"title": "t", "orientation_prose": "PROSE", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
                         ),
                         (
                             "add_pointer",
@@ -3504,16 +3472,10 @@ mod tests {
         let backend = MockBackend::from_turns(vec![
             text_turn(&clusters, usage(1, 1, None, None)),
             calls_turn(
-                &[
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "g"}),
-                    ),
-                ],
+                &[(
+                    "create_map",
+                    json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                )],
                 usage(1, 1, None, None),
             ),
         ]);
@@ -3541,144 +3503,33 @@ mod tests {
         assert_eq!(backend.calls(), 2);
     }
 
-    #[tokio::test]
-    async fn two_fresh_maps_compose_and_gate_and_the_second_is_an_ordinary_cap_admission() {
-        // NO client-side cap survives: both create_map ops compose AND gate
-        // (the gate sees both bodies), the first application applies, and
-        // the second application meets the server's 409 as an ORDINARY
-        // ADMISSION — recorded verbatim, outcome still Ready, exit 0.
-        let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
-        ])
-        .to_string();
-        let backend = MockBackend::from_turns(vec![
-            text_turn(&clusters, usage(1, 1, None, None)),
-            calls_turn(
-                &[
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c1", "title": "t1", "orientation_prose": "PROSE-1"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
-                    ),
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c2", "title": "t2", "orientation_prose": "PROSE-2"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c2", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
-                    ),
-                ],
-                usage(1, 1, None, None),
-            ),
-        ]);
-        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
-        let ledger = InMemoryLedger::new();
-        let body_root = tempfile::tempdir().expect("tempdir");
-        let gate = gate_for_script("exit 0");
-        let reason = r#"{"reason":"per-night new-map cap for demo-project exceeded"}"#;
-        let map_ops = RecordingMapOps::scripted(vec![
-            MapOpResult::Applied(crate::map_op::MapOpApplied {
-                map_id: "kb-30001".to_string(),
-                version: 1,
-                pointer_count: 1,
-                budget: 0,
-            }),
-            MapOpResult::CapAdmission {
-                reason_body: reason.to_string(),
-            },
-        ]);
-        let report = run_with_map_ops(
-            &backend,
-            source,
-            &ledger,
-            &gate,
-            body_root.path(),
-            "demo-project",
-            map_ops.clone(),
-        )
-        .await;
-        assert_eq!(
-            report.composed_bodies.len(),
-            2,
-            "BOTH fresh bodies compose and gate"
-        );
-        assert_eq!(report.gate_reports.len(), 2);
-        // Exactly TWO create POSTs dialed: the first applied, the second
-        // admitted — the latch then holds for any FURTHER fresh map.
-        assert_eq!(map_ops.requests().len(), 2);
-        assert_eq!(report.applied.len(), 1);
-        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-0-c1");
-        assert_eq!(report.cap_admissions.len(), 1);
-        assert_eq!(
-            report.cap_admissions[0],
-            AppliedOpRecord {
-                op_kind: "create_map",
-                chain_index: 0,
-                submitted_map_id: "somnus-new-0-c2".to_string(),
-                server_map_id: None,
-                version: None,
-                pointer_count: None,
-                budget: None,
-                http_status: Some(409),
-                body: serde_json::to_string(&crate::map_op::build_request_body(
-                    &MapOpRequest::CreateMap {
-                        project_ref: "demo-project".to_string(),
-                        short_title: "t2".to_string(),
-                        long_title: "t2".to_string(),
-                        body: report.composed_bodies[1].body.clone(),
-                    }
-                ))
-                .expect("serializes"),
-                admission_reason: Some(reason.to_string()),
-            }
-        );
-        assert_eq!(
-            report.outcome,
-            UnitOutcome::Ready,
-            "an admission is data on the report, never an outcome"
-        );
-        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
-        assert!(report.skipped.is_empty(), "no further fresh map this unit");
-    }
-
+    /// Two fresh maps from DIFFERENT clusters: the first create meets a
+    /// 409 and the second is submitted ANYWAY. This loop used to latch on
+    /// the first admission and skip every remaining create, which was right
+    /// while a 409 meant the project's one map for the night was spent. With
+    /// the caps gone a 409 is a fact about one submission, and latching
+    /// would discard a dozen good maps because of one earlier refusal.
     #[tokio::test]
     async fn a_rejected_create_does_not_stop_the_next_one() {
-        // Two fresh maps: the first create_map meets a 409, and the second
-        // is submitted ANYWAY. This loop used to latch on the first
-        // admission, which was right while a 409 meant the project's one map
-        // for the night was spent — a fact about the night. With the caps
-        // gone a 409 is a fact about one submission, and latching would
-        // discard every later map because of one earlier refusal.
         let clusters = json!([
             {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
-            {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null},
+            {"label": "b", "member_entry_ids": ["kb-10004", "kb-10005", "kb-10006"], "owning_map_id": null},
         ])
         .to_string();
         let backend = MockBackend::from_turns(vec![
             text_turn(&clusters, usage(1, 1, None, None)),
             calls_turn(
-                &[
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c1", "title": "t1", "orientation_prose": "PROSE-1"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
-                    ),
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c2", "title": "t2", "orientation_prose": "PROSE-2"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c2", "entry_id": "kb-10002", "gloss": "GLOSS-2"}),
-                    ),
-                ],
+                &[(
+                    "create_map",
+                    json!({"title": "t1", "orientation_prose": "PROSE-1", "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[(
+                    "create_map",
+                    json!({"title": "t2", "orientation_prose": "PROSE-2", "pointers": [{"entry_id": "kb-10004", "gloss": "GLOSS-2"}]}),
+                )],
                 usage(1, 1, None, None),
             ),
         ]);
@@ -3706,8 +3557,6 @@ mod tests {
         )
         .await;
         assert_eq!(report.composed_bodies.len(), 2);
-        // BOTH creates are POSTed; neither fresh map's add_pointers were
-        // ever candidates (they are inlined into the create body).
         assert_eq!(map_ops.requests().len(), 2);
         assert_eq!(report.cap_admissions.len(), 2);
         assert!(
@@ -3716,16 +3565,15 @@ mod tests {
             report.skipped
         );
         assert_eq!(report.outcome, UnitOutcome::Ready);
-        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
     }
 
+    /// A `create_map` with no `pointers` array is now refused when the TOOL
+    /// CALL IS PARSED, before any op exists — the pointers are part of the
+    /// op, so a pointerless map is unrepresentable rather than refusable.
+    /// The raw text still lands on disk, which is what told us the model was
+    /// narrating its entries in the prose instead of pointing at them.
     #[tokio::test]
-    async fn a_create_map_with_no_pointers_is_a_rung2_error_with_its_raw_text_offloaded() {
-        // A create_map with no pointers targeting the new map. It never
-        // reaches compose: the rung-2 validator refuses the op set, so the
-        // cluster carries a named error and its raw model text lands on
-        // disk — the evidence that tells an omission from a pointer aimed
-        // at the wrong map. Nothing is composed, gated or declined.
+    async fn a_create_map_with_no_pointers_is_refused_at_parse_with_its_raw_text_offloaded() {
         let clusters = json!([
             {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
         ])
@@ -3735,7 +3583,7 @@ mod tests {
             calls_turn(
                 &[(
                     "create_map",
-                    json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
+                    json!({"title": "t", "orientation_prose": "read the architecture entry first"}),
                 )],
                 usage(1, 1, None, None),
             ),
@@ -3753,26 +3601,21 @@ mod tests {
             "demo-project",
         )
         .await;
-        assert!(report.gate_reports.is_empty());
-        assert!(report.composed_bodies.is_empty());
-        assert!(report.compose_refusals.is_empty());
         let Rung2Outcome::ParseError { reason } = &report.clusters[0].rung2 else {
             panic!("got {:?}", report.clusters[0].rung2);
         };
-        assert!(reason.contains("carries no add_pointer op"), "{reason}");
+        assert!(
+            reason.contains("missing the array field `pointers`"),
+            "{reason}"
+        );
         let raw = report.clusters[0]
             .raw_path
             .as_ref()
             .expect("the raw model text is offloaded for forensics");
-        // NON-EMPTY, and carrying the tool calls. A rung-2 answer is tool
-        // calls and `AssistantTurn::text()` skips them, so this file was
-        // zero bytes on exactly the failures it exists to explain — a
-        // forensic record that is empty precisely when something went wrong
-        // reads as evidence of absence rather than absence of evidence.
         let raw_text = std::fs::read_to_string(raw).expect("the offload is readable");
         assert!(!raw_text.is_empty(), "the offload must not be empty");
         assert!(raw_text.contains("[tool_call] create_map"), "{raw_text}");
-        assert!(raw_text.contains("cluster_id"), "{raw_text}");
+        assert!(report.composed_bodies.is_empty());
         assert!(report.declines_recorded.is_empty());
     }
 
@@ -3833,16 +3676,10 @@ mod tests {
         let backend = MockBackend::from_turns(vec![
             text_turn(&mixed_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
-                &[
-                    (
-                        "create_map",
-                        json!({"cluster_id": "c1", "title": "t", "orientation_prose": "p"}),
-                    ),
-                    (
-                        "add_pointer",
-                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "g"}),
-                    ),
-                ],
+                &[(
+                    "create_map",
+                    json!({"title": "t", "orientation_prose": "p", "pointers": [{"entry_id": "kb-10001", "gloss": "g"}]}),
+                )],
                 usage(1, 1, None, None),
             ),
             calls_turn(
@@ -4108,14 +3945,14 @@ mod tests {
     #[test]
     fn the_apply_audit_catches_an_add_pointer_on_a_fresh_map() {
         let request = MapOpRequest::AddPointer {
-            map_id: "somnus-new-0-c0".to_string(),
+            map_id: "somnus-new-0".to_string(),
             body: "body".to_string(),
             added_entry_id: "kb-10001".to_string(),
         };
         assert_eq!(
-            apply_audit(Some("previous body"), &request, &["somnus-new-0-c0".to_string()]),
+            apply_audit(Some("previous body"), &request, &["somnus-new-0".to_string()]),
             Some(
-                "somnus: apply audit: add_pointer on fresh map somnus-new-0-c0 not absorbed by the create body"
+                "somnus: apply audit: add_pointer on fresh map somnus-new-0 not absorbed by the create body"
                     .to_string()
             )
         );
@@ -4135,7 +3972,7 @@ mod tests {
             apply_audit(
                 Some(&previous),
                 &request,
-                &["somnus-new-0-c0".to_string()],
+                &["somnus-new-0".to_string()],
             ),
             Some(
                 "somnus: apply audit: add_pointer delta for kb-20001 was [\"kb-10002\", \"kb-10003\", \"kb-00042\"], expected kb-10002"
