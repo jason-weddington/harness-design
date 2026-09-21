@@ -93,8 +93,9 @@ pub const KB_BASE_URL_VAR: &str = "SOMNUS_KB_BASE_URL";
 pub const KB_API_KEY_VAR: &str = "SOMNUS_KB_API_KEY";
 /// The operator env spelling for the Anthropic key (required).
 pub const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
-/// The operator env spelling for the nightly token ceiling (optional).
-pub const TOKEN_BUDGET_VAR: &str = "SOMNUS_TOKEN_BUDGET";
+/// The operator env spelling for the nightly SPEND ceiling, in
+/// micro-dollars (optional).
+pub const COST_BUDGET_VAR: &str = "SOMNUS_COST_BUDGET_MICROS";
 /// The operator env spelling for the state-dir override (optional).
 pub const STATE_DIR_VAR: &str = "SOMNUS_STATE_DIR";
 /// The operator env spelling for the kill switch (optional; exactly `1`).
@@ -111,9 +112,9 @@ pub const CLI_USAGE_ERROR_MSG: &str = "somnus: exactly one subcommand required: 
 pub const DISABLED_MSG: &str =
     "somnus: disabled via SOMNUS_DISABLED=1; exiting before any other env read, fetch, or write";
 
-/// The pinned token-budget fault line: any non-integer, negative, or empty
+/// The pinned cost-budget fault line: any non-integer, negative, or empty
 /// value is a configuration fault (one shape for all three).
-pub const TOKEN_BUDGET_MSG: &str = "somnus: SOMNUS_TOKEN_BUDGET is not a non-negative integer";
+pub const COST_BUDGET_MSG: &str = "somnus: SOMNUS_COST_BUDGET_MICROS is not a non-negative integer";
 
 /// The pinned base-URL fault line. A value ending in `/` is a configuration
 /// fault, never a silently-trimmed value.
@@ -125,15 +126,22 @@ pub fn render_required_env_missing_line(var: &str) -> String {
     format!("somnus: {var} is not set")
 }
 
-/// The subcommand token-budget defaults: `nightly` and `run` arm 550,000
-/// (~15× the measured nightly spend, bounding a runaway night at ~$2),
-/// `backfill` arms 1,100,000 (~2× the measured full-backfill spend).
-pub const NIGHTLY_TOKEN_BUDGET_DEFAULT: u64 = 550_000;
-/// The `run` default (same night shape as `nightly`).
-pub const RUN_TOKEN_BUDGET_DEFAULT: u64 = 550_000;
-/// The `backfill` default (a nightly ceiling loose enough to admit the
-/// backfill is not a ceiling; see the vendored spec's cap section).
-pub const BACKFILL_TOKEN_BUDGET_DEFAULT: u64 = 1_100_000;
+/// The subcommand spend ceilings, in micro-dollars.
+///
+/// **Denominated in money because tokens are the wrong unit for this
+/// question, and measuring in the wrong one punished the fix that made the
+/// loop cheaper.** The first ceiling was 550,000 billed tokens, intended as
+/// roughly $2. A prompt-cache fix then landed that cut cache WRITES from
+/// 504k to 51k and moved 434k tokens into cache READS — which bill at a
+/// fiftieth of a completion token. The run got sharply cheaper, $1.13, and
+/// tripped the ceiling anyway at 575,017 tokens. A token ceiling answers a
+/// context-window question; a guard against overspend has to count money.
+pub const NIGHTLY_COST_BUDGET_MICROS_DEFAULT: u64 = 2_000_000;
+/// The `run` default (one project, the same shape as one night's project).
+pub const RUN_COST_BUDGET_MICROS_DEFAULT: u64 = 2_000_000;
+/// The `backfill` default (loose enough to admit the backfill is not a
+/// ceiling; see the vendored spec's cap section).
+pub const BACKFILL_COST_BUDGET_MICROS_DEFAULT: u64 = 7_000_000;
 
 /// The kill switch: EXACTLY the string `1` arms it. Any other value —
 /// `true`, `0`, empty — is ignored, so a mistyped `SOMNUS_DISABLED=true`
@@ -190,16 +198,16 @@ fn required(var: &str, raw: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Parse [`TOKEN_BUDGET_VAR`]: absent → the subcommand default; `0` → 0
+/// Parse [`COST_BUDGET_VAR`]: absent → the subcommand default; `0` → 0
 /// (disabled/unbounded); any non-integer, negative, or empty value → the
 /// pinned fault line.
 ///
 /// # Errors
-/// [`TOKEN_BUDGET_MSG`] when `raw` is `Some` but not a non-negative integer.
-pub fn parse_token_budget(default: u64, raw: Option<&str>) -> Result<u64, String> {
+/// [`COST_BUDGET_MSG`] when `raw` is `Some` but not a non-negative integer.
+pub fn parse_cost_budget(default: u64, raw: Option<&str>) -> Result<u64, String> {
     match raw {
         None => Ok(default),
-        Some(raw) => raw.parse::<u64>().map_err(|_| TOKEN_BUDGET_MSG.to_string()),
+        Some(raw) => raw.parse::<u64>().map_err(|_| COST_BUDGET_MSG.to_string()),
     }
 }
 
@@ -244,7 +252,7 @@ pub const SOMNUS_MAX_ITERATIONS: u32 = 24;
 /// is a named abort and never a hang.
 ///
 /// Token-budget arming is somnus's OWN job (see
-/// [`NIGHTLY_TOKEN_BUDGET_DEFAULT`]): somnus's pipeline drives
+/// [`NIGHTLY_COST_BUDGET_MICROS_DEFAULT`]): somnus's pipeline drives
 /// `ModelBackend::turn` directly and never calls `engine::run`, so
 /// `RunConfig::token_budget` (which exists in `crates/harness/src/engine.rs`)
 /// is unreachable from it — the ceiling must live where the turns are, and
@@ -306,9 +314,9 @@ mod tests {
     fn named_constants_match_the_pinned_values() {
         assert_eq!(SOMNUS_MAX_ITERATIONS, 24);
         assert_eq!(NIGHTLY_WALL_CLOCK_SECS, 14_400);
-        assert_eq!(NIGHTLY_TOKEN_BUDGET_DEFAULT, 550_000);
-        assert_eq!(RUN_TOKEN_BUDGET_DEFAULT, 550_000);
-        assert_eq!(BACKFILL_TOKEN_BUDGET_DEFAULT, 1_100_000);
+        assert_eq!(NIGHTLY_COST_BUDGET_MICROS_DEFAULT, 2_000_000);
+        assert_eq!(RUN_COST_BUDGET_MICROS_DEFAULT, 2_000_000);
+        assert_eq!(BACKFILL_COST_BUDGET_MICROS_DEFAULT, 7_000_000);
         assert_eq!(
             crate::ops::SOMNUS_DONE_SUMMARY,
             "ops applied, map-lint gate green, pointer count moved"
@@ -385,30 +393,30 @@ mod tests {
     // --- the token budget ---------------------------------------------------
 
     #[test]
-    fn the_token_budget_parses_the_pinned_table() {
+    fn the_cost_budget_parses_the_pinned_table() {
         // (raw, armed) for the nightly default.
         let table = [
-            (None, Ok(550_000u64)),
+            (None, Ok(2_000_000u64)),
             (Some("0"), Ok(0)),
-            (Some("550000"), Ok(550_000)),
-            (Some("1100000"), Ok(1_100_000)),
-            (Some(""), Err(TOKEN_BUDGET_MSG.to_string())),
-            (Some("abc"), Err(TOKEN_BUDGET_MSG.to_string())),
-            (Some("-1"), Err(TOKEN_BUDGET_MSG.to_string())),
-            (Some("1e6"), Err(TOKEN_BUDGET_MSG.to_string())),
+            (Some("2000000"), Ok(2_000_000)),
+            (Some("7000000"), Ok(7_000_000)),
+            (Some(""), Err(COST_BUDGET_MSG.to_string())),
+            (Some("abc"), Err(COST_BUDGET_MSG.to_string())),
+            (Some("-1"), Err(COST_BUDGET_MSG.to_string())),
+            (Some("1e6"), Err(COST_BUDGET_MSG.to_string())),
         ];
         for (raw, expected) in table {
-            assert_eq!(parse_token_budget(550_000, raw), expected, "{raw:?}");
+            assert_eq!(parse_cost_budget(2_000_000, raw), expected, "{raw:?}");
         }
         // The fault line is byte-pinned.
         assert_eq!(
-            TOKEN_BUDGET_MSG,
-            "somnus: SOMNUS_TOKEN_BUDGET is not a non-negative integer"
+            COST_BUDGET_MSG,
+            "somnus: SOMNUS_COST_BUDGET_MICROS is not a non-negative integer"
         );
         // The subcommand defaults flow through.
         assert_eq!(
-            parse_token_budget(BACKFILL_TOKEN_BUDGET_DEFAULT, None),
-            Ok(1_100_000)
+            parse_cost_budget(BACKFILL_COST_BUDGET_MICROS_DEFAULT, None),
+            Ok(7_000_000)
         );
     }
 

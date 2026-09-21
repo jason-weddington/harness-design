@@ -70,12 +70,12 @@ pub struct UnitDeps<'a> {
     /// `crates/harness/src/engine.rs`). somnus enforces it ITSELF because its
     /// pipeline drives `ModelBackend::turn` directly and never runs
     /// `engine::run`.
-    pub token_budget: u64,
+    pub cost_budget_micros: u64,
     /// The invocation's billed-token total at unit START, so an across-units
     /// nightly ceiling sees what earlier units already spent. No second
     /// accumulator: the check reads the accumulator that already exists in
     /// [`run_unit`]'s report usage.
-    pub billed_before: u64,
+    pub cost_before_micros: u64,
     /// The root every composed body, raw offload, and the run report are
     /// written under. A PARAMETER (a tempdir in tests) so parallel runs
     /// cannot collide.
@@ -161,6 +161,26 @@ impl UsageTotals {
         harness::model::billed_token_sum(self.input, self.output, self.cache_read, self.cache_write)
     }
 
+    /// What these tokens cost, in micro-dollars, at the published prices for
+    /// the loop's model.
+    ///
+    /// The prices live in `harness` beside the billed-token definition for
+    /// the same reason that one does: a formula each consumer re-derives is
+    /// a formula that drifts. An unpriced model yields 0 rather than a
+    /// guessed rate — a ceiling that silently bills an unknown model at
+    /// somebody else's price is worse than one that does not fire.
+    #[must_use]
+    pub fn cost_micros(&self) -> u64 {
+        harness::model::prices_for_model(crate::rungs::SOMNUS_MODEL_ID).map_or(0, |prices| {
+            prices.cost_micros_for_counts(
+                self.input,
+                self.output,
+                self.cache_read,
+                self.cache_write,
+            )
+        })
+    }
+
     /// Accumulate one turn's [`harness::model::Usage`].
     fn add(&mut self, usage: &harness::model::Usage) {
         self.input += u64::from(usage.input_tokens);
@@ -203,6 +223,14 @@ pub struct ClusterRecord {
     pub raw_path: Option<PathBuf>,
     /// Rung 1's own account of why it ranked this cluster where it did.
     pub merit_reason: Option<String>,
+    /// Why admission refused this cluster's map, if it did.
+    ///
+    /// Recorded rather than acted on further: a mechanical refusal says the
+    /// CARVE was bad, not that the subject area is unworthy, so it must never
+    /// reach the decline ledger. A decline suppresses a cluster until its
+    /// member set changes substantially, and one run retired nine legitimate
+    /// subject areas that way before anyone saw a map.
+    pub admission_refusal: Option<String>,
 }
 
 impl ClusterRecord {
@@ -407,8 +435,8 @@ pub const MAP_OP_NOT_MACHINE_PRINCIPAL_MSG: &str = "somnus: the KB refused the c
 /// inputs. Pure so the shape is byte-pinned; the pipeline only `eprintln!`s
 /// it.
 #[must_use]
-pub fn render_token_budget_line(armed: u64, billed: u64) -> String {
-    format!("somnus: token budget exhausted (armed {armed}, billed {billed})")
+pub fn render_cost_budget_line(armed: u64, spent: u64) -> String {
+    format!("somnus: cost budget exhausted (armed {armed} micro-dollars, spent {spent})")
 }
 
 /// The pinned reason naming the FIRST red gate body, in
@@ -716,11 +744,14 @@ async fn run_unit_inner(
     // (6) Rung 1: one single-shot inference for the whole project, AFTER
     // the token-budget guard (the whole unit's spend so far is
     // `billed_before`; the sentinel 0 = unbounded short-circuits).
-    if harness::engine::token_budget_breached(deps.billed_before, deps.token_budget) {
-        let billed = deps.billed_before;
-        eprintln!("{}", render_token_budget_line(deps.token_budget, billed));
+    if harness::engine::budget_breached(deps.cost_before_micros, deps.cost_budget_micros) {
+        let spent = deps.cost_before_micros;
+        eprintln!(
+            "{}",
+            render_cost_budget_line(deps.cost_budget_micros, spent)
+        );
         report.outcome = UnitOutcome::Aborted {
-            reason: render_token_budget_line(deps.token_budget, billed),
+            reason: render_cost_budget_line(deps.cost_budget_micros, spent),
         };
         return finalize(report);
     }
@@ -775,10 +806,11 @@ async fn run_unit_inner(
         // the invocation total so far (`billed_before`) plus this unit's
         // accumulated billed usage. Same guard style as the count cap
         // above — checked between turns, never mid-flight.
-        let billed_now =
-            deps.billed_before + report.usage_rung1.billed() + report.usage_rung2.billed();
-        if harness::engine::token_budget_breached(billed_now, deps.token_budget) {
-            budget_reason = Some(render_token_budget_line(deps.token_budget, billed_now));
+        let spent_now = deps.cost_before_micros
+            + report.usage_rung1.cost_micros()
+            + report.usage_rung2.cost_micros();
+        if harness::engine::budget_breached(spent_now, deps.cost_budget_micros) {
+            budget_reason = Some(render_cost_budget_line(deps.cost_budget_micros, spent_now));
             break;
         }
         let mut record = ClusterRecord {
@@ -789,9 +821,10 @@ async fn run_unit_inner(
             rung2: Rung2Outcome::Parsed,
             raw_path: None,
             merit_reason: cluster.merit_reason.clone(),
+            admission_refusal: None,
         };
         let rung2_started = std::time::Instant::now();
-        let turn = match rung2_turn(deps.backend, project_ref, &filtered, cluster).await {
+        let turn = match rung2_turn(deps.backend, project_ref, &filtered, cluster, index).await {
             Ok(turn) => turn,
             Err(err) => {
                 record.rung2 = Rung2Outcome::ParseError {
@@ -820,11 +853,17 @@ async fn run_unit_inner(
         // Admission is applied BEFORE the guard below sees the op set: a bad
         // map cannot be withdrawn, a gap can be acted on, and a deferral
         // leaves the cluster free to win tomorrow.
-        let verdict = verdicts.get(index).cloned().unwrap_or_else(|| {
-            crate::admission::Verdict::Refused {
-                reason: "The cluster has no admission verdict, so it is recorded as a gap rather than mapped.".to_string(),
-            }
-        });
+        let verdict =
+            verdicts
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| crate::admission::Verdict::Refused {
+                    reason: "The cluster has no admission verdict, so no map is minted for it."
+                        .to_string(),
+                });
+        if let crate::admission::Verdict::Refused { reason } = &verdict {
+            record.admission_refusal = Some(reason.clone());
+        }
         let ops = crate::materialize::apply_verdict(&verdict, ops);
         // The lead-disposition guard rejects the whole op set BEFORE any
         // op is applied: an owned cluster must converge, never re-propose.
@@ -857,8 +896,14 @@ async fn run_unit_inner(
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
             continue;
         }
-        let declined = record.ops.is_empty()
-            || record
+        // ONLY a model-emitted `propose_gap` set is a decline, and by
+        // validation those exist only for clusters that already have a map.
+        // Neither a mechanical admission refusal nor an empty op set may
+        // write one: both are statements about this RUN, and a decline is a
+        // statement about the SUBJECT that suppresses it for nights to come.
+        let declined = record.admission_refusal.is_none()
+            && !record.ops.is_empty()
+            && record
                 .ops
                 .iter()
                 .all(|op| matches!(op, Op::ProposeGap { .. }));
@@ -1549,8 +1594,8 @@ mod tests {
         body_root: &Path,
         project_ref: &str,
         map_ops: std::sync::Arc<dyn MapOpClient>,
-        token_budget: u64,
-        billed_before: u64,
+        cost_budget_micros: u64,
+        cost_before_micros: u64,
     ) -> UnitReport {
         let tool_ctx = ToolCtx::stub();
         let deps = UnitDeps {
@@ -1560,8 +1605,8 @@ mod tests {
             gate_for,
             tool_ctx: &tool_ctx,
             map_ops,
-            token_budget,
-            billed_before,
+            cost_budget_micros,
+            cost_before_micros,
             body_root: body_root.to_path_buf(),
         };
         run_unit(&deps, project_ref).await
@@ -1613,6 +1658,43 @@ mod tests {
     /// such a line), so every pinned body literal holds — and the owned-
     /// cluster rejection is pinned by its own test:
     /// `create_map_for_an_owned_cluster_is_rejected_by_the_pipeline`.
+    /// Two clusters that ALREADY have a map — the only shape for which a
+    /// model-emitted `propose_gap` is legal, since a gap is a line inside an
+    /// existing map's body.
+    fn mapped_clusters_json() -> String {
+        json!([
+            {
+                "label": "wireguard-and-dns",
+                "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"],
+                "owning_map_id": "kb-20001"
+            },
+            {
+                "label": "backup-drills",
+                "member_entry_ids": ["kb-10006", "kb-10007"],
+                "owning_map_id": "kb-20001"
+            }
+        ])
+        .to_string()
+    }
+
+    /// One unmapped cluster (which may mint) and one mapped cluster (the
+    /// only shape a `propose_gap` is legal for).
+    fn mixed_clusters_json() -> String {
+        json!([
+            {
+                "label": "wireguard-and-dns",
+                "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"],
+                "owning_map_id": null
+            },
+            {
+                "label": "backup-drills",
+                "member_entry_ids": ["kb-10006", "kb-10007"],
+                "owning_map_id": "kb-20001"
+            }
+        ])
+        .to_string()
+    }
+
     fn e2e_clusters_json() -> String {
         json!([
             {
@@ -1893,15 +1975,13 @@ mod tests {
         assert_eq!(report.change, ChangeEvidence::TreeChanged);
         assert_eq!(
             ledger.recorded_declines("demo-project"),
-            vec![
-                vec!["kb-10004".to_string(), "kb-10005".to_string()],
-                vec!["kb-10006".to_string(), "kb-10007".to_string()],
-            ],
-            "the seeded decline plus this run's propose_gap decline"
+            vec![vec!["kb-10004".to_string(), "kb-10005".to_string()]],
+            "only the SEEDED decline: this run's second cluster is unmapped, and a propose_gap there is now an error rather than a decline"
         );
-        assert_eq!(
-            report.declines_recorded,
-            vec![vec!["kb-10006".to_string(), "kb-10007".to_string(),]]
+        assert!(
+            report.declines_recorded.is_empty(),
+            "this run records no decline of its own: got {:?}",
+            report.declines_recorded
         );
 
         // --- the report -----------------------------------------------------
@@ -2018,15 +2098,25 @@ mod tests {
         assert_eq!(on_disk["composed_bodies"].as_array().map(Vec::len), Some(2));
         assert_eq!(on_disk["gate_reports"].as_array().map(Vec::len), Some(2));
         assert_eq!(
-            on_disk["declines_recorded"][0],
-            json!(["kb-10006", "kb-10007"])
+            on_disk["declines_recorded"],
+            json!([]),
+            "the unmapped second cluster can no longer be declined"
         );
         assert_eq!(report.clusters.len(), 2);
         assert_eq!(report.clusters[0].label, "wireguard-and-dns");
         assert_eq!(report.clusters[0].rung2, Rung2Outcome::Parsed);
         assert_eq!(report.clusters[0].ops.len(), 4);
         assert_eq!(report.clusters[1].label, "backup-drills");
-        assert_eq!(report.clusters[1].rung2, Rung2Outcome::Parsed);
+        // The second cluster has no map, so its `propose_gap` is a rung-2
+        // ERROR rather than a disposition — and critically not a decline. A
+        // decline suppresses a cluster until its member set changes
+        // substantially; one run retired nine legitimate subject areas that
+        // way before a human saw a map.
+        let Rung2Outcome::ParseError { reason } = &report.clusters[1].rung2 else {
+            panic!("got {:?}", report.clusters[1].rung2);
+        };
+        assert!(reason.contains("propose_gap is refused"), "{reason}");
+        assert!(reason.contains("because it has no map"), "{reason}");
     }
 
     #[tokio::test]
@@ -2314,10 +2404,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_all_decline_night_issues_zero_map_op_posts() {
-        // Clusters whose op sets are empty or propose_gap-only: declines
+        // Mapped clusters whose op sets are propose_gap-only: declines
         // recorded, nothing composed, zero map-op POSTs.
         let backend = MockBackend::from_turns(vec![
-            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            text_turn(&mapped_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
                 &[("propose_gap", json!({"cluster_id": "c1", "reason": "r"}))],
                 usage(1, 1, None, None),
@@ -3021,7 +3111,7 @@ mod tests {
     #[tokio::test]
     async fn a_decline_write_failure_fails_closed() {
         let backend = MockBackend::from_turns(vec![
-            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            text_turn(&mapped_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
                 &[("propose_gap", json!({"cluster_id": "c1", "reason": "r"}))],
                 usage(1, 1, None, None),
@@ -3144,7 +3234,7 @@ mod tests {
             clusters.push(json!({
                 "label": format!("cluster-{index}"),
                 "member_entry_ids": [format!("kb-1000{index}")],
-                "owning_map_id": null
+                "owning_map_id": "kb-20001"
             }));
         }
         let mut script = vec![text_turn(
@@ -3592,7 +3682,7 @@ mod tests {
     #[tokio::test]
     async fn an_unwritable_body_root_aborts_the_unit() {
         let backend = MockBackend::from_turns(vec![
-            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            text_turn(&mixed_clusters_json(), usage(1, 1, None, None)),
             calls_turn(
                 &[
                     (
@@ -3668,8 +3758,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_rung2_offload_is_announced_and_the_run_continues() {
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
-            {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null}
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": "kb-20001"},
+            {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": "kb-20001"}
         ])
         .to_string();
         let backend = MockBackend::from_turns(vec![
@@ -3811,14 +3901,14 @@ mod tests {
     }
 
     #[test]
-    fn the_token_budget_line_carries_both_decision_inputs() {
+    fn the_cost_budget_line_carries_both_decision_inputs() {
         assert_eq!(
-            render_token_budget_line(550_000, 612_004),
-            "somnus: token budget exhausted (armed 550000, billed 612004)"
+            render_cost_budget_line(2_000_000, 2_130_674),
+            "somnus: cost budget exhausted (armed 2000000 micro-dollars, spent 2130674)"
         );
         assert_eq!(
-            render_token_budget_line(1_100_000, 1_100_333),
-            "somnus: token budget exhausted (armed 1100000, billed 1100333)"
+            render_cost_budget_line(7_000_000, 7_000_001),
+            "somnus: cost budget exhausted (armed 7000000 micro-dollars, spent 7000001)"
         );
     }
 
@@ -3964,7 +4054,7 @@ mod tests {
     // ======================================================================
 
     #[tokio::test]
-    async fn the_token_budget_exhaustion_aborts_before_further_turns() {
+    async fn the_cost_budget_exhaustion_aborts_before_further_turns() {
         // The pre-rung-1 arm: the whole spend so far is `billed_before`,
         // and it already breaches the small ceiling, so the backend is
         // never called at all.
@@ -3984,22 +4074,23 @@ mod tests {
             gate_for: &gate,
             tool_ctx: &tool_ctx,
             map_ops: std::sync::Arc::new(RecordingMapOps::default()),
-            token_budget: 100,
-            billed_before: 500,
+            cost_budget_micros: 100,
+            cost_before_micros: 500,
             body_root: body_root.path().to_path_buf(),
         };
         let report = run_unit(&deps, "demo-project").await;
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: token budget exhausted (armed 100, billed 500)".to_string(),
+                reason: "somnus: cost budget exhausted (armed 100 micro-dollars, spent 500)"
+                    .to_string(),
             }
         );
         assert_eq!(backend.calls(), 0, "the guard fired BEFORE rung 1");
     }
 
     #[tokio::test]
-    async fn the_token_budget_stops_the_rung2_loop_between_turns() {
+    async fn the_cost_budget_stops_the_rung2_loop_between_turns() {
         // Rung 1 is affordable (1200 < 5000); its billed usage alone
         // breaches the ceiling, so rung 2 never starts: the scripted turn
         // count stays at the rung-1 call.
@@ -4019,8 +4110,8 @@ mod tests {
             gate_for: &gate,
             tool_ctx: &tool_ctx,
             map_ops: std::sync::Arc::new(RecordingMapOps::default()),
-            token_budget: 5000,
-            billed_before: 500,
+            cost_budget_micros: 5000,
+            cost_before_micros: 500,
             body_root: body_root.path().to_path_buf(),
         };
         let report = run_unit(&deps, "demo-project").await;
@@ -4028,7 +4119,8 @@ mod tests {
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: token budget exhausted (armed 5000, billed 5500)".to_string(),
+                reason: "somnus: cost budget exhausted (armed 5000 micro-dollars, spent 20840)"
+                    .to_string(),
             },
             "billed_before 500 + rung-1 billed 5000 breaches 5000 before rung 2"
         );
@@ -4052,15 +4144,16 @@ mod tests {
             gate_for: &gate,
             tool_ctx: &tool_ctx,
             map_ops: std::sync::Arc::new(RecordingMapOps::default()),
-            token_budget: 550_000,
-            billed_before: 612_004,
+            cost_budget_micros: 550_000,
+            cost_before_micros: 612_004,
             body_root: body_root.path().to_path_buf(),
         };
         let report = run_unit(&deps, "demo-project").await;
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: token budget exhausted (armed 550000, billed 612004)".to_string(),
+                reason: "somnus: cost budget exhausted (armed 550000 micro-dollars, spent 612004)"
+                    .to_string(),
             }
         );
         assert_eq!(backend.calls(), 0);
@@ -4074,8 +4167,8 @@ mod tests {
             gate_for: &gate,
             tool_ctx: &tool_ctx,
             map_ops: std::sync::Arc::new(RecordingMapOps::default()),
-            token_budget: 0,
-            billed_before: 612_004,
+            cost_budget_micros: 0,
+            cost_before_micros: 612_004,
             body_root: body_root.path().to_path_buf(),
         };
         let report = run_unit(&deps, "demo-project").await;

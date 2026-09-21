@@ -3449,7 +3449,19 @@ fn budget_consumed_now(initial_consumed: &BudgetConsumed, stats: &RunStats) -> B
 /// predicate instead of re-deriving the boundary condition beside it.
 #[must_use]
 pub fn token_budget_breached(consumed_tokens: u64, limit: u64) -> bool {
-    limit != 0 && consumed_tokens >= limit
+    budget_breached(consumed_tokens, limit)
+}
+
+/// The breach predicate itself, independent of what is being counted.
+///
+/// Extracted because a consumer measuring SPEND rather than context needs the
+/// identical boundary condition, and calling the token-named function for a
+/// cost comparison would have been a naming lie that outlived whoever wrote
+/// it. `0` is the unbounded sentinel and `>=` is the breach, exactly as for
+/// tokens and the wall clock.
+#[must_use]
+pub fn budget_breached(consumed: u64, limit: u64) -> bool {
+    limit != 0 && consumed >= limit
 }
 
 /// Evaluate the token-budget breach predicate for the engine loop and, on

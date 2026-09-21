@@ -344,6 +344,17 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
             cluster.label
         ));
     }
+    // A gap is a line inside an EXISTING map's body, so a cluster with no map
+    // has nothing to propose one against. This is a rung-2 error, not a
+    // disposition — and treating it as one was expensive: nine such
+    // `propose_gap` ops were recorded as ledger declines in a single run,
+    // retiring nine legitimate subject areas before a human saw a map.
+    if cluster.owning_map_id.is_none() && ops.iter().any(|op| matches!(op, Op::ProposeGap { .. })) {
+        return Err(format!(
+            "somnus: propose_gap is refused for cluster {} because it has no map — a gap is a line inside an existing map's body, so there is nothing to propose it against; the dispositions for an unmapped cluster are create_map with pointers, or no_change",
+            cluster.label
+        ));
+    }
     Ok(())
 }
 
@@ -358,16 +369,23 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
 /// struck gaps, survive untouched: adding to an existing map is not the thing
 /// admission guards against.
 ///
-/// On a refusal the `create_map` and its pointers are replaced by a single
-/// `propose_gap`, which is what the pipeline records as a decline, so the
-/// observation survives instead of being re-proposed every night. A
-/// `no_change` is dropped alongside, because leaving one would make the set
-/// not-all-`propose_gap` and silently skip the decline write.
+/// On a refusal the `create_map` and the pointers into it are DROPPED and
+/// nothing is substituted.
+///
+/// An earlier version substituted a `propose_gap` here, so that the
+/// observation reached the decline ledger rather than vanishing. That was
+/// wrong twice over: a gap belongs to an existing map, which a refused
+/// cluster does not have, and a decline SUPPRESSES the cluster until its
+/// member set changes substantially. A mechanical refusal is not a verdict on
+/// the subject area — it says the carve was bad, not that the subject is not
+/// worth mapping — so recording one retires a real subject on the strength of
+/// a naming or overlap rule. The refusal is recorded in the run report
+/// instead, where it informs without suppressing.
 #[must_use]
 pub fn apply_verdict(verdict: &Verdict, ops: Vec<Op>) -> Vec<Op> {
-    let Verdict::Refused { reason } = verdict else {
+    if matches!(verdict, Verdict::Admitted) {
         return ops;
-    };
+    }
     let Some(cluster_id) = ops.iter().find_map(|op| match op {
         Op::CreateMap { cluster_id, .. } => Some(cluster_id.clone()),
         _ => None,
@@ -375,21 +393,13 @@ pub fn apply_verdict(verdict: &Verdict, ops: Vec<Op>) -> Vec<Op> {
         return ops;
     };
     let minted = new_map_id(&cluster_id);
-    let mut kept: Vec<Op> = ops
-        .into_iter()
+    ops.into_iter()
         .filter(|op| match op {
-            Op::CreateMap { .. } | Op::NoChange { .. } => false,
+            Op::CreateMap { .. } => false,
             Op::AddPointer { map_id, .. } => map_id != &minted,
-            Op::StrikeGap { .. } | Op::ProposeGap { .. } => true,
+            Op::StrikeGap { .. } | Op::ProposeGap { .. } | Op::NoChange { .. } => true,
         })
-        .collect();
-    if !kept.iter().any(|op| matches!(op, Op::ProposeGap { .. })) {
-        kept.push(Op::ProposeGap {
-            reason: reason.clone(),
-            cluster_id,
-        });
-    }
-    kept
+        .collect()
 }
 
 /// One composed body: the map it belongs to and the full body text.
@@ -1257,8 +1267,13 @@ mod verdict_tests {
         assert_eq!(apply_verdict(&Verdict::Admitted, ops.clone()), ops);
     }
 
+    /// A refusal drops the map and the pointers into it, and substitutes
+    /// NOTHING. It used to substitute a `propose_gap` so the observation
+    /// survived; that reached the decline ledger, which suppresses the
+    /// cluster for nights to come — a verdict on the SUBJECT, from a rule
+    /// that only ever judged the CARVE.
     #[test]
-    fn a_refused_cluster_gets_a_gap_instead_of_a_map() {
+    fn a_refused_cluster_records_nothing_at_all() {
         let ops = apply_verdict(
             &refused(),
             vec![
@@ -1267,22 +1282,15 @@ mod verdict_tests {
                 pointer("somnus-new-c1", "kb-10002"),
             ],
         );
-        assert_eq!(
-            ops,
-            vec![Op::ProposeGap {
-                cluster_id: "c1".to_string(),
-                reason: "REASON".to_string(),
-            }],
-            "the map and every pointer into it must be gone"
+        assert!(
+            ops.is_empty(),
+            "a refusal is not a decline and must leave no trace: {ops:?}"
         );
     }
 
-    /// An op set that is ONLY `propose_gap` is what the pipeline records as a
-    /// decline, so the substituted set has to be exactly that — a stray
-    /// `no_change` would silently skip the decline write and the cluster
-    /// would be re-proposed every night forever.
+    /// The model's OWN words survive a refusal — only the minting is undone.
     #[test]
-    fn the_refused_set_reads_as_a_clean_decline() {
+    fn a_refusal_keeps_the_models_own_no_change() {
         let ops = apply_verdict(
             &refused(),
             vec![
@@ -1292,9 +1300,11 @@ mod verdict_tests {
                 },
             ],
         );
-        assert!(
-            ops.iter().all(|op| matches!(op, Op::ProposeGap { .. })),
-            "got {ops:?}"
+        assert_eq!(
+            ops,
+            vec![Op::NoChange {
+                cluster_id: "c1".to_string()
+            }]
         );
     }
 

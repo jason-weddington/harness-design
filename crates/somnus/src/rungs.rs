@@ -133,7 +133,41 @@ pub fn rung1_messages(project_ref: &str, filtered: &LoopInput) -> Vec<Message> {
     messages
 }
 
-/// The rung-2 instruction for one cluster, byte-pinned.
+/// The `cluster_id` the model is TOLD to use, derived from the cluster's
+/// index so code owns it.
+///
+/// It used to be a string the model invented, which left the fresh map's id
+/// unpredictable to the very prompt that had to name it — the model had to
+/// guess our id convention in order to point at its own map, and when it
+/// guessed differently the create composed with no pointers and was refused.
+#[must_use]
+pub fn pinned_cluster_id(cluster_index: usize) -> String {
+    format!("c{cluster_index}")
+}
+
+/// The rung-2 instruction for one cluster.
+///
+/// **A map is created together with its pointers, in one write.** There is no
+/// incremental pointer API for an agent anywhere in the KB: a human agent
+/// creates a map with a single store whose body already contains its pointer
+/// lines, and the server enforces at least one at creation time. So an op set
+/// for an unmapped cluster is one `create_map` plus one `add_pointer` per
+/// member, where those `add_pointer` ops are LOCAL contributions to the
+/// pending body — never HTTP calls. `add_pointer` over the wire keeps its own
+/// separate meaning: adding a newly-written entry to a map that already
+/// exists.
+///
+/// Three runs wrote nothing because this was left implicit. The model emitted
+/// `create_map` and no pointers, compose refused for an empty pointer list,
+/// and the remaining clusters degraded. Stating the exact
+/// `map_id` to use is the fix, and it is only possible because
+/// [`pinned_cluster_id`] made that id predictable.
+///
+/// **`propose_gap` is forbidden for a cluster with no map**, because a gap is
+/// a line inside an existing map's body. Emitting one there is not a
+/// disposition, it is an error — and it used to be recorded as a ledger
+/// decline, which retired nine legitimate subject areas in a single run
+/// before a human ever saw a map.
 ///
 /// The purity sentence is not style advice — it is the cheapest place to
 /// prevent a gate rejection. The map-lint is grammar-agnostic (six purity
@@ -148,16 +182,22 @@ pub fn rung1_messages(project_ref: &str, filtered: &LoopInput) -> Vec<Message> {
 /// lint on 2026-09-20: bare integers pass, `Lives in packages/kb-core` passes
 /// (the path rule requires a leading `/` or `~/`), and backticks, double
 /// quotes, `SCREAMING_SNAKE` tokens and absolute paths all fail.
-///
-/// Rung 2 is one inference per cluster, so a rejected body costs a whole
-/// re-inference against a metered lane. One sentence here is far cheaper than
-/// a 422 round trip per gloss.
 #[must_use]
-pub fn render_rung2_instruction(cluster: &Cluster) -> String {
+pub fn render_rung2_instruction(cluster: &Cluster, cluster_index: usize) -> String {
+    let cluster_id = pinned_cluster_id(cluster_index);
+    let members = cluster.member_entry_ids.join(", ");
+    let disposition = match &cluster.owning_map_id {
+        Some(owning) => format!(
+            "This cluster is already covered by map {owning}. Do not create a second map for it. Add pointers to {owning} for entries it does not yet point at, strike any gap in it that these entries now close, or propose a gap on it. If nothing applies, emit no_change with cluster_id {cluster_id}."
+        ),
+        None => format!(
+            "This cluster has no map. If it is worth mapping, emit exactly one create_map with cluster_id set to the literal {cluster_id}, and one add_pointer for every entry the map should point at, each with map_id set to the literal {}. A map is created together with its pointers in a single write, so there is no way to add a pointer to this map afterwards, and a create_map carrying no add_pointer ops is refused outright. If it is not worth mapping, emit no_change with cluster_id {cluster_id} and nothing else. Do not emit propose_gap for this cluster: a gap is a line inside an existing map, and this cluster has none.",
+            crate::materialize::new_map_id(&cluster_id)
+        ),
+    };
     format!(
-        "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster {} covering {}. Do not write a map body; code composes bodies. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
-        cluster.label,
-        cluster.member_entry_ids.join(", ")
+        "You are given one cluster and the project's loop-input as tool results. The cluster is labelled {} and covers {members}. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap, no_change) as tool calls. Do not write a map body; code composes bodies. {disposition} In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
+        cluster.label
     )
 }
 
@@ -165,10 +205,18 @@ pub fn render_rung2_instruction(cluster: &Cluster) -> String {
 /// messages plus the cluster's instruction. `tools` is exactly the four op
 /// schemas, `system = None`.
 #[must_use]
-pub fn rung2_messages(project_ref: &str, filtered: &LoopInput, cluster: &Cluster) -> Vec<Message> {
+pub fn rung2_messages(
+    project_ref: &str,
+    filtered: &LoopInput,
+    cluster: &Cluster,
+    cluster_index: usize,
+) -> Vec<Message> {
     let mut messages = loop_input_messages(project_ref, filtered);
     messages.push(Message::User {
-        content: vec![UserBlock::Text(render_rung2_instruction(cluster))],
+        content: vec![UserBlock::Text(render_rung2_instruction(
+            cluster,
+            cluster_index,
+        ))],
     });
     messages
 }
@@ -205,8 +253,9 @@ pub async fn rung2_turn(
     project_ref: &str,
     filtered: &LoopInput,
     cluster: &Cluster,
+    cluster_index: usize,
 ) -> Result<AssistantTurn, BackendError> {
-    let messages = rung2_messages(project_ref, filtered, cluster);
+    let messages = rung2_messages(project_ref, filtered, cluster, cluster_index);
     let tools = op_tool_schemas();
     let params = somnus_sampling_params();
     let request = TurnRequest {
@@ -627,30 +676,79 @@ mod tests {
     // --- rung 2 -----------------------------------------------------------
 
     #[test]
-    fn the_rung2_instruction_is_byte_pinned() {
+    fn the_rung2_instruction_names_the_exact_map_id_for_an_unmapped_cluster() {
         let cluster = Cluster {
             label: "wireguard-and-dns".to_string(),
             member_entry_ids: vec!["kb-10001".to_string(), "kb-10002".to_string()],
+            owning_map_id: None,
+            merit_reason: None,
+        };
+        let rendered = render_rung2_instruction(&cluster, 3);
+        // The exact id, because the model has to name it to point at its own
+        // map and guessing our convention is what wrote nothing for 3 runs.
+        assert!(
+            rendered.contains("cluster_id set to the literal c3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("map_id set to the literal somnus-new-c3"),
+            "{rendered}"
+        );
+        // A create with no pointers is refused, so say so up front.
+        assert!(
+            rendered.contains("carrying no add_pointer ops is refused"),
+            "{rendered}"
+        );
+        // And a gap has nothing to attach to here.
+        assert!(
+            rendered.contains("Do not emit propose_gap for this cluster"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_mapped_cluster_is_told_to_converge_rather_than_mint() {
+        let cluster = Cluster {
+            label: "wireguard-and-dns".to_string(),
+            member_entry_ids: vec!["kb-10001".to_string()],
             owning_map_id: Some("kb-20001".to_string()),
             merit_reason: None,
         };
-        assert_eq!(
-            render_rung2_instruction(&cluster),
-            "You are given one cluster and the project's loop-input as tool results. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap) as tool calls for the cluster wireguard-and-dns covering kb-10001, kb-10002. Do not write a map body; code composes bodies. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'."
+        let rendered = render_rung2_instruction(&cluster, 0);
+        assert!(
+            rendered.contains("already covered by map kb-20001"),
+            "{rendered}"
         );
+        assert!(
+            rendered.contains("Do not create a second map"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Do not emit propose_gap"),
+            "a mapped cluster may legitimately propose a gap: {rendered}"
+        );
+    }
 
+    #[test]
+    fn the_purity_warnings_survive_every_cluster_shape() {
         // The purity sentence is load-bearing, not decorative: it is the only
         // guard against the model writing a gloss the map-lint rejects, and
         // `e.g.` is the member of the list nobody predicts — the
-        // dotted-identifier rule matches any `word.word`. Assert the two
-        // highest-traffic tokens explicitly so a future edit that "tightens"
-        // the wording cannot silently drop them.
-        let rendered = render_rung2_instruction(&cluster);
-        assert!(rendered.contains("e.g."), "the e.g. warning must survive");
-        assert!(
-            rendered.contains("no backticks"),
-            "the backtick warning must survive"
-        );
+        // dotted-identifier rule matches any `word.word`.
+        for owning in [None, Some("kb-20001".to_string())] {
+            let cluster = Cluster {
+                label: "a".to_string(),
+                member_entry_ids: vec!["kb-10001".to_string()],
+                owning_map_id: owning,
+                merit_reason: None,
+            };
+            let rendered = render_rung2_instruction(&cluster, 0);
+            assert!(rendered.contains("e.g."), "the e.g. warning must survive");
+            assert!(
+                rendered.contains("no backticks"),
+                "the backtick warning must survive"
+            );
+        }
     }
 
     #[test]
@@ -662,21 +760,21 @@ mod tests {
             owning_map_id: None,
             merit_reason: None,
         };
-        let messages = rung2_messages("demo-project", &filtered, &cluster);
+        let messages = rung2_messages("demo-project", &filtered, &cluster, 0);
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0], rung1_messages("demo-project", &filtered)[0]);
         assert_eq!(messages[1], rung1_messages("demo-project", &filtered)[1]);
         assert_eq!(
             messages[2],
             Message::User {
-                content: vec![UserBlock::Text(render_rung2_instruction(&cluster))],
+                content: vec![UserBlock::Text(render_rung2_instruction(&cluster, 0))],
             }
         );
     }
 
     #[tokio::test]
     async fn rung2_turn_is_one_call_per_cluster_with_exactly_the_four_op_tools() {
-        let clusters = vec![
+        let clusters = [
             Cluster {
                 label: "a".to_string(),
                 member_entry_ids: vec!["kb-10001".to_string()],
@@ -696,8 +794,8 @@ mod tests {
         ]);
         let filtered = crate::loop_input::fixture();
 
-        for cluster in &clusters {
-            rung2_turn(&backend, "demo-project", &filtered, cluster)
+        for (index, cluster) in clusters.iter().enumerate() {
+            rung2_turn(&backend, "demo-project", &filtered, cluster, index)
                 .await
                 .expect("scripted turn");
         }
@@ -728,11 +826,11 @@ mod tests {
         let messages = backend.messages_seen();
         assert_eq!(
             messages[0],
-            rung2_messages("demo-project", &filtered, &clusters[0])
+            rung2_messages("demo-project", &filtered, &clusters[0], 0)
         );
         assert_eq!(
             messages[1],
-            rung2_messages("demo-project", &filtered, &clusters[1])
+            rung2_messages("demo-project", &filtered, &clusters[1], 1)
         );
     }
 

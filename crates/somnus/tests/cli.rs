@@ -17,7 +17,7 @@ const SOMNUS_ENV_VARS: [&str; 8] = [
     "SOMNUS_KB_BASE_URL",
     "SOMNUS_KB_API_KEY",
     "ANTHROPIC_API_KEY",
-    "SOMNUS_TOKEN_BUDGET",
+    "SOMNUS_COST_BUDGET_MICROS",
     "SOMNUS_STATE_DIR",
     "SOMNUS_DISABLED",
     "XDG_STATE_HOME",
@@ -319,17 +319,17 @@ fn a_trailing_slash_base_url_exits_1() {
     );
 }
 
-/// Any non-integer, negative, or empty `SOMNUS_TOKEN_BUDGET` exits 1 with
+/// Any non-integer, negative, or empty `SOMNUS_COST_BUDGET_MICROS` exits 1 with
 /// the pinned line.
 #[test]
-fn a_bad_token_budget_exits_1() {
+fn a_bad_cost_budget_exits_1() {
     for raw in ["", "abc", "-1", "1e6"] {
         let mut env = required_env("http://kb.invalid");
-        env.push(("SOMNUS_TOKEN_BUDGET".to_string(), raw.to_string()));
+        env.push(("SOMNUS_COST_BUDGET_MICROS".to_string(), raw.to_string()));
         let (code, _stdout, stderr) = run_cli_with(&["nightly"], &env);
         assert_eq!(code, Some(1), "raw {raw:?}: {stderr}");
         assert!(
-            stderr.contains("somnus: SOMNUS_TOKEN_BUDGET is not a non-negative integer"),
+            stderr.contains("somnus: SOMNUS_COST_BUDGET_MICROS is not a non-negative integer"),
             "raw {raw:?}: {stderr}"
         );
     }
@@ -383,7 +383,7 @@ async fn an_empty_night_exits_0_and_writes_the_record() {
     assert_eq!(value["subcommand"], "nightly");
     assert_eq!(value["stop_reason"], "nothing_eligible");
     assert_eq!(value["exit_code"], 0);
-    assert_eq!(value["armed_budget"], 550_000);
+    assert_eq!(value["armed_budget"], 2_000_000);
     assert_eq!(value["worklist_projects"], serde_json::json!([]));
     assert_eq!(value["units"], serde_json::json!([]));
 }

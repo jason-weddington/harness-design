@@ -155,6 +155,15 @@ pub fn judge(clusters: &[Cluster]) -> Vec<Verdict> {
     clusters
         .iter()
         .map(|cluster| {
+            // These rules gate MINTING, and a cluster that already has a map
+            // never mints — `validate_ops_for_cluster` refuses a second map
+            // for it outright. Judging it here would refuse a cluster on a
+            // rule that cannot apply to it, and the refusal would then block
+            // the dispositions it IS allowed: adding pointers to its map,
+            // striking a gap, proposing one.
+            if cluster.owning_map_id.is_some() {
+                return Verdict::Admitted;
+            }
             if let Some(reason) = refusal(cluster) {
                 return Verdict::Refused { reason };
             }

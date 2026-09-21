@@ -128,14 +128,14 @@ async fn main() {
         }
     };
 
-    // (5) The token budget, armed by subcommand.
-    let budget_raw = std::env::var(somnus::TOKEN_BUDGET_VAR).ok();
+    // (5) The SPEND budget, armed by subcommand.
+    let budget_raw = std::env::var(somnus::COST_BUDGET_VAR).ok();
     let default = match &cli.command {
-        Command::Nightly => somnus::NIGHTLY_TOKEN_BUDGET_DEFAULT,
-        Command::Run(_) => somnus::RUN_TOKEN_BUDGET_DEFAULT,
-        Command::Backfill(_) => somnus::BACKFILL_TOKEN_BUDGET_DEFAULT,
+        Command::Nightly => somnus::NIGHTLY_COST_BUDGET_MICROS_DEFAULT,
+        Command::Run(_) => somnus::RUN_COST_BUDGET_MICROS_DEFAULT,
+        Command::Backfill(_) => somnus::BACKFILL_COST_BUDGET_MICROS_DEFAULT,
     };
-    let armed = match somnus::parse_token_budget(default, budget_raw.as_deref()) {
+    let armed = match somnus::parse_cost_budget(default, budget_raw.as_deref()) {
         Ok(armed) => armed,
         Err(line) => {
             eprintln!("{line}");
@@ -285,7 +285,7 @@ async fn run_one_unit(
     state_dir: &Path,
     token_file: &Path,
     armed: u64,
-    billed_before: u64,
+    cost_before_micros: u64,
 ) -> Result<somnus::unit::UnitReport, String> {
     let workspace = harness::workspace::Workspace::new(state_dir, Some(state_dir.join("offload")))
         .map_err(|err| {
@@ -311,8 +311,8 @@ async fn run_one_unit(
         gate_for: &gate_for,
         tool_ctx: &tool_ctx,
         map_ops: Arc::clone(&stack.map_ops),
-        token_budget: armed,
-        billed_before,
+        cost_budget_micros: armed,
+        cost_before_micros,
         body_root: state_dir.to_path_buf(),
     };
     Ok(somnus::unit::run_unit(&deps, project_ref).await)
@@ -393,7 +393,7 @@ async fn nightly(
     }
 
     let mut units: Vec<NightlyUnitRecord> = Vec::new();
-    let mut billed_total: u64 = 0;
+    let mut cost_total_micros: u64 = 0;
     let mut stop_reason = STOP_REASON_ALL_DONE.to_string();
     let mut exit_code = 0i32;
     for project_ref in &selected {
@@ -401,10 +401,10 @@ async fn nightly(
         // billed usage is checked BEFORE the next unit's deps are
         // constructed. No second accumulator — this reads the accumulator
         // that already exists in [`somnus::unit::run_unit`]'s report usage.
-        if harness::engine::token_budget_breached(billed_total, armed) {
+        if harness::engine::budget_breached(cost_total_micros, armed) {
             eprintln!(
                 "{}",
-                render_nightly_budget_stop_line(armed, billed_total, project_ref)
+                render_nightly_budget_stop_line(armed, cost_total_micros, project_ref)
             );
             stop_reason = budget_stopped_before(project_ref);
             exit_code = 2;
@@ -416,7 +416,7 @@ async fn nightly(
             state_dir,
             token_file,
             armed,
-            billed_total,
+            cost_total_micros,
         )
         .await
         {
@@ -429,8 +429,8 @@ async fn nightly(
             }
         };
         eprintln!("{}", render_nightly_unit_line(project_ref, &report.outcome));
-        let billed = report.usage_rung1.billed() + report.usage_rung2.billed();
-        billed_total += billed;
+        let billed = report.usage_rung1.cost_micros() + report.usage_rung2.cost_micros();
+        cost_total_micros += billed;
         units.push(NightlyUnitRecord {
             project_ref: project_ref.clone(),
             outcome: report.outcome.clone(),

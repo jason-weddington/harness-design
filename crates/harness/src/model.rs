@@ -188,6 +188,100 @@ pub fn billed_token_sum(
         .saturating_add(cache_write_tokens)
 }
 
+/// What one million tokens of each kind costs, in micro-dollars.
+///
+/// Lives here rather than in a consumer for the same reason
+/// [`billed_token_sum`] does: a formula each caller re-derives is a formula
+/// that drifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPrices {
+    /// Uncached input tokens, per million.
+    pub input_micros_per_mtok: u64,
+    /// Completion tokens, per million.
+    pub output_micros_per_mtok: u64,
+    /// Cache reads, per million.
+    pub cache_read_micros_per_mtok: u64,
+    /// Cache writes, per million.
+    pub cache_write_micros_per_mtok: u64,
+}
+
+impl ModelPrices {
+    /// Anthropic's published shape: a cache write costs 1.25x an input token
+    /// and a cache read 0.1x, so one input price fixes three of the four.
+    const fn anthropic(input: u64, output: u64) -> Self {
+        Self {
+            input_micros_per_mtok: input,
+            output_micros_per_mtok: output,
+            cache_read_micros_per_mtok: input / 10,
+            cache_write_micros_per_mtok: input + input / 4,
+        }
+    }
+
+    /// What `usage` cost under these prices, in micro-dollars.
+    ///
+    /// The four products are summed BEFORE the single division, rather than
+    /// each being rounded to micro-dollars first. Per-kind rounding loses a
+    /// fraction on every kind of every turn, always downward, so a ceiling
+    /// built on it drifts permissive as a run gets longer — the wrong
+    /// direction for a spend guard.
+    #[must_use]
+    pub fn cost_micros(&self, usage: &Usage) -> u64 {
+        self.cost_micros_for_counts(
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+            u64::from(usage.cache_read_tokens.unwrap_or(0)),
+            u64::from(usage.cache_write_tokens.unwrap_or(0)),
+        )
+    }
+
+    /// The same price, over counters a caller has already accumulated —
+    /// the shape a consumer summing many turns needs, since per-turn `u32`
+    /// counters overflow long before a run's totals do.
+    #[must_use]
+    pub fn cost_micros_for_counts(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> u64 {
+        input_tokens
+            .saturating_mul(self.input_micros_per_mtok)
+            .saturating_add(output_tokens.saturating_mul(self.output_micros_per_mtok))
+            .saturating_add(cache_read_tokens.saturating_mul(self.cache_read_micros_per_mtok))
+            .saturating_add(cache_write_tokens.saturating_mul(self.cache_write_micros_per_mtok))
+            / 1_000_000
+    }
+}
+
+/// Published prices for `model`, or `None` for a model with no entry.
+///
+/// **A token count is the wrong unit for a spend question, and this exists
+/// because measuring in the wrong one punished a fix that saved money.** A
+/// consumer capped at 550,000 billed tokens tripped on a run that cost $1.13,
+/// because 434,196 of those tokens were CACHE READS — which bill at a
+/// fiftieth of a completion token. Improving the cache hit rate moved the run
+/// sharply *cheaper* and sharply *closer to the cap* at the same time. Token
+/// budgets answer a context-window question; a ceiling meant to catch
+/// overspend has to be denominated in money.
+///
+/// `None` rather than a fallback price, deliberately: a guessed price on an
+/// unknown model produces a confident wrong number, and a caller that cannot
+/// price its model should say so rather than bill it at somebody else's rate.
+#[must_use]
+pub fn prices_for_model(model: &str) -> Option<ModelPrices> {
+    // Verified 2026-09-21 against a real somnus run: these rates reproduce
+    // its reported $1.1307 from the per-rung token split exactly.
+    match model {
+        "claude-sonnet-5" => Some(ModelPrices::anthropic(3_000_000, 15_000_000)),
+        "claude-opus-5" | "claude-opus-4-8" => Some(ModelPrices::anthropic(15_000_000, 75_000_000)),
+        "claude-haiku-4-5" | "claude-haiku-4-5-20251001" => {
+            Some(ModelPrices::anthropic(1_000_000, 5_000_000))
+        }
+        _ => None,
+    }
+}
+
 impl Usage {
     /// This turn's billed-token sum: [`billed_token_sum`] over this
     /// usage's fields (each `Option` cache field unwrapped to 0).
@@ -1063,5 +1157,80 @@ mod tests {
         assert_eq!(MaxTokensSource::Table.as_str(), "table");
         assert_eq!(MaxTokensSource::Derived.as_str(), "derived");
         assert_eq!(MaxTokensSource::Fallback.as_str(), "fallback");
+    }
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::{Usage, prices_for_model};
+
+    fn usage(input: u32, output: u32, cache_read: u32, cache_write: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: Some(cache_write),
+            reasoning_tokens: None,
+        }
+    }
+
+    /// The table is pinned against a REAL run rather than a price page: this
+    /// is the per-rung split somnus reported on 2026-09-21, and the consumer
+    /// independently put the run at about $1.13.
+    #[test]
+    fn the_sonnet_table_reproduces_a_measured_run() {
+        let prices = prices_for_model("claude-sonnet-5").expect("sonnet is priced");
+        let rung1 = prices.cost_micros(&usage(2, 26_393, 0, 47_891));
+        let rung2 = prices.cost_micros(&usage(20, 15_594, 434_196, 50_921));
+        assert_eq!(
+            rung1 + rung2,
+            1_130_674,
+            "the consumer independently put it at about $1.13"
+        );
+    }
+
+    /// The whole reason the unit had to change: cache reads are cheap in
+    /// money and identical in tokens.
+    #[test]
+    fn a_cache_read_bills_at_a_fiftieth_of_a_completion_token() {
+        let prices = prices_for_model("claude-sonnet-5").expect("sonnet is priced");
+        let read = prices.cost_micros(&usage(0, 0, 1_000_000, 0));
+        let output = prices.cost_micros(&usage(0, 1_000_000, 0, 0));
+        assert_eq!(read, 300_000);
+        assert_eq!(output, 15_000_000);
+        assert_eq!(output / read, 50);
+    }
+
+    #[test]
+    fn anthropics_cache_multipliers_hold_for_every_priced_model() {
+        for model in ["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"] {
+            let p = prices_for_model(model).expect("priced");
+            assert_eq!(p.cache_read_micros_per_mtok * 10, p.input_micros_per_mtok);
+            assert_eq!(
+                p.cache_write_micros_per_mtok * 4,
+                p.input_micros_per_mtok * 5
+            );
+        }
+    }
+
+    /// No fallback price: billing an unknown model at somebody else's rate
+    /// produces a confident wrong number.
+    #[test]
+    fn an_unpriced_model_is_none_rather_than_a_guess() {
+        assert!(prices_for_model("glm-5.3").is_none());
+        assert!(prices_for_model("").is_none());
+    }
+
+    #[test]
+    fn an_absent_cache_field_costs_nothing_rather_than_panicking() {
+        let prices = prices_for_model("claude-sonnet-5").expect("priced");
+        let bare = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        };
+        assert_eq!(prices.cost_micros(&bare), 3_000_000);
     }
 }
