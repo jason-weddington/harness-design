@@ -165,6 +165,43 @@ pub struct Usage {
     pub reasoning_tokens: Option<u32>,
 }
 
+/// The workspace's ONE definition of a billed token, extracted as the shared
+/// core of every budget consumption expression (this crate's
+/// `engine::budget_consumed_now`, [`Usage::billed_tokens`], and somnus's
+/// `UsageTotals::billed`): the saturating u64 sum
+/// `input + output + cache_read + cache_write`, with every `Option` cache
+/// field unwrapped to 0 by the CALLER at accumulation time (see
+/// [`crate::run_record::BudgetLimits::tokens`]'s documented formula). It is
+/// deliberately NOT `Usage::input_tokens` alone (the uncached remainder) and
+/// NOT the Anthropic wire sum `input + cache_creation + cache_read` (which
+/// omits completions entirely).
+#[must_use]
+pub fn billed_token_sum(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) -> u64 {
+    input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens)
+}
+
+impl Usage {
+    /// This turn's billed-token sum: [`billed_token_sum`] over this
+    /// usage's fields (each `Option` cache field unwrapped to 0).
+    #[must_use]
+    pub fn billed_tokens(&self) -> u64 {
+        billed_token_sum(
+            u64::from(self.input_tokens),
+            u64::from(self.output_tokens),
+            u64::from(self.cache_read_tokens.unwrap_or(0)),
+            u64::from(self.cache_write_tokens.unwrap_or(0)),
+        )
+    }
+}
+
 // ===== Assistant turn =================================================
 
 /// One full assistant response — `content` plus the per-turn metadata
@@ -494,6 +531,38 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip should be lossless");
+    }
+
+    // --- the billed-token core (one definition for the whole workspace) ---
+
+    #[test]
+    fn billed_token_sum_sums_the_four_buckets_saturating() {
+        assert_eq!(super::billed_token_sum(10, 2, 30, 4), 46);
+        assert_eq!(
+            super::billed_token_sum(u64::MAX, 1, 0, 0),
+            u64::MAX,
+            "saturating, never wrapping"
+        );
+    }
+
+    #[test]
+    fn usage_billed_tokens_unwraps_absent_cache_fields_to_zero() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: Some(200),
+            cache_write_tokens: Some(10),
+            reasoning_tokens: Some(7),
+        };
+        assert_eq!(usage.billed_tokens(), 360);
+        let cold = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        };
+        assert_eq!(cold.billed_tokens(), 150, "absent is zero for the budget");
     }
 
     // ---- helpers ----

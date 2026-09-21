@@ -3428,10 +3428,12 @@ fn budget_consumed_now(initial_consumed: &BudgetConsumed, stats: &RunStats) -> B
         iterations: initial_consumed.iterations + stats.iterations,
         tokens: initial_consumed
             .tokens
-            .saturating_add(stats.input_tokens)
-            .saturating_add(stats.output_tokens)
-            .saturating_add(stats.cache_read_tokens)
-            .saturating_add(stats.cache_write_tokens),
+            .saturating_add(crate::model::billed_token_sum(
+                stats.input_tokens,
+                stats.output_tokens,
+                stats.cache_read_tokens,
+                stats.cache_write_tokens,
+            )),
         cost_micros: initial_consumed.cost_micros,
     }
 }
@@ -3441,7 +3443,12 @@ fn budget_consumed_now(initial_consumed: &BudgetConsumed, stats: &RunStats) -> B
 /// same shape as `wall_clock_secs == 0` returning false), and `>=` mirrors
 /// the wall-clock breach condition (`elapsed_secs >= wall_clock_secs`) —
 /// consuming exactly the limit is a breach.
-fn token_budget_breached(consumed_tokens: u64, limit: u64) -> bool {
+///
+/// Public so a caller that drives `ModelBackend::turn` DIRECTLY (and
+/// therefore never runs `engine::run`) enforces its ceiling against this ONE
+/// predicate instead of re-deriving the boundary condition beside it.
+#[must_use]
+pub fn token_budget_breached(consumed_tokens: u64, limit: u64) -> bool {
     limit != 0 && consumed_tokens >= limit
 }
 

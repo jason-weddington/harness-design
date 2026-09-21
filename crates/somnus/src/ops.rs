@@ -8,10 +8,13 @@
 //! cluster by not acting, and code can represent the decline without giving
 //! the model a tool for it.
 //!
-//! Op execution stays behind a [`MapOpSink`] seam: the KB write-endpoint
-//! paths are pinned nowhere in this repo (the `MapOpSink` production
-//! transport is the remaining gap), so no HTTP write code may be invented.
-//! The only implementation this cut returns a loud, named error.
+//! Op execution stays behind a [`MapOpSink`] seam. The op tools are
+//! SCHEMA-ONLY in the somnus run path: rung-2 tool calls are parsed via
+//! [`op_from_call`], never executed through a registry, so no agent can
+//! invent an execution leg — ops are applied through the map-op client
+//! ([`crate::map_op`]) after the gate, by code, in the pipeline's pinned
+//! application step. The registered sink exists only to answer a stray
+//! direct execution with a loud, named refusal.
 //!
 //! [`map_disposition`] maps the loop's inputs to the HARNESS
 //! [`Disposition`] enum (not a somnus twin, so there is one disposition
@@ -100,17 +103,17 @@ pub trait MapOpSink: Send + Sync {
     async fn apply(&self, op: Op) -> ToolResult;
 }
 
-/// The ONLY [`MapOpSink`] implementation this cut: a loud, named refusal.
-///
-/// No KB write code exists because no write path is pinned; a silent
-/// success here would manufacture leg-2 evidence out of nothing.
+/// The production [`MapOpSink`]: a loud, named refusal — the op tools are
+/// SCHEMA-ONLY in the somnus run path (only `schema()` is ever called on
+/// them), because ops are applied through the map-op client after the gate,
+/// by code, never through a registry execution.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct UnwiredOpSink;
+pub struct SchemaOnlySink;
 
-pub(crate) const OP_APPLY_REFUSAL: &str = "somnus: op execution is not wired this cut — no KB write endpoint is pinned in this repo (the MapOpSink production transport is the remaining gap); the loop-input fetch, the decline filter, and rungs 1-3 are wired as library code, but ops cannot be applied.";
+pub(crate) const OP_APPLY_REFUSAL: &str = "somnus: op tools are schema-only in the somnus run path; ops are applied through the map-op client after the gate";
 
 #[async_trait]
-impl MapOpSink for UnwiredOpSink {
+impl MapOpSink for SchemaOnlySink {
     async fn apply(&self, _op: Op) -> ToolResult {
         ToolResult::error(OP_APPLY_REFUSAL)
     }
@@ -249,11 +252,11 @@ pub fn op_from_call(name: &str, input: &Value) -> Result<Op, String> {
 
 /// The four op tool schemas, byte-identical to what
 /// [`crate::gate::build_registry`] registers — built over the same
-/// [`UnwiredOpSink`] and the same [`OpTool`] construction, so the rung-2
+/// [`SchemaOnlySink`] and the same [`OpTool`] construction, so the rung-2
 /// tool union and the registry can never drift apart.
 #[must_use]
 pub fn op_tool_schemas() -> Vec<Value> {
-    let sink: Arc<dyn MapOpSink> = Arc::new(UnwiredOpSink);
+    let sink: Arc<dyn MapOpSink> = Arc::new(SchemaOnlySink);
     ["add_pointer", "create_map", "strike_gap", "propose_gap"]
         .into_iter()
         .map(|name| OpTool::new(name, Arc::clone(&sink)).schema())
@@ -510,43 +513,44 @@ mod tests {
         );
     }
 
-    // --- the op tools: the unwired sink is the ONLY implementation ---
+    // --- the op tools: the schema-only sink is the only registered sink ---
 
     #[tokio::test]
-    async fn unwired_sink_refuses_loudly_naming_the_remaining_gap() {
-        let result = UnwiredOpSink
-            .apply(Op::NoChange {
-                cluster_id: "c1".to_string(),
+    async fn the_schema_only_sink_refuses_loudly_before_any_execution() {
+        let result = SchemaOnlySink
+            .apply(Op::AddPointer {
+                map_id: "kb-20001".to_string(),
+                entry_id: "kb-10001".to_string(),
+                gloss: "g".to_string(),
             })
             .await;
         assert!(result.is_error);
-        assert!(result.summary.contains("MapOpSink"), "{}", result.summary);
-        assert!(
-            result.summary.contains("KB write endpoint"),
-            "{}",
-            result.summary
+        assert_eq!(
+            result.summary,
+            "somnus: op tools are schema-only in the somnus run path; ops are applied through the map-op client after the gate"
         );
-        assert!(!result.summary.contains("somnus-loop-input"));
-        assert!(!result.summary.contains("somnus-cluster-ledger"));
+        // The refusal names where application really happens, and never
+        // claims a write landed.
+        assert!(result.summary.contains("map-op client after the gate"));
     }
 
     #[tokio::test]
-    async fn all_four_op_tools_refuse_through_the_registry_naming_the_remaining_gap() {
+    async fn all_four_op_tools_refuse_through_the_registry_at_the_schema_only_sink() {
         let registry = crate::gate::build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         for name in ["add_pointer", "create_map", "strike_gap", "propose_gap"] {
             let result = registry
                 .invoke(name, serde_json::json!({}), &harness::tool::ToolCtx::stub())
                 .await;
             assert!(result.is_error, "{name} must refuse");
-            assert!(
-                result.summary.contains("MapOpSink")
-                    && result.summary.contains("KB write endpoint")
-                    && !result.summary.contains("somnus-loop-input")
-                    && !result.summary.contains("somnus-cluster-ledger"),
-                "{name} summary must name the remaining gap only: {}",
+            assert_eq!(
+                result.summary,
+                "somnus: op tools are schema-only in the somnus run path; ops are applied through the map-op client after the gate",
+                "{name} must refuse through the schema-only sink: {}",
                 result.summary
             );
         }
@@ -557,6 +561,8 @@ mod tests {
         let registry = crate::gate::build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/somnus/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         let result = registry
             .invoke(
@@ -565,10 +571,14 @@ mod tests {
                 &harness::tool::ToolCtx::stub(),
             )
             .await;
-        // Still an error (the sink is unwired), but the op WAS parsed and
-        // handed to the sink — the mapping is mechanical, not a schema error.
+        // Still an error (the sink is schema-only), but the op WAS parsed
+        // and handed to the sink — the mapping is mechanical, not a schema
+        // error.
         assert!(result.is_error);
-        assert!(result.summary.contains("MapOpSink"));
+        assert_eq!(
+            result.summary,
+            "somnus: op tools are schema-only in the somnus run path; ops are applied through the map-op client after the gate"
+        );
     }
 
     // --- map_disposition: the pinned rows ---
@@ -750,7 +760,7 @@ mod tests {
 
     #[test]
     fn op_tool_debug_and_clone_are_wired() {
-        let tool = OpTool::new("add_pointer", Arc::new(UnwiredOpSink));
+        let tool = OpTool::new("add_pointer", Arc::new(SchemaOnlySink));
         let rendered = format!("{tool:?}");
         assert!(rendered.contains("OpTool"), "{rendered}");
         let cloned = tool.clone();
@@ -801,7 +811,7 @@ mod tests {
             ),
         ];
         for (name, input, expected_op) in scripts {
-            let tool = OpTool::new(name, Arc::new(UnwiredOpSink));
+            let tool = OpTool::new(name, Arc::new(SchemaOnlySink));
             let parsed = tool.parse_op(&input).expect("valid input parses");
             assert_eq!(parsed, expected_op, "{name} mapping must be mechanical");
         }
@@ -847,7 +857,7 @@ mod tests {
 
     #[test]
     fn req_str_rejects_a_missing_or_non_string_field() {
-        let tool = OpTool::new("add_pointer", Arc::new(UnwiredOpSink));
+        let tool = OpTool::new("add_pointer", Arc::new(SchemaOnlySink));
         let error = tool
             .parse_op(&serde_json::json!({"map_id": "m1", "entry_id": 3}))
             .expect_err("non-string field is rejected");
@@ -920,6 +930,8 @@ mod tests {
         let registry = crate::gate::build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/somnus/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         let mut names: Vec<String> = schemas
             .iter()

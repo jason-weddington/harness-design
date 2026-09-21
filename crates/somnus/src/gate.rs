@@ -36,7 +36,7 @@ use harness::exec::{CheckCommand, ChecksRunner};
 use harness::tool::ToolRegistry;
 use harness::tools::run_checks::RunChecksTool;
 
-use crate::ops::{MapOpSink, OpTool, UnwiredOpSink};
+use crate::ops::{MapOpSink, OpTool};
 
 /// Wall-clock bound on one map-lint invocation. The lint is a server-side
 /// POST over the local host's network; thirty seconds covers a full corpus
@@ -44,24 +44,29 @@ use crate::ops::{MapOpSink, OpTool, UnwiredOpSink};
 pub const SOMNUS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The map-lint gate command for `kb_base` posting the composed body at
-/// `body_path`.
+/// `body_path`, authenticating with the token read from `token_path`.
 ///
-/// Program `/bin/sh`, args `["-c", "curl -sf -X POST {kb_base}/api/kb/map-lint
-/// -H \"Authorization: Bearer $(cat \"$HOME\"/.config/somnus/kb-token)\"
-/// --data-binary \"@{path}\""]`. The token is read from the file by the CHILD
-/// at runtime — the command string is constant per base and carries no
-/// secret. The `@{path}` is double-quoted so no shell metacharacter in the
-/// body path can reach the child; the path is composed by
+/// Program `/bin/sh`, args `["-c", "curl -s --fail-with-body -X POST
+/// {kb_base}/api/kb/map-lint -H \"Authorization: Bearer $(cat
+/// \"{token_path}\")\" --data-binary \"@{path}\""]`. The token is read from
+/// the file by the CHILD at runtime — the command string is constant per
+/// base and carries no secret. `--fail-with-body` (not `-f`) is deliberate:
+/// on HTTP ≥ 400 the exit verdict is IDENTICAL, but the response body (the
+/// map-lint server's 422 lint findings) flows to stdout and lands in the
+/// report's excerpt and state-dir offload instead of being discarded. The
+/// `@{path}` is double-quoted so no shell metacharacter in the body path can
+/// reach the child; the path is composed by
 /// [`crate::materialize::map_body_path`], whose parent directory is named by
 /// a charset-validated project ref.
 #[must_use]
-pub fn map_lint_command(kb_base: &str, body_path: &Path) -> CheckCommand {
+pub fn map_lint_command(kb_base: &str, body_path: &Path, token_path: &Path) -> CheckCommand {
     CheckCommand {
         program: "/bin/sh".to_string(),
         args: vec![
             "-c".to_string(),
             format!(
-                "curl -sf -X POST {kb_base}/api/kb/map-lint -H \"Authorization: Bearer $(cat \"$HOME\"/.config/somnus/kb-token)\" --data-binary \"@{}\"",
+                "curl -s --fail-with-body -X POST {kb_base}/api/kb/map-lint -H \"Authorization: Bearer $(cat \"{}\")\" --data-binary \"@{}\"",
+                token_path.to_string_lossy(),
                 body_path.to_string_lossy()
             ),
         ],
@@ -75,9 +80,9 @@ pub fn map_lint_command(kb_base: &str, body_path: &Path) -> CheckCommand {
 /// directory entirely, and `ChecksRunner`'s fields are private and
 /// unassertable, so this construction rule IS the pin.
 #[must_use]
-pub fn map_lint_runner(kb_base: &str, body_path: &Path) -> ChecksRunner {
+pub fn map_lint_runner(kb_base: &str, body_path: &Path, token_path: &Path) -> ChecksRunner {
     ChecksRunner::new(
-        map_lint_command(kb_base, body_path),
+        map_lint_command(kb_base, body_path, token_path),
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         SOMNUS_GATE_TIMEOUT,
     )
@@ -91,8 +96,12 @@ pub fn map_lint_runner(kb_base: &str, body_path: &Path) -> ChecksRunner {
 /// read tools from the output union: rung-1 input is injected as synthetic
 /// tool-call/result events, so the model cannot wander the KB.
 #[must_use]
-pub fn build_registry(kb_base: &str, body_path: &Path) -> ToolRegistry {
-    let sink: Arc<dyn MapOpSink> = Arc::new(UnwiredOpSink);
+pub fn build_registry(
+    kb_base: &str,
+    body_path: &Path,
+    token_path: &Path,
+    sink: Arc<dyn MapOpSink>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(
         "add_pointer",
@@ -122,7 +131,9 @@ pub fn build_registry(kb_base: &str, body_path: &Path) -> ToolRegistry {
     // lands and drop the magic name.
     registry.register(
         "run_checks",
-        Arc::new(RunChecksTool::new(map_lint_runner(kb_base, body_path))),
+        Arc::new(RunChecksTool::new(map_lint_runner(
+            kb_base, body_path, token_path,
+        ))),
     );
 
     registry
@@ -131,35 +142,46 @@ pub fn build_registry(kb_base: &str, body_path: &Path) -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::SchemaOnlySink;
 
     // --- the gate command: token out of argv, body from a quoted file path ---
 
     #[test]
     fn map_lint_command_shape_pins_the_token_to_the_child_runtime() {
         let body_path = std::path::Path::new("/tmp/somnus/demo-project/kb-20001.json");
-        let command = map_lint_command("http://kb.invalid", body_path);
+        let token_path = std::path::Path::new("/tmp/somnus/kb-token");
+        let command = map_lint_command("http://kb.invalid", body_path, token_path);
         assert_eq!(command.program, "/bin/sh");
         assert_eq!(command.args[0], "-c");
         let script = &command.args[1];
-        assert!(script.contains("curl -sf -X POST"));
+        assert!(script.contains("curl -s --fail-with-body -X POST"));
         assert!(script.contains("http://kb.invalid/api/kb/map-lint"));
-        // The token is pinned to the CHILD runtime, never argv.
+        // The token is pinned to the CHILD runtime, never argv, and read
+        // from the state dir's kb-token FILE the binary wrote.
         assert!(script.contains("Bearer $(cat"));
-        assert!(script.contains(".config/somnus/kb-token"));
+        assert!(script.contains("$(cat \"/tmp/somnus/kb-token\")"));
         // The body posts from a FILE: `exec::run` spawns with
         // `.stdin(Stdio::null())` and `ChecksRunner` exposes no stdin seam,
         // so the composed body must be on disk and double-quoted here.
         assert!(script.contains("--data-binary"));
         assert!(script.contains("--data-binary \"@/tmp/somnus/demo-project/kb-20001.json\""));
+        // `--fail-with-body`, not `-f`: identical exit verdict on HTTP >= 400,
+        // but the 422 lint findings reach the report's excerpt.
+        assert!(!script.contains("curl -sf"));
     }
 
     #[test]
     fn map_lint_runner_builds_the_pinned_command() {
         let body_path = std::path::Path::new("/tmp/somnus/demo-project/kb-20001.json");
-        let runner = map_lint_runner("http://kb.invalid", body_path);
+        let runner = map_lint_runner(
+            "http://kb.invalid",
+            body_path,
+            std::path::Path::new("/tmp/somnus/kb-token"),
+        );
         assert_eq!(runner.command().program, "/bin/sh");
         assert!(runner.command().args[1].contains("http://kb.invalid/api/kb/map-lint"));
         assert!(runner.command().args[1].contains("--data-binary"));
+        assert!(runner.command().args[1].contains("--fail-with-body"));
     }
 
     // --- the registry shape: exactly six tools, closed vocabulary ---
@@ -169,6 +191,8 @@ mod tests {
         let registry = build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/somnus/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         let mut names: Vec<String> = registry
             .list()
@@ -209,6 +233,8 @@ mod tests {
         let registry = build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/somnus/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         for absent in ["read_file", "list_files", "edit_file", "bash", "no_change"] {
             assert!(registry.get(absent).is_none(), "{absent} must be absent");
@@ -222,6 +248,8 @@ mod tests {
         let registry = build_registry(
             "http://kb.invalid",
             std::path::Path::new("/tmp/somnus-body.json"),
+            std::path::Path::new("/tmp/somnus/kb-token"),
+            std::sync::Arc::new(SchemaOnlySink),
         );
         let pinned = [
             ("add_pointer", vec!["map_id", "entry_id", "gloss"]),

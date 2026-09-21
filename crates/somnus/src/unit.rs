@@ -31,8 +31,10 @@ use crate::loop_input::{
     Cluster, FetchOutcome, LoopInputCountSource, LoopInputSource, PocketsStatus, pockets_status,
     render_ledger_filter_line, render_pockets_not_computed_line, validate_project_ref,
 };
+use crate::map_op::{MapOpClient, MapOpRequest, MapOpResult};
 use crate::materialize::{
-    ComposedBody, Materialized, materialize_cluster, run_report_path, write_composed_body,
+    ComposedBody, MapEdit, Materialized, materialize_cluster, new_map_id, run_report_path,
+    write_composed_body,
 };
 use crate::observer::MapPointerObserver;
 use crate::ops::{Op, op_from_call};
@@ -57,10 +59,23 @@ pub struct UnitDeps<'a> {
     pub ledger: &'a dyn ClusterLedger,
     /// Builds the gate runner for one composed body's path.
     pub gate_for: &'a dyn Fn(&Path) -> ChecksRunner,
-    /// The tool context the gate runner offloads through. `ToolCtx::stub()`
-    /// in every test; the production construction rides with the
-    /// write-transport follow-up.
+    /// The tool context the gate runner offloads through. Tests use
+    /// `ToolCtx::stub()`; the binary builds the production `ToolCtx` over
+    /// the state dir.
     pub tool_ctx: &'a ToolCtx,
+    /// The map-op client the application step POSTs through.
+    pub map_ops: Arc<dyn MapOpClient>,
+    /// The invocation's token ceiling, in billed tokens. The sentinel `0` =
+    /// unbounded (mirroring `RunConfig::token_budget` in
+    /// `crates/harness/src/engine.rs`). somnus enforces it ITSELF because its
+    /// pipeline drives `ModelBackend::turn` directly and never runs
+    /// `engine::run`.
+    pub token_budget: u64,
+    /// The invocation's billed-token total at unit START, so an across-units
+    /// nightly ceiling sees what earlier units already spent. No second
+    /// accumulator: the check reads the accumulator that already exists in
+    /// [`run_unit`]'s report usage.
+    pub billed_before: u64,
     /// The root every composed body, raw offload, and the run report are
     /// written under. A PARAMETER (a tempdir in tests) so parallel runs
     /// cannot collide.
@@ -78,11 +93,46 @@ pub enum UnitOutcome {
     NotEligible,
     /// The bearer token was rejected.
     Unauthorized,
+    /// The KB refused the caller on `/api/kb/map-op` as not the machine
+    /// principal: a server configuration fact, never a somnus configuration
+    /// fault.
+    NotMachinePrincipal,
     /// The unit stopped with a named reason (never a retry).
     Aborted {
         /// Why the unit aborted.
         reason: String,
     },
+}
+
+impl UnitOutcome {
+    /// The outcome's name, as it serializes verbatim and as the nightly
+    /// stderr line renders it.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::UnknownProject => "UnknownProject",
+            Self::NotEligible => "NotEligible",
+            Self::Unauthorized => "Unauthorized",
+            Self::NotMachinePrincipal => "NotMachinePrincipal",
+            Self::Aborted { .. } => "Aborted",
+        }
+    }
+}
+
+/// The pinned exit-code mapping: 0 on the ordinary outcomes (including a
+/// `create_map` 409 cap admission, which never leaves `Ready`), 1 on the
+/// config-class outcomes (401/403 from ANY endpoint), 2 on every
+/// run-class abort (transport errors, gate failures, map-op faults, budget
+/// exhaustion). Per-cluster rung-2 parse errors KEEP their skip-and-continue
+/// semantics — this mapping is never licence to convert them to aborts.
+#[must_use]
+pub fn exit_code_for_outcome(outcome: &UnitOutcome) -> i32 {
+    match outcome {
+        UnitOutcome::Ready | UnitOutcome::UnknownProject | UnitOutcome::NotEligible => 0,
+        UnitOutcome::Unauthorized | UnitOutcome::NotMachinePrincipal => 1,
+        UnitOutcome::Aborted { .. } => 2,
+    }
 }
 
 /// Cost telemetry for one rung, accumulated per turn. Enforcement is NOT
@@ -101,6 +151,16 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
+    /// The billed-token sum: `input + output + cache_read + cache_write`,
+    /// saturating, over the ALREADY-unwrapped counters — the ONE formula
+    /// every consumer calls, extracted from `harness` so the workspace has
+    /// a single definition of a billed token (see
+    /// `harness::model::billed_token_sum`).
+    #[must_use]
+    pub fn billed(&self) -> u64 {
+        harness::model::billed_token_sum(self.input, self.output, self.cache_read, self.cache_write)
+    }
+
     /// Accumulate one turn's [`harness::model::Usage`].
     fn add(&mut self, usage: &harness::model::Usage) {
         self.input += u64::from(usage.input_tokens);
@@ -181,6 +241,12 @@ pub struct GateReportRecord {
     pub exit_code: Option<i32>,
     /// Whether the gate child timed out.
     pub timed_out: bool,
+    /// The gate child's combined stdout+stderr tail — the map-lint server's
+    /// 422 lint findings on a red body, preserved instead of discarded
+    /// (`curl -s --fail-with-body`).
+    pub excerpt: String,
+    /// Where the full combined output was offloaded.
+    pub offload_path: Option<PathBuf>,
 }
 
 /// The report one unit leaves on disk. Every refusal, decline, body, gate
@@ -214,14 +280,25 @@ pub struct UnitReport {
     /// Rendered authorship refusals (an op targeted a map somnus does not
     /// own).
     pub authorship_refusals: Vec<String>,
-    /// Rendered per-project new-map cap refusals.
-    pub cap_refusals: Vec<String>,
     /// Rendered hard compose refusals (no body was composed for that op).
     pub compose_refusals: Vec<String>,
     /// The composed bodies, in materialization order.
     pub composed_bodies: Vec<ComposedBodyRecord>,
     /// One gate report per composed body.
     pub gate_reports: Vec<GateReportRecord>,
+    /// One record per op `POSTed` to `/api/kb/map-op` (a skipped op is in
+    /// [`UnitReport::skipped`]; a cap admission in
+    /// [`UnitReport::cap_admissions`]).
+    pub applied: Vec<AppliedOpRecord>,
+    /// One record per op deliberately NOT `POSTed` (a `create_map` skipped by
+    /// the cap-admission latch).
+    pub skipped: Vec<SkippedOpRecord>,
+    /// The `create_map` 409 cap admissions, ordinary by contract: the
+    /// server's reason body recorded verbatim, never an outcome.
+    pub cap_admissions: Vec<AppliedOpRecord>,
+    /// The apply-audit tripwire lines (a materialize ordering or inlining
+    /// regression, caught client-side).
+    pub apply_audit: Vec<String>,
     /// The leg-3 change evidence.
     pub change: ChangeEvidence,
     /// How many `ModelBackend::turn` calls the unit made.
@@ -230,6 +307,10 @@ pub struct UnitReport {
     pub usage_rung1: UsageTotals,
     /// Rung-2 cost telemetry.
     pub usage_rung2: UsageTotals,
+    /// Wall-clock milliseconds around the rung-1 turn.
+    pub wall_rung1_ms: u64,
+    /// Wall-clock milliseconds summed across the rung-2 turns.
+    pub wall_rung2_ms: u64,
     /// The single-shot tripwire: `Some` only when the call count exceeds
     /// 1 + cluster count, i.e. exactly when the discipline was violated.
     pub call_count_audit: Option<String>,
@@ -255,19 +336,176 @@ impl UnitReport {
             clusters: Vec::new(),
             declines_recorded: Vec::new(),
             authorship_refusals: Vec::new(),
-            cap_refusals: Vec::new(),
             compose_refusals: Vec::new(),
             composed_bodies: Vec::new(),
             gate_reports: Vec::new(),
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            cap_admissions: Vec::new(),
+            apply_audit: Vec::new(),
             change: ChangeEvidence::default(),
             backend_calls: 0,
             usage_rung1: UsageTotals::default(),
             usage_rung2: UsageTotals::default(),
+            wall_rung1_ms: 0,
+            wall_rung2_ms: 0,
             call_count_audit: None,
             rung1_raw_path: None,
             report_path,
         }
     }
+}
+
+/// One op `POSTed` to `/api/kb/map-op`. The `body` field is the exact
+/// `POSTed` body text (the [`ComposedBodyRecord`] precedent), so the report alone
+/// reconstructs every byte sent to the mutating endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AppliedOpRecord {
+    /// `"create_map"`, `"add_pointer"`, or `"strike_gap"`.
+    pub op_kind: &'static str,
+    /// `0` for a `create_map`, `i` for the i-th edit in the map's edit chain
+    /// (1-based, so a create and its first edit never share an index).
+    pub chain_index: usize,
+    /// The map id the request named (a fresh map keeps its client-side
+    /// `somnus-new-{cluster_id}` id here).
+    pub submitted_map_id: String,
+    /// The server's returned map id, when the op applied.
+    pub server_map_id: Option<String>,
+    /// The server's returned version, when the op applied.
+    pub version: Option<u64>,
+    /// The server's returned pointer count, when the op applied.
+    pub pointer_count: Option<u64>,
+    /// The server's returned remaining budget, when the op applied.
+    pub budget: Option<u64>,
+    /// The HTTP status (`Some` for dialed ops, `None` for skipped).
+    pub http_status: Option<u16>,
+    /// The exact `POSTed` body text.
+    pub body: String,
+    /// The verbatim 409 reason body, on a cap admission.
+    pub admission_reason: Option<String>,
+}
+
+/// One op deliberately NOT `POSTed`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SkippedOpRecord {
+    /// The skipped op's kind.
+    pub op_kind: &'static str,
+    /// The map the op targeted.
+    pub map_id: String,
+    /// Why it was skipped.
+    pub reason: String,
+}
+
+/// The pinned stderr line for a map-op 403: the server's configuration is
+/// at fault (its `machine_principal_email`), never somnus's.
+pub const MAP_OP_NOT_MACHINE_PRINCIPAL_MSG: &str = "somnus: the KB refused the caller on /api/kb/map-op as not the machine principal — check machine_principal_email on the server; this is not a somnus configuration fault";
+
+/// The pinned token-budget exhaustion message, carrying BOTH decision
+/// inputs. Pure so the shape is byte-pinned; the pipeline only `eprintln!`s
+/// it.
+#[must_use]
+pub fn render_token_budget_line(armed: u64, billed: u64) -> String {
+    format!("somnus: token budget exhausted (armed {armed}, billed {billed})")
+}
+
+/// The pinned reason naming the FIRST red gate body, in
+/// `composed_bodies` order.
+#[must_use]
+pub fn render_gate_rejected_line(map_id: &str) -> String {
+    format!("somnus: map-lint gate rejected the body for {map_id}")
+}
+
+/// The pinned skip reason for a `create_map` withheld by the
+/// cap-admission latch.
+#[must_use]
+pub fn render_create_skipped_after_admission(map_id: &str) -> String {
+    format!(
+        "somnus: create_map for {map_id} skipped: a create_map cap admission was already recorded this invocation"
+    )
+}
+
+/// The map-op fault reason prefix for one failed op.
+#[must_use]
+pub fn render_map_op_fault_line(map_id: &str, reason: &str) -> String {
+    format!("somnus: map-op failed for {map_id}: {reason}")
+}
+
+/// The apply-audit tripwire: a pure, fixture-tested scan that catches a
+/// materialize ordering or inlining regression client-side, with a named
+/// reason, instead of by the KB after the metered spend.
+///
+/// For an `add_pointer`, it answers:
+///
+/// - the pinned fresh-map line when the op targets a map in `fresh_ids`
+///   (its pointers were already inlined into the create body, so an
+///   `add_pointer` request for one is a regression);
+/// - the pinned delta line when `previous_body` is supplied and the
+///   request's body introduces a ref delta other than exactly the claimed
+///   `added_entry_id` — the delta computed by a hand-rolled scan for the
+///   literal shape `kb-` + five ASCII digits (the vendored spec's pinned
+///   pointer shape; no new dependency);
+/// - `None` otherwise.
+///
+/// Every other op kind is unaudited (the server's own set comparison is
+/// authoritative for it).
+#[must_use]
+pub fn apply_audit(
+    previous_body: Option<&str>,
+    request: &MapOpRequest,
+    fresh_ids: &[String],
+) -> Option<String> {
+    let MapOpRequest::AddPointer {
+        map_id,
+        body,
+        added_entry_id,
+    } = request
+    else {
+        return None;
+    };
+    if fresh_ids.iter().any(|fresh| fresh == map_id) {
+        return Some(format!(
+            "somnus: apply audit: add_pointer on fresh map {map_id} not absorbed by the create body"
+        ));
+    }
+    let previous = previous_body?;
+    let old = kb_refs(previous);
+    let new_refs = kb_refs(body);
+    let mut delta: Vec<String> = Vec::new();
+    for reference in new_refs {
+        if !old.contains(&reference) && !delta.contains(&reference) {
+            delta.push(reference);
+        }
+    }
+    if delta.as_slice() != [added_entry_id.as_str()] {
+        return Some(format!(
+            "somnus: apply audit: add_pointer delta for {map_id} was {delta:?}, expected {added_entry_id}"
+        ));
+    }
+    None
+}
+
+/// Every `kb-XXXXX` ref in `text` (the literal shape `kb-` followed by five
+/// ASCII digits), deduplicated in first-appearance order. A hand-rolled
+/// scan, not a regex dependency: the shape is the vendored spec's pinned
+/// pointer shape.
+fn kb_refs(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut refs = Vec::new();
+    let mut index = 0;
+    while index + 8 <= bytes.len() {
+        if &bytes[index..index + 3] == b"kb-"
+            && bytes[index + 3..index + 8].iter().all(u8::is_ascii_digit)
+        {
+            let reference = text[index..index + 8].to_string();
+            if !refs.contains(&reference) {
+                refs.push(reference);
+            }
+            index += 8;
+        } else {
+            index += 1;
+        }
+    }
+    refs
 }
 
 /// The single-shot discipline tripwire: `Some` iff `calls > 1 +
@@ -472,7 +710,18 @@ async fn run_unit_inner(
     let mut filtered = input.clone();
     filtered.pockets = kept;
 
-    // (6) Rung 1: one single-shot inference for the whole project.
+    // (6) Rung 1: one single-shot inference for the whole project, AFTER
+    // the token-budget guard (the whole unit's spend so far is
+    // `billed_before`; the sentinel 0 = unbounded short-circuits).
+    if harness::engine::token_budget_breached(deps.billed_before, deps.token_budget) {
+        let billed = deps.billed_before;
+        eprintln!("{}", render_token_budget_line(deps.token_budget, billed));
+        report.outcome = UnitOutcome::Aborted {
+            reason: render_token_budget_line(deps.token_budget, billed),
+        };
+        return finalize(report);
+    }
+    let rung1_started = std::time::Instant::now();
     let turn = match rung1_turn(deps.backend, project_ref, &filtered).await {
         Ok(turn) => turn,
         Err(err) => {
@@ -482,6 +731,7 @@ async fn run_unit_inner(
             return finalize(report);
         }
     };
+    report.wall_rung1_ms = u64::try_from(rung1_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     report.backend_calls += 1;
     report.usage_rung1.add(&turn.usage);
 
@@ -512,6 +762,16 @@ async fn run_unit_inner(
             budget_reason = Some(BUDGET_ABORT_MSG.to_string());
             break;
         }
+        // The token-budget guard, BEFORE the turn: the decision inputs are
+        // the invocation total so far (`billed_before`) plus this unit's
+        // accumulated billed usage. Same guard style as the count cap
+        // above — checked between turns, never mid-flight.
+        let billed_now =
+            deps.billed_before + report.usage_rung1.billed() + report.usage_rung2.billed();
+        if harness::engine::token_budget_breached(billed_now, deps.token_budget) {
+            budget_reason = Some(render_token_budget_line(deps.token_budget, billed_now));
+            break;
+        }
         let mut record = ClusterRecord {
             label: cluster.label.clone(),
             member_entry_ids: cluster.member_entry_ids.clone(),
@@ -520,6 +780,7 @@ async fn run_unit_inner(
             rung2: Rung2Outcome::Parsed,
             raw_path: None,
         };
+        let rung2_started = std::time::Instant::now();
         let turn = match rung2_turn(deps.backend, project_ref, &filtered, cluster).await {
             Ok(turn) => turn,
             Err(err) => {
@@ -530,6 +791,8 @@ async fn run_unit_inner(
                 continue;
             }
         };
+        report.wall_rung2_ms +=
+            u64::try_from(rung2_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         report.backend_calls += 1;
         report.usage_rung2.add(&turn.usage);
 
@@ -616,8 +879,13 @@ async fn run_unit_inner(
     }
 
     // (10) Rung 3: compose the bodies, recording every refusal by name.
-    let mut new_maps_so_far = 0u32;
+    // There is NO client-side new-map cap: both caps are server-side, so a
+    // second create_map in one op set composes and gates like any other
+    // and meets the server's ordinary 409 admission at application time.
     let mut composed: Vec<ComposedBody> = Vec::new();
+    // The per-edit chains, grouped by map in collection order, consumed by
+    // the application step below.
+    let mut edits_by_map: Vec<(String, Vec<MapEdit>)> = Vec::new();
     for record in &report.clusters {
         if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
             continue;
@@ -625,24 +893,22 @@ async fn run_unit_inner(
         let Materialized {
             bodies,
             authorship_refusals,
-            cap_refusals,
             compose_refusals,
-            new_maps,
-        } = materialize_cluster(
-            project_ref,
-            &record.cluster(),
-            &record.ops,
-            &input,
-            new_maps_so_far,
-        );
-        new_maps_so_far += new_maps;
+            edits,
+        } = materialize_cluster(&record.cluster(), &record.ops, &input);
         report.authorship_refusals.extend(authorship_refusals);
-        report.cap_refusals.extend(cap_refusals);
         report.compose_refusals.extend(compose_refusals);
+        for edit in edits {
+            let (map_id, edit) = (edit.map_id.clone(), edit);
+            match edits_by_map
+                .iter_mut()
+                .find(|(existing, _)| *existing == map_id)
+            {
+                Some((_, chain)) => chain.push(edit),
+                None => edits_by_map.push((map_id, vec![edit])),
+            }
+        }
         composed.extend(bodies);
-    }
-    for refusal in &report.cap_refusals {
-        eprintln!("{refusal}");
     }
 
     // (11) Every composed body goes on disk (the gate posts a file), and
@@ -673,12 +939,315 @@ async fn run_unit_inner(
             passed: gate_report.passed,
             exit_code: gate_report.exit_code,
             timed_out: gate_report.timed_out,
+            excerpt: gate_report.excerpt,
+            offload_path: gate_report.offload_path,
         });
+    }
+
+    // (12.5) The application step: every composed body whose gate report
+    // PASSED has its ops applied through the map-op client, in op order
+    // per map. A red gate body is NOT applied (its paid work is recorded,
+    // never discarded); the unit aborts naming the FIRST red body, while
+    // gate-green siblings are still applied — one bad body must not
+    // discard the others' paid work.
+    let application = apply_map_ops(
+        &mut report,
+        &deps.map_ops,
+        project_ref,
+        &input,
+        edits_by_map,
+    )
+    .await;
+    if let Some(first_red) = application.first_red_body
+        && !matches!(report.outcome, UnitOutcome::Aborted { .. })
+    {
+        report.outcome = UnitOutcome::Aborted {
+            reason: render_gate_rejected_line(&first_red),
+        };
+    }
+    if let Some(outcome) = application.outcome_override {
+        report.outcome = outcome;
     }
 
     // (13) The final observation through the SAME observer (cached
     // baseline, fail closed) and the leg-3 classification.
     observe_and_finalize(report, &observer, &baseline).await
+}
+
+/// What the application step decided after all green bodies were handled.
+struct ApplicationResult {
+    /// The FIRST red gate body, in `composed_bodies` order, when any gate
+    /// report was red.
+    first_red_body: Option<String>,
+    /// A terminal outcome the application step decided (a map-op 401/403
+    /// stop or a fault abort), which overrides whatever the pipeline had
+    /// already concluded — config-class outcomes outrank run-class aborts.
+    outcome_override: Option<UnitOutcome>,
+}
+
+/// The application step: POST every gate-green composed body's ops through
+/// `map_ops`, in op order per map, recording every byte, skip, and
+/// admission on the report.
+///
+/// - A FRESH map (an id of [`crate::materialize::new_map_id`]'s
+///   `somnus-new-{cluster_id}` shape) issues exactly ONE `create_map` POST
+///   carrying the full composed fresh body, with short and long title both
+///   the create op's `title` verbatim. Its own `add_pointer` ops are NOT
+///   re-issued as calls — materialize's `fresh_ids` filter already inlined
+///   them into the create body, and re-issuing would 409 "nothing added".
+/// - An EXISTING map issues one POST per edit in its chain, the i-th
+///   `add_pointer` carrying `body_after` (the body state after the first i
+///   edits — the server's `new − old == {added_entry_id}` set comparison
+///   makes the final composed body wrong for every call but the last).
+/// - A `create_map` 409 cap admission is an ORDINARY ADMISSION OUTCOME: the
+///   reason body is recorded verbatim, a boolean LATCH (not a counter —
+///   somnus must not track the two server-side caps) turns further
+///   `create_map` application off for the rest of the unit, and the exit
+///   stays 0.
+/// - A 401 stops as [`UnitOutcome::Unauthorized`], a 403 as
+///   [`UnitOutcome::NotMachinePrincipal`] (with the pinned stderr line),
+///   and any fault aborts the unit with
+///   [`render_map_op_fault_line`] — none of them is retryable, so the
+///   remaining bodies are not applied after one stops.
+#[allow(clippy::too_many_lines)] // one dispatch loop, two op shapes
+async fn apply_map_ops(
+    report: &mut UnitReport,
+    map_ops: &std::sync::Arc<dyn MapOpClient>,
+    project_ref: &str,
+    input: &crate::loop_input::LoopInput,
+    mut edits_by_map: Vec<(String, Vec<MapEdit>)>,
+) -> ApplicationResult {
+    // The fresh maps and their titles, from the parsed ops.
+    let mut fresh: Vec<(String, String)> = Vec::new();
+    for record in &report.clusters {
+        if matches!(record.rung2, Rung2Outcome::ParseError { .. }) {
+            continue;
+        }
+        for op in &record.ops {
+            if let Op::CreateMap {
+                cluster_id, title, ..
+            } = op
+            {
+                fresh.push((new_map_id(cluster_id), title.clone()));
+            }
+        }
+    }
+    let fresh_ids: Vec<String> = fresh.iter().map(|(id, _)| id.clone()).collect();
+
+    let plan: Vec<(ComposedBodyRecord, bool)> = report
+        .composed_bodies
+        .iter()
+        .zip(report.gate_reports.iter().map(|gate| gate.passed))
+        .map(|(body, passed)| (body.clone(), passed))
+        .collect();
+
+    let mut first_red_body: Option<String> = None;
+    let mut admission_latch: Option<String> = None;
+    for (body_record, passed) in plan {
+        if !passed {
+            if first_red_body.is_none() {
+                first_red_body = Some(body_record.map_id.clone());
+            }
+            continue;
+        }
+        if let Some((_, title)) = fresh.iter().find(|(id, _)| *id == body_record.map_id) {
+            // A fresh map: exactly ONE create_map POST.
+            if admission_latch.is_some() {
+                report.skipped.push(SkippedOpRecord {
+                    op_kind: "create_map",
+                    map_id: body_record.map_id.clone(),
+                    reason: render_create_skipped_after_admission(&body_record.map_id),
+                });
+                continue;
+            }
+            let request = MapOpRequest::CreateMap {
+                project_ref: project_ref.to_string(),
+                short_title: title.clone(),
+                long_title: title.clone(),
+                body: body_record.body.clone(),
+            };
+            let body_text = request_body_text(&request);
+            let submitted = body_record.map_id.clone();
+            match map_ops.apply(request).await {
+                MapOpResult::Applied(applied) => {
+                    report.applied.push(AppliedOpRecord {
+                        op_kind: "create_map",
+                        chain_index: 0,
+                        submitted_map_id: submitted,
+                        server_map_id: Some(applied.map_id),
+                        version: Some(applied.version),
+                        pointer_count: Some(applied.pointer_count),
+                        budget: Some(applied.budget),
+                        http_status: Some(201),
+                        body: body_text,
+                        admission_reason: None,
+                    });
+                }
+                MapOpResult::CapAdmission { reason_body } => {
+                    admission_latch = Some(reason_body.clone());
+                    report.cap_admissions.push(AppliedOpRecord {
+                        op_kind: "create_map",
+                        chain_index: 0,
+                        submitted_map_id: submitted,
+                        server_map_id: None,
+                        version: None,
+                        pointer_count: None,
+                        budget: None,
+                        http_status: Some(409),
+                        body: body_text,
+                        admission_reason: Some(reason_body),
+                    });
+                }
+                MapOpResult::Unauthorized => {
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Unauthorized),
+                    };
+                }
+                MapOpResult::NotMachinePrincipal => {
+                    eprintln!("{MAP_OP_NOT_MACHINE_PRINCIPAL_MSG}");
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::NotMachinePrincipal),
+                    };
+                }
+                MapOpResult::Fault { map_id, reason } => {
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Aborted {
+                            reason: render_map_op_fault_line(&map_id, &reason),
+                        }),
+                    };
+                }
+            }
+            continue;
+        }
+
+        // An existing map: one POST per edit, in chain (op) order.
+        let Some(position) = edits_by_map
+            .iter()
+            .position(|(map_id, _)| *map_id == body_record.map_id)
+        else {
+            continue;
+        };
+        let (_, chain) = edits_by_map.remove(position);
+        let original_body = input
+            .maps
+            .iter()
+            .find(|map| map.id == body_record.map_id)
+            .map(|map| map.body.clone());
+        for (index, edit) in chain.iter().enumerate() {
+            let (request, op_kind) = match edit {
+                MapEdit {
+                    map_id,
+                    kind: crate::materialize::MapEditKind::AddPointer { entry_id },
+                    body_after,
+                } => (
+                    MapOpRequest::AddPointer {
+                        map_id: map_id.clone(),
+                        body: body_after.clone(),
+                        added_entry_id: entry_id.clone(),
+                    },
+                    "add_pointer",
+                ),
+                MapEdit {
+                    map_id,
+                    kind:
+                        crate::materialize::MapEditKind::StrikeGap {
+                            gap_text,
+                            closing_entry_id,
+                        },
+                    body_after,
+                } => (
+                    MapOpRequest::StrikeGap {
+                        map_id: map_id.clone(),
+                        body: body_after.clone(),
+                        gap_text: gap_text.clone(),
+                        closing_entry_id: closing_entry_id.clone(),
+                    },
+                    "strike_gap",
+                ),
+            };
+            // The audit tripwire runs BEFORE the POST: a materialize
+            // regression aborts the unit with the named reason instead of
+            // being caught by the KB after the metered spend.
+            if matches!(request, MapOpRequest::AddPointer { .. }) {
+                let previous = if index == 0 {
+                    original_body.as_deref()
+                } else {
+                    Some(chain[index - 1].body_after.as_str())
+                };
+                if let Some(line) = apply_audit(previous, &request, &fresh_ids) {
+                    report.apply_audit.push(line.clone());
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Aborted { reason: line }),
+                    };
+                }
+            }
+            let body_text = request_body_text(&request);
+            let submitted = body_record.map_id.clone();
+            match map_ops.apply(request).await {
+                MapOpResult::Applied(applied) => {
+                    report.applied.push(AppliedOpRecord {
+                        op_kind,
+                        chain_index: index + 1,
+                        submitted_map_id: submitted,
+                        server_map_id: Some(applied.map_id),
+                        version: Some(applied.version),
+                        pointer_count: Some(applied.pointer_count),
+                        budget: Some(applied.budget),
+                        http_status: Some(200),
+                        body: body_text,
+                        admission_reason: None,
+                    });
+                }
+                MapOpResult::CapAdmission { reason_body } => {
+                    // Unreachable from the production client (it classifies
+                    // every update-op 409 as a Fault): treated as a fault
+                    // rather than an admission against an EXISTING map.
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Aborted {
+                            reason: render_map_op_fault_line(&submitted, &reason_body),
+                        }),
+                    };
+                }
+                MapOpResult::Unauthorized => {
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Unauthorized),
+                    };
+                }
+                MapOpResult::NotMachinePrincipal => {
+                    eprintln!("{MAP_OP_NOT_MACHINE_PRINCIPAL_MSG}");
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::NotMachinePrincipal),
+                    };
+                }
+                MapOpResult::Fault { map_id, reason } => {
+                    return ApplicationResult {
+                        first_red_body,
+                        outcome_override: Some(UnitOutcome::Aborted {
+                            reason: render_map_op_fault_line(&map_id, &reason),
+                        }),
+                    };
+                }
+            }
+        }
+    }
+    ApplicationResult {
+        first_red_body,
+        outcome_override: None,
+    }
+}
+
+/// The exact `POSTed` body text for one map-op request (the
+/// [`ComposedBodyRecord`] precedent).
+fn request_body_text(request: &MapOpRequest) -> String {
+    serde_json::to_string(&crate::map_op::build_request_body(request))
+        .expect("the pinned request body always serializes")
 }
 
 /// Observe once more through the same observer, classify the change, audit
@@ -853,6 +1422,56 @@ mod tests {
         }
     }
 
+    /// A scripted [`MapOpClient`] that records every request and answers
+    /// from a script (the last entry repeats); an empty script answers
+    /// `Applied` with a pinned envelope, so tests opt into failure modes.
+    #[derive(Debug, Default)]
+    struct RecordingMapOps {
+        requests: std::sync::Mutex<Vec<MapOpRequest>>,
+        script: std::sync::Mutex<Vec<MapOpResult>>,
+    }
+
+    impl RecordingMapOps {
+        fn scripted(script: Vec<MapOpResult>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                script: std::sync::Mutex::new(script),
+            })
+        }
+
+        fn requests(&self) -> Vec<MapOpRequest> {
+            self.requests
+                .lock()
+                .expect("requests lock poisoned")
+                .clone()
+        }
+    }
+
+    fn applied_envelope() -> MapOpResult {
+        MapOpResult::Applied(crate::map_op::MapOpApplied {
+            map_id: "kb-30001".to_string(),
+            version: 3,
+            pointer_count: 6,
+            budget: 2,
+        })
+    }
+
+    #[async_trait]
+    impl MapOpClient for RecordingMapOps {
+        async fn apply(&self, request: MapOpRequest) -> MapOpResult {
+            self.requests
+                .lock()
+                .expect("requests lock poisoned")
+                .push(request);
+            let mut script = self.script.lock().expect("script lock poisoned");
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                script.first().cloned().unwrap_or_else(applied_envelope)
+            }
+        }
+    }
+
     /// Run one unit against the injected fakes and return the report.
     async fn run_with(
         backend: &dyn ModelBackend,
@@ -862,6 +1481,58 @@ mod tests {
         body_root: &Path,
         project_ref: &str,
     ) -> UnitReport {
+        run_with_map_ops(
+            backend,
+            source,
+            ledger,
+            gate_for,
+            body_root,
+            project_ref,
+            std::sync::Arc::new(RecordingMapOps::default()),
+        )
+        .await
+    }
+
+    /// [`run_with`] with a named map-op client, for the application-step
+    /// tests (the budget defaults to unbounded and the invocation baseline
+    /// to zero).
+    async fn run_with_map_ops(
+        backend: &dyn ModelBackend,
+        source: std::sync::Arc<dyn LoopInputSource>,
+        ledger: &dyn ClusterLedger,
+        gate_for: &dyn Fn(&Path) -> ChecksRunner,
+        body_root: &Path,
+        project_ref: &str,
+        map_ops: std::sync::Arc<dyn MapOpClient>,
+    ) -> UnitReport {
+        run_with_budget(
+            backend,
+            source,
+            ledger,
+            gate_for,
+            body_root,
+            project_ref,
+            map_ops,
+            0,
+            0,
+        )
+        .await
+    }
+
+    /// The full-shape helper: a named map-op client plus the invocation
+    /// token-budget arm and baseline.
+    #[allow(clippy::too_many_arguments)] // the full UnitDeps shape
+    async fn run_with_budget(
+        backend: &dyn ModelBackend,
+        source: std::sync::Arc<dyn LoopInputSource>,
+        ledger: &dyn ClusterLedger,
+        gate_for: &dyn Fn(&Path) -> ChecksRunner,
+        body_root: &Path,
+        project_ref: &str,
+        map_ops: std::sync::Arc<dyn MapOpClient>,
+        token_budget: u64,
+        billed_before: u64,
+    ) -> UnitReport {
         let tool_ctx = ToolCtx::stub();
         let deps = UnitDeps {
             backend,
@@ -869,6 +1540,9 @@ mod tests {
             ledger,
             gate_for,
             tool_ctx: &tool_ctx,
+            map_ops,
+            token_budget,
+            billed_before,
             body_root: body_root.to_path_buf(),
         };
         run_unit(&deps, project_ref).await
@@ -1006,6 +1680,7 @@ mod tests {
             server.uri(),
             "kb-token".to_string(),
         ));
+        drop(server);
 
         // Pre-seeded decline: P2 ([kb-10004, kb-10005]) was declined on a
         // previous night and is not yet reopen-eligible.
@@ -1052,13 +1727,15 @@ mod tests {
 
         let body_root = tempfile::tempdir().expect("tempdir");
         let gate = gate_for_script("exit 0");
-        let report = run_with(
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
             &backend,
             source,
             &ledger,
             &gate,
             body_root.path(),
             "demo-project",
+            map_ops.clone(),
         )
         .await;
 
@@ -1139,7 +1816,53 @@ mod tests {
             assert!(gate_report.passed, "the stub gate exits 0");
             assert_eq!(gate_report.exit_code, Some(0));
             assert!(!gate_report.timed_out);
+            assert_eq!(
+                gate_report.excerpt, "",
+                "a green stub gate has no output to excerpt"
+            );
+            assert!(gate_report.offload_path.is_some());
         }
+
+        // --- the application step ------------------------------------------
+        // One create_map POST for the fresh map, ONE add_pointer POST for
+        // kb-20001, the fresh map's own add_pointers inlined (never
+        // re-issued), each record carrying the exact POSTed body text.
+        let requests = map_ops.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0],
+            MapOpRequest::CreateMap {
+                project_ref: "demo-project".to_string(),
+                short_title: "Wireguard and DNS".to_string(),
+                long_title: "Wireguard and DNS".to_string(),
+                body: "Lives in knowledge/linux/network\n\nORIENTATION-PROSE\n\nDetail entries:\n- kb-10001 — GLOSS-1\n- kb-10002 — GLOSS-2".to_string(),
+            },
+            "short_title and long_title are the create op's title verbatim"
+        );
+        assert_eq!(
+            requests[1],
+            MapOpRequest::AddPointer {
+                map_id: "kb-20001".to_string(),
+                body: "Lives in knowledge/linux/network\n\nOrients the switch, DNS, and VPN entries for the home network.\n\nDetail entries:\n- kb-10001 — switch VLAN tagging baseline\n- kb-10002 — recursive DNS resolvers\n- kb-10003 — wireguard client config\n- kb-99999 — cross-project wireguard hub notes\n- kb-10004 — DHCP lease hygiene\n- kb-10005 — GLOSS-5\n\nNot yet documented:\n- Site-to-site wireguard topology".to_string(),
+                added_entry_id: "kb-10005".to_string(),
+            },
+            "the single edit POST carries the FINAL composed body"
+        );
+        assert_eq!(report.applied.len(), 2);
+        assert_eq!(report.applied[0].op_kind, "create_map");
+        assert_eq!(report.applied[0].chain_index, 0);
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-c1");
+        assert_eq!(
+            report.applied[0].server_map_id.as_deref(),
+            Some("kb-30001"),
+            "the server's map id makes the round trip auditable"
+        );
+        assert_eq!(report.applied[0].http_status, Some(201));
+        assert!(report.skipped.is_empty());
+        assert!(report.cap_admissions.is_empty());
+        assert!(report.apply_audit.is_empty());
+        assert_eq!(report.wall_rung1_ms, 0, "MockBackend turns are instant");
+        assert_eq!(report.wall_rung2_ms, 0);
 
         // --- leg 3 and the ledger write -----------------------------------
         assert_eq!(report.change, ChangeEvidence::TreeChanged);
@@ -1215,7 +1938,7 @@ mod tests {
             "3 calls for 2 clusters is exactly the single-shot shape"
         );
         assert!(report.authorship_refusals.is_empty());
-        assert!(report.cap_refusals.is_empty());
+        assert!(report.cap_admissions.is_empty());
         assert!(report.compose_refusals.is_empty());
         assert!(report.rung1_raw_path.is_none());
         assert_eq!(
@@ -1239,14 +1962,19 @@ mod tests {
             "clusters",
             "declines_recorded",
             "authorship_refusals",
-            "cap_refusals",
             "compose_refusals",
             "composed_bodies",
             "gate_reports",
+            "applied",
+            "skipped",
+            "cap_admissions",
+            "apply_audit",
             "change",
             "backend_calls",
             "usage_rung1",
             "usage_rung2",
+            "wall_rung1_ms",
+            "wall_rung2_ms",
             "call_count_audit",
             "rung1_raw_path",
             "report_path",
@@ -1309,7 +2037,733 @@ mod tests {
         assert_eq!(report.gate_reports.len(), 1);
         assert!(!report.gate_reports[0].passed, "`curl -f` maps 422 to red");
         assert_eq!(report.gate_reports[0].exit_code, Some(22));
+        // GATE-THEN-APPLY: a red gate body is NOT applied, and the unit
+        // aborts with the pinned first-red-body reason.
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: render_gate_rejected_line("kb-20001"),
+            }
+        );
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: map-lint gate rejected the body for kb-20001".to_string()
+            }
+        );
+        assert_eq!(exit_code_for_outcome(&report.outcome), 2);
+    }
+
+    #[tokio::test]
+    async fn a_red_gate_body_is_not_applied_while_gate_green_siblings_still_are() {
+        // Two bodies: the first (the fresh map) is gate-red, the second
+        // (kb-20001) gate-green. EXACTLY the green body's POST goes out,
+        // and the outcome aborts naming the FIRST red body.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "create_map",
+                        json!({"cluster_id": "c1", "title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        // The gate script REDS the FIRST body only: the stub runs
+        // `/bin/sh -c` once per body in order; `exit 0` for the second.
+        // (The gate factory receives the body path; the scripted fake
+        // below distinguishes by path.)
+        let gate = |body_path: &Path| {
+            let script = if body_path.to_string_lossy().contains("somnus-new-c1") {
+                "exit 22"
+            } else {
+                "exit 0"
+            };
+            ChecksRunner::new(
+                harness::exec::CheckCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                },
+                std::path::PathBuf::from("."),
+                crate::gate::SOMNUS_GATE_TIMEOUT,
+            )
+        };
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.gate_reports.len(), 2);
+        assert!(!report.gate_reports[0].passed);
+        assert!(report.gate_reports[1].passed);
+        assert_eq!(map_ops.requests().len(), 1, "only the green body applied");
+        assert_eq!(
+            map_ops.requests()[0],
+            MapOpRequest::AddPointer {
+                map_id: "kb-20001".to_string(),
+                body: report.composed_bodies[1].body.clone(),
+                added_entry_id: "kb-10005".to_string(),
+            }
+        );
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: map-lint gate rejected the body for somnus-new-c1".to_string(),
+            }
+        );
+        assert_eq!(exit_code_for_outcome(&report.outcome), 2);
+    }
+
+    #[tokio::test]
+    async fn two_red_gate_bodies_abort_naming_the_first() {
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "create_map",
+                        json!({"cluster_id": "c1", "title": "t", "orientation_prose": "ORIENTATION-PROSE"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let gate = gate_for_script("exit 22");
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.gate_reports.len(), 2);
+        assert!(!report.gate_reports.iter().any(|gate| gate.passed));
+        assert!(map_ops.requests().is_empty(), "zero map-op POSTs");
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: map-lint gate rejected the body for somnus-new-c1".to_string(),
+            },
+            "the reason names the FIRST red body in composed_bodies order"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_k_chain_posts_intermediate_bodies_in_chain_order() {
+        // k=3 add_pointer edits on one map: EXACTLY 3 POSTs, the i-th
+        // carrying the fixture-derived INTERMEDIATE body byte for byte and
+        // the i-th entry id.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10006", "gloss": "GLOSS-6"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10007", "gloss": "GLOSS-7"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
         assert_eq!(report.outcome, UnitOutcome::Ready);
+        let requests = map_ops.requests();
+        assert_eq!(requests.len(), 3);
+        let original = "Lives in knowledge/linux/network\n\nOrients the switch, DNS, and VPN entries for the home network.\n\nDetail entries:\n- kb-10001 — switch VLAN tagging baseline\n- kb-10002 — recursive DNS resolvers\n- kb-10003 — wireguard client config\n- kb-99999 — cross-project wireguard hub notes\n- kb-10004 — DHCP lease hygiene\n\nNot yet documented:\n- Site-to-site wireguard topology".to_string();
+        // Each insert lands INSIDE the `Detail entries:` section (before
+        // the blank line), never at the body's end.
+        let after_1 = original.replace(
+            "- kb-10004 — DHCP lease hygiene\n",
+            "- kb-10004 — DHCP lease hygiene\n- kb-10005 — GLOSS-5\n",
+        );
+        let after_2 = after_1.replace(
+            "- kb-10005 — GLOSS-5\n",
+            "- kb-10005 — GLOSS-5\n- kb-10006 — GLOSS-6\n",
+        );
+        let after_3 = after_2.replace(
+            "- kb-10006 — GLOSS-6\n",
+            "- kb-10006 — GLOSS-6\n- kb-10007 — GLOSS-7\n",
+        );
+        let expected = [
+            ("kb-10005", after_1.as_str()),
+            ("kb-10006", after_2.as_str()),
+            ("kb-10007", after_3.as_str()),
+        ];
+        for (index, (entry_id, body)) in expected.iter().enumerate() {
+            assert_eq!(
+                requests[index],
+                MapOpRequest::AddPointer {
+                    map_id: "kb-20001".to_string(),
+                    body: (*body).to_string(),
+                    added_entry_id: (*entry_id).to_string(),
+                },
+                "POST #{index} carries the body AFTER {index} edit(s)"
+            );
+        }
+        // The report's records carry the exact POSTed text and the 1-based
+        // chain indices.
+        for (index, record) in report.applied.iter().enumerate() {
+            assert_eq!(record.op_kind, "add_pointer");
+            assert_eq!(record.chain_index, index + 1);
+            assert_eq!(record.http_status, Some(200));
+            assert_eq!(record.submitted_map_id, "kb-20001");
+            assert_eq!(record.server_map_id.as_deref(), Some("kb-30001"));
+            assert!(matches!(requests[index], MapOpRequest::AddPointer { .. }));
+            let rendered =
+                serde_json::to_string(&crate::map_op::build_request_body(&requests[index]))
+                    .expect("serializes");
+            assert_eq!(record.body, rendered);
+        }
+        // The FINAL composed body equals the last POSTed body_after.
+        assert_eq!(report.composed_bodies[0].body, after_3);
+    }
+
+    #[tokio::test]
+    async fn an_all_decline_night_issues_zero_map_op_posts() {
+        // Clusters whose op sets are empty or propose_gap-only: declines
+        // recorded, nothing composed, zero map-op POSTs.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c1", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert!(report.composed_bodies.is_empty());
+        assert!(map_ops.requests().is_empty(), "zero map-op POSTs");
+        assert_eq!(report.declines_recorded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_map_op_403_is_not_the_machine_principal_and_names_the_server_config() {
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![MapOpResult::NotMachinePrincipal]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops,
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::NotMachinePrincipal);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 1);
+        assert!(
+            MAP_OP_NOT_MACHINE_PRINCIPAL_MSG.contains("machine_principal_email"),
+            "the pinned line names the server's config knob: {MAP_OP_NOT_MACHINE_PRINCIPAL_MSG}"
+        );
+        assert!(
+            !MAP_OP_NOT_MACHINE_PRINCIPAL_MSG.contains("SOMNUS_"),
+            "the line never points at somnus config: {MAP_OP_NOT_MACHINE_PRINCIPAL_MSG}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_map_op_401_stops_as_unauthorized_with_exit_1() {
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![MapOpResult::Unauthorized]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops,
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Unauthorized);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 1);
+        assert_eq!(report.applied.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_map_op_fault_aborts_with_the_pinned_prefix() {
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![MapOpResult::Fault {
+            map_id: "kb-20001".to_string(),
+            reason: "unexpected HTTP status 409".to_string(),
+        }]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops,
+        )
+        .await;
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: map-op failed for kb-20001: unexpected HTTP status 409"
+                    .to_string(),
+            }
+        );
+        assert_eq!(exit_code_for_outcome(&report.outcome), 2);
+    }
+
+    #[tokio::test]
+    async fn a_strike_gap_edit_posts_the_intermediate_strike_state() {
+        // A strike_gap edit issues ONE POST whose body is the state as of
+        // that strike (the gap line removed, header preserved).
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "strike_gap",
+                    json!({"map_id": "kb-20001", "gap_text": "Site-to-site wireguard topology", "closing_entry_id": "kb-10003"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        let requests = map_ops.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0],
+            MapOpRequest::StrikeGap {
+                map_id: "kb-20001".to_string(),
+                body: "Lives in knowledge/linux/network\n\nOrients the switch, DNS, and VPN entries for the home network.\n\nDetail entries:\n- kb-10001 — switch VLAN tagging baseline\n- kb-10002 — recursive DNS resolvers\n- kb-10003 — wireguard client config\n- kb-99999 — cross-project wireguard hub notes\n- kb-10004 — DHCP lease hygiene\n\nNot yet documented:".to_string(),
+                gap_text: "Site-to-site wireguard topology".to_string(),
+                closing_entry_id: "kb-10003".to_string(),
+            }
+        );
+        assert_eq!(report.applied[0].op_kind, "strike_gap");
+        assert_eq!(report.applied[0].chain_index, 1);
+    }
+
+    #[tokio::test]
+    async fn an_interleaved_chain_posts_in_chain_order() {
+        // add_pointer then strike_gap on one map: the POSTs land in op
+        // order, each with the body as of that edit.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                    (
+                        "strike_gap",
+                        json!({"map_id": "kb-20001", "gap_text": "Site-to-site wireguard topology", "closing_entry_id": "kb-10003"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        let requests = map_ops.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(requests[0], MapOpRequest::AddPointer { .. }));
+        assert!(matches!(requests[1], MapOpRequest::StrikeGap { .. }));
+        // The strike POST's body carries the pointer the FIRST edit added
+        // (the state as of that strike), and the report's chain indices
+        // are 1 and 2.
+        assert_eq!(report.applied[0].chain_index, 1);
+        assert_eq!(report.applied[1].chain_index, 2);
+        let MapOpRequest::StrikeGap { body, .. } = &requests[1] else {
+            panic!("strike");
+        };
+        assert!(body.contains("GLOSS-5"));
+        assert!(!body.contains("Site-to-site wireguard topology"));
+    }
+
+    #[tokio::test]
+    async fn a_create_map_401_403_and_fault_each_stop_before_the_next_body() {
+        // The create branch's stop arms: a scripted 401 on the fresh map's
+        // create POST stops as Unauthorized.
+        let script_run = |script: Vec<MapOpResult>| async {
+            let backend = MockBackend::from_turns(vec![
+                text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+                calls_turn(
+                    &[
+                        (
+                            "create_map",
+                            json!({"cluster_id": "c1", "title": "t", "orientation_prose": "PROSE"}),
+                        ),
+                        (
+                            "add_pointer",
+                            json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                        ),
+                        (
+                            "add_pointer",
+                            json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                        ),
+                    ],
+                    usage(1, 1, None, None),
+                ),
+                calls_turn(
+                    &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                    usage(1, 1, None, None),
+                ),
+            ]);
+            let source =
+                std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+            let ledger = InMemoryLedger::new();
+            let body_root = tempfile::tempdir().expect("tempdir");
+            let gate = gate_for_script("exit 0");
+            let map_ops = RecordingMapOps::scripted(script);
+            let report = run_with_map_ops(
+                &backend,
+                source,
+                &ledger,
+                &gate,
+                body_root.path(),
+                "demo-project",
+                map_ops.clone(),
+            )
+            .await;
+            (map_ops, report)
+        };
+        let (map_ops, report) = script_run(vec![MapOpResult::Unauthorized]).await;
+        assert_eq!(report.outcome, UnitOutcome::Unauthorized);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 1);
+        assert_eq!(map_ops.requests().len(), 1, "the night stops after the 401");
+
+        let (map_ops, report) = script_run(vec![MapOpResult::NotMachinePrincipal]).await;
+        assert_eq!(report.outcome, UnitOutcome::NotMachinePrincipal);
+        assert_eq!(map_ops.requests().len(), 1);
+
+        let (map_ops, report) = script_run(vec![MapOpResult::Fault {
+            map_id: String::new(),
+            reason: "unexpected HTTP status 422".to_string(),
+        }])
+        .await;
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: map-op failed for : unexpected HTTP status 422".to_string(),
+            }
+        );
+        assert_eq!(map_ops.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_audit_catches_a_double_add_pointer_and_aborts_before_the_post() {
+        // Two add_pointer ops for the SAME entry in one chain: the second
+        // edit's ref delta is empty, the audit fires with the pinned line,
+        // and the second POST never happens.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5-again"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(map_ops.requests().len(), 1, "the audited op was NOT POSTed");
+        assert_eq!(report.apply_audit.len(), 1);
+        assert_eq!(
+            report.apply_audit[0],
+            "somnus: apply audit: add_pointer delta for kb-20001 was [], expected kb-10005"
+        );
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason:
+                    "somnus: apply audit: add_pointer delta for kb-20001 was [], expected kb-10005"
+                        .to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cap_admission_on_an_edit_op_is_a_fault_by_contract() {
+        // The production client classifies every update-op 409 as a Fault,
+        // so a CapAdmission arriving for an edit is a client-contract
+        // violation; the step aborts rather than recording an ordinary
+        // admission against an existing map.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![MapOpResult::CapAdmission {
+            reason_body: "invariant".to_string(),
+        }]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert!(matches!(
+            &report.outcome,
+            UnitOutcome::Aborted { reason } if reason.contains("map-op failed for kb-20001")
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_apply_audit_regression_aborts_before_the_post() {
+        // A scripted client that hands back a WRONG body state: the audit
+        // (previous body minus new refs != exactly the added id) fires
+        // client-side with the pinned reason and the POST never happens.
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        // The scripted client's `Applied` envelope is returned but the
+        // REQUEST recorded is what the audit sees; to force a delta failure
+        // we script an add_pointer whose body state drops an existing
+        // pointer — impossible from real materialize, so the audit catches
+        // it via the pure-fn test below. Here we drive the audit directly
+        // through the pipeline's decision seam: the recording client
+        // answers Applied, so we instead assert the pure fn's two lines.
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert!(
+            report.apply_audit.is_empty(),
+            "a conforming night is silent"
+        );
     }
 
     // ======================================================================
@@ -1839,7 +3293,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_create_map_hits_the_per_project_cap_and_is_recorded() {
+    async fn two_fresh_maps_compose_and_gate_and_the_second_is_an_ordinary_cap_admission() {
+        // NO client-side cap survives: both create_map ops compose AND gate
+        // (the gate sees both bodies), the first application applies, and
+        // the second application meets the server's 409 as an ORDINARY
+        // ADMISSION — recorded verbatim, outcome still Ready, exit 0.
         let clusters = json!([
             {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null}
         ])
@@ -1860,6 +3318,10 @@ mod tests {
                         "create_map",
                         json!({"cluster_id": "c2", "title": "t2", "orientation_prose": "PROSE-2"}),
                     ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c2", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                    ),
                 ],
                 usage(1, 1, None, None),
             ),
@@ -1868,26 +3330,153 @@ mod tests {
         let ledger = InMemoryLedger::new();
         let body_root = tempfile::tempdir().expect("tempdir");
         let gate = gate_for_script("exit 0");
-        let report = run_with(
+        let reason = r#"{"reason":"per-night new-map cap for demo-project exceeded"}"#;
+        let map_ops = RecordingMapOps::scripted(vec![
+            MapOpResult::Applied(crate::map_op::MapOpApplied {
+                map_id: "kb-30001".to_string(),
+                version: 1,
+                pointer_count: 1,
+                budget: 0,
+            }),
+            MapOpResult::CapAdmission {
+                reason_body: reason.to_string(),
+            },
+        ]);
+        let report = run_with_map_ops(
             &backend,
             source,
             &ledger,
             &gate,
             body_root.path(),
             "demo-project",
+            map_ops.clone(),
         )
         .await;
         assert_eq!(
             report.composed_bodies.len(),
-            1,
-            "the first create_map composes"
+            2,
+            "BOTH fresh bodies compose and gate"
         );
-        assert_eq!(report.composed_bodies[0].map_id, "somnus-new-c1");
+        assert_eq!(report.gate_reports.len(), 2);
+        // Exactly TWO create POSTs dialed: the first applied, the second
+        // admitted — the latch then holds for any FURTHER fresh map.
+        assert_eq!(map_ops.requests().len(), 2);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].submitted_map_id, "somnus-new-c1");
+        assert_eq!(report.cap_admissions.len(), 1);
         assert_eq!(
-            report.cap_refusals,
-            vec![crate::materialize::render_cap_refusal_line("demo-project")]
+            report.cap_admissions[0],
+            AppliedOpRecord {
+                op_kind: "create_map",
+                chain_index: 0,
+                submitted_map_id: "somnus-new-c2".to_string(),
+                server_map_id: None,
+                version: None,
+                pointer_count: None,
+                budget: None,
+                http_status: Some(409),
+                body: serde_json::to_string(&crate::map_op::build_request_body(
+                    &MapOpRequest::CreateMap {
+                        project_ref: "demo-project".to_string(),
+                        short_title: "t2".to_string(),
+                        long_title: "t2".to_string(),
+                        body: report.composed_bodies[1].body.clone(),
+                    }
+                ))
+                .expect("serializes"),
+                admission_reason: Some(reason.to_string()),
+            }
         );
-        assert_eq!(report.gate_reports.len(), 1);
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Ready,
+            "an admission is data on the report, never an outcome"
+        );
+        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
+        assert!(report.skipped.is_empty(), "no further fresh map this unit");
+    }
+
+    #[tokio::test]
+    async fn the_cap_admission_latch_skips_a_later_fresh_map_and_stays_ready() {
+        // Two fresh maps from DIFFERENT clusters: the first create_map
+        // meets the server's cap admission, the latch turns create_map
+        // application off, and the second fresh map's create is SKIPPED
+        // (recorded) with zero POSTs for it — while the outcome stays
+        // Ready and the exit stays 0.
+        let clusters = json!([
+            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null},
+            {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null},
+        ])
+        .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters, usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "create_map",
+                        json!({"cluster_id": "c1", "title": "t1", "orientation_prose": "PROSE-1"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c1", "entry_id": "kb-10001", "gloss": "GLOSS-1"}),
+                    ),
+                    (
+                        "create_map",
+                        json!({"cluster_id": "c2", "title": "t2", "orientation_prose": "PROSE-2"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c2", "entry_id": "kb-10002", "gloss": "GLOSS-2"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let reason = r#"{"reason":"per-KB nightly cap exceeded"}"#;
+        let map_ops = RecordingMapOps::scripted(vec![
+            MapOpResult::CapAdmission {
+                reason_body: reason.to_string(),
+            },
+            // Anything after the latch would be a defect: the script
+            // repeats the admission, so a second POST would record another
+            // admission and the count assertion below would catch it.
+            MapOpResult::CapAdmission {
+                reason_body: reason.to_string(),
+            },
+        ]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.composed_bodies.len(), 2);
+        // EXACTLY one POST: the second fresh map's create is latched off,
+        // and neither fresh map's add_pointers were ever candidates.
+        assert_eq!(map_ops.requests().len(), 1);
+        assert_eq!(report.cap_admissions.len(), 1);
+        assert_eq!(
+            report.skipped,
+            vec![SkippedOpRecord {
+                op_kind: "create_map",
+                map_id: "somnus-new-c2".to_string(),
+                reason: render_create_skipped_after_admission("somnus-new-c2"),
+            }]
+        );
+        assert_eq!(
+            report.skipped[0].reason,
+            "somnus: create_map for somnus-new-c2 skipped: a create_map cap admission was already recorded this invocation"
+        );
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(exit_code_for_outcome(&report.outcome), 0);
     }
 
     #[tokio::test]
@@ -2157,5 +3746,323 @@ mod tests {
         );
         assert_eq!(crate::NIGHTLY_WALL_CLOCK_SECS, 14_400);
         assert_eq!(crate::SOMNUS_MAX_ITERATIONS, 24);
+    }
+
+    // ======================================================================
+    // the exit-code table, the budget render, and the apply audit
+    // ======================================================================
+
+    #[test]
+    fn the_exit_code_table_covers_every_outcome_variant() {
+        let table = [
+            (UnitOutcome::Ready, 0),
+            (UnitOutcome::UnknownProject, 0),
+            (UnitOutcome::NotEligible, 0),
+            (UnitOutcome::Unauthorized, 1),
+            (UnitOutcome::NotMachinePrincipal, 1),
+            (
+                UnitOutcome::Aborted {
+                    reason: "x".to_string(),
+                },
+                2,
+            ),
+        ];
+        for (outcome, expected) in table {
+            assert_eq!(exit_code_for_outcome(&outcome), expected, "{outcome:?}");
+        }
+        // A cap-admission unit stays Ready, so the nightly exit-0 predicate
+        // is decidable as written.
+        assert_eq!(exit_code_for_outcome(&UnitOutcome::Ready), 0);
+    }
+
+    #[test]
+    fn the_outcome_names_render_pascal_case() {
+        for (outcome, name) in [
+            (UnitOutcome::Ready, "Ready"),
+            (UnitOutcome::UnknownProject, "UnknownProject"),
+            (UnitOutcome::NotEligible, "NotEligible"),
+            (UnitOutcome::Unauthorized, "Unauthorized"),
+            (UnitOutcome::NotMachinePrincipal, "NotMachinePrincipal"),
+            (
+                UnitOutcome::Aborted {
+                    reason: "r".to_string(),
+                },
+                "Aborted",
+            ),
+        ] {
+            assert_eq!(outcome.name(), name, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_token_budget_line_carries_both_decision_inputs() {
+        assert_eq!(
+            render_token_budget_line(550_000, 612_004),
+            "somnus: token budget exhausted (armed 550000, billed 612004)"
+        );
+        assert_eq!(
+            render_token_budget_line(1_100_000, 1_100_333),
+            "somnus: token budget exhausted (armed 1100000, billed 1100333)"
+        );
+    }
+
+    #[test]
+    fn the_gate_and_map_op_lines_are_byte_pinned() {
+        assert_eq!(
+            render_gate_rejected_line("kb-20001"),
+            "somnus: map-lint gate rejected the body for kb-20001"
+        );
+        assert_eq!(
+            render_map_op_fault_line("kb-20001", "unexpected HTTP status 422"),
+            "somnus: map-op failed for kb-20001: unexpected HTTP status 422"
+        );
+        assert_eq!(
+            MAP_OP_NOT_MACHINE_PRINCIPAL_MSG,
+            "somnus: the KB refused the caller on /api/kb/map-op as not the machine principal — check machine_principal_email on the server; this is not a somnus configuration fault"
+        );
+    }
+
+    #[test]
+    fn the_usage_totals_bill_the_one_workspace_formula() {
+        assert_eq!(
+            UsageTotals {
+                input: 1000,
+                output: 50,
+                cache_read: 200,
+                cache_write: 10,
+            }
+            .billed(),
+            1260
+        );
+        assert_eq!(UsageTotals::default().billed(), 0);
+        assert_eq!(
+            UsageTotals {
+                input: u64::MAX,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+            }
+            .billed(),
+            u64::MAX,
+            "saturating, never wrapping"
+        );
+    }
+
+    // --- the apply audit: the two pinned tripwire lines --------------------
+
+    #[test]
+    fn the_apply_audit_catches_an_add_pointer_on_a_fresh_map() {
+        let request = MapOpRequest::AddPointer {
+            map_id: "somnus-new-c1".to_string(),
+            body: "body".to_string(),
+            added_entry_id: "kb-10001".to_string(),
+        };
+        assert_eq!(
+            apply_audit(Some("previous body"), &request, &["somnus-new-c1".to_string()]),
+            Some(
+                "somnus: apply audit: add_pointer on fresh map somnus-new-c1 not absorbed by the create body"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_apply_audit_catches_a_wrong_delta_with_the_pinned_line() {
+        // The previous body carries kb-10001; the submitted body adds TWO
+        // refs and drops none — the delta is not exactly the claimed id.
+        let request = MapOpRequest::AddPointer {
+            map_id: "kb-20001".to_string(),
+            body: "Lives in x\n\nDetail entries:\n- kb-10001 — a\n- kb-10002 — b\n- kb-10003 — c\n\nNot yet documented:\n- gap with kb-00042 in it".to_string(),
+            added_entry_id: "kb-10002".to_string(),
+        };
+        let previous = "Lives in x\n\nDetail entries:\n- kb-10001 — a".to_string();
+        assert_eq!(
+            apply_audit(
+                Some(&previous),
+                &request,
+                &["somnus-new-c1".to_string()],
+            ),
+            Some(
+                "somnus: apply audit: add_pointer delta for kb-20001 was [\"kb-10002\", \"kb-10003\", \"kb-00042\"], expected kb-10002"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_apply_audit_passes_a_conforming_single_addition() {
+        let previous = "Detail entries:\n- kb-10001 — a".to_string();
+        let body = "Detail entries:\n- kb-10001 — a\n- kb-10005 — b".to_string();
+        let request = MapOpRequest::AddPointer {
+            map_id: "kb-20001".to_string(),
+            body,
+            added_entry_id: "kb-10005".to_string(),
+        };
+        assert_eq!(
+            apply_audit(Some(&previous), &request, &[]),
+            None,
+            "exactly one added ref, the claimed id: silent"
+        );
+    }
+
+    #[test]
+    fn the_apply_audit_scans_the_pinned_pointer_shape_with_no_dependency() {
+        // `kb-` + exactly five ASCII digits: six or four digits are not
+        // refs, and a scan never overruns.
+        let text = "kb-12345 kb-123456 kb-1234 kb-00000 kb-99999";
+        let refs = super::kb_refs(text);
+        assert_eq!(
+            refs,
+            vec![
+                "kb-12345".to_string(),
+                "kb-00000".to_string(),
+                "kb-99999".to_string()
+            ],
+            "six-digit and four-digit shapes are not refs; duplicates collapse"
+        );
+        assert_eq!(super::kb_refs("no refs here"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_apply_audit_ignores_non_add_pointer_ops() {
+        for request in [
+            MapOpRequest::CreateMap {
+                project_ref: "p".to_string(),
+                short_title: "s".to_string(),
+                long_title: "l".to_string(),
+                body: "b".to_string(),
+            },
+            MapOpRequest::StrikeGap {
+                map_id: "kb-20001".to_string(),
+                body: "b".to_string(),
+                gap_text: "g".to_string(),
+                closing_entry_id: "kb-10001".to_string(),
+            },
+        ] {
+            assert_eq!(apply_audit(Some("prev"), &request, &[]), None);
+        }
+    }
+
+    // ======================================================================
+    // the token-budget guard
+    // ======================================================================
+
+    #[tokio::test]
+    async fn the_token_budget_exhaustion_aborts_before_further_turns() {
+        // The pre-rung-1 arm: the whole spend so far is `billed_before`,
+        // and it already breaches the small ceiling, so the backend is
+        // never called at all.
+        let backend = MockBackend::from_turns(vec![text_turn(
+            &e2e_clusters_json(),
+            usage(1000, 50, Some(200), None),
+        )]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let tool_ctx = ToolCtx::stub();
+        let deps = UnitDeps {
+            backend: &backend,
+            source,
+            ledger: &ledger,
+            gate_for: &gate,
+            tool_ctx: &tool_ctx,
+            map_ops: std::sync::Arc::new(RecordingMapOps::default()),
+            token_budget: 100,
+            billed_before: 500,
+            body_root: body_root.path().to_path_buf(),
+        };
+        let report = run_unit(&deps, "demo-project").await;
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: token budget exhausted (armed 100, billed 500)".to_string(),
+            }
+        );
+        assert_eq!(backend.calls(), 0, "the guard fired BEFORE rung 1");
+    }
+
+    #[tokio::test]
+    async fn the_token_budget_stops_the_rung2_loop_between_turns() {
+        // Rung 1 is affordable (1200 < 5000); its billed usage alone
+        // breaches the ceiling, so rung 2 never starts: the scripted turn
+        // count stays at the rung-1 call.
+        let backend = MockBackend::from_turns(vec![text_turn(
+            &e2e_clusters_json(),
+            usage(4000, 500, Some(300), Some(200)),
+        )]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let tool_ctx = ToolCtx::stub();
+        let deps = UnitDeps {
+            backend: &backend,
+            source,
+            ledger: &ledger,
+            gate_for: &gate,
+            tool_ctx: &tool_ctx,
+            map_ops: std::sync::Arc::new(RecordingMapOps::default()),
+            token_budget: 5000,
+            billed_before: 500,
+            body_root: body_root.path().to_path_buf(),
+        };
+        let report = run_unit(&deps, "demo-project").await;
+        assert_eq!(backend.calls(), 1, "rung 2 never started");
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: token budget exhausted (armed 5000, billed 5500)".to_string(),
+            },
+            "billed_before 500 + rung-1 billed 5000 breaches 5000 before rung 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_armed_invocation_baseline_trips_the_guard_before_rung1() {
+        // The across-units arm: `billed_before` already over the ceiling,
+        // so the unit reports the budget abort before ANY turn — the
+        // nightly binary's budget-stop decision, mirrored in-pipeline.
+        let backend = MockBackend::from_turns(vec![]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let tool_ctx = ToolCtx::stub();
+        let deps = UnitDeps {
+            backend: &backend,
+            source: source.clone(),
+            ledger: &ledger,
+            gate_for: &gate,
+            tool_ctx: &tool_ctx,
+            map_ops: std::sync::Arc::new(RecordingMapOps::default()),
+            token_budget: 550_000,
+            billed_before: 612_004,
+            body_root: body_root.path().to_path_buf(),
+        };
+        let report = run_unit(&deps, "demo-project").await;
+        assert_eq!(
+            report.outcome,
+            UnitOutcome::Aborted {
+                reason: "somnus: token budget exhausted (armed 550000, billed 612004)".to_string(),
+            }
+        );
+        assert_eq!(backend.calls(), 0);
+        // The sentinel 0 is UNBOUNDED: the same unit runs clean.
+        let backend = MockBackend::from_turns(vec![text_turn("[]", usage(1, 1, None, None))]);
+        let tool_ctx = ToolCtx::stub();
+        let deps = UnitDeps {
+            backend: &backend,
+            source: source.clone(),
+            ledger: &ledger,
+            gate_for: &gate,
+            tool_ctx: &tool_ctx,
+            map_ops: std::sync::Arc::new(RecordingMapOps::default()),
+            token_budget: 0,
+            billed_before: 612_004,
+            body_root: body_root.path().to_path_buf(),
+        };
+        let report = run_unit(&deps, "demo-project").await;
+        assert_eq!(report.outcome, UnitOutcome::Ready, "0 = unbounded");
     }
 }

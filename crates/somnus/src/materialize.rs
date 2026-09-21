@@ -28,19 +28,12 @@ use crate::ops::Op;
 /// against this constant: somnus may only edit maps it wrote.
 pub const SOMNUS_WRITER_ID: &str = "somnus";
 
-/// Structural cap: one new map per project per run. ENFORCED here, per
-/// `create_map` op.
-pub const SOMNUS_MAX_NEW_MAPS_PER_PROJECT: u32 = 1;
-
-/// Structural cap: three new maps per KB per night. NOT enforceable from a
-/// single project's loop-input this cut — it binds when a KB-wide/nightly
-/// runner view lands (Phase 3). No code pretends to enforce it; the constant
-/// is pinned so the runner has one place to read it.
-pub const SOMNUS_MAX_NEW_MAPS_PER_KB: u32 = 3;
-
-/// Structural cap: three eligible projects per night. NOT enforceable from
-/// inside one project's unit this cut — same Phase 3 boundary as
-/// [`SOMNUS_MAX_NEW_MAPS_PER_KB`].
+/// Structural cap: three eligible projects per night — the ONE cap with no
+/// server analogue, so it is somnus's own worklist policy, enforced by the
+/// nightly worklist slice ([`crate::worklist::select_first_projects`]) via
+/// `take(3)`. The other two caps (one new map per project, three per KB,
+/// both counted since UTC midnight) are SERVER-side at `POST /api/kb/map-op`;
+/// somnus tracks neither.
 pub const SOMNUS_MAX_PROJECTS_PER_NIGHT: u32 = 3;
 
 /// The `Lives in` line's prefix, pinned so the value derivation and the
@@ -307,6 +300,38 @@ pub struct ComposedBody {
     pub body: String,
 }
 
+/// One per-edit application step for an EXISTING map, as the pipeline's
+/// map-op application needs it: the map, which edit, and the body state
+/// AFTER that edit — the intermediate state each `add_pointer` POST must
+/// carry (the server's `new − old == {added_entry_id}` set comparison makes
+/// the FINAL composed body wrong for every call but the last).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MapEdit {
+    /// The map being edited.
+    pub map_id: String,
+    /// The edit.
+    pub kind: MapEditKind,
+    /// The body as of this edit (the state after applying it).
+    pub body_after: String,
+}
+
+/// Which edit a [`MapEdit`] carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum MapEditKind {
+    /// Point at `entry_id` from the map.
+    AddPointer {
+        /// The entry being pointed at.
+        entry_id: String,
+    },
+    /// Strike `gap_text`, closed by `closing_entry_id`.
+    StrikeGap {
+        /// The gap text being struck.
+        gap_text: String,
+        /// The entry cited as closing it.
+        closing_entry_id: String,
+    },
+}
+
 /// The materialized result of one cluster's parsed op set. Never an error:
 /// a refusal is recorded in the matching vector so one bad op can never
 /// discard another op's paid work.
@@ -318,40 +343,31 @@ pub struct Materialized {
     /// Rendered authorship refusals (an op targeted a map the loop does not
     /// own).
     pub authorship_refusals: Vec<String>,
-    /// Rendered per-project cap refusals (a second `create_map` in one run).
-    pub cap_refusals: Vec<String>,
     /// Rendered hard compose refusals (no body was composed for that op).
     pub compose_refusals: Vec<String>,
-    /// How many new maps this op set minted (0 or 1).
-    pub new_maps: u32,
+    /// The per-edit application chain, in op order per map, for the maps
+    /// that survived (a map whose edit failed is dropped wholesale, its
+    /// edits dropped with it). A fresh map's pointers are NOT here — they
+    /// were already inlined into the create body.
+    pub edits: Vec<MapEdit>,
 }
 
-/// Materialize one cluster's parsed op set into bodies and named refusals.
-///
-/// `new_maps_so_far` is the per-project count of maps already minted by
-/// this run, so the per-project cap holds across clusters as well as within
-/// one op set.
+/// Materialize one cluster's parsed op set into bodies, edits, and named
+/// refusals. There is NO client-side new-map cap: both the per-project and
+/// per-KB caps are SERVER-side at `POST /api/kb/map-op` (counted since UTC
+/// midnight), so every `create_map` op composes, and a second map in one
+/// op set meets the server's 409 as an ORDINARY ADMISSION OUTCOME at
+/// application time.
 #[allow(clippy::too_many_lines)]
 // one op set, one linear pass: splitting it
 // would scatter the read-modify-write chain across helpers.
 #[must_use]
-pub fn materialize_cluster(
-    project_ref: &str,
-    cluster: &Cluster,
-    ops: &[Op],
-    input: &LoopInput,
-    new_maps_so_far: u32,
-) -> Materialized {
+pub fn materialize_cluster(cluster: &Cluster, ops: &[Op], input: &LoopInput) -> Materialized {
     let mut out = Materialized::default();
 
-    // Every `create_map` op in the set is considered in order: the first one
-    // under the per-project cap composes, and each further one is refused by
-    // the cap, loudly, once per refused op.
+    // Every `create_map` op in the set composes (no client-side cap: the
+    // server's per-night 409 is the ordinary admission outcome).
     for op in ops.iter().filter(|op| matches!(op, Op::CreateMap { .. })) {
-        if new_maps_so_far + out.new_maps >= SOMNUS_MAX_NEW_MAPS_PER_PROJECT {
-            out.cap_refusals.push(render_cap_refusal_line(project_ref));
-            continue;
-        }
         if let Op::CreateMap {
             cluster_id,
             orientation_prose,
@@ -364,7 +380,6 @@ pub fn materialize_cluster(
                         map_id: new_map_id(cluster_id),
                         body,
                     });
-                    out.new_maps += 1;
                 }
                 Err(err) => out.compose_refusals.push(err.to_string()),
             }
@@ -376,6 +391,7 @@ pub fn materialize_cluster(
     // overwrite each other. A map whose edit failed is dropped from the
     // deliverables entirely — a partially applied op set is not a body.
     let mut working: Vec<ComposedBody> = Vec::new();
+    let mut working_edits: Vec<Vec<MapEdit>> = Vec::new();
     let mut failed_maps: Vec<String> = Vec::new();
     let fresh_ids: Vec<String> = ops
         .iter()
@@ -393,13 +409,20 @@ pub fn materialize_cluster(
                 gloss,
             } => (map_id, Edit::AddPointer { entry_id, gloss }),
             Op::StrikeGap {
-                map_id, gap_text, ..
-            } => (map_id, Edit::StrikeGap { gap_text }),
+                map_id,
+                gap_text,
+                closing_entry_id,
+            } => (
+                map_id,
+                Edit::StrikeGap {
+                    gap_text,
+                    closing_entry_id,
+                },
+            ),
             Op::CreateMap { .. } | Op::ProposeGap { .. } | Op::NoChange { .. } => continue,
         };
         // The fresh maps' pointers were already composed into their bodies
-        // (a cap-refused create's pointers are dropped with it: the map it
-        // names never exists, and the cap refusal is the loud record).
+        // (inlined by the create), so they are never re-issued as calls.
         if fresh_ids.iter().any(|fresh_id| fresh_id == map_id) {
             continue;
         }
@@ -429,6 +452,7 @@ pub fn materialize_cluster(
                     map_id: map_id.clone(),
                     body: map.body.clone(),
                 });
+                working_edits.push(Vec::new());
                 working.len() - 1
             });
         let entry = &mut working[position];
@@ -441,7 +465,7 @@ pub fn materialize_cluster(
                     .to_string()
                 })
             }
-            Edit::StrikeGap { gap_text } => {
+            Edit::StrikeGap { gap_text, .. } => {
                 strike_gap_line(&entry.body, gap_text).ok_or_else(|| {
                     ComposeError::GapNotFound {
                         map_id: map_id.clone(),
@@ -452,7 +476,26 @@ pub fn materialize_cluster(
             }
         };
         match edited {
-            Ok(body) => entry.body = body,
+            Ok(body) => {
+                let kind = match &edit {
+                    Edit::AddPointer { entry_id, .. } => MapEditKind::AddPointer {
+                        entry_id: (*entry_id).clone(),
+                    },
+                    Edit::StrikeGap {
+                        gap_text,
+                        closing_entry_id,
+                    } => MapEditKind::StrikeGap {
+                        gap_text: (*gap_text).clone(),
+                        closing_entry_id: (*closing_entry_id).clone(),
+                    },
+                };
+                entry.body = body;
+                working_edits[position].push(MapEdit {
+                    map_id: map_id.clone(),
+                    kind,
+                    body_after: entry.body.clone(),
+                });
+            }
             Err(err) => {
                 out.compose_refusals.push(err);
                 failed_maps.push(map_id.clone());
@@ -460,11 +503,13 @@ pub fn materialize_cluster(
         }
     }
 
-    out.bodies.extend(
-        working
-            .into_iter()
-            .filter(|entry| !failed_maps.contains(&entry.map_id)),
-    );
+    for (entry, edits) in working.into_iter().zip(working_edits) {
+        if failed_maps.contains(&entry.map_id) {
+            continue;
+        }
+        out.bodies.push(entry);
+        out.edits.extend(edits);
+    }
     out
 }
 
@@ -476,16 +521,8 @@ enum Edit<'a> {
     },
     StrikeGap {
         gap_text: &'a String,
+        closing_entry_id: &'a String,
     },
-}
-
-/// The stderr line for a refused second `create_map`. Pure so the shape is
-/// byte-pinned; the pipeline only `eprintln!`s it.
-#[must_use]
-pub fn render_cap_refusal_line(project_ref: &str) -> String {
-    format!(
-        "somnus: per-project new-map cap reached for {project_ref}; refusing a second create_map"
-    )
 }
 
 /// Where a composed map body is written: one file PER MAP (never one shared
@@ -501,13 +538,6 @@ pub fn map_body_path(root: &Path, project_ref: &str, map_id: &str) -> PathBuf {
 #[must_use]
 pub fn run_report_path(root: &Path, project_ref: &str) -> PathBuf {
     root.join(project_ref).join("run-report.json")
-}
-
-/// The production body root (used only by the future CLI wiring): the
-/// machine tempdir, per map-lint's file-shaped body transport.
-#[must_use]
-pub fn somnus_body_root() -> PathBuf {
-    std::env::temp_dir().join("somnus")
 }
 
 /// Write one composed body to its [`map_body_path`], creating parent
@@ -565,8 +595,6 @@ mod tests {
     #[test]
     fn the_structural_caps_and_writer_id_are_pinned() {
         assert_eq!(SOMNUS_WRITER_ID, "somnus");
-        assert_eq!(SOMNUS_MAX_NEW_MAPS_PER_PROJECT, 1);
-        assert_eq!(SOMNUS_MAX_NEW_MAPS_PER_KB, 3);
         assert_eq!(SOMNUS_MAX_PROJECTS_PER_NIGHT, 3);
         assert_eq!(new_map_id("c1"), "somnus-new-c1");
     }
@@ -599,7 +627,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("services", &["kb-10005"], None);
         let ops = vec![add_pointer("kb-20002", "kb-10005", "gloss")];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.authorship_refusals.len(), 1);
         assert!(
@@ -612,7 +640,6 @@ mod tests {
             "{}",
             materialized.authorship_refusals[0]
         );
-        assert_eq!(materialized.new_maps, 0);
     }
 
     // --- the Lives in derivation -----------------------------------------
@@ -661,9 +688,8 @@ mod tests {
             add_pointer("somnus-new-c1", "kb-10002", "GLOSS-2"),
             add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
         ];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
 
-        assert_eq!(materialized.new_maps, 1);
         assert_eq!(materialized.bodies.len(), 2);
         // Every byte outside ORIENTATION-PROSE and the two glosses is
         // code-composed or fixture-derived.
@@ -691,9 +717,8 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
         let ops = vec![create_map("c1", "ORIENTATION-PROSE")];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert!(materialized.bodies.is_empty());
-        assert_eq!(materialized.new_maps, 0);
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
             materialized.compose_refusals[0].contains("no pointers"),
@@ -752,7 +777,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-20001", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1);
         assert_eq!(
             materialized.bodies[0].body,
@@ -768,7 +793,7 @@ mod tests {
             add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
             add_pointer("kb-20001", "kb-10006", "GLOSS-6"),
         ];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1, "one body per map");
         assert!(materialized.bodies[0].body.contains(
             "- kb-10004 — DHCP lease hygiene\n- kb-10005 — GLOSS-5\n- kb-10006 — GLOSS-6"
@@ -780,7 +805,7 @@ mod tests {
         let input = fixture();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-99999", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -796,7 +821,7 @@ mod tests {
         input.maps[0].body = "Lives in knowledge/linux/network\n\nProse only.".to_string();
         let owned = cluster("home-network", &["kb-10005"], Some("kb-20001"));
         let ops = vec![add_pointer("kb-20001", "kb-10005", "GLOSS-5")];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -817,7 +842,7 @@ mod tests {
             gap_text: "Site-to-site wireguard topology".to_string(),
             closing_entry_id: "kb-10003".to_string(),
         }];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert_eq!(materialized.bodies.len(), 1);
         assert_eq!(
             materialized.bodies[0].body,
@@ -834,7 +859,7 @@ mod tests {
             gap_text: "a gap nobody recorded".to_string(),
             closing_entry_id: "kb-10003".to_string(),
         }];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
+        let materialized = materialize_cluster(&owned, &ops, &input);
         assert!(materialized.bodies.is_empty());
         assert_eq!(materialized.compose_refusals.len(), 1);
         assert!(
@@ -844,10 +869,13 @@ mod tests {
         );
     }
 
-    // --- the per-project cap ---------------------------------------------
+    // --- the caps are SERVER-side: both create_map ops compose here ------
 
     #[test]
-    fn a_second_create_map_in_one_run_is_refused_and_the_first_composes() {
+    fn two_create_maps_in_one_op_set_both_compose_and_both_gate() {
+        // No client-side cap survives: the per-project and per-KB caps are
+        // server-side at POST /api/kb/map-op, so both fresh bodies compose
+        // and the second's application meets the ordinary 409 admission.
         let input = fixture();
         let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
         let ops = vec![
@@ -856,39 +884,60 @@ mod tests {
             create_map("c2", "PROSE-2"),
             add_pointer("somnus-new-c2", "kb-10001", "GLOSS-1"),
         ];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 0);
-        assert_eq!(
-            materialized.new_maps, 1,
-            "the first map mints, the second refuses"
-        );
-        assert_eq!(materialized.bodies.len(), 1);
+        let materialized = materialize_cluster(&owned, &ops, &input);
+        assert_eq!(materialized.bodies.len(), 2);
         assert_eq!(materialized.bodies[0].map_id, "somnus-new-c1");
-        assert_eq!(materialized.cap_refusals.len(), 1);
-        assert_eq!(
-            materialized.cap_refusals[0],
-            render_cap_refusal_line("demo-project")
-        );
+        assert_eq!(materialized.bodies[1].map_id, "somnus-new-c2");
+        assert_eq!(materialized.compose_refusals, Vec::<String>::new());
+        // A fresh map's add_pointers are inlined into the create body: no
+        // edits for either fresh map.
+        assert!(materialized.edits.is_empty());
     }
 
     #[test]
-    fn a_create_map_refuses_when_a_earlier_cluster_already_minted_the_cap() {
+    fn fresh_maps_do_not_appear_in_the_edit_chain_and_existing_maps_do() {
         let input = fixture();
-        let owned = cluster("home-network", &["kb-10001"], Some("kb-20001"));
+        let owned = cluster("home-network", &["kb-10005", "kb-10006"], Some("kb-20001"));
         let ops = vec![
-            create_map("c2", "PROSE-2"),
-            add_pointer("somnus-new-c2", "kb-10001", "GLOSS-1"),
+            add_pointer("kb-20001", "kb-10005", "GLOSS-5"),
+            Op::StrikeGap {
+                map_id: "kb-20001".to_string(),
+                gap_text: "Site-to-site wireguard topology".to_string(),
+                closing_entry_id: "kb-10003".to_string(),
+            },
         ];
-        let materialized = materialize_cluster("demo-project", &owned, &ops, &input, 1);
-        assert!(materialized.bodies.is_empty());
-        assert_eq!(materialized.new_maps, 0);
-        assert_eq!(materialized.cap_refusals.len(), 1);
-    }
-
-    #[test]
-    fn the_cap_refusal_line_is_byte_pinned() {
+        let materialized = materialize_cluster(&owned, &ops, &input);
+        assert_eq!(materialized.bodies.len(), 1);
+        assert_eq!(materialized.edits.len(), 2, "one edit per op, in op order");
         assert_eq!(
-            render_cap_refusal_line("demo-project"),
-            "somnus: per-project new-map cap reached for demo-project; refusing a second create_map"
+            materialized.edits[0],
+            MapEdit {
+                map_id: "kb-20001".to_string(),
+                kind: MapEditKind::AddPointer {
+                    entry_id: "kb-10005".to_string(),
+                },
+                body_after: materialized.edits[0].body_after.clone(),
+            }
+        );
+        assert!(
+            materialized.edits[0]
+                .body_after
+                .contains("- kb-10005 — GLOSS-5"),
+            "body_after carries the state after the FIRST edit"
+        );
+        assert!(!materialized.edits[0].body_after.contains("GLOSS-6"));
+        assert_eq!(
+            materialized.edits[1].kind,
+            MapEditKind::StrikeGap {
+                gap_text: "Site-to-site wireguard topology".to_string(),
+                closing_entry_id: "kb-10003".to_string(),
+            }
+        );
+        assert!(
+            !materialized.edits[1]
+                .body_after
+                .contains("Site-to-site wireguard topology"),
+            "body_after carries the state after the SECOND edit"
         );
     }
 
@@ -954,7 +1003,6 @@ mod tests {
             run_report_path(root, "demo-project"),
             PathBuf::from("/tmp/somnus-root/demo-project/run-report.json")
         );
-        assert_eq!(somnus_body_root(), std::env::temp_dir().join("somnus"));
     }
 
     #[test]
