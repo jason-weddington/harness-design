@@ -303,6 +303,33 @@ fn build_request_body<'a>(model: &'a str, req: &'a TurnRequest<'a>) -> RequestBo
 
     let mut messages: Vec<WireMessage<'a>> = req.messages.iter().map(map_message).collect();
 
+    // STABLE breakpoint: mark the last content block of the PENULTIMATE
+    // message, so the cached prefix ENDS BEFORE the part of the request that
+    // varies between sibling calls.
+    //
+    // The rolling breakpoint below is right for an append-only agentic loop,
+    // where each turn's messages are a prefix of the next turn's. It is
+    // exactly wrong for a consumer that makes N sibling calls sharing a
+    // prefix and differing in the tail — somnus's rung 2, one call per
+    // cluster over the same injected loop-input. With only the rolling
+    // breakpoint, every cached prefix includes that call's own instruction,
+    // so no later call can ever match it: the cache is written on every call
+    // and read on none, at the 1.25x write premium, forever.
+    //
+    // That is not a hypothesis. somnus's first real run billed 577,293
+    // tokens across 12 calls with cache_read EXACTLY 0 and cache_write
+    // 549,085, and a live two-arm probe against the API on 2026-09-21
+    // reproduced it: with the breakpoint only on the varying last message,
+    // call 2 read 0 and wrote 14,514 again; with this breakpoint added, call
+    // 2 read 14,489 and wrote 25. Adding it did not increase the first
+    // call's write — nested prefixes share, so the marginal cost is nil.
+    let penultimate = messages.len().checked_sub(2);
+    if let Some(index) = penultimate
+        && let Some(block) = messages[index].content.last_mut()
+    {
+        block.set_cache_breakpoint();
+    }
+
     // ROLLING breakpoint: cache the growing conversation prefix by marking
     // the LAST content block of the LAST message. Guarded so an empty
     // messages slice or an empty content vec is a no-op (no panic, no
@@ -607,8 +634,8 @@ fn parse_retry_after(header: Option<&reqwest::header::HeaderValue>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::{
-        AnthropicBackend, classify_bad_request, map_stop_reason, output_cap_for_model,
-        parse_retry_after,
+        AnthropicBackend, build_request_body, classify_bad_request, map_stop_reason,
+        output_cap_for_model, parse_retry_after,
     };
     use crate::model::{
         BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
@@ -1056,14 +1083,78 @@ mod tests {
         // serialization unit test and MUST NOT be "fixed"; production's last
         // pre-model message is always a user text/tool_result block.
         assert_eq!(a_content[2]["cache_control"]["type"], "ephemeral");
+        // STABLE breakpoint: the last content block of the PENULTIMATE
+        // message — here the user message's tool_result. This is the one that
+        // survives when the final message varies between sibling calls.
+        assert_eq!(u_content[1]["cache_control"]["type"], "ephemeral");
         // No other block carries a breakpoint.
         assert_eq!(u_content[0]["cache_control"], Value::Null);
-        assert_eq!(u_content[1]["cache_control"], Value::Null);
         assert_eq!(a_content[0]["cache_control"], Value::Null);
         assert_eq!(a_content[1]["cache_control"], Value::Null);
-        // Budget: static system + rolling last-block = exactly 2.
+        // Budget: static system + stable penultimate + rolling last-block =
+        // exactly 3, one under Anthropic's limit of four.
         let cc_count = body_text.matches("\"cache_control\"").count();
-        assert_eq!(cc_count, 2, "expected exactly 2 cache_control breakpoints");
+        assert_eq!(cc_count, 3, "expected exactly 3 cache_control breakpoints");
+    }
+
+    /// The shape somnus's rung 2 sends: N sibling calls over one injected
+    /// loop-input, differing only in the final instruction. The breakpoint
+    /// that matters is the one on the `tool_result`, because it is the last
+    /// block BEFORE the part that varies — without it every cached prefix
+    /// contains that call's own instruction and no sibling can ever read it.
+    #[tokio::test]
+    async fn sibling_calls_cache_the_prefix_that_ends_before_the_varying_tail() {
+        let messages = vec![
+            Message::Assistant {
+                content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                    id: "somnus-loop-input-1".to_string(),
+                    name: "load_loop_input".to_string(),
+                    input: json!({"project_ref": "photoqueue"}),
+                })],
+            },
+            Message::User {
+                content: vec![UserBlock::ToolResult {
+                    call_id: "somnus-loop-input-1".to_string(),
+                    content: "THE-STABLE-PAYLOAD".to_string(),
+                    is_error: false,
+                }],
+            },
+            Message::User {
+                content: vec![UserBlock::Text("cluster one".to_string())],
+            },
+        ];
+        let params = SamplingParams {
+            max_tokens: 16,
+            temperature: None,
+            stop_sequences: vec![],
+        };
+        let tools: Vec<Value> = Vec::new();
+        let request = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &params,
+        };
+        let body = serde_json::to_value(build_request_body("claude-sonnet-5", &request))
+            .expect("the body serializes");
+        let msgs = body["messages"].as_array().expect("messages");
+
+        // The tool_result — the last block before the varying instruction.
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the stable prefix must end at the tool_result"
+        );
+        // And the rolling breakpoint still lands on the instruction itself.
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // No system block here, so exactly two.
+        assert!(body.get("system").is_none() || body["system"].is_null());
+        assert_eq!(
+            serde_json::to_string(&body)
+                .expect("body stringifies")
+                .matches("\"cache_control\"")
+                .count(),
+            2
+        );
     }
 
     // ---- request-shape: optional fields are omitted when absent -----------
@@ -1203,7 +1294,7 @@ mod tests {
     // breakpoint, and the whole body contains EXACTLY two cache_control
     // occurrences (static system + rolling last-block).
     #[tokio::test]
-    async fn two_breakpoints_attach_for_production_realistic_last_message() {
+    async fn three_breakpoints_attach_for_production_realistic_last_message() {
         let server = MockServer::start().await;
         mount_success(
             &server,
@@ -1257,9 +1348,20 @@ mod tests {
         let last_block = last_content.last().expect("last block present");
         assert_eq!(last_block["cache_control"]["type"], "ephemeral");
 
-        // Budget: exactly two breakpoints total.
+        // STABLE breakpoint on the penultimate message's last block — the
+        // prefix that survives when the final message varies.
+        let penultimate = &msgs[msgs.len() - 2];
+        let penultimate_block = penultimate["content"]
+            .as_array()
+            .expect("penultimate content array")
+            .last()
+            .expect("penultimate block present");
+        assert_eq!(penultimate_block["cache_control"]["type"], "ephemeral");
+
+        // Budget: exactly three breakpoints total, one under Anthropic's
+        // limit of four.
         let cc_count = body_text.matches("\"cache_control\"").count();
-        assert_eq!(cc_count, 2, "expected exactly 2 cache_control breakpoints");
+        assert_eq!(cc_count, 3, "expected exactly 3 cache_control breakpoints");
     }
 
     // ---- status-code arm coverage ----------------------------------------

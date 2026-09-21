@@ -190,6 +190,24 @@ async fn main() {
             run_single(&project, &machine, &state_dir, &token_file, armed).await
         }
     };
+
+    // The token file is a bridge to one child process, not state: unlink it
+    // the moment the last gate has run, so it does not outlive the process
+    // that needed it. Mode 0600 keeps other users out, but it is no defence
+    // against the owner reading the state dir later — which is exactly how a
+    // token leaked into a transcript on 2026-09-21, from an ad-hoc glob
+    // during forensics. A file that is not there cannot be read by accident.
+    //
+    // Best-effort by design: a failure here must not change the run's exit
+    // code, since the work is already done and the code is what the caller
+    // acts on. It is announced rather than swallowed, because a token still
+    // on disk is something the operator should know about.
+    if let Err(err) = std::fs::remove_file(&token_file) {
+        eprintln!(
+            "somnus: could not remove the kb-token file {}: {err}",
+            token_file.display()
+        );
+    }
     std::process::exit(exit_code);
 }
 

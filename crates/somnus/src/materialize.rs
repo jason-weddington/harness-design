@@ -291,6 +291,84 @@ pub fn validate_ops_for_cluster(cluster: &Cluster, ops: &[Op]) -> Result<(), Str
     Ok(())
 }
 
+/// The fewest entries a cluster must hold before somnus will mint a NEW map
+/// for it.
+///
+/// Set from measurement plus an asymmetry, not from taste. Across the 27 live
+/// hand-authored maps the body-pointer counts run min 1, median 5, max 20 — so
+/// humans do sometimes write a one-pointer map, but as a deliberate
+/// set-completing choice made with the whole map set in view, which a machine
+/// writing one map a night does not have.
+///
+/// What settles the number above the human minimum is that the two errors are
+/// not symmetric. **A bad map cannot be withdrawn**: the KB's write API
+/// refuses to deactivate a mental map, because deactivating one strips its
+/// outbound edges and orphans every detail entry it pointed at. A missed small
+/// cluster costs a `propose_gap` that a human can act on. Permanent damage on
+/// one side, a recoverable note on the other, so the floor sits above the
+/// minimum a human would choose rather than at it.
+pub const MIN_CLUSTER_MEMBERS_FOR_NEW_MAP: usize = 3;
+
+/// The refusal prose recorded when a cluster is too thin to mint a map.
+///
+/// Written in the same plain words the map-lint demands of the model — whole
+/// numbers, no backticks, no quotes, no dotted abbreviations — because this
+/// text crosses the same wire as model-written prose does.
+#[must_use]
+pub fn below_floor_reason(members: usize) -> String {
+    format!(
+        "The cluster holds {members} entries, fewer than the {MIN_CLUSTER_MEMBERS_FOR_NEW_MAP} a new map needs, so the grouping is recorded as a gap rather than mapped."
+    )
+}
+
+/// Substitute a `propose_gap` for a `create_map` the cluster is too thin to
+/// justify, returning the op set the pipeline should actually apply.
+///
+/// A floor is a structural invariant, so it lives here rather than in the
+/// rung-2 instruction: a prompt makes a thin map unlikely, and code makes it
+/// impossible. The KB's own cardinal-rule check is at least ONE pointer, so
+/// nothing downstream would refuse the one-pointer map this prevents.
+///
+/// The substitution is deliberate rather than a refusal. A cluster under the
+/// floor is still a real observation, and an op set that is only
+/// `propose_gap` is what the pipeline records as a decline — so the grouping
+/// reaches the ledger, stops being re-proposed every night, and surfaces for a
+/// human to act on. Refusing the cluster outright would throw all of that
+/// away.
+///
+/// Only the minting is refused. Pointers into maps that ALREADY exist, and
+/// struck gaps, survive untouched: adding to an existing map is not the thing
+/// the floor guards against. A `no_change` is dropped alongside the
+/// `create_map`, so the substituted set reads as a clean decline.
+#[must_use]
+pub fn enforce_min_cluster_size(cluster: &Cluster, ops: Vec<Op>) -> Vec<Op> {
+    if cluster.member_entry_ids.len() >= MIN_CLUSTER_MEMBERS_FOR_NEW_MAP {
+        return ops;
+    }
+    let Some(cluster_id) = ops.iter().find_map(|op| match op {
+        Op::CreateMap { cluster_id, .. } => Some(cluster_id.clone()),
+        _ => None,
+    }) else {
+        return ops;
+    };
+    let minted = new_map_id(&cluster_id);
+    let mut kept: Vec<Op> = ops
+        .into_iter()
+        .filter(|op| match op {
+            Op::CreateMap { .. } | Op::NoChange { .. } => false,
+            Op::AddPointer { map_id, .. } => map_id != &minted,
+            Op::StrikeGap { .. } | Op::ProposeGap { .. } => true,
+        })
+        .collect();
+    if !kept.iter().any(|op| matches!(op, Op::ProposeGap { .. })) {
+        kept.push(Op::ProposeGap {
+            reason: below_floor_reason(cluster.member_entry_ids.len()),
+            cluster_id,
+        });
+    }
+    kept
+}
+
 /// One composed body: the map it belongs to and the full body text.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ComposedBody {
@@ -1036,5 +1114,134 @@ mod tests {
             body: "x".to_string(),
         };
         assert!(write_composed_body(root.path(), "demo-project", &composed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    fn cluster(members: &[&str], owning: Option<&str>) -> Cluster {
+        Cluster {
+            label: "thin".to_string(),
+            member_entry_ids: members.iter().map(|id| (*id).to_string()).collect(),
+            owning_map_id: owning.map(str::to_string),
+        }
+    }
+
+    fn create_map() -> Op {
+        Op::CreateMap {
+            cluster_id: "c1".to_string(),
+            title: "Thin Cluster".to_string(),
+            orientation_prose: "PROSE".to_string(),
+        }
+    }
+
+    fn pointer(map_id: &str, entry_id: &str) -> Op {
+        Op::AddPointer {
+            map_id: map_id.to_string(),
+            entry_id: entry_id.to_string(),
+            gloss: "GLOSS".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_two_entry_cluster_gets_a_gap_instead_of_a_map() {
+        let cluster = cluster(&["kb-10001", "kb-10002"], None);
+        let ops = enforce_min_cluster_size(
+            &cluster,
+            vec![
+                create_map(),
+                pointer("somnus-new-c1", "kb-10001"),
+                pointer("somnus-new-c1", "kb-10002"),
+            ],
+        );
+        assert_eq!(
+            ops,
+            vec![Op::ProposeGap {
+                cluster_id: "c1".to_string(),
+                reason: below_floor_reason(2),
+            }],
+            "the map and every pointer into it must be gone"
+        );
+    }
+
+    /// An op set that is ONLY `propose_gap` is what the pipeline records as a
+    /// decline, so the substituted set has to be exactly that — otherwise the
+    /// thin cluster is re-proposed every night forever.
+    #[test]
+    fn the_substituted_set_reads_as_a_clean_decline() {
+        let cluster = cluster(&["kb-10001"], None);
+        let ops = enforce_min_cluster_size(
+            &cluster,
+            vec![
+                create_map(),
+                Op::NoChange {
+                    cluster_id: "c1".to_string(),
+                },
+            ],
+        );
+        assert!(
+            ops.iter().all(|op| matches!(op, Op::ProposeGap { .. })),
+            "a stray no_change would stop the decline being recorded; got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_at_the_floor_is_untouched() {
+        let cluster = cluster(&["kb-10001", "kb-10002", "kb-10003"], None);
+        let ops = vec![create_map(), pointer("somnus-new-c1", "kb-10001")];
+        assert_eq!(enforce_min_cluster_size(&cluster, ops.clone()), ops);
+    }
+
+    /// The floor guards MINTING, not contributing. A thin cluster may still
+    /// legitimately add pointers to a map that already exists.
+    #[test]
+    fn pointers_into_an_existing_map_survive_the_substitution() {
+        let cluster = cluster(&["kb-10001", "kb-10002"], None);
+        let ops = enforce_min_cluster_size(
+            &cluster,
+            vec![
+                create_map(),
+                pointer("somnus-new-c1", "kb-10001"),
+                pointer("kb-20001", "kb-10002"),
+            ],
+        );
+        assert_eq!(
+            ops,
+            vec![
+                pointer("kb-20001", "kb-10002"),
+                Op::ProposeGap {
+                    cluster_id: "c1".to_string(),
+                    reason: below_floor_reason(2),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thin_cluster_the_model_already_declined_is_left_alone() {
+        let cluster = cluster(&["kb-10001"], None);
+        let ops = vec![Op::ProposeGap {
+            cluster_id: "c1".to_string(),
+            reason: "the model's own words".to_string(),
+        }];
+        assert_eq!(enforce_min_cluster_size(&cluster, ops.clone()), ops);
+    }
+
+    /// The reason crosses the same wire as model-written prose, so it must
+    /// obey the same purity rules the rung-2 instruction imposes.
+    #[test]
+    fn the_refusal_prose_obeys_the_map_lint_rules() {
+        let reason = below_floor_reason(2);
+        assert!(!reason.contains('`'));
+        assert!(!reason.contains('"'));
+        assert!(!reason.contains('/'));
+        assert!(!reason.contains("e.g."));
+        assert!(!reason.contains("i.e."));
+        assert!(
+            !reason.chars().any(|c| c == '_'),
+            "no ALL CAPS UNDERSCORE tokens"
+        );
     }
 }

@@ -766,3 +766,26 @@ async fn a_401_worklist_exits_1_with_the_pinned_line() {
     assert_eq!(value["stop_reason"], "fault:1");
     assert_eq!(value["exit_code"], 1);
 }
+
+/// The token bridge to the gate child must not outlive the process. Mode 0600
+/// keeps other users out but is no defence against the owner reading the state
+/// dir afterwards — which is how a token reached a transcript once. Asserted
+/// on a failing run, because that is the path most likely to skip cleanup.
+#[tokio::test]
+async fn the_kb_token_file_does_not_survive_the_run() {
+    let server = worklist_server("denied", 401).await;
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut env = required_env(&server.uri());
+    env.push((
+        "SOMNUS_STATE_DIR".to_string(),
+        state.path().to_str().expect("utf8").to_string(),
+    ));
+    let (code, _stdout, stderr) = run_cli_with(&["nightly"], &env);
+    assert_eq!(code, Some(1), "{stderr}");
+    // The record proves the run got past the token write and ran to the end.
+    assert!(state.path().join("nightly-invocation.json").exists());
+    assert!(
+        !state.path().join("kb-token").exists(),
+        "the kb-token file outlived the process that needed it"
+    );
+}

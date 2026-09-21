@@ -807,6 +807,10 @@ async fn run_unit_inner(
                 }
             }
         }
+        // The size floor substitutes a gap for a map the cluster is too thin
+        // to justify, BEFORE the guard below sees the op set — a bad map
+        // cannot be withdrawn, a gap can be acted on.
+        let ops = crate::materialize::enforce_min_cluster_size(cluster, ops);
         // The lead-disposition guard rejects the whole op set BEFORE any
         // op is applied: an owned cluster must converge, never re-propose.
         let reason = parse_error
@@ -3181,7 +3185,7 @@ mod tests {
         // names a tool outside the closed vocabulary, the third emits real
         // ops. Only the third composes a body, and the run continues.
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null},
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
             {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null},
             {"label": "c", "member_entry_ids": ["kb-10005"], "owning_map_id": null}
         ])
@@ -3255,7 +3259,7 @@ mod tests {
         // create_map is rejected BEFORE any op is applied — partial
         // coverage must converge, not re-propose.
         let clusters = json!([
-            {"label": "home-network", "member_entry_ids": ["kb-10001", "kb-10002"], "owning_map_id": "kb-20001"}
+            {"label": "home-network", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": "kb-20001"}
         ])
         .to_string();
         let backend = MockBackend::from_turns(vec![
@@ -3305,7 +3309,7 @@ mod tests {
         // the second application meets the server's 409 as an ORDINARY
         // ADMISSION — recorded verbatim, outcome still Ready, exit 0.
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null}
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
         ])
         .to_string();
         let backend = MockBackend::from_turns(vec![
@@ -3410,7 +3414,7 @@ mod tests {
         // (recorded) with zero POSTs for it — while the outcome stays
         // Ready and the exit stays 0.
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null},
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
             {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null},
         ])
         .to_string();
@@ -3491,7 +3495,7 @@ mod tests {
         // EmptyPointerList refusal lands in the report and nothing is
         // composed or gated.
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null}
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
         ])
         .to_string();
         let backend = MockBackend::from_turns(vec![
@@ -3658,7 +3662,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_rung2_offload_is_announced_and_the_run_continues() {
         let clusters = json!([
-            {"label": "a", "member_entry_ids": ["kb-10001"], "owning_map_id": null},
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
             {"label": "b", "member_entry_ids": ["kb-10002"], "owning_map_id": null}
         ])
         .to_string();
