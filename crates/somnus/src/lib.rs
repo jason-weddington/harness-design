@@ -35,7 +35,7 @@
 //! own `initial_messages` from `prompt::render_task_prompt` internally (its
 //! `RunConfig` exposes no history seam and `run_loop_impl` is private), so
 //! there is no engine loop here and therefore no nudge or compaction
-//! machinery to configure. `SOMNUS_MAX_ITERATIONS` survived and was
+//! machinery to configure. The per-unit inference budget survived and was
 //! repurposed as the per-unit inference budget instead.
 
 pub mod admission;
@@ -240,12 +240,26 @@ pub fn resolve_state_dir(
     }
 }
 
-/// Hard cap on `ModelBackend::turn` calls inside ONE `run_unit`
-/// ([`crate::unit::run_unit`]): 1 rung-1 inference plus at most 23 rung-2
-/// inferences (one per cluster). Enforced by the pipeline BEFORE each rung-2
-/// turn, count-based (no clock), so a runaway cluster list aborts the unit
-/// with a named reason instead of a silent over-spend.
-pub const SOMNUS_MAX_ITERATIONS: u32 = 24;
+/// How many clusters ONE `run_unit` will pay a rung-2 inference for.
+///
+/// **Raised from an effective 23 on 2026-09-21, and re-expressed in the unit
+/// that actually governs.** Rung 2 is exactly one call per cluster, so a cap
+/// on CALLS was a cap on clusters with an off-by-one hiding in it — and the
+/// number was a compiled guess made before anyone had seen a real project's
+/// cluster count. Photoqueue produced 23, which is to say the guess was
+/// wrong by about one cluster on the first project that tested it.
+///
+/// The ceiling that should stop a runaway is MONEY, not a call count: a call
+/// count stops legitimate work at a boundary that has nothing to do with
+/// what the work is worth, and run 5 spent $1.62 against a $2.00 ceiling
+/// while being cut short by this. So this is now a genuine runaway guard —
+/// a rung 1 returning 64 clusters for one project has misunderstood the
+/// project — rather than a working limit anything normal reaches.
+///
+/// When it does bind, the clusters beyond it are the ones rung 1 ranked
+/// LAST, because the list arrives in merit order. That is the job merit
+/// order was always for; it just never had a truncation to govern before.
+pub const SOMNUS_MAX_CLUSTERS_PER_UNIT: usize = 64;
 
 /// The nightly wall-clock budget, in seconds: 4 hours. Consumed by
 /// [`crate::unit::run_unit`]'s `tokio::time::timeout` wrapper, so an expiry
@@ -312,7 +326,7 @@ mod tests {
 
     #[test]
     fn named_constants_match_the_pinned_values() {
-        assert_eq!(SOMNUS_MAX_ITERATIONS, 24);
+        assert_eq!(SOMNUS_MAX_CLUSTERS_PER_UNIT, 64);
         assert_eq!(NIGHTLY_WALL_CLOCK_SECS, 14_400);
         assert_eq!(NIGHTLY_COST_BUDGET_MICROS_DEFAULT, 2_000_000);
         assert_eq!(RUN_COST_BUDGET_MICROS_DEFAULT, 2_000_000);

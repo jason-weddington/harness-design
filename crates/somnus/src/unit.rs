@@ -44,7 +44,7 @@ use crate::rungs::{parse_clusters, rung1_raw_path, rung1_turn, rung2_raw_path, r
 pub const WALL_CLOCK_ABORT_MSG: &str = "somnus: nightly wall-clock budget exhausted (14400s)";
 
 /// The pinned abort reason for the per-unit inference budget.
-pub const BUDGET_ABORT_MSG: &str = "somnus: per-unit inference budget exhausted (24 backend calls); aborting rung 2 for remaining clusters";
+pub const BUDGET_ABORT_MSG: &str = "somnus: per-unit cluster budget exhausted (64 clusters); aborting rung 2 for the lowest-ranked remaining clusters";
 
 /// Every collaborator one unit needs, injected. The model is a `MockBackend`
 /// in tests, the ledger an `InMemoryLedger`, the KB a wiremock server, the
@@ -798,7 +798,7 @@ async fn run_unit_inner(
     let verdicts = crate::admission::judge(&clusters);
     let mut budget_reason: Option<String> = None;
     for (index, cluster) in clusters.iter().enumerate() {
-        if report.backend_calls >= u64::from(crate::SOMNUS_MAX_ITERATIONS) {
+        if index >= crate::SOMNUS_MAX_CLUSTERS_PER_UNIT {
             budget_reason = Some(BUDGET_ABORT_MSG.to_string());
             break;
         }
@@ -3226,11 +3226,12 @@ mod tests {
     // ======================================================================
 
     #[tokio::test]
-    async fn the_inference_budget_aborts_rung2_at_twenty_four_calls() {
-        // A 30-cluster rung-1 answer: 1 rung-1 inference + at most 23
-        // rung-2 inferences = the 24-call cap, count-based (no clock).
+    async fn the_cluster_budget_truncates_the_lowest_ranked_tail() {
+        // A 70-cluster rung-1 answer against the 64-cluster cap. The list
+        // arrives in MERIT order, so the clusters that fall off the end are
+        // the ones rung 1 ranked last — the job merit order exists for.
         let mut clusters = Vec::new();
-        for index in 0..30 {
+        for index in 0..70 {
             clusters.push(json!({
                 "label": format!("cluster-{index}"),
                 "member_entry_ids": [format!("kb-1000{index}")],
@@ -3241,7 +3242,7 @@ mod tests {
             &Value::Array(clusters).to_string(),
             usage(1, 1, None, None),
         )];
-        for _ in 0..23 {
+        for _ in 0..64 {
             script.push(calls_turn(
                 &[("propose_gap", json!({"cluster_id": "c", "reason": "r"}))],
                 usage(1, 1, None, None),
@@ -3261,21 +3262,21 @@ mod tests {
             "demo-project",
         )
         .await;
-        assert_eq!(backend.calls(), 24, "1 rung-1 + 23 rung-2, then the cap");
-        assert_eq!(report.backend_calls, 24);
+        assert_eq!(backend.calls(), 65, "1 rung-1 + 64 rung-2, then the cap");
+        assert_eq!(report.backend_calls, 65);
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
                 reason: BUDGET_ABORT_MSG.to_string(),
             }
         );
-        // 24 calls for 23 processed clusters is exactly `1 + cluster_count`,
+        // 65 calls for 64 processed clusters is exactly `1 + cluster_count`,
         // so the tripwire stays silent: the cap fired, the discipline did
         // not break.
         assert_eq!(report.call_count_audit, None);
         assert_eq!(
             report.declines_recorded.len(),
-            23,
+            64,
             "the paid work before the cap is still recorded"
         );
     }
@@ -3844,14 +3845,14 @@ mod tests {
     fn the_budget_and_wall_clock_abort_messages_are_pinned() {
         assert_eq!(
             BUDGET_ABORT_MSG,
-            "somnus: per-unit inference budget exhausted (24 backend calls); aborting rung 2 for remaining clusters"
+            "somnus: per-unit cluster budget exhausted (64 clusters); aborting rung 2 for the lowest-ranked remaining clusters"
         );
         assert_eq!(
             WALL_CLOCK_ABORT_MSG,
             "somnus: nightly wall-clock budget exhausted (14400s)"
         );
         assert_eq!(crate::NIGHTLY_WALL_CLOCK_SECS, 14_400);
-        assert_eq!(crate::SOMNUS_MAX_ITERATIONS, 24);
+        assert_eq!(crate::SOMNUS_MAX_CLUSTERS_PER_UNIT, 64);
     }
 
     // ======================================================================

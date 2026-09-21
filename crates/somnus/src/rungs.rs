@@ -13,7 +13,7 @@
 //! Both rungs are SINGLE-SHOT: a parse failure is never retried (the
 //! pipeline aborts the unit or skips the cluster and offloads the raw model
 //! text), and the per-unit inference budget
-//! ([`crate::SOMNUS_MAX_ITERATIONS`]) is checked by the pipeline before
+//! ([`crate::SOMNUS_MAX_CLUSTERS_PER_UNIT`]) is checked by the pipeline before
 //! every rung-2 turn.
 //!
 //! Layering (pinned): this module references [`crate::loop_input`] and
@@ -169,6 +169,21 @@ pub fn pinned_cluster_id(cluster_index: usize) -> String {
 /// decline, which retired nine legitimate subject areas in a single run
 /// before a human ever saw a map.
 ///
+/// **The length sentence names a TARGET, not the limit, and that distinction
+/// cost 8 of 11 bodies on run 5.** The map-lint's budget is
+/// `900 + 175 × pointers`, which is roughly two and a half times what a
+/// human actually writes — all 30 hand-authored maps in the corpus come in
+/// UNDER it by 500 to 2,500 characters, at about `400 + 60 × pointers`. The
+/// model was told nothing about length, optimised against the only number in
+/// sight, and wrote 1,841 to 3,398 characters where a human writes 600 to
+/// 900. Eight bodies were rejected `over_budget`.
+///
+/// So the numbers here are the measured human norm rather than the ceiling:
+/// orientation prose under 600 characters, each gloss under 120. For a
+/// six-pointer map that lands near 1,320 against a 1,950 budget. **Aiming at
+/// a limit is how you get rejections; aim at half of it.** The budget is
+/// advisory in name and fatal in effect, because the gate is mandatory.
+///
 /// The purity sentence is not style advice — it is the cheapest place to
 /// prevent a gate rejection. The map-lint is grammar-agnostic (six purity
 /// regexes plus a length budget; it never parses our section headings or
@@ -196,7 +211,7 @@ pub fn render_rung2_instruction(cluster: &Cluster, cluster_index: usize) -> Stri
         ),
     };
     format!(
-        "You are given one cluster and the project's loop-input as tool results. The cluster is labelled {} and covers {members}. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap, no_change) as tool calls. Do not write a map body; code composes bodies. {disposition} In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
+        "You are given one cluster and the project's loop-input as tool results. The cluster is labelled {} and covers {members}. Emit ops from the closed vocabulary (add_pointer, create_map, strike_gap, propose_gap, no_change) as tool calls. Do not write a map body; code composes bodies. {disposition} Be brief: keep the orientation prose under 600 characters and each gloss under 120 characters. A map is a directory card, not a summary, and a body that runs long is rejected outright rather than trimmed. In every gloss and every line of orientation prose you write, use plain words only: no abbreviations containing a period such as e.g. or i.e., no backticks, no double quotes, no ALL_CAPS_UNDERSCORE tokens, no absolute paths beginning with / or ~/, and no decimal numbers. Whole numbers are fine. Spell out 'for example' and 'that is'.",
         cluster.label
     )
 }
