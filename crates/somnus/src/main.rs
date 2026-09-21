@@ -173,7 +173,11 @@ async fn main() {
     // `exec::run`'s env_clear preserves only TERM/PATH/HOME and keeping the
     // path (never the token) in the script keeps it out of argv,
     // `command_display`, the transcript, and gitleaks.
-    let token_file = state_dir.join("kb-token");
+    // Process-unique, so two somnus runs sharing a state dir cannot unlink
+    // the token out from under each other's gates. A shared `kb-token` made
+    // the exit-time cleanup below into a cross-process hazard: whichever run
+    // finished first removed the file the other's gates were still reading.
+    let token_file = state_dir.join(format!("kb-token-{}", std::process::id()));
     if let Err(err) = write_token_file(&token_file, &machine.kb_api_key) {
         eprintln!(
             "somnus: could not write the kb-token file {}: {err}",

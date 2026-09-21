@@ -456,6 +456,17 @@ pub fn render_cost_budget_line(armed: u64, spent: u64) -> String {
     format!("somnus: cost budget exhausted (armed {armed} micro-dollars, spent {spent})")
 }
 
+/// The pinned reason naming the first body whose gate could not be
+/// EVALUATED — an infrastructure fault, never a verdict on the body.
+#[must_use]
+pub fn render_gate_unevaluated_line(map_id: &str, exit_code: Option<i32>, excerpt: &str) -> String {
+    let code = exit_code.map_or_else(|| "none".to_string(), |code| code.to_string());
+    let excerpt = excerpt.trim();
+    format!(
+        "somnus: the map-lint gate for {map_id} could not be evaluated (exit {code}); this is an infrastructure fault, not a verdict on the body: {excerpt}"
+    )
+}
+
 /// The pinned reason naming the FIRST red gate body, in
 /// `composed_bodies` order.
 #[must_use]
@@ -1013,9 +1024,31 @@ async fn run_unit_inner(
             }
         }
     }
+    let mut unevaluated_gate: Option<String> = None;
     for record in &report.composed_bodies {
         let runner = (deps.gate_for)(&record.body_path);
         let gate_report = runner.run(deps.tool_ctx).await;
+        // A gate that could not be EVALUATED is not a gate that FAILED, and
+        // collapsing the two is the fail-open shape on the one component
+        // whose entire job is refusing. On 2026-09-21 the token file went
+        // missing mid-run, every gate answered "Not authenticated", and all
+        // eleven were recorded as bodies the lint had rejected — a red
+        // verdict nobody had actually asked for.
+        //
+        // So anything that is not a pass or a lint refusal is an
+        // INFRASTRUCTURE fault: it aborts the unit before a single op is
+        // applied, rather than silently converting every body into a
+        // rejection and reporting a tidy run.
+        let evaluated = !gate_report.timed_out
+            && (gate_report.exit_code == Some(crate::gate::GATE_PASSED)
+                || gate_report.exit_code == Some(crate::gate::GATE_REFUSED));
+        if !evaluated && unevaluated_gate.is_none() {
+            unevaluated_gate = Some(render_gate_unevaluated_line(
+                &record.map_id,
+                gate_report.exit_code,
+                &gate_report.excerpt,
+            ));
+        }
         report.gate_reports.push(GateReportRecord {
             map_id: record.map_id.clone(),
             passed: gate_report.passed,
@@ -1024,6 +1057,11 @@ async fn run_unit_inner(
             excerpt: gate_report.excerpt,
             offload_path: gate_report.offload_path,
         });
+    }
+    if let Some(reason) = unevaluated_gate {
+        eprintln!("{reason}");
+        report.outcome = UnitOutcome::Aborted { reason };
+        return finalize(report);
     }
 
     // (12.5) The application step: every composed body whose gate report
@@ -1489,7 +1527,8 @@ mod tests {
     }
 
     /// A gate factory whose children run `/bin/sh -c "{script}"`: `exit 0`
-    /// is a green leg, `exit 22` is the `curl -f` 422 shape. No real curl is
+    /// is a green leg, `exit 1` is the map-lint REFUSAL shape (exit 3 is a
+    /// gate that could not be evaluated at all). No real curl is
     /// ever executed.
     fn gate_for_script(script: &'static str) -> impl Fn(&Path) -> ChecksRunner {
         move |_: &Path| {
@@ -2137,6 +2176,72 @@ mod tests {
         assert!(reason.contains("because it has no map"), "{reason}");
     }
 
+    /// THE fail-open regression. A gate that could not be EVALUATED — the
+    /// token file gone, a 401, a dead endpoint — must abort the unit, not be
+    /// recorded as a body the lint rejected.
+    ///
+    /// On 2026-09-21 the token vanished mid-run, all eleven gates answered
+    /// "Not authenticated", and every one was recorded as a red verdict. The
+    /// gate is the one component whose whole job is refusing, and it had no
+    /// way to say "I could not ask".
+    #[tokio::test]
+    async fn a_gate_that_cannot_be_evaluated_aborts_instead_of_reading_as_a_verdict() {
+        let clusters = json!([
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null}
+        ])
+        .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters, usage(1, 1, None, None)),
+            calls_turn(
+                &[
+                    (
+                        "create_map",
+                        json!({"cluster_id": "c0", "title": "t", "orientation_prose": "PROSE"}),
+                    ),
+                    (
+                        "add_pointer",
+                        json!({"map_id": "somnus-new-c0", "entry_id": "kb-10001", "gloss": "g"}),
+                    ),
+                ],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        // The shape a missing token or a 401 produces.
+        let gate = gate_for_script("echo 'somnus-gate: token file is unreadable'; exit 3");
+        // Scripted with NOTHING: any POST at all would panic the stub, which
+        // is the assertion this test most wants to make.
+        let map_ops = RecordingMapOps::scripted(vec![]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        let UnitOutcome::Aborted { reason } = &report.outcome else {
+            panic!("an un-evaluable gate must abort, got {:?}", report.outcome);
+        };
+        assert!(reason.contains("could not be evaluated"), "{reason}");
+        assert!(
+            reason.contains("infrastructure fault, not a verdict"),
+            "{reason}"
+        );
+        // And NOTHING was written: the whole point is that an un-asked gate
+        // never becomes a decision about the body either way.
+        assert!(
+            map_ops.requests().is_empty(),
+            "no op may be applied when the gate could not be evaluated: {:?}",
+            map_ops.requests()
+        );
+        assert!(report.applied.is_empty());
+    }
+
     #[tokio::test]
     async fn a_red_gate_stub_records_a_failed_gate_report() {
         let backend = MockBackend::from_turns(vec![
@@ -2156,7 +2261,7 @@ mod tests {
         let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
         let ledger = InMemoryLedger::new();
         let body_root = tempfile::tempdir().expect("tempdir");
-        let gate = gate_for_script("exit 22");
+        let gate = gate_for_script("exit 1");
         let report = run_with(
             &backend,
             source,
@@ -2169,7 +2274,7 @@ mod tests {
         assert_eq!(report.composed_bodies.len(), 1);
         assert_eq!(report.gate_reports.len(), 1);
         assert!(!report.gate_reports[0].passed, "`curl -f` maps 422 to red");
-        assert_eq!(report.gate_reports[0].exit_code, Some(22));
+        assert_eq!(report.gate_reports[0].exit_code, Some(1));
         // GATE-THEN-APPLY: a red gate body is NOT applied, and the unit
         // aborts with the pinned first-red-body reason.
         assert_eq!(
@@ -2226,7 +2331,7 @@ mod tests {
         // below distinguishes by path.)
         let gate = |body_path: &Path| {
             let script = if body_path.to_string_lossy().contains("somnus-new-0-c1") {
-                "exit 22"
+                "exit 1"
             } else {
                 "exit 0"
             };
@@ -2301,7 +2406,7 @@ mod tests {
         let ledger = InMemoryLedger::new();
         let body_root = tempfile::tempdir().expect("tempdir");
         let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
-        let gate = gate_for_script("exit 22");
+        let gate = gate_for_script("exit 1");
         let report = run_with_map_ops(
             &backend,
             source,

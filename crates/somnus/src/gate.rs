@@ -43,33 +43,76 @@ use crate::ops::{MapOpSink, OpTool};
 /// pass and keeps a hung endpoint from hanging a finish.
 pub const SOMNUS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Exit code meaning the map-lint ACCEPTED the body.
+pub const GATE_PASSED: i32 = 0;
+/// Exit code meaning the map-lint REFUSED the body — a real verdict.
+pub const GATE_REFUSED: i32 = 1;
+/// Exit code meaning the gate could not be EVALUATED at all: the token file
+/// is unreadable, curl could not reach the endpoint, or the server answered
+/// something that is not a lint verdict (a 401, a 500, a redirect).
+pub const GATE_UNEVALUATED: i32 = 3;
+
 /// The map-lint gate command for `kb_base` posting the composed body at
 /// `body_path`, authenticating with the token read from `token_path`.
 ///
-/// Program `/bin/sh`, args `["-c", "curl -s --fail-with-body -X POST
-/// {kb_base}/api/kb/map-lint -H \"Authorization: Bearer $(cat
-/// \"{token_path}\")\" --data-binary \"@{path}\""]`. The token is read from
-/// the file by the CHILD at runtime — the command string is constant per
-/// base and carries no secret. `--fail-with-body` (not `-f`) is deliberate:
-/// on HTTP ≥ 400 the exit verdict is IDENTICAL, but the response body (the
-/// map-lint server's 422 lint findings) flows to stdout and lands in the
-/// report's excerpt and state-dir offload instead of being discarded. The
-/// `@{path}` is double-quoted so no shell metacharacter in the body path can
-/// reach the child; the path is composed by
-/// [`crate::materialize::map_body_path`], whose parent directory is named by
-/// a charset-validated project ref.
+/// **The exit code is a verdict, not curl's opinion of the HTTP status, and
+/// that distinction is the whole point of this command.** The first version
+/// used `curl -s --fail-with-body`, which exits 22 for EVERY status at or
+/// above 400 — so a 422 carrying the lint's findings and a 401 saying the
+/// request never reached the lint were the same non-zero number. On
+/// 2026-09-21 the token file went missing mid-run, all eleven gates answered
+/// `{"detail":"Not authenticated"}`, and every one of them was recorded as a
+/// body the lint had rejected. The gate is the one component whose entire
+/// job is refusing, and it had no way to say "I could not ask".
+///
+/// So the script branches on the HTTP status itself:
+/// [`GATE_PASSED`] for 2xx, [`GATE_REFUSED`] for 422 — the only status that
+/// IS a lint verdict — and [`GATE_UNEVALUATED`] for anything else, including
+/// a missing token file, which is checked first and by name so the failure
+/// reads as itself rather than as an authentication error downstream of it.
+///
+/// The response body still reaches stdout ahead of the status line, so the
+/// lint's findings land in the report excerpt and the state-dir offload
+/// exactly as before.
+///
+/// POSIX `sh` only: `/bin/sh` is dash on the deployment hosts, so no
+/// `$'...'`, no `[[`, no arrays. The token is read from the file BY THE
+/// CHILD at runtime — the command string is constant per base and carries no
+/// secret.
 #[must_use]
 pub fn map_lint_command(kb_base: &str, body_path: &Path, token_path: &Path) -> CheckCommand {
+    let token = token_path.to_string_lossy();
+    let body = body_path.to_string_lossy();
+    let script = format!(
+        concat!(
+            "if [ ! -r \"{token}\" ]; then ",
+            "echo \"somnus-gate: token file {token} is unreadable; the gate could not be evaluated\"; ",
+            "exit {unevaluated}; fi; ",
+            "out=$(curl -s -w '\\n%{{http_code}}' -X POST {base}/api/kb/map-lint ",
+            "-H \"Authorization: Bearer $(cat \"{token}\")\" --data-binary \"@{body}\"); ",
+            "rc=$?; ",
+            "printf '%s\\n' \"$out\"; ",
+            "if [ $rc -ne 0 ]; then ",
+            "echo \"somnus-gate: curl exited $rc; the gate could not be evaluated\"; ",
+            "exit {unevaluated}; fi; ",
+            "code=$(printf '%s' \"$out\" | tail -n 1); ",
+            "case \"$code\" in ",
+            "2??) exit {passed} ;; ",
+            "422) exit {refused} ;; ",
+            "*) echo \"somnus-gate: status $code is not a lint verdict; the gate could not be evaluated\"; ",
+            "exit {unevaluated} ;; ",
+            "esac"
+        ),
+        token = token,
+        body = body,
+        base = kb_base,
+        passed = GATE_PASSED,
+        refused = GATE_REFUSED,
+        unevaluated = GATE_UNEVALUATED,
+    );
     CheckCommand {
         program: "/bin/sh".to_string(),
-        args: vec![
-            "-c".to_string(),
-            format!(
-                "curl -s --fail-with-body -X POST {kb_base}/api/kb/map-lint -H \"Authorization: Bearer $(cat \"{}\")\" --data-binary \"@{}\"",
-                token_path.to_string_lossy(),
-                body_path.to_string_lossy()
-            ),
-        ],
+        args: vec!["-c".to_string(), script],
     }
 }
 
@@ -154,10 +197,10 @@ mod tests {
         assert_eq!(command.program, "/bin/sh");
         assert_eq!(command.args[0], "-c");
         let script = &command.args[1];
-        assert!(script.contains("curl -s --fail-with-body -X POST"));
+        assert!(script.contains("curl -s -w '\\n%{http_code}' -X POST"));
         assert!(script.contains("http://kb.invalid/api/kb/map-lint"));
         // The token is pinned to the CHILD runtime, never argv, and read
-        // from the state dir's kb-token FILE the binary wrote.
+        // from the state dir's token FILE the binary wrote.
         assert!(script.contains("Bearer $(cat"));
         assert!(script.contains("$(cat \"/tmp/somnus/kb-token\")"));
         // The body posts from a FILE: `exec::run` spawns with
@@ -165,9 +208,56 @@ mod tests {
         // so the composed body must be on disk and double-quoted here.
         assert!(script.contains("--data-binary"));
         assert!(script.contains("--data-binary \"@/tmp/somnus/demo-project/kb-20001.json\""));
-        // `--fail-with-body`, not `-f`: identical exit verdict on HTTP >= 400,
-        // but the 422 lint findings reach the report's excerpt.
+        // `--fail-with-body` is GONE. It exits 22 for every status at or
+        // above 400, which made a 422 lint verdict and a 401 "I never
+        // reached the lint" the same number — the fail-open shape that
+        // recorded eleven un-asked gates as rejections.
+        assert!(!script.contains("--fail-with-body"));
         assert!(!script.contains("curl -sf"));
+    }
+
+    /// The three exit codes are the contract between this script and the
+    /// pipeline, so they are pinned by value: the pipeline treats anything
+    /// that is not PASSED or REFUSED as an infrastructure fault.
+    #[test]
+    fn the_gate_exit_codes_are_pinned_and_distinct() {
+        assert_eq!(GATE_PASSED, 0);
+        assert_eq!(GATE_REFUSED, 1);
+        assert_eq!(GATE_UNEVALUATED, 3);
+    }
+
+    /// The missing-token branch is checked FIRST and names the file, so the
+    /// failure reads as itself rather than as the authentication error
+    /// downstream of it.
+    #[test]
+    fn a_missing_token_is_named_before_curl_is_reached() {
+        let command = map_lint_command(
+            "http://kb.invalid",
+            std::path::Path::new("/tmp/b.json"),
+            std::path::Path::new("/tmp/t"),
+        );
+        let script = &command.args[1];
+        let guard = script
+            .find("[ ! -r \"/tmp/t\" ]")
+            .expect("the guard is present");
+        let curl = script.find("curl").expect("curl is present");
+        assert!(guard < curl, "the token guard must precede the request");
+        assert!(script.contains("token file /tmp/t is unreadable"));
+    }
+
+    /// Only 422 is a lint verdict. Every other status — a 401, a 500, a
+    /// redirect — means the body was never judged.
+    #[test]
+    fn only_422_is_treated_as_a_verdict() {
+        let command = map_lint_command(
+            "http://kb.invalid",
+            std::path::Path::new("/tmp/b.json"),
+            std::path::Path::new("/tmp/t"),
+        );
+        let script = &command.args[1];
+        assert!(script.contains("2??) exit 0 ;;"));
+        assert!(script.contains("422) exit 1 ;;"));
+        assert!(script.contains("is not a lint verdict"));
     }
 
     #[test]
@@ -181,7 +271,7 @@ mod tests {
         assert_eq!(runner.command().program, "/bin/sh");
         assert!(runner.command().args[1].contains("http://kb.invalid/api/kb/map-lint"));
         assert!(runner.command().args[1].contains("--data-binary"));
-        assert!(runner.command().args[1].contains("--fail-with-body"));
+        assert!(runner.command().args[1].contains("%{http_code}"));
     }
 
     // --- the registry shape: exactly six tools, closed vocabulary ---

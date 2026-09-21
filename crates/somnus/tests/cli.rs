@@ -672,19 +672,30 @@ async fn a_broken_offload_child_exits_2() {
     );
 }
 
-/// A kb-token target that cannot be written (a DIRECTORY named `kb-token`)
-/// exits 2 before any fetch.
+/// A token file that cannot be written exits 2 before any fetch.
+///
+/// The token's name carries the PID (so concurrent runs cannot unlink each
+/// other's), which means a test cannot pre-create a colliding path. Instead
+/// the offload dir is created first — so somnus gets past it — and the state
+/// dir is then made read-only, leaving the token write as the first thing
+/// that can fail.
 #[tokio::test]
 async fn an_unwritable_kb_token_exits_2_before_any_fetch() {
+    use std::os::unix::fs::PermissionsExt;
     let server = loop_input_server(200, LOOP_INPUT_FIXTURE).await;
     let state = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir(state.path().join("kb-token")).expect("mkdir");
+    std::fs::create_dir(state.path().join("offload")).expect("mkdir offload");
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("chmod read-only");
     let mut env = required_env(&server.uri());
     env.push((
         "SOMNUS_STATE_DIR".to_string(),
         state.path().to_str().expect("utf8").to_string(),
     ));
     let (code, _stdout, stderr) = run_cli_with(&["nightly"], &env);
+    // Restore write permission so the tempdir can clean itself up.
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod writable");
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
         stderr.contains("could not write the kb-token file"),
