@@ -180,6 +180,8 @@ pub struct NightlyUnitRecord {
 /// alone. A pure `Serialize` struct — no store, no database.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NightlyInvocation {
+    /// The binary that produced this record ([`crate::SOMNUS_VERSION`]).
+    pub somnus_version: String,
     /// When the invocation started, as a u64 UNIX epoch in seconds (passed
     /// in by the binary from `SystemTime::now`).
     pub invoked_at_utc: u64,
@@ -236,6 +238,7 @@ pub fn build_invocation(
     exit_code: i32,
 ) -> NightlyInvocation {
     NightlyInvocation {
+        somnus_version: crate::SOMNUS_VERSION.to_string(),
         invoked_at_utc,
         subcommand: subcommand.to_string(),
         armed_budget,

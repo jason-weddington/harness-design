@@ -38,6 +38,18 @@
 //! machinery to configure. The per-unit inference budget survived and was
 //! repurposed as the per-unit inference budget instead.
 
+/// The binary's own version token, stamped by `build.rs` from
+/// `git describe --tags` — the same string `somnus --version` prints and the
+/// same one the artifact host publishes under.
+///
+/// Every record somnus writes carries it. Without it a report is a set of
+/// numbers with no way to say which build produced them, which forces an
+/// operator to choose between installing a fix and being able to attribute
+/// the run they are in the middle of. That is a false choice and it costs a
+/// night: a report that cannot be attributed is a measurement that cannot be
+/// compared, and a fix withheld to protect attribution is a fix not running.
+pub const SOMNUS_VERSION: &str = env!("SOMNUS_VERSION");
+
 pub mod admission;
 pub mod gate;
 pub mod ledger;

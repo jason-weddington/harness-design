@@ -789,3 +789,35 @@ async fn the_kb_token_file_does_not_survive_the_run() {
         "the kb-token file outlived the process that needed it"
     );
 }
+
+/// Every record somnus writes names the binary that wrote it.
+///
+/// Without this an operator has to choose between installing a fix and being
+/// able to attribute the run in flight — a false choice that costs a night,
+/// because a report nobody can attribute is a measurement nobody can compare.
+#[tokio::test]
+async fn every_record_names_the_binary_that_wrote_it() {
+    let server = worklist_server("denied", 401).await;
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut env = required_env(&server.uri());
+    env.push((
+        "SOMNUS_STATE_DIR".to_string(),
+        state.path().to_str().expect("utf8").to_string(),
+    ));
+    let (_code, _stdout, _stderr) = run_cli_with(&["nightly"], &env);
+    let record = std::fs::read_to_string(state.path().join("nightly-invocation.json"))
+        .expect("the record is on disk");
+    let value: serde_json::Value = serde_json::from_str(&record).expect("parses");
+    let version = value["somnus_version"].as_str().expect("a version string");
+    assert!(
+        !version.is_empty() && version == env!("SOMNUS_VERSION"),
+        "the record must carry this binary's own token, got {version}"
+    );
+    // The same string `--version` prints and the artifact host publishes
+    // under, so a report is reconcilable with a published binary.
+    let (_c, stdout, _e) = run_cli_with(&["--version"], &env);
+    assert!(
+        stdout.contains(version),
+        "{stdout} does not carry {version}"
+    );
+}

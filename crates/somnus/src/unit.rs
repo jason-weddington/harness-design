@@ -287,6 +287,10 @@ pub struct GateReportRecord {
 /// at what jaccard.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnitReport {
+    /// The binary that produced this report ([`crate::SOMNUS_VERSION`]), so
+    /// a run's numbers are attributable without anyone remembering what was
+    /// installed at the time.
+    pub somnus_version: String,
     /// The project this unit ran for.
     pub project_ref: String,
     /// How the unit ended.
@@ -386,6 +390,7 @@ impl UnitReport {
             cap_admissions: Vec::new(),
             apply_audit: Vec::new(),
             change: ChangeEvidence::default(),
+            somnus_version: crate::SOMNUS_VERSION.to_string(),
             backend_calls: 0,
             clusters_emitted: 0,
             usage_rung1: UsageTotals::default(),
