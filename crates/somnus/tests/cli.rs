@@ -429,7 +429,7 @@ impl wiremock::Respond for Sequenced {
 const LOOP_INPUT_FIXTURE: &str = somnus::loop_input::FIXTURE;
 
 /// The nightly worklist answer: one project, server-ranked first.
-const WORKLIST_ONE: &str = r#"{"projects":[{"project_ref":"demo-project","mappable":true,"unpointed":4,"map_count":2,"latest_map_written_at":"2026-09-19T03:14:15Z"}]}"#;
+const WORKLIST_ONE: &str = r#"{"projects":[{"project_ref":"demo-project","mappable_entries":26,"map_count":2,"latest_map_written_at":"2026-09-19T03:14:15Z"}]}"#;
 
 /// Serve the worklist with one project, then the loop-input sequence:
 /// FIRST GET 200 with the pinned fixture (the baseline observation
@@ -720,7 +720,7 @@ async fn a_stopping_unit_stops_the_nightly_and_writes_the_record() {
         .and(wiremock::matchers::path("/api/kb/map-worklist"))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
-                .set_body_string(r#"{"projects":[{"project_ref":"demo-project","mappable":true,"unpointed":4,"map_count":2,"latest_map_written_at":null}]}"#),
+                .set_body_string(r#"{"projects":[{"project_ref":"demo-project","mappable_entries":26,"map_count":2,"latest_map_written_at":null}]}"#),
         )
         .mount(&server)
         .await;

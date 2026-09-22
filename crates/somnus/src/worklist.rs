@@ -56,9 +56,20 @@ pub const WORKLIST_UNAUTHORIZED_MSG: &str =
 pub struct WorklistProject {
     /// The project ref.
     pub project_ref: String,
-    /// Whether the project is mappable (the server's verdict; overrides
-    /// respected server-side).
-    pub mappable: bool,
+    /// How many of the project's entries are mappable — a COUNT, not a
+    /// flag.
+    ///
+    /// It was typed `bool` here under the name `mappable`, which reads as a
+    /// predicate: *is this project mappable?* The spec said non-negative
+    /// integer in as many words, and the type was never ambiguous in
+    /// writing — the name fought the spec and the name won, so the first
+    /// supervised nightly aborted on `invalid type: integer 26, expected a
+    /// boolean`. The producer renamed the field rather than making the
+    /// documentation firmer, which is the same move as putting the pointers
+    /// in `create_map`'s signature: make the wrong reading unrepresentable
+    /// instead of arguing against it. A field name is part of the shape a
+    /// consumer expects, and shape outranks prose.
+    pub mappable_entries: u64,
     /// How many maps the project already has.
     pub map_count: u64,
     /// When the last map was written to the project, if ever. A
@@ -144,8 +155,8 @@ pub fn render_worklist_fault_line(reason: &str) -> String {
 
 /// Select the nightly projects: the FIRST THREE rows in verbatim server
 /// order — no sorting, no re-ranking, no most-unpointed-first heuristic,
-/// and no row filter (a `mappable == false` row, if the server ever sends
-/// one, is still taken and consumes a slot; filtering is the server's job
+/// and no row filter (a row with zero mappable entries, if the server ever
+/// sends one, is still taken and consumes a slot; filtering is the server's job
 /// because `/api/kb/map-worklist` IS the eligibility surface). See the
 /// module doc for why the heuristic is refused.
 #[must_use]
@@ -298,13 +309,13 @@ mod tests {
     /// A row fixture.
     fn row(
         project_ref: &str,
-        mappable: bool,
+        mappable_entries: u64,
         map_count: u64,
         latest_map_written_at: Option<&str>,
     ) -> WorklistProject {
         WorklistProject {
             project_ref: project_ref.to_string(),
-            mappable,
+            mappable_entries,
             map_count,
             latest_map_written_at: latest_map_written_at.map(str::to_string),
         }
@@ -313,16 +324,16 @@ mod tests {
     #[test]
     fn the_payload_parses_the_pinned_field_spellings_tolerating_null() {
         let text = r#"{"projects":[
-            {"project_ref":"never-mapped","mappable":true,"map_count":0,"latest_map_written_at":null},
-            {"project_ref":"stale","mappable":true,"map_count":2,"latest_map_written_at":"2026-09-19T03:14:15Z"}
+            {"project_ref":"never-mapped","mappable_entries":26,"map_count":0,"latest_map_written_at":null},
+            {"project_ref":"stale","mappable_entries":26,"map_count":2,"latest_map_written_at":"2026-09-19T03:14:15Z"}
         ]}"#;
         let parsed: WorklistResponse =
             serde_json::from_str(text).expect("the pinned spellings parse");
         assert_eq!(
             parsed.projects,
             vec![
-                row("never-mapped", true, 0, None),
-                row("stale", true, 2, Some("2026-09-19T03:14:15Z")),
+                row("never-mapped", 26, 0, None),
+                row("stale", 26, 2, Some("2026-09-19T03:14:15Z")),
             ]
         );
     }
@@ -339,13 +350,13 @@ mod tests {
     fn the_first_three_are_taken_verbatim_with_no_sort_and_no_filter() {
         // A fixture whose order would change under ANY known heuristic: the
         // never-mapped project is listed AFTER an oldest-mapped one, and a
-        // `mappable == false` row sits in the taken slice (the policy is
+        // a zero-mappable-entries row sits in the taken slice (the policy is
         // tested, not implied).
         let projects = vec![
-            row("oldest-mapped", true, 5, Some("2020-01-01T00:00:00Z")),
-            row("not-mappable", false, 0, None),
-            row("mid", true, 1, Some("2024-01-01T00:00:00Z")),
-            row("never-mapped-first-under-any-heuristic", true, 0, None),
+            row("oldest-mapped", 26, 5, Some("2020-01-01T00:00:00Z")),
+            row("not-mappable", 0, 0, None),
+            row("mid", 26, 1, Some("2024-01-01T00:00:00Z")),
+            row("never-mapped-first-under-any-heuristic", 26, 0, None),
         ];
         assert_eq!(
             select_first_projects(&projects),
@@ -359,7 +370,7 @@ mod tests {
 
     #[test]
     fn fewer_than_three_rows_are_all_taken() {
-        let projects = vec![row("only", true, 0, None)];
+        let projects = vec![row("only", 26, 0, None)];
         assert_eq!(select_first_projects(&projects), vec!["only".to_string()]);
         assert!(select_first_projects(&[]).is_empty());
     }
@@ -378,7 +389,7 @@ mod tests {
             .await;
     }
 
-    const WORKLIST_BODY: &str = r#"{"projects":[{"project_ref":"a","mappable":true,"map_count":0,"latest_map_written_at":null}]}"#;
+    const WORKLIST_BODY: &str = r#"{"projects":[{"project_ref":"a","mappable_entries":26,"map_count":0,"latest_map_written_at":null}]}"#;
 
     #[tokio::test]
     async fn a_200_parses_the_projects_in_server_order() {
@@ -386,7 +397,7 @@ mod tests {
         mount(&server, 200, WORKLIST_BODY).await;
         assert_eq!(
             fetch_worklist(&server.uri(), "kb-token").await,
-            WorklistOutcome::Ready(vec![row("a", true, 0, None)])
+            WorklistOutcome::Ready(vec![row("a", 26, 0, None)])
         );
         assert_eq!(server.received_requests().await.expect("captured").len(), 1);
     }
@@ -486,7 +497,7 @@ mod tests {
             1_760_000_000,
             "nightly",
             550_000,
-            vec![row("a", true, 0, None)],
+            vec![row("a", 26, 0, None)],
             vec!["a".to_string()],
             vec![NightlyUnitRecord {
                 project_ref: "a".to_string(),
