@@ -439,6 +439,7 @@ async fn nightly(
             project_ref: project_ref.clone(),
             outcome: report.outcome.clone(),
             billed_tokens: billed,
+            maps_created: somnus::worklist::maps_created(&report),
             report_path: report.report_path.clone(),
         });
         match &report.outcome {

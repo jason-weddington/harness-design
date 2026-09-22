@@ -180,8 +180,32 @@ pub struct NightlyUnitRecord {
     pub outcome: crate::unit::UnitOutcome,
     /// The unit's billed-token sum (rung 1 + rung 2).
     pub billed_tokens: u64,
+    /// How many maps the unit actually created.
+    ///
+    /// **`Ready` and `all_done` say the loop got through its work, NOT that
+    /// any work happened.** A project whose only cluster sits below the size
+    /// floor is worked correctly, mints nothing, and ends `Ready` — which is
+    /// right, since a quiet night is a success by contract. But an operator
+    /// reading the invocation record could not tell that project from one
+    /// that minted six maps without opening each per-project report, and the
+    /// invocation record is the artifact a human actually reads at 3am.
+    ///
+    /// Recorded alongside the outcome rather than folded into it: the
+    /// outcome answers "did anything fail", this answers "did anything
+    /// happen", and collapsing the two would lose one of them.
+    pub maps_created: usize,
     /// Where the unit's run report was written.
     pub report_path: PathBuf,
+}
+
+/// How many maps a unit created, from its applied-op record.
+#[must_use]
+pub fn maps_created(report: &crate::unit::UnitReport) -> usize {
+    report
+        .applied
+        .iter()
+        .filter(|applied| applied.op_kind == "create_map")
+        .count()
 }
 
 /// The nightly invocation record: written to
@@ -505,6 +529,7 @@ mod tests {
                     reason: "boom".to_string(),
                 },
                 billed_tokens: 12_345,
+                maps_created: 0,
                 report_path: PathBuf::from("/state/a/run-report.json"),
             }],
             STOP_REASON_ALL_DONE.to_string(),
@@ -578,5 +603,44 @@ mod tests {
             render_nightly_budget_stop_line(550_000, 612_004, "proj-b"),
             "somnus: token budget exhausted (armed 550000, billed 612004); stopping before proj-b"
         );
+    }
+    /// `Ready` says nothing failed; it does not say anything happened. A
+    /// project whose only cluster sits below the floor is worked correctly,
+    /// mints nothing, and ends `Ready` — and an operator reading the
+    /// invocation record could not tell it from a project that minted six.
+    #[test]
+    fn a_worked_project_that_minted_nothing_is_distinguishable() {
+        let mut report = crate::unit::UnitReport::new("quiet", PathBuf::from("/state/quiet.json"));
+        assert_eq!(maps_created(&report), 0);
+        report.applied.push(crate::unit::AppliedOpRecord {
+            op_kind: "add_pointer",
+            chain_index: 0,
+            submitted_map_id: "kb-20001".to_string(),
+            server_map_id: Some("kb-20001".to_string()),
+            version: Some(2),
+            pointer_count: Some(4),
+            budget: Some(1),
+            http_status: Some(200),
+            body: String::new(),
+            admission_reason: None,
+        });
+        assert_eq!(
+            maps_created(&report),
+            0,
+            "a pointer added to an existing map is not a new map"
+        );
+        report.applied.push(crate::unit::AppliedOpRecord {
+            op_kind: "create_map",
+            chain_index: 0,
+            submitted_map_id: "somnus-new-0".to_string(),
+            server_map_id: Some("kb-30001".to_string()),
+            version: Some(1),
+            pointer_count: Some(3),
+            budget: Some(0),
+            http_status: Some(201),
+            body: String::new(),
+            admission_reason: None,
+        });
+        assert_eq!(maps_created(&report), 1);
     }
 }
