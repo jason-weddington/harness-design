@@ -83,6 +83,24 @@ pub enum Op {
         /// This is the only part of the loop that speaks to a human rather
         /// than an agent. Every other line routes a reader to knowledge that
         /// exists; a gap line says where knowledge is missing.
+        ///
+        /// **Scope: WITHIN this map's subject area, and nothing wider.** A
+        /// gap here means "no entry in this cluster documents X". It cannot
+        /// mean "this project needs a map that does not exist" — that is a
+        /// PROJECT-level gap, and nothing in the op vocabulary can express
+        /// one. `propose_gap` needs a `map_id` so it is per-map by
+        /// construction, and `create_map` only ever mints maps for clusters
+        /// the model already found.
+        ///
+        /// The distinction matters because the two are easy to conflate and
+        /// the conflation is dangerous in one direction: **an empty `gaps`
+        /// array is NOT evidence that a project is fully covered.** A map
+        /// about catalog locking reporting `[]` says its own subject area
+        /// looks documented, and says nothing whatever about the project
+        /// lacking, say, a privacy map. Finding THAT requires reasoning about
+        /// what is absent from the clustering itself, which no rung does and
+        /// which a periodic adversarial review over the whole corpus has
+        /// twice done well.
         gaps: Vec<String>,
     },
     /// Strike a gap, citing the entry that closed it.
