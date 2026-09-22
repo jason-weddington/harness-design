@@ -1,20 +1,44 @@
 # harness-design
 
-A learning project to understand **agent harness design** by building one in Rust.
+**This started as a learning project and is now production infrastructure.** Treat it as the latter: things depend on it.
 
 ## What this is
 
 An agent harness — the loop that turns an LLM into an autonomous agent: prompt
 assembly, tool dispatch, model I/O, conversation/state management, and the safety
-rails around all of it. We build it to learn the design space hands-on, not because
-an off-the-shelf harness wouldn't work.
+rails around all of it. It was built to learn the design space hands-on rather than
+because an off-the-shelf harness wouldn't work, and that origin still shows in the
+design records. But the learning goal is no longer what the work serves.
+
+**What depends on this code today:**
+
+- **`talos` is a dispatch build engine on the fleet.** Four hosts run a published
+  binary that this repo cuts; GTD items on several boards route to `talos-glm`,
+  `talos-glm-flash` and `talos-qwen`, and a regression here stops real work.
+- **`talos` grooms this project's own backlog**, and another project's — the
+  talos-flow port of groom-to-ready is the default grooming engine here (see below),
+  so the harness argues the specs that then build the harness.
+- **`somnus` is a nightly production loop** built on `harness` as a library: the
+  personal KB's map-maintenance job, running unattended against a metered lane and
+  writing to a live knowledge base. It is the first external consumer, and the
+  reason several seams exist (`ChangeObserver`, the exported billed-token and
+  pricing definitions, the budget predicates).
+
+**The practical consequence:** a change here is not a study exercise whose cost is
+your own time. Breaking a seam breaks a consumer that runs at 3am with nobody
+watching, and "I learned something" is not a reason to ship. The quality gates,
+the three-legs-of-a-Done discipline, and the run-the-binary rule exist because of
+this, not in spite of it.
 
 ## Goals
 
-- **Learn agent harness design** by building a real one, in Rust.
-- **Concrete use case: a build engine for Agent GTD.** This harness should be able to
-  serve as another headless-dispatch build engine — the thing that picks up a groomed
-  GTD task and executes it autonomously, alongside the existing Claude Code engine.
+- **Serve the consumers above without regressions.** That is now the first goal.
+- **Concrete use case: a build engine for Agent GTD.** This harness serves as a
+  headless-dispatch build engine — the thing that picks up a groomed GTD task and
+  executes it autonomously, alongside the existing Claude Code engine.
+- **Keep learning the design space in the open.** The design records in `docs/design/`
+  and the session history are deliberate artefacts, not a by-product; see the session
+  discipline below for what that means now that the project ships.
 - **Model support, in order:**
   - Anthropic API — Haiku, Sonnet, Opus (claude-haiku-4-5, claude-sonnet-5,
     claude-opus-4-8).
@@ -93,28 +117,54 @@ supply-chain, secret scanning, commit hygiene) vs. what would just be ceremony.
 - Query the KB before guessing at architecture or conventions; capture hard-won
   lessons as you go.
 
-## Session log (this is a learning project — document the process)
+## End-of-session discipline
 
-We capture *how* we work, not just what we ship. At a natural breakpoint in each
-working session:
+Three artefacts, and **they are not three copies of the same thing**. Writing them as
+one narrative three times is what produced a "session" that ran for a month.
 
-1. Log a dated `lesson_learned` entry in the KB (`project_ref: harness-design`,
-   tags include `session-log`) covering that session's arc — what we did and why,
-   key decisions/lessons, where we landed, and **what's next** — so it doubles as
-   the handoff note for the following session.
-2. Append a 3-4 sentence summary + the KB entry id to
-   [`docs/session-summaries.md`](./docs/session-summaries.md) (chronological,
-   newest at the bottom).
-3. Bring [`docs/roadmap.md`](./docs/roadmap.md) current: rewrite its **"Where we
-   are"** header to the newest shipped version, mark any milestone that shipped
-   this session **✅ shipped**, and re-order/rescope what's next if the session
-   changed the plan. The roadmap is the living forward view; a session that ships
-   a capability but leaves the roadmap describing an older state has left the
-   handoff half-done.
+| Artefact | Audience | Tense | Answers |
+|---|---|---|---|
+| `docs/roadmap.md` "Where we are" | the next session | present | *what is true now* |
+| `docs/session-summaries.md` | Jason, months later | past | *what changed and why* |
+| KB `session-log` entry | whoever asks a question later | past | *everything else* |
 
-**When resuming a session, read the latest `docs/session-summaries.md` entry and
-its linked KB entry first**, then skim `docs/roadmap.md` "Where we are" for the
-current forward view. Session 1 (`kb-02851`) is the template.
+**A session is one sitting.** When you stop, it ends; when work resumes, that is the
+next session with the next number. There is no "Session 17, continued" — that heading
+is how one entry came to span 2026-08-20 through 2026-09-19 with twelve blocks under
+it, which is unreadable as history and useless as orientation.
+
+At the end of a sitting, in this order:
+
+1. **KB entry** — dated `lesson_learned`, `project_ref: harness-design`, tags include
+   `session-log`. This is where detail belongs: the arc, the decisions and why, the
+   numbers, the dead ends, what's next. Length is not a problem here. If a lesson is
+   durable on its own, give it its OWN entry (`decision`, `lesson_learned`) and let
+   the session log point at it — `kb-03486` and `kb-03473` are worth more standing
+   alone than buried in a day's narrative.
+2. **`docs/session-summaries.md`** — a `## Session N — date: title` heading and
+   **3–5 sentences, ~1,200 characters at the outside**, ending with the KB id. Match
+   the existing heading style; never a bare bold paragraph.
+3. **`docs/roadmap.md`** — rewrite "Where we are" to the newest shipped version, mark
+   shipped milestones, re-scope what's next. A session that ships a capability and
+   leaves the roadmap describing an older state has left the handoff half-done.
+
+**What belongs in the summary, now that this ships rather than teaches.** Lead with
+what a consumer got or lost — a released version, a seam a consumer now depends on, a
+regression that reached the fleet. Then the one thing worth remembering. That is it.
+
+**What does NOT belong in the summary**, and this is the rule that would have kept
+session 17 readable: anything that will be stale in a month. Credit balances and
+spend figures, fleet binary versions, host counts, which GPU processes were stopped
+to free VRAM, how many dirs a prune removed. Those are real and worth recording — in
+the KB entry, where staleness is expected and dating is implicit. A summary sentence
+should still be true and still be interesting in six months, or it is KB material.
+
+**The test before you write a summary sentence:** would Jason want to read this in
+six months? If it is a number that only mattered that afternoon, it fails.
+
+**When resuming**, read the latest `docs/session-summaries.md` entry and its linked
+KB entry, then `docs/roadmap.md` "Where we are". Session 20 (`kb-03504`) is the
+current template for a session log; session 18 shows the summary length to aim for.
 
 ## Layout
 
