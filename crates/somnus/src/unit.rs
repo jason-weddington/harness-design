@@ -431,6 +431,11 @@ pub struct AppliedOpRecord {
     pub body: String,
     /// The verbatim 409 reason body, on a cap admission.
     pub admission_reason: Option<String>,
+    /// True when the POST timed out client-side and the op was CONFIRMED
+    /// applied by re-reading the project's loop-input (the server had
+    /// committed it). `version`, `budget`, and `http_status` are `None` for
+    /// such a record: no envelope was ever seen.
+    pub applied_after_timeout: bool,
 }
 
 /// One op deliberately NOT `POSTed`.
@@ -1076,6 +1081,7 @@ async fn run_unit_inner(
     let application = apply_map_ops(
         &mut report,
         &deps.map_ops,
+        &deps.source,
         project_ref,
         &input,
         edits_by_map,
@@ -1142,6 +1148,7 @@ struct ApplicationResult {
 async fn apply_map_ops(
     report: &mut UnitReport,
     map_ops: &std::sync::Arc<dyn MapOpClient>,
+    source: &std::sync::Arc<dyn LoopInputSource>,
     project_ref: &str,
     input: &crate::loop_input::LoopInput,
     mut edits_by_map: Vec<(String, Vec<MapEdit>)>,
@@ -1195,6 +1202,7 @@ async fn apply_map_ops(
             };
             let body_text = request_body_text(&request);
             let submitted = body_record.map_id.clone();
+            let retained = request.clone();
             match map_ops.apply(request).await {
                 MapOpResult::Applied(applied) => {
                     report.applied.push(AppliedOpRecord {
@@ -1208,6 +1216,7 @@ async fn apply_map_ops(
                         http_status: Some(201),
                         body: body_text,
                         admission_reason: None,
+                        applied_after_timeout: false,
                     });
                 }
                 MapOpResult::CapAdmission { reason_body } => {
@@ -1222,6 +1231,7 @@ async fn apply_map_ops(
                         http_status: Some(409),
                         body: body_text,
                         admission_reason: Some(reason_body),
+                        applied_after_timeout: false,
                     });
                 }
                 MapOpResult::Unauthorized => {
@@ -1237,11 +1247,39 @@ async fn apply_map_ops(
                         outcome_override: Some(UnitOutcome::NotMachinePrincipal),
                     };
                 }
+                MapOpResult::TimedOut { reason, .. } => {
+                    let label = create_label(project_ref, title);
+                    if let Some(found) =
+                        reconcile_after_timeout(source, project_ref, &retained, input, report).await
+                    {
+                        report.applied.push(found.into_record(
+                            "create_map",
+                            0,
+                            submitted,
+                            body_text,
+                        ));
+                    } else {
+                        return ApplicationResult {
+                            first_red_body,
+                            outcome_override: Some(UnitOutcome::Aborted {
+                                reason: render_map_op_fault_line(
+                                    &label,
+                                    &format!("{reason}; {RECONCILE_NOT_FOUND}"),
+                                ),
+                            }),
+                        };
+                    }
+                }
                 MapOpResult::Fault { map_id, reason } => {
+                    let label = if map_id.is_empty() {
+                        create_label(project_ref, title)
+                    } else {
+                        map_id
+                    };
                     return ApplicationResult {
                         first_red_body,
                         outcome_override: Some(UnitOutcome::Aborted {
-                            reason: render_map_op_fault_line(&map_id, &reason),
+                            reason: render_map_op_fault_line(&label, &reason),
                         }),
                     };
                 }
@@ -1313,6 +1351,7 @@ async fn apply_map_ops(
             }
             let body_text = request_body_text(&request);
             let submitted = body_record.map_id.clone();
+            let retained = request.clone();
             match map_ops.apply(request).await {
                 MapOpResult::Applied(applied) => {
                     report.applied.push(AppliedOpRecord {
@@ -1326,6 +1365,7 @@ async fn apply_map_ops(
                         http_status: Some(200),
                         body: body_text,
                         admission_reason: None,
+                        applied_after_timeout: false,
                     });
                 }
                 MapOpResult::CapAdmission { reason_body } => {
@@ -1352,6 +1392,28 @@ async fn apply_map_ops(
                         outcome_override: Some(UnitOutcome::NotMachinePrincipal),
                     };
                 }
+                MapOpResult::TimedOut { map_id, reason } => {
+                    if let Some(found) =
+                        reconcile_after_timeout(source, project_ref, &retained, input, report).await
+                    {
+                        report.applied.push(found.into_record(
+                            op_kind,
+                            index + 1,
+                            submitted,
+                            body_text,
+                        ));
+                    } else {
+                        return ApplicationResult {
+                            first_red_body,
+                            outcome_override: Some(UnitOutcome::Aborted {
+                                reason: render_map_op_fault_line(
+                                    &map_id,
+                                    &format!("{reason}; {RECONCILE_NOT_FOUND}"),
+                                ),
+                            }),
+                        };
+                    }
+                }
                 MapOpResult::Fault { map_id, reason } => {
                     return ApplicationResult {
                         first_red_body,
@@ -1367,6 +1429,134 @@ async fn apply_map_ops(
         first_red_body,
         outcome_override: None,
     }
+}
+
+/// Appended to a timeout abort when the re-read found no evidence the server
+/// applied the op.
+const RECONCILE_NOT_FOUND: &str =
+    "reconciliation by re-reading the project found no matching write";
+
+/// The label a `create_map` fault names instead of an (absent) map id.
+fn create_label(project_ref: &str, title: &str) -> String {
+    format!("{project_ref} create_map \"{title}\"")
+}
+
+/// What a re-read proved the server had applied.
+struct Reconciled {
+    server_map_id: String,
+    pointer_count: u64,
+}
+
+impl Reconciled {
+    fn into_record(
+        self,
+        op_kind: &'static str,
+        chain_index: usize,
+        submitted_map_id: String,
+        body: String,
+    ) -> AppliedOpRecord {
+        AppliedOpRecord {
+            op_kind,
+            chain_index,
+            submitted_map_id,
+            server_map_id: Some(self.server_map_id),
+            version: None,
+            pointer_count: Some(self.pointer_count),
+            budget: None,
+            http_status: None,
+            body,
+            admission_reason: None,
+            applied_after_timeout: true,
+        }
+    }
+}
+
+/// Every `kb-NNNNN` ref in `body`.
+fn body_refs(body: &str) -> std::collections::BTreeSet<String> {
+    let bytes = body.as_bytes();
+    let mut refs = std::collections::BTreeSet::new();
+    let mut at = 0;
+    while let Some(found) = body[at..].find("kb-") {
+        let start = at + found;
+        let end = start + 8;
+        if end <= bytes.len() && bytes[start + 3..end].iter().all(u8::is_ascii_digit) {
+            refs.insert(body[start..end].to_string());
+        }
+        at = start + 3;
+    }
+    refs
+}
+
+/// Whether the KB attributes `map` to somnus's machine principal (the
+/// contributor may be the bare writer id or `somnus@<host>`).
+fn written_by_somnus(map: &crate::loop_input::LoopInputMap) -> bool {
+    let is_somnus = |who: &Option<String>| {
+        who.as_deref().is_some_and(|who| {
+            who == crate::materialize::SOMNUS_WRITER_ID
+                || who.starts_with(&format!("{}@", crate::materialize::SOMNUS_WRITER_ID))
+        })
+    };
+    is_somnus(&map.contributor) || is_somnus(&map.updated_by)
+}
+
+/// A client timeout is not a failed write: re-read the project and decide
+/// whether the server committed `request`. `None` means no evidence (or the
+/// re-read itself failed) — the caller aborts as it always did.
+///
+/// - `create_map`: an ACTIVE map somnus wrote, absent from the run-start
+///   `input` and from this run's applied records, whose pointer set equals
+///   the submitted body's refs.
+/// - `add_pointer`: the target map's pointers now include the entry.
+/// - `strike_gap`: the target map's body now equals the submitted body.
+async fn reconcile_after_timeout(
+    source: &std::sync::Arc<dyn LoopInputSource>,
+    project_ref: &str,
+    request: &MapOpRequest,
+    input: &crate::loop_input::LoopInput,
+    report: &UnitReport,
+) -> Option<Reconciled> {
+    let FetchOutcome::Ready(fresh) = source.fetch(project_ref).await else {
+        return None;
+    };
+    let found = match request {
+        MapOpRequest::CreateMap { body, .. } => {
+            let wanted = body_refs(body);
+            fresh.maps.iter().find(|map| {
+                written_by_somnus(map)
+                    && !input.maps.iter().any(|old| old.id == map.id)
+                    && !report
+                        .applied
+                        .iter()
+                        .any(|op| op.server_map_id.as_deref() == Some(map.id.as_str()))
+                    && map
+                        .pointers
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        == wanted
+            })
+        }
+        MapOpRequest::AddPointer {
+            map_id,
+            added_entry_id,
+            ..
+        } => fresh
+            .maps
+            .iter()
+            .find(|map| map.id == *map_id && map.pointers.contains(added_entry_id)),
+        MapOpRequest::StrikeGap { map_id, body, .. } => fresh
+            .maps
+            .iter()
+            .find(|map| map.id == *map_id && map.body == *body),
+    }?;
+    Some(Reconciled {
+        server_map_id: found.id.clone(),
+        pointer_count: map_pointer_count(found),
+    })
+}
+
+fn map_pointer_count(map: &crate::loop_input::LoopInputMap) -> u64 {
+    u64::try_from(map.pointers.len()).unwrap_or(u64::MAX)
 }
 
 /// The exact `POSTed` body text for one map-op request (the
@@ -2770,6 +2960,222 @@ mod tests {
         assert!(!body.contains("Site-to-site wireguard topology"));
     }
 
+    /// Drive one unit whose `ops` are model-emitted, with a map-op script and
+    /// a scripted source (the first fetch is the run-start input; later
+    /// fetches are the reconciliation re-reads).
+    async fn timeout_run(
+        ops: Vec<(&'static str, Value)>,
+        script: Vec<MapOpResult>,
+        fetches: Vec<FetchOutcome>,
+    ) -> (std::sync::Arc<RecordingMapOps>, UnitReport) {
+        // The leg-3 baseline observation fetches first, so the script
+        // starts with one extra copy of the run-start input.
+        let mut fetches = fetches;
+        fetches.insert(0, FetchOutcome::Ready(fixture()));
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(&ops, usage(1, 1, None, None)),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(fetches));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(script);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        (map_ops, report)
+    }
+
+    fn timed_out(map_id: &str) -> MapOpResult {
+        MapOpResult::TimedOut {
+            map_id: map_id.to_string(),
+            reason: "timed out after 60s".to_string(),
+        }
+    }
+
+    fn create_ops() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "create_map",
+                json!({"title": "t", "orientation_prose": "PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+            ),
+            (
+                "add_pointer",
+                json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_create_timeout_reconciles_when_the_server_wrote_the_map() {
+        let mut after = fixture();
+        after.maps.push(crate::loop_input::LoopInputMap {
+            id: "kb-30001".to_string(),
+            short_title: "t".to_string(),
+            long_title: "t".to_string(),
+            pointers: vec!["kb-10001".to_string()],
+            body: "x".to_string(),
+            contributor: Some("somnus@lab.example.com".to_string()),
+            updated_by: None,
+        });
+        let (map_ops, report) = timeout_run(
+            create_ops(),
+            vec![timed_out(""), applied_envelope()],
+            vec![FetchOutcome::Ready(fixture()), FetchOutcome::Ready(after)],
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(map_ops.requests().len(), 2, "the unit continued");
+        assert_eq!(report.applied.len(), 2);
+        assert!(report.applied[0].applied_after_timeout);
+        assert_eq!(report.applied[0].server_map_id.as_deref(), Some("kb-30001"));
+        assert_eq!(report.applied[0].pointer_count, Some(1));
+        assert!(!report.applied[1].applied_after_timeout);
+    }
+
+    #[tokio::test]
+    async fn a_create_timeout_with_no_matching_map_aborts_naming_the_project() {
+        // A same-pointer map by ANOTHER writer, and a somnus map with
+        // different pointers, are both non-matches.
+        let mut after = fixture();
+        for (contributor, pointers) in [
+            ("someone-else", vec!["kb-10001"]),
+            ("somnus", vec!["kb-10001", "kb-10002"]),
+        ] {
+            after.maps.push(crate::loop_input::LoopInputMap {
+                id: "kb-30001".to_string(),
+                short_title: "t".to_string(),
+                long_title: "t".to_string(),
+                pointers: pointers.into_iter().map(str::to_string).collect(),
+                body: "x".to_string(),
+                contributor: Some(contributor.to_string()),
+                updated_by: None,
+            });
+        }
+        let (map_ops, report) = timeout_run(
+            create_ops(),
+            vec![timed_out("")],
+            vec![FetchOutcome::Ready(fixture()), FetchOutcome::Ready(after)],
+        )
+        .await;
+        let UnitOutcome::Aborted { reason } = &report.outcome else {
+            panic!("expected abort, got {:?}", report.outcome);
+        };
+        assert!(
+            reason.starts_with(
+                "somnus: map-op failed for demo-project create_map \"t\": timed out after 60s;"
+            ),
+            "{reason}"
+        );
+        assert_eq!(map_ops.requests().len(), 1);
+        assert!(report.applied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_whose_reread_fails_aborts() {
+        let (_, report) = timeout_run(
+            create_ops(),
+            vec![timed_out("")],
+            vec![
+                FetchOutcome::Ready(fixture()),
+                FetchOutcome::Unreachable {
+                    reason: "down".to_string(),
+                },
+            ],
+        )
+        .await;
+        assert!(matches!(report.outcome, UnitOutcome::Aborted { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_add_pointer_timeout_reconciles_by_the_target_maps_pointers() {
+        let after: LoopInput = serde_json::from_str(&bumped_fixture_json()).expect("parses");
+        let ops = vec![(
+            "add_pointer",
+            json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+        )];
+        let (_, report) = timeout_run(
+            ops.clone(),
+            vec![timed_out("kb-20001")],
+            vec![FetchOutcome::Ready(fixture()), FetchOutcome::Ready(after)],
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.applied[0].applied_after_timeout);
+        assert_eq!(report.applied[0].server_map_id.as_deref(), Some("kb-20001"));
+
+        // Not yet pointed at: abort naming the map.
+        let (_, report) = timeout_run(
+            ops,
+            vec![timed_out("kb-20001")],
+            vec![FetchOutcome::Ready(fixture())],
+        )
+        .await;
+        let UnitOutcome::Aborted { reason } = &report.outcome else {
+            panic!("expected abort");
+        };
+        assert!(reason.starts_with("somnus: map-op failed for kb-20001: timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_strike_gap_timeout_reconciles_by_the_submitted_body() {
+        let ops = vec![(
+            "strike_gap",
+            json!({"map_id": "kb-20001", "gap_text": "Site-to-site wireguard topology", "closing_entry_id": "kb-10003"}),
+        )];
+        // Unchanged map: the strike did not land, so abort.
+        let (map_ops, report) = timeout_run(
+            ops.clone(),
+            vec![timed_out("kb-20001")],
+            vec![FetchOutcome::Ready(fixture())],
+        )
+        .await;
+        assert!(matches!(report.outcome, UnitOutcome::Aborted { .. }));
+        // The map now carries exactly the submitted body: applied.
+        let MapOpRequest::StrikeGap { body, .. } = map_ops.requests()[0].clone() else {
+            panic!("strike");
+        };
+        let mut after = fixture();
+        after
+            .maps
+            .iter_mut()
+            .find(|map| map.id == "kb-20001")
+            .expect("map")
+            .body = body;
+        let (_, report) = timeout_run(
+            ops,
+            vec![timed_out("kb-20001")],
+            vec![FetchOutcome::Ready(fixture()), FetchOutcome::Ready(after)],
+        )
+        .await;
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert!(report.applied[0].applied_after_timeout);
+        assert_eq!(report.applied[0].op_kind, "strike_gap");
+    }
+
+    #[test]
+    fn body_refs_reads_exactly_the_kb_ids() {
+        let refs = body_refs("- kb-10001 — a\n- kb-1002 short kb-20002kb-30003 kb-");
+        let expected: std::collections::BTreeSet<String> = ["kb-10001", "kb-20002", "kb-30003"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(refs, expected);
+    }
+
     #[tokio::test]
     async fn a_create_map_401_403_and_fault_each_stop_before_the_next_body() {
         // The create branch's stop arms: a scripted 401 on the fresh map's
@@ -2830,7 +3236,7 @@ mod tests {
         assert_eq!(
             report.outcome,
             UnitOutcome::Aborted {
-                reason: "somnus: map-op failed for : unexpected HTTP status 422".to_string(),
+                reason: "somnus: map-op failed for demo-project create_map \"t\": unexpected HTTP status 422".to_string(),
             }
         );
         assert_eq!(map_ops.requests().len(), 1);

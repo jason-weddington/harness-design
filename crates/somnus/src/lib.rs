@@ -112,6 +112,9 @@ pub const COST_BUDGET_VAR: &str = "SOMNUS_COST_BUDGET_MICROS";
 /// micro-dollars (optional). `backfill` ignores [`COST_BUDGET_VAR`] (the
 /// nightly's ceiling) and reads only this one.
 pub const BACKFILL_COST_BUDGET_VAR: &str = "SOMNUS_BACKFILL_COST_BUDGET_MICROS";
+/// The operator env spelling for the per-POST map-op timeout, in whole
+/// seconds (optional; default 60).
+pub const MAP_OP_TIMEOUT_VAR: &str = "SOMNUS_MAP_OP_TIMEOUT_SECS";
 /// The operator env spelling for the state-dir override (optional).
 pub const STATE_DIR_VAR: &str = "SOMNUS_STATE_DIR";
 /// The operator env spelling for the kill switch (optional; exactly `1`).
@@ -131,6 +134,11 @@ pub const DISABLED_MSG: &str =
 /// The pinned cost-budget fault line: any non-integer, negative, or empty
 /// value is a configuration fault (one shape for all three).
 pub const COST_BUDGET_MSG: &str = "somnus: SOMNUS_COST_BUDGET_MICROS is not a non-negative integer";
+
+/// The pinned map-op timeout fault line: anything but a positive integer
+/// number of seconds is a configuration fault.
+pub const MAP_OP_TIMEOUT_MSG: &str =
+    "somnus: SOMNUS_MAP_OP_TIMEOUT_SECS is not a positive integer number of seconds";
 
 /// The pinned base-URL fault line. A value ending in `/` is a configuration
 /// fault, never a silently-trimmed value.
@@ -224,6 +232,22 @@ pub fn parse_cost_budget(default: u64, raw: Option<&str>) -> Result<u64, String>
     match raw {
         None => Ok(default),
         Some(raw) => raw.parse::<u64>().map_err(|_| COST_BUDGET_MSG.to_string()),
+    }
+}
+
+/// Parse [`MAP_OP_TIMEOUT_VAR`]: absent → [`map_op::MAP_OP_HTTP_BOUND`]; a
+/// positive integer → that many seconds; anything else → the pinned fault
+/// line.
+///
+/// # Errors
+/// [`MAP_OP_TIMEOUT_MSG`] when `raw` is `Some` but not a positive integer.
+pub fn parse_map_op_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    match raw {
+        None => Ok(map_op::MAP_OP_HTTP_BOUND),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(std::time::Duration::from_secs(secs)),
+            _ => Err(MAP_OP_TIMEOUT_MSG.to_string()),
+        },
     }
 }
 
@@ -382,6 +406,25 @@ mod tests {
     use super::*;
 
     // --- the run-start guard ---
+
+    #[test]
+    fn the_map_op_timeout_defaults_parses_and_rejects() {
+        assert_eq!(
+            parse_map_op_timeout(None),
+            Ok(std::time::Duration::from_mins(1))
+        );
+        assert_eq!(
+            parse_map_op_timeout(Some("120")),
+            Ok(std::time::Duration::from_mins(2))
+        );
+        for bad in ["", "0", "abc", "-1", "1.5"] {
+            assert_eq!(
+                parse_map_op_timeout(Some(bad)),
+                Err(MAP_OP_TIMEOUT_MSG.to_string()),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn run_start_refusal_accepts_any_observed_baseline() {

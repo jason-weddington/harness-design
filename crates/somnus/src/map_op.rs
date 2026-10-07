@@ -29,10 +29,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Wall-clock bound on one map-op POST, mirroring
-/// [`crate::ledger::LEDGER_HTTP_BOUND`]. Nothing on this surface is
-/// retryable, so the bound converts a hung endpoint into a named fault.
-pub const MAP_OP_HTTP_BOUND: Duration = Duration::from_secs(10);
+/// The DEFAULT wall-clock bound on one map-op POST. The server lints and
+/// enriches synchronously and runs on slow hardware, so 10s was too tight: a
+/// client timeout there is NOT a failed write (the server may have
+/// committed). Overridable via [`crate::MAP_OP_TIMEOUT_VAR`].
+pub const MAP_OP_HTTP_BOUND: Duration = Duration::from_mins(1);
 
 /// One map-op request. Field sets are PINNED per op (see
 /// [`build_request_body`]): exactly the fields the server reads, no more.
@@ -117,10 +118,19 @@ pub enum MapOpResult {
     Unauthorized,
     /// `403` — the caller is not the configured machine principal.
     NotMachinePrincipal,
+    /// The client-side timeout elapsed. NOT a failed write: the server may
+    /// have committed the op, so the caller reconciles by reading instead of
+    /// treating this as a fault.
+    TimedOut {
+        /// The map the op targeted (empty for a `create_map`).
+        map_id: String,
+        /// The timeout message, naming the bound.
+        reason: String,
+    },
     /// `409` on an update op (an invariant somnus cannot provoke — it never
     /// sends `base_version` and a pointerless create is refused upstream —
     /// is classified client-side as a fault by reachability), `404`,
-    /// `422`, `5xx`, a timeout, a transport failure, or a 2xx whose body
+    /// `422`, `5xx`, a transport failure, or a 2xx whose body
     /// does not parse as the envelope.
     Fault {
         /// The map the op targeted (empty for a `create_map`, which carries
@@ -201,6 +211,7 @@ fn fault_map_id(request: &MapOpRequest) -> String {
 pub struct HttpMapOpClient {
     base_url: String,
     token: String,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for HttpMapOpClient {
@@ -216,7 +227,18 @@ impl HttpMapOpClient {
     /// Build a transport over an already-read token.
     #[must_use]
     pub fn new(base_url: String, token: String) -> Self {
-        Self { base_url, token }
+        Self {
+            base_url,
+            token,
+            timeout: MAP_OP_HTTP_BOUND,
+        }
+    }
+
+    /// Override the per-POST timeout (default [`MAP_OP_HTTP_BOUND`]).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -281,11 +303,11 @@ impl MapOpClient for HttpMapOpClient {
                 },
             }
         };
-        match tokio::time::timeout(MAP_OP_HTTP_BOUND, exchange).await {
+        match tokio::time::timeout(self.timeout, exchange).await {
             Ok(result) => result,
-            Err(_elapsed) => MapOpResult::Fault {
+            Err(_elapsed) => MapOpResult::TimedOut {
                 map_id,
-                reason: format!("timed out after {}s", MAP_OP_HTTP_BOUND.as_secs()),
+                reason: format!("timed out after {}s", self.timeout.as_secs()),
             },
         }
     }
@@ -604,5 +626,33 @@ mod tests {
             reason.starts_with("transport failed: "),
             "reason was {reason}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_server_times_out_at_the_configured_bound_not_a_fault() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/api/kb/map-op"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(ENVELOPE)
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+        let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string())
+            .with_timeout(Duration::from_secs(1));
+        let MapOpResult::TimedOut { map_id, reason } = client.apply(add_request()).await else {
+            panic!("expected TimedOut");
+        };
+        assert_eq!(map_id, "kb-20001");
+        assert_eq!(reason, "timed out after 1s");
+        // The same slow server answers within the DEFAULT bound.
+        let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+        assert!(matches!(
+            client.apply(add_request()).await,
+            MapOpResult::Applied(_)
+        ));
+        assert_eq!(MAP_OP_HTTP_BOUND, Duration::from_mins(1));
     }
 }

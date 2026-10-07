@@ -623,6 +623,7 @@ mod tests {
             http_status: Some(200),
             body: String::new(),
             admission_reason: None,
+            applied_after_timeout: false,
         });
         assert_eq!(
             maps_created(&report),
@@ -640,6 +641,7 @@ mod tests {
             http_status: Some(201),
             body: String::new(),
             admission_reason: None,
+            applied_after_timeout: false,
         });
         assert_eq!(maps_created(&report), 1);
     }

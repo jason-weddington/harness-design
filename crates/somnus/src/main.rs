@@ -13,7 +13,7 @@
 //! 3. the empty-or-whitespace `--project` check ([`EMPTY_PROJECT_MSG`])
 //!    BEFORE required-env validation;
 //! 4. required-env validation;
-//! 5. [`TOKEN_BUDGET_VAR`] parse;
+//! 5. [`TOKEN_BUDGET_VAR`] parse, then the map-op timeout parse;
 //! 6. state-dir resolution + creation.
 //!
 //! Kill-switch, env-fault, and clap-usage exits occur before the state dir
@@ -72,6 +72,7 @@ struct RunArgs {
 /// BEFORE required-env validation.
 const EMPTY_PROJECT_MSG: &str = "somnus: --project must be a non-empty project ref";
 
+#[allow(clippy::too_many_lines)] // the pinned startup sequence, one step per line group
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // (1) argv parse. clap's default usage-error exit 2 is overridden: any
@@ -135,6 +136,7 @@ async fn main() {
         Command::Backfill(_) => somnus::BudgetKind::Backfill,
     };
     let budget_raw = std::env::var(kind.env_var()).ok();
+    exit_on_invalid_map_op_timeout();
     let armed = match somnus::arm_cost_budget(kind, budget_raw.as_deref()) {
         Ok((armed, line)) => {
             eprintln!("{line}");
@@ -249,6 +251,16 @@ fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     }
 }
 
+/// Exit 1 with the pinned line when [`somnus::MAP_OP_TIMEOUT_VAR`] is set
+/// to anything but a positive integer number of seconds.
+fn exit_on_invalid_map_op_timeout() {
+    let raw = std::env::var(somnus::MAP_OP_TIMEOUT_VAR).ok();
+    if let Err(line) = somnus::parse_map_op_timeout(raw.as_deref()) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
+}
+
 /// The shared production stack every subcommand drives: the production
 /// [`AnthropicBackend`], [`HttpLoopInputSource`], [`HttpClusterLedger`],
 /// [`HttpMapOpClient`], and the gate wiring (its runner reads the token from
@@ -264,6 +276,10 @@ struct Stack {
 impl Stack {
     /// Build the stack over `machine`.
     fn build(machine: &somnus::MachineEnv) -> Self {
+        // Already validated at startup; the default is unreachable fallback.
+        let map_op_timeout =
+            somnus::parse_map_op_timeout(std::env::var(somnus::MAP_OP_TIMEOUT_VAR).ok().as_deref())
+                .unwrap_or(somnus::map_op::MAP_OP_HTTP_BOUND);
         Self {
             base: machine.kb_base_url.clone(),
             backend: AnthropicBackend::new(
@@ -275,10 +291,10 @@ impl Stack {
                 machine.kb_base_url.clone(),
                 machine.kb_api_key.clone(),
             )),
-            map_ops: Arc::new(HttpMapOpClient::new(
-                machine.kb_base_url.clone(),
-                machine.kb_api_key.clone(),
-            )),
+            map_ops: Arc::new(
+                HttpMapOpClient::new(machine.kb_base_url.clone(), machine.kb_api_key.clone())
+                    .with_timeout(map_op_timeout),
+            ),
         }
     }
 }
