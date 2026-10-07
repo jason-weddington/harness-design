@@ -129,14 +129,17 @@ async fn main() {
     };
 
     // (5) The SPEND budget, armed by subcommand.
-    let budget_raw = std::env::var(somnus::COST_BUDGET_VAR).ok();
-    let default = match &cli.command {
-        Command::Nightly => somnus::NIGHTLY_COST_BUDGET_MICROS_DEFAULT,
-        Command::Run(_) => somnus::RUN_COST_BUDGET_MICROS_DEFAULT,
-        Command::Backfill(_) => somnus::BACKFILL_COST_BUDGET_MICROS_DEFAULT,
+    let kind = match &cli.command {
+        Command::Nightly => somnus::BudgetKind::Nightly,
+        Command::Run(_) => somnus::BudgetKind::Run,
+        Command::Backfill(_) => somnus::BudgetKind::Backfill,
     };
-    let armed = match somnus::parse_cost_budget(default, budget_raw.as_deref()) {
-        Ok(armed) => armed,
+    let budget_raw = std::env::var(kind.env_var()).ok();
+    let armed = match somnus::arm_cost_budget(kind, budget_raw.as_deref()) {
+        Ok((armed, line)) => {
+            eprintln!("{line}");
+            armed
+        }
         Err(line) => {
             eprintln!("{line}");
             std::process::exit(1);

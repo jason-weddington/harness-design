@@ -108,6 +108,10 @@ pub const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 /// The operator env spelling for the nightly SPEND ceiling, in
 /// micro-dollars (optional).
 pub const COST_BUDGET_VAR: &str = "SOMNUS_COST_BUDGET_MICROS";
+/// The operator env spelling for the `backfill` SPEND ceiling, in
+/// micro-dollars (optional). `backfill` ignores [`COST_BUDGET_VAR`] (the
+/// nightly's ceiling) and reads only this one.
+pub const BACKFILL_COST_BUDGET_VAR: &str = "SOMNUS_BACKFILL_COST_BUDGET_MICROS";
 /// The operator env spelling for the state-dir override (optional).
 pub const STATE_DIR_VAR: &str = "SOMNUS_STATE_DIR";
 /// The operator env spelling for the kill switch (optional; exactly `1`).
@@ -221,6 +225,71 @@ pub fn parse_cost_budget(default: u64, raw: Option<&str>) -> Result<u64, String>
         None => Ok(default),
         Some(raw) => raw.parse::<u64>().map_err(|_| COST_BUDGET_MSG.to_string()),
     }
+}
+
+/// Which subcommand is arming a budget; each has its own default and, for
+/// `backfill`, its own env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetKind {
+    /// `somnus nightly`.
+    Nightly,
+    /// `somnus run`.
+    Run,
+    /// `somnus backfill`.
+    Backfill,
+}
+
+impl BudgetKind {
+    /// The subcommand's name, as printed in the startup line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Nightly => "nightly",
+            Self::Run => "run",
+            Self::Backfill => "backfill",
+        }
+    }
+
+    /// The default ceiling in micro-dollars.
+    #[must_use]
+    pub fn default_micros(self) -> u64 {
+        match self {
+            Self::Nightly => NIGHTLY_COST_BUDGET_MICROS_DEFAULT,
+            Self::Run => RUN_COST_BUDGET_MICROS_DEFAULT,
+            Self::Backfill => BACKFILL_COST_BUDGET_MICROS_DEFAULT,
+        }
+    }
+
+    /// The env var this subcommand reads. `backfill` reads its OWN var so the
+    /// nightly's `SOMNUS_COST_BUDGET_MICROS` can never cap it.
+    #[must_use]
+    pub fn env_var(self) -> &'static str {
+        match self {
+            Self::Backfill => BACKFILL_COST_BUDGET_VAR,
+            Self::Nightly | Self::Run => COST_BUDGET_VAR,
+        }
+    }
+}
+
+/// Arm the budget for `kind` from the raw value of [`BudgetKind::env_var`],
+/// returning the amount and the pinned startup line naming it and its source.
+///
+/// # Errors
+/// [`COST_BUDGET_MSG`] when `raw` is `Some` but not a non-negative integer.
+pub fn arm_cost_budget(kind: BudgetKind, raw: Option<&str>) -> Result<(u64, String), String> {
+    let armed = parse_cost_budget(kind.default_micros(), raw)?;
+    let source = if raw.is_some() {
+        kind.env_var()
+    } else {
+        "default"
+    };
+    Ok((
+        armed,
+        format!(
+            "somnus: cost budget {armed} micros ({source} for {})",
+            kind.name()
+        ),
+    ))
 }
 
 /// The default state dir: `$XDG_STATE_HOME/somnus` when `xdg` is set, else
@@ -443,6 +512,73 @@ mod tests {
         assert_eq!(
             parse_cost_budget(BACKFILL_COST_BUDGET_MICROS_DEFAULT, None),
             Ok(7_000_000)
+        );
+    }
+
+    /// Arm from a fake env the way main does: the kind's own var only.
+    fn armed_from(kind: BudgetKind, env: &[(&str, &str)]) -> Result<(u64, String), String> {
+        let raw = env
+            .iter()
+            .find(|(k, _)| *k == kind.env_var())
+            .map(|(_, v)| *v);
+        arm_cost_budget(kind, raw)
+    }
+
+    #[test]
+    fn backfill_ignores_the_nightly_budget_var() {
+        let (armed, line) =
+            armed_from(BudgetKind::Backfill, &[(COST_BUDGET_VAR, "2000000")]).unwrap();
+        assert_eq!(armed, 7_000_000);
+        assert_eq!(
+            line,
+            "somnus: cost budget 7000000 micros (default for backfill)"
+        );
+    }
+
+    #[test]
+    fn backfill_reads_its_own_var() {
+        let (armed, line) = armed_from(
+            BudgetKind::Backfill,
+            &[
+                (COST_BUDGET_VAR, "2000000"),
+                (BACKFILL_COST_BUDGET_VAR, "3000000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(armed, 3_000_000);
+        assert_eq!(
+            line,
+            "somnus: cost budget 3000000 micros (SOMNUS_BACKFILL_COST_BUDGET_MICROS for backfill)"
+        );
+    }
+
+    #[test]
+    fn nightly_and_run_read_the_shared_var() {
+        let env = [
+            (COST_BUDGET_VAR, "2500000"),
+            (BACKFILL_COST_BUDGET_VAR, "9"),
+        ];
+        for kind in [BudgetKind::Nightly, BudgetKind::Run] {
+            let (armed, line) = armed_from(kind, &env).unwrap();
+            assert_eq!(armed, 2_500_000);
+            assert_eq!(
+                line,
+                format!(
+                    "somnus: cost budget 2500000 micros (SOMNUS_COST_BUDGET_MICROS for {})",
+                    kind.name()
+                )
+            );
+        }
+        let (armed, line) = armed_from(BudgetKind::Nightly, &[]).unwrap();
+        assert_eq!(armed, 2_000_000);
+        assert_eq!(
+            line,
+            "somnus: cost budget 2000000 micros (default for nightly)"
+        );
+        assert_eq!(armed_from(BudgetKind::Run, &[]).unwrap().0, 2_000_000);
+        assert_eq!(
+            armed_from(BudgetKind::Nightly, &[(COST_BUDGET_VAR, "x")]),
+            Err(COST_BUDGET_MSG.to_string())
         );
     }
 

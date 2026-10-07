@@ -13,11 +13,12 @@ const SOMNUS_BIN: &str = env!("CARGO_BIN_EXE_somnus");
 /// The eight env vars somnus reads (the six operator vars plus the two
 /// state-dir defaults), removed from EVERY spawned child so a test never
 /// inherits the runner's own environment.
-const SOMNUS_ENV_VARS: [&str; 8] = [
+const SOMNUS_ENV_VARS: [&str; 9] = [
     "SOMNUS_KB_BASE_URL",
     "SOMNUS_KB_API_KEY",
     "ANTHROPIC_API_KEY",
     "SOMNUS_COST_BUDGET_MICROS",
+    "SOMNUS_BACKFILL_COST_BUDGET_MICROS",
     "SOMNUS_STATE_DIR",
     "SOMNUS_DISABLED",
     "XDG_STATE_HOME",
