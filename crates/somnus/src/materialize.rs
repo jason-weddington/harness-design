@@ -41,6 +41,44 @@ pub const SOMNUS_MAX_PROJECTS_PER_NIGHT: u32 = 3;
 /// append path share one definition.
 const LIVES_IN_PREFIX: &str = "Lives in ";
 
+/// Repo-relative source roots a `Lives in` token must start with.
+///
+/// The 2026-10-07 reviews found the line wrong or meaningless in every map
+/// that carried it: `Library/Application` (threat-intel, not a code project),
+/// `home/jason`, `ai-toolkit/output` (a path that no longer exists) and
+/// `scans/activity`. A code location only helps an agent when it is a real
+/// source directory, so the first segment must be on this list.
+const LIVES_IN_SOURCE_ROOTS: &[&str] = &[
+    "src",
+    "crates",
+    "packages",
+    "lib",
+    "app",
+    "apps",
+    "frontend",
+    "scripts",
+    "tests",
+    "docs",
+    "knowledge",
+];
+
+/// Host-path segments that disqualify a `Lives in` token anywhere in it
+/// (same 2026-10-07 evidence: `home/jason`, `Library/Application`).
+const LIVES_IN_HOST_SEGMENTS: &[&str] = &[
+    "home", "Users", "Library", "var", "etc", "tmp", "usr", "opt", "root", "mnt",
+];
+
+/// Whether a directory token is a plausible repo-relative source path.
+fn is_source_path(token: &str) -> bool {
+    let mut segments = token.split('/');
+    segments
+        .next()
+        .is_some_and(|root| LIVES_IN_SOURCE_ROOTS.contains(&root))
+        && !token
+            .split('/')
+            .any(|segment| LIVES_IN_HOST_SEGMENTS.contains(&segment))
+}
+
 /// The detail-entries section header line.
 const DETAIL_ENTRIES_HEADER: &str = "Detail entries:";
 
@@ -181,11 +219,14 @@ pub fn lives_in_value(cluster: &Cluster, input: &LoopInput) -> Option<String> {
     let members = cluster.member_entry_ids.len();
     let (first, first_count) = homes.first().cloned()?;
     if first_count * 2 > members {
-        return Some(first);
+        return is_source_path(&first).then_some(first);
     }
     let (second, second_count) = homes.get(1).cloned()?;
-    ((first_count + second_count) * 2 > members && second_count >= MIN_MEMBERS_PER_NAMED_DIRECTORY)
-        .then(|| format!("{first} and {second}"))
+    ((first_count + second_count) * 2 > members
+        && second_count >= MIN_MEMBERS_PER_NAMED_DIRECTORY
+        && is_source_path(&first)
+        && is_source_path(&second))
+    .then(|| format!("{first} and {second}"))
 }
 
 /// Compose a FRESH map body from the op's own strings: one `Detail entries:`
@@ -779,6 +820,54 @@ mod tests {
             lives_in_value(&owned, &input),
             Some("knowledge/network".to_string())
         );
+    }
+
+    /// The four tokens the 2026-10-07 reviews found junk are omitted; real
+    /// source paths are kept.
+    #[test]
+    fn non_source_tokens_are_omitted_and_source_tokens_kept() {
+        for (token, kept) in [
+            ("Library/Application", false),
+            ("home/jason", false),
+            ("ai-toolkit/output", false),
+            ("scans/activity", false),
+            ("src/home/x", false),
+            ("packages/kb-core", true),
+            ("src/photoqueue", true),
+        ] {
+            let mut input = fixture();
+            for entry in &mut input.entries {
+                entry.directory_tokens = vec![crate::loop_input::DirectoryToken {
+                    token: token.to_string(),
+                    hits: 3,
+                }];
+            }
+            let c = cluster("c", &["kb-10001"], None);
+            assert_eq!(
+                lives_in_value(&c, &input),
+                kept.then(|| token.to_string()),
+                "{token}"
+            );
+        }
+    }
+
+    /// A split pair is omitted when either half is not a source path.
+    #[test]
+    fn a_split_with_a_non_source_half_is_omitted() {
+        let mut input = fixture();
+        for (index, entry) in input.entries.iter_mut().enumerate() {
+            let token = if index < 2 { "apps/web" } else { "home/jason" };
+            entry.directory_tokens = vec![crate::loop_input::DirectoryToken {
+                token: token.to_string(),
+                hits: 3,
+            }];
+        }
+        let spread = cluster(
+            "spread",
+            &["kb-10001", "kb-10002", "kb-10003", "kb-10004"],
+            None,
+        );
+        assert_eq!(lives_in_value(&spread, &input), None);
     }
 
     /// Two directories, each the home of at least two members and together a
