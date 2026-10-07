@@ -108,11 +108,25 @@ pub struct MapOpApplied {
 pub enum MapOpResult {
     /// `200`/`201` with a parseable envelope.
     Applied(MapOpApplied),
-    /// `409` on `create_map` only: a per-night cap admission, ordinary by
-    /// contract, carrying the server's reason body verbatim.
+    /// `409` on `create_map` that is NOT a superseded-pointer rejection (see
+    /// [`MapOpResult::PointerSuperseded`]): a per-night cap admission,
+    /// ordinary by contract, carrying the server's reason body verbatim.
     CapAdmission {
         /// The server's machine-readable reason, verbatim.
         reason_body: String,
+    },
+    /// `409` on `create_map` or `add_pointer` whose body names superseded
+    /// entries (kb-service's `pointer_superseded` guard). A per-op skip: the
+    /// caller records it and continues with its next op. Race-only, since
+    /// the loop input already excludes superseded entries.
+    PointerSuperseded {
+        /// The map the op targeted (empty for a `create_map`).
+        map_id: String,
+        /// `(pointer, superseder)` pairs parsed from the detail string;
+        /// empty when the string could not be parsed.
+        pairs: Vec<(String, String)>,
+        /// The server's `detail` string, verbatim.
+        detail: String,
     },
     /// `401` — the bearer token was rejected.
     Unauthorized,
@@ -127,9 +141,10 @@ pub enum MapOpResult {
         /// The timeout message, naming the bound.
         reason: String,
     },
-    /// `409` on an update op (an invariant somnus cannot provoke — it never
-    /// sends `base_version` and a pointerless create is refused upstream —
-    /// is classified client-side as a fault by reachability), `404`,
+    /// `409` on an update op other than a superseded-pointer rejection (an
+    /// invariant somnus cannot provoke — it never sends `base_version` and a
+    /// pointerless create is refused upstream — is classified client-side as
+    /// a fault by reachability), `404`,
     /// `422`, `5xx`, a transport failure, or a 2xx whose body
     /// does not parse as the envelope.
     Fault {
@@ -292,8 +307,24 @@ impl MapOpClient for HttpMapOpClient {
                 },
                 401 => MapOpResult::Unauthorized,
                 403 => MapOpResult::NotMachinePrincipal,
-                // A create_map 409 is the ONLY 409 somnus can provoke (see
-                // the reachability note on [`MapOpResult::Fault`]).
+                // A superseded-pointer 409 (create_map or add_pointer) is a
+                // per-op skip, checked before the cap/fault split.
+                409 if superseded_detail(&body).is_some()
+                    && matches!(
+                        request,
+                        MapOpRequest::CreateMap { .. } | MapOpRequest::AddPointer { .. }
+                    ) =>
+                {
+                    let detail = superseded_detail(&body).unwrap_or_default();
+                    MapOpResult::PointerSuperseded {
+                        map_id,
+                        pairs: parse_superseded_pairs(&detail),
+                        detail,
+                    }
+                }
+                // Any other create_map 409 is a cap admission; any other
+                // 409 is a fault (see the reachability note on
+                // [`MapOpResult::Fault`]).
                 409 if matches!(request, MapOpRequest::CreateMap { .. }) => {
                     MapOpResult::CapAdmission { reason_body: body }
                 }
@@ -311,6 +342,44 @@ impl MapOpClient for HttpMapOpClient {
             },
         }
     }
+}
+
+/// The literal prefix of kb-service's superseded-pointer 409 `detail`.
+const SUPERSEDED_PREFIX: &str = "map pointers name superseded entries:";
+
+/// The `detail` string of a 409 body when it is a superseded-pointer
+/// rejection (`detail` a plain string starting with [`SUPERSEDED_PREFIX`]).
+fn superseded_detail(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let detail = value.get("detail")?.as_str()?;
+    detail
+        .starts_with(SUPERSEDED_PREFIX)
+        .then(|| detail.to_string())
+}
+
+/// Parse `<pointer> (superseded by <superseder>)` pairs out of the detail
+/// string; empty when anything does not parse.
+fn parse_superseded_pairs(detail: &str) -> Vec<(String, String)> {
+    let list = detail
+        .strip_prefix(SUPERSEDED_PREFIX)
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    let mut pairs = Vec::new();
+    for part in list.split(',') {
+        let parsed = part
+            .trim()
+            .strip_suffix(')')
+            .and_then(|p| p.split_once(" (superseded by "));
+        match parsed {
+            Some((pointer, superseder)) if !pointer.is_empty() && !superseder.is_empty() => {
+                pairs.push((pointer.to_string(), superseder.to_string()));
+            }
+            _ => return Vec::new(),
+        }
+    }
+    pairs
 }
 
 // ===== tests ==============================================================
@@ -515,6 +584,95 @@ mod tests {
                 reason_body: reason.to_string(),
             }
         );
+    }
+
+    const SUPERSEDED_BODY: &str = r#"{"detail": "map pointers name superseded entries: kb-00038 (superseded by kb-01723), kb-00105 (superseded by kb-00123); point at the superseding entry instead"}"#;
+    const SUPERSEDED_DETAIL: &str = "map pointers name superseded entries: kb-00038 (superseded by kb-01723), kb-00105 (superseded by kb-00123); point at the superseding entry instead";
+
+    #[tokio::test]
+    async fn a_superseded_409_on_create_map_is_pointer_superseded_with_parsed_pairs() {
+        let server = wiremock::MockServer::start().await;
+        mount(&server, 409, SUPERSEDED_BODY).await;
+        let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+        assert_eq!(
+            client.apply(create_request()).await,
+            MapOpResult::PointerSuperseded {
+                map_id: String::new(),
+                pairs: vec![
+                    ("kb-00038".to_string(), "kb-01723".to_string()),
+                    ("kb-00105".to_string(), "kb-00123".to_string()),
+                ],
+                detail: SUPERSEDED_DETAIL.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_409_on_add_pointer_is_pointer_superseded() {
+        let server = wiremock::MockServer::start().await;
+        mount(&server, 409, SUPERSEDED_BODY).await;
+        let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+        let MapOpResult::PointerSuperseded { map_id, pairs, .. } =
+            client.apply(add_request()).await
+        else {
+            panic!("expected PointerSuperseded");
+        };
+        assert_eq!(map_id, "kb-20001");
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_superseded_detail_is_still_pointer_superseded_with_no_pairs() {
+        for detail in [
+            "map pointers name superseded entries: garbage; point at it",
+            "map pointers name superseded entries: kb-1 (superseded by )",
+        ] {
+            let body = json!({ "detail": detail }).to_string();
+            let server = wiremock::MockServer::start().await;
+            mount(&server, 409, &body).await;
+            let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+            assert_eq!(
+                client.apply(create_request()).await,
+                MapOpResult::PointerSuperseded {
+                    map_id: String::new(),
+                    pairs: Vec::new(),
+                    detail: detail.to_string(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_matching_detail_stays_cap_admission_or_fault() {
+        for body in [
+            r#"{"detail": "something else"}"#,
+            r#"{"detail": {"reason": "map pointers name superseded entries: x"}}"#,
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount(&server, 409, body).await;
+            let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+            assert_eq!(
+                client.apply(create_request()).await,
+                MapOpResult::CapAdmission {
+                    reason_body: body.to_string(),
+                }
+            );
+            assert!(matches!(
+                client.apply(add_request()).await,
+                MapOpResult::Fault { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_superseded_409_on_strike_gap_is_a_fault() {
+        let server = wiremock::MockServer::start().await;
+        mount(&server, 409, SUPERSEDED_BODY).await;
+        let client = HttpMapOpClient::new(server.uri(), "kb-token".to_string());
+        assert!(matches!(
+            client.apply(strike_request()).await,
+            MapOpResult::Fault { .. }
+        ));
     }
 
     #[tokio::test]

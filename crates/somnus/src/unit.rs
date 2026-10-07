@@ -331,6 +331,9 @@ pub struct UnitReport {
     /// The `create_map` 409 cap admissions, ordinary by contract: the
     /// server's reason body recorded verbatim, never an outcome.
     pub cap_admissions: Vec<AppliedOpRecord>,
+    /// Ops the server rejected with a superseded-pointer 409: per-op skips,
+    /// recorded with their parsed pairs; the unit carried on.
+    pub superseded_skips: Vec<SupersededSkipRecord>,
     /// The apply-audit tripwire lines (a materialize ordering or inlining
     /// regression, caught client-side).
     pub apply_audit: Vec<String>,
@@ -388,6 +391,7 @@ impl UnitReport {
             applied: Vec::new(),
             skipped: Vec::new(),
             cap_admissions: Vec::new(),
+            superseded_skips: Vec::new(),
             apply_audit: Vec::new(),
             change: ChangeEvidence::default(),
             somnus_version: crate::SOMNUS_VERSION.to_string(),
@@ -436,6 +440,25 @@ pub struct AppliedOpRecord {
     /// committed it). `version`, `budget`, and `http_status` are `None` for
     /// such a record: no envelope was ever seen.
     pub applied_after_timeout: bool,
+}
+
+/// One op the server rejected with a superseded-pointer 409.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupersededSkipRecord {
+    /// `"create_map"` or `"add_pointer"`.
+    pub op_kind: &'static str,
+    /// `0` for a `create_map`, else the 1-based edit-chain index.
+    pub chain_index: usize,
+    /// The map id the request named.
+    pub submitted_map_id: String,
+    /// The map the server rejected the op against (empty for a `create_map`).
+    pub map_id: String,
+    /// `(pointer, superseder)` pairs; empty when unparsable.
+    pub pairs: Vec<(String, String)>,
+    /// The server's detail string, verbatim.
+    pub detail: String,
+    /// The exact `POSTed` body text.
+    pub body: String,
 }
 
 /// One op deliberately NOT `POSTed`.
@@ -1234,6 +1257,21 @@ async fn apply_map_ops(
                         applied_after_timeout: false,
                     });
                 }
+                MapOpResult::PointerSuperseded {
+                    map_id,
+                    pairs,
+                    detail,
+                } => {
+                    report.superseded_skips.push(SupersededSkipRecord {
+                        op_kind: "create_map",
+                        chain_index: 0,
+                        submitted_map_id: submitted,
+                        map_id,
+                        pairs,
+                        detail,
+                        body: body_text,
+                    });
+                }
                 MapOpResult::Unauthorized => {
                     return ApplicationResult {
                         first_red_body,
@@ -1378,6 +1416,21 @@ async fn apply_map_ops(
                             reason: render_map_op_fault_line(&submitted, &reason_body),
                         }),
                     };
+                }
+                MapOpResult::PointerSuperseded {
+                    map_id,
+                    pairs,
+                    detail,
+                } => {
+                    report.superseded_skips.push(SupersededSkipRecord {
+                        op_kind,
+                        chain_index: index + 1,
+                        submitted_map_id: submitted,
+                        map_id,
+                        pairs,
+                        detail,
+                        body: body_text,
+                    });
                 }
                 MapOpResult::Unauthorized => {
                     return ApplicationResult {
@@ -2318,6 +2371,7 @@ mod tests {
             "applied",
             "skipped",
             "cap_admissions",
+            "superseded_skips",
             "apply_audit",
             "change",
             "backend_calls",
@@ -3970,6 +4024,112 @@ mod tests {
             "one rejection must not skip the next map: {:?}",
             report.skipped
         );
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+    }
+
+    /// A superseded-pointer 409 is a per-op skip: the next op still runs,
+    /// the skip is recorded, and the unit stays `Ready`.
+    #[tokio::test]
+    async fn a_pointer_superseded_op_does_not_stop_the_next_op() {
+        let clusters = json!([
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002", "kb-10003"], "owning_map_id": null},
+            {"label": "b", "member_entry_ids": ["kb-10004", "kb-10005", "kb-10006"], "owning_map_id": null},
+        ])
+        .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters, usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "create_map",
+                    json!({"title": "t1", "orientation_prose": "PROSE-1", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}]}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[(
+                    "create_map",
+                    json!({"title": "t2", "orientation_prose": "PROSE-2", "gaps": [], "pointers": [{"entry_id": "kb-10004", "gloss": "GLOSS-2"}]}),
+                )],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![
+            MapOpResult::PointerSuperseded {
+                map_id: String::new(),
+                pairs: vec![("kb-10001".to_string(), "kb-10009".to_string())],
+                detail: "map pointers name superseded entries: kb-10001 (superseded by kb-10009)"
+                    .to_string(),
+            },
+            MapOpResult::Applied(crate::map_op::MapOpApplied {
+                map_id: "kb-30001".to_string(),
+                version: 1,
+                pointer_count: 1,
+                budget: 2,
+            }),
+        ]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(map_ops.requests().len(), 2, "the next op still ran");
+        assert_eq!(report.superseded_skips.len(), 1);
+        assert_eq!(report.superseded_skips[0].op_kind, "create_map");
+        assert_eq!(report.superseded_skips[0].pairs.len(), 1);
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.cap_admissions.is_empty());
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+    }
+
+    /// The same skip on an edit op against an existing map.
+    #[tokio::test]
+    async fn a_pointer_superseded_edit_op_is_recorded_and_the_unit_stays_ready() {
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&e2e_clusters_json(), usage(1, 1, None, None)),
+            calls_turn(
+                &[(
+                    "add_pointer",
+                    json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                )],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[("propose_gap", json!({"cluster_id": "c2", "reason": "r"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops = RecordingMapOps::scripted(vec![MapOpResult::PointerSuperseded {
+            map_id: "kb-20001".to_string(),
+            pairs: Vec::new(),
+            detail: "map pointers name superseded entries: ?".to_string(),
+        }]);
+        let report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+        assert_eq!(report.superseded_skips.len(), 1);
+        assert_eq!(report.superseded_skips[0].op_kind, "add_pointer");
+        assert_eq!(report.superseded_skips[0].map_id, "kb-20001");
         assert_eq!(report.outcome, UnitOutcome::Ready);
     }
 
