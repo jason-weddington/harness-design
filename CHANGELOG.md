@@ -2,6 +2,47 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.14.0 - 2026-10-07
+#### Features
+- (**engine**) arm the cumulative token budget for metered backends - (5b06daf) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) the nightly record says whether anything actually happened - (060e2bd) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a new map can say what its subject area is missing - (3691bda) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a map without pointers is unrepresentable, not merely refusable - (830c94f) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) every record names the binary that wrote it - (279409b) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a map is created with its pointers, and the budget counts money - (a8c4f7b) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) submit every valid cluster, and omit Lives in rather than refuse - (2a3392c) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) decide WHICH cluster becomes tonight's map - (d730a23) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) wire the run body — the binary does the job now - (983c65a) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) wire the real cluster-ledger HTTP transport - (6095026) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) loop wiring — loop-input, ledger filter, rungs 1-3, gate body on disk - (e60e530) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) the crate skeleton for the nightly map-maintenance loop - (322e315) - Jason Weddington, *Claude Opus 5*
+#### Bug Fixes
+- (**9308878d**) somnus: drop the "Lives in <path fragment>" line from composed map bodies — it is wrong or meaningless in every map that has it - (c659a9d) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**946af050**) somnus: a 10s map-op client timeout aborted agent-gtd after the server had already written the map — the run report never recorded kb-03604 - (3642e4c) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**9c162add**) somnus: SOMNUS_COST_BUDGET_MICROS in the env overrides backfill's larger default, so `backfill` is silently capped at the nightly $2 - (f73c58e) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**anthropic**) cache the prefix that ends before the varying tail - (076f9e3) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) mappable is a count, not a flag - (ff9baae) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) warn the model off dotted code identifiers - (8e37cf9) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) the forensic offload was empty, and the fresh-map id had two spellings - (8da78b5) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a rejected body is a per-map outcome, not a verdict on the project - (ab464ac) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a gate that could not be evaluated is not a gate that failed - (eb43ae6) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) a create_map without pointers is a rung-2 error - (5e219e6) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) aim the model at the human norm, and cap clusters not calls - (5522ed7) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) tolerate a fenced or framed rung-1 array - (4ff48f2) - Jason Weddington, *Claude Opus 5*
+- (**somnus**) warn the rung-2 model off tokens the map-lint rejects - (876c029) - Jason Weddington, *Claude Opus 5*
+- (**talos**) the wall-clock default is 0 — the caller arms it, not talos - (da9f3b2) - Jason Weddington, *Claude Opus 5*
+#### Documentation
+- (**somnus**) an empty gaps array is not evidence a project is covered - (aca951c) - Jason Weddington, *Claude Opus 5*
+- this is production infrastructure now, and the session log says so - (180f2fa) - Jason Weddington, *Claude Opus 5*
+- session 19 — somnus ships and the first live run - (eff4b94) - Jason Weddington, *Claude Opus 5*
+- re-vendor the somnus spec with the map-op write path - (95a4c82) - Jason Weddington, *Claude Opus 5*
+- a green gate proves the library works, not that the binary does - (3677ed8) - Jason Weddington, *Claude Opus 5*
+- re-vendor the somnus spec with the pinned server contract - (f6c44fd) - Jason Weddington, *Claude Opus 5*
+- vendor the somnus functional spec so the build agent can cite it - (c11e84a) - Jason Weddington, *Claude Opus 5*
+- a groom worktree goes stale silently when you merge mid-run - (7decdba) - Jason Weddington, *Claude Opus 5*
+
+- - -
+
 ## 0.13.0 - 2026-09-20
 #### Features
 - (**engine**) cap consecutive identical answer-schema rejections - (e312f8e) - Jason Weddington, *Claude Opus 5*
