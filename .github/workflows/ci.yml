@@ -60,3 +60,26 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The Python Harbor adapter (harbor/). uv provisions Python 3.12 from
+  # harbor/.python-version, so there is no setup-python step.
+  harbor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: uv sync
+        working-directory: harbor
+        run: uv sync --frozen
+      - name: ruff check
+        working-directory: harbor
+        run: uv run --frozen ruff check .
+      - name: ruff format
+        working-directory: harbor
+        run: uv run --frozen ruff format --check .
+      - name: mypy
+        working-directory: harbor
+        run: uv run --frozen mypy
+      - name: pytest
+        working-directory: harbor
+        run: uv run --frozen pytest -q

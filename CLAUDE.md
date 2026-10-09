@@ -174,6 +174,8 @@ build-engine binary (`talos run`, `talos ralph`). New crates get added to `membe
 in the root `Cargo.toml`. Lint strictness + shared deps are centralized in
 `[workspace.lints]` / `[workspace.dependencies]`.
 
+`harbor/` is a separate uv project (Python 3.12), not a cargo crate: the import package `talos_harbor` holds `TalosAgent`, the Harbor installed-agent adapter that runs talos inside a trial container. Its gate chain is `cd harbor && uv sync --frozen && uv run --frozen ruff check . && uv run --frozen ruff format --check . && uv run --frozen mypy && uv run --frozen pytest -q`, wired into lefthook (pre-commit on `harbor/**`, and pre-push) and the CI `harbor` job, so `uv` must be on PATH for the hooks. Usage and trial-image requirements live in `harbor/README.md`.
+
 Current status and the forward view live in [`docs/roadmap.md`](./docs/roadmap.md)
 (its "Where we are" header), not here.
 

@@ -1,0 +1,17 @@
+version = "1.0"
+
+[metadata]
+difficulty = "easy"
+category = "smoke"
+tags = ["talos", "smoke"]
+
+[agent]
+timeout_sec = 600
+
+[verifier]
+timeout_sec = 60
+
+[environment]
+workdir = "/app"
+allow_internet = true
+env = { AGENT_GATE_COMMAND = "test -f hello.txt" }

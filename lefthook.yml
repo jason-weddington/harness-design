@@ -27,6 +27,12 @@ pre-commit:
       run: cargo nextest run --workspace
       skip:
         - run: ./scripts/docs-only.sh --staged
+    harbor:
+      # The Python Harbor adapter (harbor/). Checkers only — never a fixer.
+      run: cd harbor && uv sync --frozen && uv run --frozen ruff check . && uv run --frozen ruff format --check . && uv run --frozen mypy && uv run --frozen pytest -q
+      glob: "harbor/**"
+      skip:
+        - run: ./scripts/docs-only.sh --staged
 
 pre-push:
   parallel: false
@@ -47,5 +53,9 @@ pre-push:
         - run: ./scripts/docs-only.sh --push
     deny:
       run: cargo deny check
+      skip:
+        - run: ./scripts/docs-only.sh --push
+    harbor:
+      run: cd harbor && uv sync --frozen && uv run --frozen ruff check . && uv run --frozen ruff format --check . && uv run --frozen mypy && uv run --frozen pytest -q
       skip:
         - run: ./scripts/docs-only.sh --push

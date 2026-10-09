@@ -10,3 +10,11 @@
 # Local direnv env (holds secrets like OLLAMA_API_KEY) — never commit.
 /.envrc
 /.envrc.secrets
+
+# Harbor adapter (uv project under harbor/).
+/harbor/.venv/
+__pycache__/
+/harbor/.coverage
+/harbor/.mypy_cache/
+/harbor/.ruff_cache/
+/harbor/.pytest_cache/

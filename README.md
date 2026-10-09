@@ -91,6 +91,10 @@ The flag conflicts with `--file`, `--schema` and `--mode answer`, and stdin is n
 
 The transcript's `run_start.messages[0]` first Text block equals `# Task` + blank line + the instruction file bytes, and input mode and gate presence are recorded only in `run_start`, so pass `--transcript` when a run must be auditable.
 
+## Harbor adapter
+
+`harbor/` is a small uv-managed Python package, `talos_harbor`, whose `TalosAgent` runs talos as a [Harbor](https://github.com/harbor-framework/harbor) installed agent inside a trial container (`--agent-import-path talos_harbor.agent:TalosAgent`). See [`harbor/README.md`](./harbor/README.md) for usage from another repo, the trial-image requirements, and its gate chain.
+
 ## Ralph mode (`talos ralph`)
 
 The **Ralph loop** drives an agent toward an objective by re-invoking the inner engine with a **fresh context every outer iteration** — durable state lives *outside* the context window (the code on disk, the git history, and a notes file the agent reads-then-appends), so each pass starts cold and still makes forward progress. Each iteration does exactly one unit of work; the **harness owns a git commit per iteration** (a deliberate ralph-only exception to the worker-owns-git rule). Distinct from finish-recovery (which nudges the *same* context when a gate is red) — Ralph *restarts* the context. Core: `crates/harness/src/ralph.rs`.

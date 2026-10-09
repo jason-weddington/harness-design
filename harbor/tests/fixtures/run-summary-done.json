@@ -1,0 +1,24 @@
+{
+  "outcome": "Finished",
+  "disposition": {
+    "Done": {
+      "summary": "ok",
+      "verification": "NoChecksConfigured",
+      "change": "TreeChanged"
+    }
+  },
+  "run_id": "harbor:1",
+  "record_path": "/logs/agent/run.sqlite",
+  "iterations": 2,
+  "compactions": 0,
+  "highest_compaction_tier": 0,
+  "backend_settings": {
+    "kind": "Anthropic",
+    "model": "claude-sonnet-5",
+    "think": null,
+    "num_ctx": null,
+    "num_ctx_source": null,
+    "max_tokens": 16384,
+    "max_tokens_source": "default"
+  }
+}

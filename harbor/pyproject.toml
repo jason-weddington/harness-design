@@ -1,0 +1,40 @@
+[project]
+name = "talos-harbor"
+version = "0.1.0"
+description = "Harbor BaseInstalledAgent adapter that runs talos inside a trial container"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["harbor==0.9.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/talos_harbor"]
+
+[dependency-groups]
+dev = ["ruff", "mypy", "pytest", "pytest-cov"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["harbor", "harbor.*"]
+follow_untyped_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--cov=talos_harbor --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.coverage.report]
+fail_under = 90

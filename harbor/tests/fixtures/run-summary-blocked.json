@@ -1,0 +1,22 @@
+{
+  "outcome": "Finished",
+  "disposition": {
+    "Blocked": {
+      "decision_needed": "the instruction names a file that does not exist"
+    }
+  },
+  "run_id": "harbor:1",
+  "record_path": "/logs/agent/run.sqlite",
+  "iterations": 1,
+  "compactions": 0,
+  "highest_compaction_tier": 0,
+  "backend_settings": {
+    "kind": "Ollama",
+    "model": "glm-5.3:cloud",
+    "think": "high",
+    "num_ctx": 262144,
+    "num_ctx_source": "probe",
+    "max_tokens": null,
+    "max_tokens_source": null
+  }
+}
