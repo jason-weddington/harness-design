@@ -1098,7 +1098,7 @@ struct Worktree {
 /// those misresolves against the WRONG repo (observed: `worktree add` dying
 /// with `.git/index: Not a directory` inside a freshly-created worktree).
 /// Every git invocation in this module must go through this constructor.
-fn git_command() -> std::process::Command {
+pub(crate) fn git_command() -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     for var in [
         "GIT_DIR",
@@ -1233,7 +1233,7 @@ fn add_worktree(source: &Path, dst: &Path, sha: &str) -> std::io::Result<()> {
 /// returned unchanged. When `$HOME` is unset the input is returned as-is
 /// (a leading `~/` will then be treated as a literal path segment by the
 /// caller — better than a silent expansion to `/`).
-fn expand_home(raw: &str) -> String {
+pub(crate) fn expand_home(raw: &str) -> String {
     expand_home_with(raw, std::env::var_os("HOME"))
 }
 
@@ -1312,7 +1312,7 @@ pub async fn run_env_setup(
 /// render_test_first_approach())`. With `agent_gate_command = Some(cmd)`, the
 /// output is exactly that string followed immediately by
 /// `render_verification_section(cmd)`, with NO separator inserted.
-fn tier2_task_prompt(
+pub fn tier2_task_prompt(
     statement: &str,
     agent_gate_command: Option<&str>,
     test_first: bool,

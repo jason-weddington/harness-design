@@ -113,3 +113,36 @@ cd harbor && uv sync --frozen && uv run --frozen ruff check . && uv run --frozen
 The tests are hermetic: no Docker, network, model or real talos binary. Coverage must stay at or above 90%.
 
 `scripts/harbor-smoke.sh` is an opt-in end-to-end run of `examples/hello-talos` in Docker. It needs a running Docker daemon, a talos binary supporting `--instruction-file` (`TALOS_PATH=<local binary>` or `TALOS_ARTIFACT_BASE=<artifact host>`), and a backend env such as `ANTHROPIC_API_KEY`. It prints `PASS <jobs-dir>` when the trial scores 1 and talos wrote its run summary. No hook, CI job or test runs it.
+
+## Running the tier-2 mined tasks on Harbor
+
+`cargo run -p harness --example mined_to_harbor` converts talos-evals tier-2 mined tasks into Harbor task dirs. It reads the private talos-evals checkout and the source repos at each task's `repo_path`, so it is opt-in and no hook, CI job or test runs it. Its output contains git bundles of private repos and must never be committed; the emitter refuses any `--out` inside a git work tree.
+
+The recipe, on a host that has the talos-evals checkout and the source repos:
+
+```bash
+cargo run -p harness --example mined_to_harbor -- --tasks-dir ~/git/talos-evals/tasks --out /tmp/harbor-tasks   # [--task <ID>] [--spec-level s1|s2|s3], default s2
+scripts/harbor-build-base.sh /tmp/harbor-tasks
+cd harbor && ANTHROPIC_API_KEY=... uv run --frozen harbor run -p /tmp/harbor-tasks --agent-import-path talos_harbor.agent:TalosAgent --ak max_iterations=500 --ak gate_timeout_secs=900 --ak wall_clock_secs=3300 -o <jobs>
+```
+
+The emitter prints the exact `harbor:` line for its `--out`; prefix it with the backend env TalosAgent forwards (see above). It also prints a `paired mined_eval:` line, the env for a `mined_eval` run that measures the same row: `MINED_EVAL_TASKS_DIR=<tasks-dir> MINED_EVAL_SPEC_LEVEL=<slug> MINED_EVAL_MAX_ITERATIONS=500 MINED_EVAL_WALL_CLOCK_SECS=3300 MINED_EVAL_AGENT_GATE=1 MINED_EVAL_GATE_TIMEOUT_SECS=900 MINED_EVAL_TEST_FIRST=1`. Any `--ak` change on the Harbor side must be mirrored in that line, or the two runs stop being comparable. Each task.toml records `spec_level`, `test_first` and `agent_gate` in `[metadata]`, and the calibration report (item D) compares them against the SUMMARY header of the paired mined_eval run.
+
+`scripts/harbor-build-base.sh` builds `<out>/_base` as `talos-evals-base:1`, which every emitted Dockerfile builds `FROM`. The image is never pushed, so the build must use the default `docker` buildx driver (the local image store); a `docker-container` builder makes the task builds fail with 'pull access denied'.
+
+Each task's image build is also its environment check. A bundle whose `HEAD` is not the expected sha, a failing `env.setup`, or an agent gate that is red at the parent commit fails the image build with a `TALOS_EVAL_INVALID reason=<prefix>` line (`baseline-head-mismatch`, `setup-failed`, `agent-gate-red-at-parent`) in the trial's exception message; item D classifies those trials as Invalid, not as model failures. The agent-gate tripwire runs once per image build, not per trial, so a cached image does not re-check it; `docker build --no-cache` resamples it.
+
+The verifier (`tests/test.sh`) writes its outputs to `/logs/verifier`:
+
+| File | Contents |
+|---|---|
+| `steps.jsonl` | one `{"step", "rc"}` line per verifier step (the `gate` step also has `gate_ms`). |
+| `agent-gate-post.out` | the agent gate re-run after the agent finished. |
+| `porcelain.txt`, `porcelain.err` | `git status --porcelain -uall` of `/app` before the sealed copy. |
+| `authored.json` | the agent's added and modified test files, from `mined_score.parse_authored_tests`. |
+| `verify-meta.json` | `HEAD`, the `talos-baseline` sha and the commits ahead of it. |
+| `sealed-check.txt` | any sealed file that did not land byte-for-byte. |
+| `gate.out`, `gate.err` | stdout and stderr of the sealed scoring gate. |
+| `reward.txt`, `score.json` | the scorer's verdict. |
+
+A failed sealed copy, sealed check or gate-command read exits before the scorer, so no reward file is written and Harbor raises `RewardFileNotFoundError`; item D counts those trials as Invalid.

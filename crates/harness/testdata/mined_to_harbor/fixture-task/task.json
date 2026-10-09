@@ -1,0 +1,41 @@
+{
+  "id": "fixture-task",
+  "repo": "fixture-repo",
+  "repo_path": "~/git/fixture-repo",
+  "parent_sha": "1111111111111111111111111111111111111111",
+  "fix_sha": "2222222222222222222222222222222222222222",
+  "rung_guess": "easy",
+  "language": "python",
+  "provenance": {
+    "source": "synthetic fixture for mined_to_harbor"
+  },
+  "env": {
+    "setup": "uv sync --frozen",
+    "sibling_repos": [
+      {
+        "repo": "fixture-sib",
+        "pin": "v0.1.0"
+      }
+    ]
+  },
+  "test_scope": "tests/test_fixture.py",
+  "gate_command": "uv run --frozen pytest tests/test_fixture.py -q",
+  "agent_gate_command": "P=$(shuf -i 20000-60000 -n 1); echo \"port $P\" && printf 'a\\\\b\\n' && true",
+  "fail_to_pass": [
+    "tests/test_fixture.py::TestWidget::test_new_behaviour"
+  ],
+  "positive_controls": [
+    "tests/test_fixture.py::TestWidget::test_existing_behaviour"
+  ],
+  "pass_to_pass_exclusions": [
+    "TestFlaky::*"
+  ],
+  "sealed": [
+    {
+      "path": "tests/test_fixture.py"
+    }
+  ],
+  "notes": [
+    "Synthetic: nothing here is copied from talos-evals."
+  ]
+}

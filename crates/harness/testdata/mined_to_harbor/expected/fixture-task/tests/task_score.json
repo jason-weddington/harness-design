@@ -1,0 +1,18 @@
+{
+  "fail_to_pass": [
+    "tests/test_fixture.py::TestWidget::test_new_behaviour"
+  ],
+  "gate_command": "uv run --frozen pytest tests/test_fixture.py -q",
+  "id": "fixture-task",
+  "pass_to_pass_exclusions": [
+    "TestFlaky::*"
+  ],
+  "positive_controls": [
+    "tests/test_fixture.py::TestWidget::test_existing_behaviour"
+  ],
+  "sealed": [
+    {
+      "path": "tests/test_fixture.py"
+    }
+  ]
+}
