@@ -8,6 +8,22 @@
 //! whose working tree is UNCHANGED since the run started. See the `--mode`
 //! answer section below.
 //!
+//! ## `talos run --instruction-file`
+//!
+//! `--instruction-file <path>` runs build mode on a free-text instruction
+//! instead of a `TaskSpec`. The file bytes are the seed verbatim, wrapped only
+//! by the engine's shared `# Task` heading like every other seed. The flag
+//! conflicts with `--file`, `--schema` and `--mode answer`, and stdin is not
+//! read. `--gate-command <cmd>` requires `--instruction-file`, must be
+//! non-empty, and is registered as `run_checks` exactly like
+//! `TaskSpec.gate_command` (finish-recovery armed, `finish(done)`
+//! claim-verified); omitting it means no checks.
+//!
+//! Audit point: the transcript's `run_start.messages[0]` first Text block
+//! equals `# Task` + blank line + the instruction file bytes; input mode and
+//! gate presence are recorded only in `run_start`, so pass `--transcript` when
+//! a run must be auditable.
+//!
 //! ## Exit code contract (locked)
 //!
 //! | Code | Meaning |
@@ -397,10 +413,25 @@ struct RunArgs {
     #[arg(long)]
     workspace: PathBuf,
 
-    /// Path to the run input — a `TaskSpec` JSON in build mode, the free-text
-    /// prompt in answer mode (reads stdin when omitted).
+    /// Path to the run input — a `TaskSpec` JSON in build mode (unless
+    /// `--instruction-file` supplies a free-text instruction instead), the
+    /// free-text prompt in answer mode (reads stdin when omitted).
     #[arg(long)]
     file: Option<PathBuf>,
+
+    /// Path to a free-text instruction file, used VERBATIM as the build-mode
+    /// seed (wrapped only by the engine's shared `# Task` heading). Replaces
+    /// `--file`/stdin as the run input: stdin is never read.
+    ///
+    /// Conflicts with `--file` and `--schema`; valid only with `--mode build`.
+    #[arg(long, conflicts_with_all = ["file", "schema"])]
+    instruction_file: Option<PathBuf>,
+
+    /// Gate command registered as `run_checks` for an `--instruction-file`
+    /// run, exactly like `TaskSpec.gate_command`. Must be non-empty; omit it
+    /// for a run with no checks. Requires `--instruction-file`.
+    #[arg(long, requires = "instruction_file")]
+    gate_command: Option<String>,
 
     /// What this run is: `build` (execute a `TaskSpec`, the default) or
     /// `answer` (answer a question about the workspace without changing it).
@@ -1653,6 +1684,43 @@ fn read_run_input(args: &RunArgs) -> Result<String, String> {
     }
 }
 
+/// Read `--instruction-file` verbatim (no trim, no parsing).
+///
+/// Runs before the run store is opened, like [`read_run_input`].
+fn read_instruction_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read instruction file `{}`: {e}", path.display()))
+}
+
+/// Validate the `--instruction-file` / `--gate-command` flag shape that clap
+/// cannot express: build-only, and a non-blank gate (fail closed — a blank
+/// gate must never silently become "no gate").
+fn validate_instruction_flags(
+    mode: RunMode,
+    instruction_file: Option<&Path>,
+    gate_command: Option<&str>,
+) -> Result<(), String> {
+    if instruction_file.is_some() && mode != RunMode::Build {
+        return Err("--instruction-file is only valid with --mode build".to_string());
+    }
+    // clap's `requires` is silently skipped when the required arg conflicts
+    // with another present arg (`--file`), so enforce it here too.
+    if gate_command.is_some() && instruction_file.is_none() {
+        return Err("--gate-command requires --instruction-file".to_string());
+    }
+    if gate_command.is_some_and(|g| g.trim().is_empty()) {
+        return Err("--gate-command must be non-empty".to_string());
+    }
+    Ok(())
+}
+
+/// The build-mode run input: a groomed [`TaskSpec`], or a free-text
+/// instruction from `--instruction-file` used as the seed verbatim.
+enum BuildInput {
+    Spec(TaskSpec),
+    Instruction(String),
+}
+
 /// Validate the answer-mode flag SHAPE: `--schema` is required with
 /// `--mode answer` and rejected without it.
 ///
@@ -1742,6 +1810,14 @@ async fn main() {
 async fn run_cmd(args: RunArgs) {
     // 1. Flag shape, BEFORE stdin — mirrors `run_ralph_cmd`'s `--stop-when`
     //    guard.
+    if let Err(e) = validate_instruction_flags(
+        args.mode,
+        args.instruction_file.as_deref(),
+        args.gate_command.as_deref(),
+    ) {
+        stderr_json_error(&e);
+        std::process::exit(1);
+    }
     if let Err(e) = validate_mode_flags(args.mode, args.schema.as_deref()) {
         stderr_json_error(&e);
         std::process::exit(1);
@@ -1763,18 +1839,34 @@ async fn run_cmd(args: RunArgs) {
 
     // 3. Read the run input — must happen BEFORE the store is opened, so a
     //    bad spec never touches the filesystem.
-    let run_input = match read_run_input(&args) {
-        Ok(s) => s,
-        Err(e) => {
-            stderr_json_error(&e);
-            std::process::exit(1);
+    //    `--instruction-file` replaces the stdin/`--file` read entirely.
+    let (run_input, instruction) = if let Some(path) = args.instruction_file.as_deref() {
+        match read_instruction_file(path) {
+            Ok(text) if text.trim().is_empty() => {
+                stderr_json_error("instruction file must be non-empty");
+                std::process::exit(1);
+            }
+            Ok(text) => (String::new(), Some(text)),
+            Err(e) => {
+                stderr_json_error(&e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match read_run_input(&args) {
+            Ok(s) => (s, None),
+            Err(e) => {
+                stderr_json_error(&e);
+                std::process::exit(1);
+            }
         }
     };
 
     // 4. Interpret the input per mode. In answer mode it is free text and is
     //    NEVER handed to `serde_json` — only emptiness is checked, because an
     //    empty question would send the agent off to answer nothing.
-    let spec: Option<TaskSpec> = match args.mode {
+    let build_input: Option<BuildInput> = match args.mode {
+        _ if instruction.is_some() => instruction.map(BuildInput::Instruction),
         RunMode::Answer => {
             if run_input.trim().is_empty() {
                 stderr_json_error("answer prompt must be non-empty");
@@ -1783,7 +1875,7 @@ async fn run_cmd(args: RunArgs) {
             None
         }
         RunMode::Build => match serde_json::from_str(&run_input) {
-            Ok(s) => Some(s),
+            Ok(s) => Some(BuildInput::Spec(s)),
             Err(e) => {
                 stderr_json_error(&format!("invalid TaskSpec: {e}"));
                 std::process::exit(1);
@@ -1918,7 +2010,7 @@ async fn run_cmd(args: RunArgs) {
 
     // 9/10. Registry + seed prompt + RunConfig, per mode. The seed is always
     //       byte-for-byte from a renderer, never hand-formatted.
-    let (tools, mut config) = match (answer_schema, spec) {
+    let (tools, mut config) = match (answer_schema, build_input) {
         (Some((schema_text, compiled)), _) => {
             // ANSWER mode wires NO gate and NO nudges this cut. There is no
             // TaskSpec, hence no `gate_command`, hence no `ChecksRunner` — so
@@ -1942,8 +2034,31 @@ async fn run_cmd(args: RunArgs) {
             .with_max_nudges(0);
             (answer_registry(None), config)
         }
-        (None, Some(spec)) => {
-            // BUILD mode — unchanged. The optional ChecksRunner from
+        (None, Some(BuildInput::Instruction(text))) => {
+            // BUILD mode, free-text instruction: seed is the file verbatim;
+            // the optional `--gate-command` wires exactly like
+            // `TaskSpec.gate_command`.
+            let checks = build_checks_runner(
+                args.gate_command.as_deref().unwrap_or(""),
+                workspace_root,
+                args.gate_timeout_secs,
+            );
+            let tools = standard_registry(checks.clone());
+            let base = RunConfig::new(text, args.max_iterations);
+            let base = if let Some(runner) = checks {
+                base.with_checks(runner)
+            } else {
+                base
+            };
+            let config = with_flagged_max_tokens(
+                base.with_wall_clock_secs(wall_clock_secs)
+                    .with_token_budget(token_budget),
+                args.max_tokens,
+            );
+            (tools, config)
+        }
+        (None, Some(BuildInput::Spec(spec))) => {
+            // BUILD mode, TaskSpec arm — unchanged. The optional ChecksRunner from
             // spec.gate_command wires to BOTH the tool registry (so the agent
             // can call `run_checks`) AND the RunConfig (so finish(done) is
             // harness-verified).
@@ -2193,6 +2308,7 @@ mod tests {
         touch_dir_mtime, transcript_label, validate_mode_flags, with_flagged_max_tokens,
         write_ralph_error_detail,
     };
+    use super::{read_instruction_file, validate_instruction_flags};
     use harness::anthropic::AnthropicBackend;
     use harness::bedrock::BedrockBackend;
     use harness::engine::LoopOutcome;
@@ -2208,6 +2324,7 @@ mod tests {
         BackendKind, BackendSettings, Disposition, FailureMode, Verification,
     };
     use harness::task_spec::{FileToModify, TaskSpec};
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -2512,6 +2629,46 @@ mod tests {
     /// `--schema` is required with `--mode answer` and rejected without it;
     /// the two legal shapes pass. Pins the exact wording the CLI tests assert
     /// on stderr.
+    #[test]
+    fn validate_instruction_flags_branches() {
+        let p = Path::new("i.md");
+        assert!(validate_instruction_flags(RunMode::Build, None, None).is_ok());
+        assert!(validate_instruction_flags(RunMode::Answer, None, None).is_ok());
+        assert!(validate_instruction_flags(RunMode::Build, Some(p), None).is_ok());
+        assert!(validate_instruction_flags(RunMode::Build, Some(p), Some("true")).is_ok());
+        assert_eq!(
+            validate_instruction_flags(RunMode::Answer, Some(p), None).unwrap_err(),
+            "--instruction-file is only valid with --mode build"
+        );
+        assert_eq!(
+            validate_instruction_flags(RunMode::Build, None, Some("true")).unwrap_err(),
+            "--gate-command requires --instruction-file"
+        );
+        for g in ["", "  "] {
+            assert_eq!(
+                validate_instruction_flags(RunMode::Build, Some(p), Some(g)).unwrap_err(),
+                "--gate-command must be non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn read_instruction_file_reads_verbatim_and_reports_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("a.md");
+        std::fs::write(&ok, "\n x é\n\n").unwrap();
+        assert_eq!(read_instruction_file(&ok).unwrap(), "\n x é\n\n");
+        let missing = dir.path().join("missing.md");
+        let err = read_instruction_file(&missing).unwrap_err();
+        assert!(
+            err.starts_with("failed to read instruction file `"),
+            "{err}"
+        );
+        let bad = dir.path().join("bad.md");
+        std::fs::write(&bad, [0xff, 0xfe]).unwrap();
+        assert!(read_instruction_file(&bad).is_err());
+    }
+
     #[test]
     fn validate_mode_flags_requires_schema_iff_answer_mode() {
         let path = PathBuf::from("/tmp/schema.json");

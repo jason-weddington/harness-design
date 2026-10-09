@@ -75,6 +75,22 @@ Two operator notes:
 1. **Concurrent answer agents on one host MUST each pass a distinct `--task-id`** (or a distinct `--run-store` plus `--offload-dir`). The default `talos-run` resolves to one state dir and one run id (`talos-run:1`), so parallel runs would collide on the same `run.sqlite` and the same run record.
 2. **`tree_dirty` and `mutating_iters` are not the read-only oracle.** In answer mode they count *successful `bash` calls*, not observed tree changes, so a run that only grepped will still report them set. The authoritative read-only evidence is `Disposition::Answer.change` (and, on a transcript, the `run_end` stats `edit_file_calls_ok` and any `finish_rejection: "modified_workspace"` rows).
 
+## Instruction-file mode (`talos run --instruction-file`)
+
+**Instruction-file mode** runs build mode on a free-text instruction instead of a `TaskSpec`: `talos run --instruction-file instruction.md` reads the file and uses its bytes as the seed.
+
+```bash
+talos run --workspace /app --instruction-file instruction.md --gate-command 'uv run pytest -q' --task-id harbor --transcript /logs/agent/transcript.jsonl
+```
+
+The file bytes are the seed verbatim, wrapped only by the engine's shared `# Task` heading like every other seed (no trim, no TaskSpec template).
+
+The flag conflicts with `--file`, `--schema` and `--mode answer`, and stdin is not read.
+
+`--gate-command` requires `--instruction-file`, must be non-empty, and is registered as `run_checks` exactly like `TaskSpec.gate_command` (finish-recovery armed, `finish(done)` claim-verified). Omitting it means no checks.
+
+The transcript's `run_start.messages[0]` first Text block equals `# Task` + blank line + the instruction file bytes, and input mode and gate presence are recorded only in `run_start`, so pass `--transcript` when a run must be auditable.
+
 ## Ralph mode (`talos ralph`)
 
 The **Ralph loop** drives an agent toward an objective by re-invoking the inner engine with a **fresh context every outer iteration** — durable state lives *outside* the context window (the code on disk, the git history, and a notes file the agent reads-then-appends), so each pass starts cold and still makes forward progress. Each iteration does exactly one unit of work; the **harness owns a git commit per iteration** (a deliberate ralph-only exception to the worker-owns-git rule). Distinct from finish-recovery (which nudges the *same* context when a gate is red) — Ralph *restarts* the context. Core: `crates/harness/src/ralph.rs`.

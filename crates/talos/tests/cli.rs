@@ -2401,3 +2401,295 @@ fn assert_answer_run_start(run_start: &serde_json::Value, question: &str) {
     assert_eq!(run_start["config"]["max_nudges"], 0);
     assert_eq!(run_start["config"]["mode"], "answer");
 }
+
+// ============================================================================
+// `talos run --instruction-file` / `--gate-command`
+// ============================================================================
+
+/// Spawn `talos run` with the refused-port environment and extra args.
+/// `stdin_bytes` of `None` means null stdin. Returns the finished output.
+fn run_instruction(
+    dir: &std::path::Path,
+    extra: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> std::process::Output {
+    let store = dir.join("run.sqlite");
+    let mut cmd = Command::new(TALOS_BIN);
+    cmd.args([
+        "run",
+        "--workspace",
+        dir.to_str().unwrap(),
+        "--run-store",
+        store.to_str().unwrap(),
+        "--state-retention-days",
+        "0",
+    ])
+    .args(extra)
+    .env("TALOS_BACKEND", "ollama")
+    .env("OLLAMA_MODEL", "x")
+    .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+    .env("OLLAMA_NUM_CTX", "32768")
+    .env_remove("OLLAMA_THINK")
+    .env_remove("TALOS_BEDROCK")
+    .env("XDG_STATE_HOME", dir.join("state-home"))
+    .env("HOME", dir)
+    .env_remove("TALOS_STATE_RETENTION_DAYS")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if stdin_bytes.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    let mut child = cmd.spawn().expect("spawn talos");
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = child.stdin.take().unwrap();
+        // BrokenPipe is fine: talos must not read stdin at all.
+        let _ = stdin.write_all(bytes);
+    }
+    child.wait_with_output().expect("wait for talos")
+}
+
+/// Assert the run exited 1 with a one-line JSON `error` on stderr, nothing on
+/// stdout, and no run store. Returns the error string.
+fn assert_rejected(output: &std::process::Output, dir: &std::path::Path) -> String {
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "stdout must be empty");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.trim().lines().count(), 1, "stderr: {stderr:?}");
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("stderr is JSON");
+    assert!(!dir.join("run.sqlite").exists(), "store must not exist");
+    v["error"].as_str().expect("error key").to_string()
+}
+
+fn write_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+    let p = dir.join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p.to_str().unwrap().to_string()
+}
+
+/// Run an instruction-file refused-port run with a transcript; returns
+/// `(summary, run_start)`.
+fn instruction_transcript_run(
+    dir: &std::path::Path,
+    extra: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> (serde_json::Value, serde_json::Value) {
+    let t = dir.join("t.jsonl");
+    let mut args = vec!["--transcript", t.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let out = run_instruction(dir, &args, stdin_bytes);
+    assert_eq!(out.status.code(), Some(1));
+    let summary: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("summary JSON");
+    assert_eq!(summary["outcome"], "BackendError");
+    let first = std::fs::read_to_string(&t).unwrap();
+    let run_start = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+    (summary, run_start)
+}
+
+fn assert_instruction_run_start(
+    run_start: &serde_json::Value,
+    expected_text: &str,
+    expect_checks: Option<&str>,
+) {
+    assert_eq!(run_start["event"], "run_start");
+    assert_eq!(run_start["config"]["mode"], "build");
+    assert_eq!(
+        run_start["config"]["max_nudges"],
+        harness::engine::DEFAULT_MAX_NUDGES
+    );
+    let names: Vec<&str> = run_start["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"edit_file"));
+    assert_eq!(names.contains(&"run_checks"), expect_checks.is_some());
+    match expect_checks {
+        Some(c) => assert_eq!(run_start["config"]["checks"], c),
+        None => assert!(run_start["config"]["checks"].is_null()),
+    }
+    let tool_lines: Vec<harness::prompt::ToolLine> = run_start["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| harness::prompt::ToolLine {
+            name: t["name"].as_str().unwrap().to_string(),
+            description: t["description"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        run_start["system"],
+        serde_json::Value::String(harness::prompt::render_system_prompt(
+            &tool_lines,
+            expect_checks
+        ))
+    );
+    let text = run_start["messages"][0]["User"]["content"][0]["Text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text, harness::prompt::render_task_prompt(expected_text));
+    assert!(!text.contains("## Acceptance Criteria"));
+    assert!(!text.contains("## Files to Modify"));
+}
+
+#[test]
+fn run_help_lists_instruction_file_and_gate_command() {
+    let out = Command::new(TALOS_BIN)
+        .args(["run", "--help"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("--instruction-file"));
+    assert!(s.contains("--gate-command"));
+}
+
+#[test]
+fn instruction_file_with_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let i = write_file(dir.path(), "i.md", b"do it");
+    let f = write_file(dir.path(), "s.json", valid_spec_json().as_bytes());
+    let out = run_instruction(dir.path(), &["--instruction-file", &i, "--file", &f], None);
+    assert_rejected(&out, dir.path());
+}
+
+#[test]
+fn instruction_file_with_schema_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let i = write_file(dir.path(), "i.md", b"do it");
+    let s = write_file(dir.path(), "s.json", b"{}");
+    let out = run_instruction(
+        dir.path(),
+        &["--instruction-file", &i, "--mode", "answer", "--schema", &s],
+        None,
+    );
+    assert_rejected(&out, dir.path());
+}
+
+#[test]
+fn gate_command_without_instruction_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_instruction(dir.path(), &["--gate-command", "true"], None);
+    assert_rejected(&out, dir.path());
+
+    let dir = tempfile::tempdir().unwrap();
+    let f = write_file(dir.path(), "s.json", valid_spec_json().as_bytes());
+    let out = run_instruction(dir.path(), &["--gate-command", "true", "--file", &f], None);
+    assert_rejected(&out, dir.path());
+}
+
+#[test]
+fn instruction_file_with_answer_mode_gives_build_only_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let i = write_file(dir.path(), "i.md", b"do it");
+    let out = run_instruction(
+        dir.path(),
+        &["--instruction-file", &i, "--mode", "answer"],
+        None,
+    );
+    assert_eq!(
+        assert_rejected(&out, dir.path()),
+        "--instruction-file is only valid with --mode build"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        r#"{"error":"--instruction-file is only valid with --mode build"}"#
+    );
+}
+
+#[test]
+fn instruction_file_missing_empty_invalid_and_blank_gate_are_input_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.md");
+    let out = run_instruction(
+        dir.path(),
+        &["--instruction-file", missing.to_str().unwrap()],
+        None,
+    );
+    let err = assert_rejected(&out, dir.path());
+    assert!(
+        err.starts_with(&format!(
+            "failed to read instruction file `{}`: ",
+            missing.display()
+        )),
+        "{err}"
+    );
+
+    for body in [&b""[..], &b" \n\t "[..]] {
+        let i = write_file(dir.path(), "e.md", body);
+        let out = run_instruction(dir.path(), &["--instruction-file", &i], None);
+        assert_rejected(&out, dir.path());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            r#"{"error":"instruction file must be non-empty"}"#
+        );
+    }
+
+    let bad = write_file(dir.path(), "bad.md", &[0xff, 0xfe]);
+    let out = run_instruction(dir.path(), &["--instruction-file", &bad], None);
+    let err = assert_rejected(&out, dir.path());
+    assert!(
+        err.starts_with("failed to read instruction file `"),
+        "{err}"
+    );
+
+    let i = write_file(dir.path(), "i.md", b"do it");
+    for gate in ["", "   "] {
+        let out = run_instruction(
+            dir.path(),
+            &["--instruction-file", &i, "--gate-command", gate],
+            None,
+        );
+        assert_rejected(&out, dir.path());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            r#"{"error":"--gate-command must be non-empty"}"#
+        );
+    }
+}
+
+#[test]
+fn instruction_file_seed_is_verbatim_and_stdin_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = "\n## Heading\nsentinel-xyzzy é\n\n";
+    let i = write_file(dir.path(), "i.md", content.as_bytes());
+    let (_, run_start) = instruction_transcript_run(
+        dir.path(),
+        &["--instruction-file", &i],
+        Some(valid_spec_json().as_bytes()),
+    );
+    assert_instruction_run_start(&run_start, content, None);
+    let text = run_start["messages"][0]["User"]["content"][0]["Text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("sentinel-xyzzy"));
+    assert!(!text.contains("Integration test task"));
+}
+
+#[test]
+fn instruction_file_with_gate_registers_run_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let i = write_file(dir.path(), "i.md", b"fix the bug");
+    let (_, run_start) = instruction_transcript_run(
+        dir.path(),
+        &["--instruction-file", &i, "--gate-command", "true"],
+        None,
+    );
+    assert_instruction_run_start(&run_start, "fix the bug", Some("/bin/sh -c true"));
+}
+
+#[test]
+fn instruction_file_explicit_mode_build_matches_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let i = write_file(dir.path(), "i.md", b"fix the bug");
+    let (_, run_start) = instruction_transcript_run(
+        dir.path(),
+        &["--instruction-file", &i, "--mode", "build"],
+        None,
+    );
+    assert_instruction_run_start(&run_start, "fix the bug", None);
+}
