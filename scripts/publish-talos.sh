@@ -29,7 +29,8 @@
 # fails loudly if that convention ever diverges from what cargo actually
 # builds, so a future crate cannot be silently under-published.
 #
-# Safety: runs the project gate first (a binary that fails its own gate never
+# Safety: binaries are built with cargo-zigbuild against glibc $GLIBC_FLOOR and
+# checked by scripts/check-glibc-floor.sh before any upload; runs the project gate first (a binary that fails its own gate never
 # ships); artifacts are immutable per-TOKEN (an existing <TOKEN> dir is never
 # overwritten); `latest` advances only once the per-file check passes.
 #
@@ -61,6 +62,14 @@ PUBLISH_HOST="jason@pi-04"
 [ -n "${TALOS_PUBLISH_HOST-}" ] && PUBLISH_HOST="$TALOS_PUBLISH_HOST"
 PUBLISH_DIR="${TALOS_PUBLISH_DIR:-/srv/talos}"
 ARM_TARGET="aarch64-unknown-linux-gnu"
+X86_TARGET="x86_64-unknown-linux-gnu"
+# Raise only when no fleet host or consumer image is older (Ubuntu 24.04 = 2.39).
+GLIBC_FLOOR="2.39"
+# cargo-zigbuild builds against this glibc regardless of the publish host's own,
+# and cargo-zigbuild strips the ".$GLIBC_FLOOR" suffix from the output directory
+# (README: "target/<triple>/release"), so artifacts land at target/<triple>/release/<bin>.
+X86_OUT="target/$X86_TARGET/release"
+ARM_OUT="target/$ARM_TARGET/release"
 
 cd "$(dirname "$0")/.."
 
@@ -129,18 +138,33 @@ if [ "$DRY_RUN" = 0 ]; then
     exit 1
   fi
 
+  # --- Toolchain preflight, before the (slow) gate.
+  if ! cargo zigbuild --version >/dev/null 2>&1; then
+    echo "ERROR: cargo-zigbuild not installed (cargo binstall cargo-zigbuild; plus zig: pip/uv install ziglang or a zig on PATH)" >&2
+    exit 1
+  fi
+
   # --- Gate first: a binary that can't pass its own gate never reaches the fleet.
   echo "==> Gate: fmt + clippy + nextest…"
   cargo fmt --check
   cargo clippy --workspace --all-targets -- -D warnings
   cargo nextest run --workspace
 
-  # --- Build every binary, both arches (release): native x86_64 + cross aarch64.
-  echo "==> Building release binaries (x86_64 native + $ARM_TARGET cross)…"
+  # --- Build every binary, both arches (release), against the pinned glibc floor.
+  echo "==> Building release binaries (x86_64 + $ARM_TARGET, glibc $GLIBC_FLOOR via cargo-zigbuild)…"
   for bin in "${BINS[@]}"; do
-    cargo build --release -p "$bin"
-    cargo build --release --target "$ARM_TARGET" -p "$bin"
+    cargo zigbuild --release --target "$X86_TARGET.$GLIBC_FLOOR" -p "$bin"
+    cargo zigbuild --release --target "$ARM_TARGET.$GLIBC_FLOOR" -p "$bin"
   done
+
+  # --- Refuse to publish anything needing a newer glibc than the floor. Runs
+  # before any remote_run/remote_put, so a failure never reaches pi-04.
+  echo "==> Checking glibc floor $GLIBC_FLOOR…"
+  built=()
+  for bin in "${BINS[@]}"; do
+    built+=("$X86_OUT/$bin" "$ARM_OUT/$bin")
+  done
+  ./scripts/check-glibc-floor.sh "$GLIBC_FLOOR" "${built[@]}"
 fi
 
 # --- Token: identical derivation in both modes (see header for why it matches
@@ -157,8 +181,8 @@ else
   echo "==> Uploading to $PUBLISH_DIR/$TOKEN/…"
   remote_run "mkdir -p '$PUBLISH_DIR/$TOKEN/x86_64' '$PUBLISH_DIR/$TOKEN/aarch64'"
   for bin in "${BINS[@]}"; do
-    remote_put "target/release/$bin" "$PUBLISH_DIR/$TOKEN/x86_64/$bin"
-    remote_put "target/$ARM_TARGET/release/$bin" "$PUBLISH_DIR/$TOKEN/aarch64/$bin"
+    remote_put "$X86_OUT/$bin" "$PUBLISH_DIR/$TOKEN/x86_64/$bin"
+    remote_put "$ARM_OUT/$bin" "$PUBLISH_DIR/$TOKEN/aarch64/$bin"
   done
 fi
 

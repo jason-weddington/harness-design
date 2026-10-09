@@ -173,10 +173,7 @@ to the homelab artifact host (`pi-04`); the fleet's `talos-update.sh`
   holding the current `<TOKEN>` on one line — advanced only after both arches
   upload. Artifacts are immutable per-`<TOKEN>` (a gate-failing or dirty-tree
   build never ships; an existing `<TOKEN>` dir is never overwritten).
-- **One-time cross-toolchain setup** (on the x86_64 publisher):
-  `rustup target add aarch64-unknown-linux-gnu` and install the linker
-  `gcc-aarch64-linux-gnu` (Debian/Ubuntu). The linker is wired in
-  `.cargo/config.toml`.
+- **One-time toolchain setup** (on the x86_64 publisher): `cargo binstall cargo-zigbuild` plus zig (`uv tool install ziglang` or a zig on `PATH`); `rust-toolchain.toml` installs both std targets. Binaries are built against the pinned `GLIBC_FLOOR` (2.39, Ubuntu 24.04) regardless of the host's glibc, and `scripts/check-glibc-floor.sh` refuses to publish a binary requiring a newer one. The macOS artifact is unaffected.
 - **Target override.** `TALOS_PUBLISH_HOST` (default `jason@pi-04`) and
   `TALOS_PUBLISH_DIR` (default `/srv/talos`).
 
