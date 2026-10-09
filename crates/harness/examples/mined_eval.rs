@@ -96,7 +96,9 @@
 //!   window also moves the derived per-turn output cap, which would confound
 //!   two variables.
 //! - `TALOS_MINED_STATE_ROOT` (optional) — root for per-trial captures
-//!   (`gate-output.txt`, `agent-gate-output.txt`, `transcript.jsonl`).
+//!   (`gate-output.txt`, `agent-gate-output.txt`, `transcript.jsonl`, and the
+//!   machine-readable per-trial record `trial-result.json` that the Harbor
+//!   calibration report reads).
 //!   Resolved ONCE in `main` via `mined_eval::default_state_root()`: this
 //!   var, else `XDG_STATE_HOME`, else `$HOME/.local/state`, else the process
 //!   temp dir; captures land at `<root>/talos/mined-eval/<run-id>/<task-id>/trial-<k>/`.
@@ -396,12 +398,14 @@ async fn main() {
         .collect();
 
     let state_root: PathBuf = mined_eval::default_state_root();
+    let run_dir: PathBuf = mined_eval::run_dir(&state_root);
 
     println!(
-        "running mined_eval across {} task(s) (k={k}, spec_level={spec_level:?}, max_iterations={max_iterations}, agent_gate={agent_gate}, test_first={}, wall_clock={wall_clock_desc}, transcripts={transcripts_desc}, compact_threshold_pct={compact_threshold_pct}, state_root={}) against {backend_desc}",
+        "running mined_eval across {} task(s) (k={k}, spec_level={spec_level:?}, max_iterations={max_iterations}, agent_gate={agent_gate}, test_first={}, wall_clock={wall_clock_desc}, transcripts={transcripts_desc}, compact_threshold_pct={compact_threshold_pct}, state_root={}) against {backend_desc} run_dir={}",
         loaded.len(),
         if test_first { "on" } else { "off" },
         state_root.display(),
+        run_dir.display(),
     );
 
     let parser = PytestParser;
@@ -508,6 +512,10 @@ async fn main() {
             test_first,
             wall_clock_secs,
         },
+    );
+    println!(
+        "trial records: {}/<task-id>/trial-<k>/trial-result.json",
+        run_dir.display()
     );
 }
 

@@ -102,6 +102,10 @@ talos exit codes 0 (Done), 10 (Blocked), 20 (Failed / stopped / out of budget), 
 
 Harbor still runs the verifier after `NonZeroAgentExitCodeError`. Treat a trial whose `exception_info` is `NonZeroAgentExitCodeError` or `AgentTimeoutError`, or whose `metadata.talos.outcome` is `BackendError`, as an infra failure and report it as Invalid, not as a model failure.
 
+## Calibration report
+
+`talos-harbor-calibrate --harbor-job <jobs> --mined-run <run_dir>` compares a Harbor job against a `mined_eval` run over the same tasks: it classifies every trial on both sides, checks config parity, prints a per-task table and pooled Wilson intervals, and ends with `MATCH` or `MISMATCH: <reasons>`. Exit codes are 0 (MATCH), 3 (MATCH but comparability DEGRADED), 1 (MISMATCH) and 2 (input error). The runbook, including the parity knobs and the exact command sequence, is [`docs/design/09-harbor-calibration.md`](../docs/design/09-harbor-calibration.md).
+
 ## Development
 
 The package's gate chain, run from `harbor/` (lefthook runs it on commits touching `harbor/**` and on every push, and CI runs it as the `harbor` job):

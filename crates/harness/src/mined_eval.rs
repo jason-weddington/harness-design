@@ -2090,11 +2090,123 @@ fn run_id() -> &'static str {
 /// when [`MinedRunConfig::transcripts`] is on, [`single_trial`]'s
 /// `transcript.jsonl`.
 fn trial_state_dir(state_root: &Path, task_id: &str, trial: u32) -> PathBuf {
-    state_root
-        .join("talos/mined-eval")
-        .join(run_id())
+    run_dir(state_root)
         .join(task_id)
         .join(format!("trial-{trial}"))
+}
+
+/// This process's mined-eval run directory:
+/// `<state-root>/talos/mined-eval/<run-id>`. Every per-trial directory
+/// ([`trial_state_dir`]) lives under it as `<task-id>/trial-<k>`, so the
+/// calibration report can be pointed at this one path.
+#[must_use]
+pub fn run_dir(state_root: &Path) -> PathBuf {
+    state_root.join("talos/mined-eval").join(run_id())
+}
+
+/// Wire-format version of [`trial_record_json`]'s object.
+pub const TRIAL_RECORD_SCHEMA: &str = "talos-mined-trial/1";
+
+/// The machine-readable per-trial record written as `trial-result.json` next
+/// to `gate-output.txt`, read by the Harbor calibration report.
+///
+/// Built explicitly with `serde_json::json!` rather than by deriving
+/// `Serialize`, so the wire shape (exactly 40 keys, `schema`
+/// [`TRIAL_RECORD_SCHEMA`]) is pinned independently of the struct layout.
+///
+/// - `unexcluded_red` deliberately mirrors Rust [`ResolveDetail::unexcluded_red`];
+///   it corresponds to `score.json`'s `uncovered_red` on the Harbor side.
+/// - `input_tokens` is raw input on successful turns EXCLUDING cache tokens,
+///   so it is NOT comparable to Harbor's `n_input_tokens` (which includes
+///   cache read + cache write).
+#[must_use]
+pub fn trial_record_json(
+    config: &MinedRunConfig<'_>,
+    trial: &MinedTrialResult,
+) -> serde_json::Value {
+    let (score, invalid_reason, missing, unexcluded, collection): (
+        &str,
+        Option<&str>,
+        &[String],
+        &[String],
+        &[String],
+    ) = match &trial.score {
+        TrialScore::Resolved => ("resolved", None, &[], &[], &[]),
+        TrialScore::Unresolved { reason } => (
+            "unresolved",
+            None,
+            &reason.missing_fail_to_pass,
+            &reason.unexcluded_red,
+            &reason.collection_errors,
+        ),
+        TrialScore::Invalid { reason } => ("invalid", Some(reason.as_str()), &[], &[], &[]),
+    };
+    serde_json::json!({
+        "schema": TRIAL_RECORD_SCHEMA,
+        "task_id": config.task.id,
+        "trial": trial.trial,
+        "k": config.k,
+        "spec_level": config.spec_level.slug(),
+        "backend_desc": config.backend_desc,
+        "max_iterations": config.max_iterations,
+        "agent_gate": config.agent_gate.to_string(),
+        "test_first": config.test_first,
+        "wall_clock_secs": config.wall_clock_secs,
+        "compact_threshold_pct": config.compact_threshold_pct,
+        "harness_version": env!("CARGO_PKG_VERSION"),
+        "score": score,
+        "invalid_reason": invalid_reason,
+        "missing_fail_to_pass": missing,
+        "unexcluded_red": unexcluded,
+        "collection_errors": collection,
+        "claimed_disposition": trial.claimed_disposition,
+        "claimed_done": trial.claimed_disposition == CLAIMED_DONE,
+        "iterations": trial.iterations,
+        "input_tokens": trial.input_tokens,
+        "output_tokens": trial.output_tokens,
+        "wall_secs": trial.wall.as_secs_f64(),
+        "gates_green_at_exit": trial.gates_green_at_exit,
+        "nudges_fired": trial.nudges_fired,
+        "tree_dirty": trial.tree_dirty,
+        "mutating_iters": trial.mutating_iters,
+        "edit_file_calls_ok": trial.edit_file_calls_ok,
+        "bash_calls_ok": trial.bash_calls_ok,
+        "no_change_rejections": trial.no_change_rejections,
+        "tree_baseline_unobservable": trial.tree_baseline_unobservable,
+        "finish_recovery_armed": trial.finish_recovery_armed,
+        "agent_gate_post": trial.agent_gate_post,
+        "agent_tests_added": trial.agent_tests_added,
+        "agent_tests_modified": trial.agent_tests_modified,
+        "sections_seen": trial.sections_seen,
+        "dropped_outside_section": trial.dropped_outside_section,
+        "summary_count": trial.summary_count,
+        "count_check": trial.count_check().label(),
+        "gate_output_path": trial.gate_output_path.display().to_string(),
+    })
+}
+
+/// Persist [`trial_record_json`] as `trial-result.json` in the trial's state
+/// dir, warning on stderr when the write fell back outside [`run_dir`].
+fn persist_trial_record(config: &MinedRunConfig<'_>, trial: &MinedTrialResult) -> PathBuf {
+    let mut raw =
+        serde_json::to_string_pretty(&trial_record_json(config, trial)).unwrap_or_default();
+    raw.push('\n');
+    let path = persist_named_output(
+        config.state_root,
+        &config.task.id,
+        trial.trial,
+        "trial-result.json",
+        &raw,
+    );
+    if !path.starts_with(run_dir(config.state_root)) {
+        eprintln!(
+            "WARN: trial record for {}/trial-{} fell back to {}",
+            config.task.id,
+            trial.trial,
+            path.display()
+        );
+    }
+    path
 }
 
 /// Persist `raw` under
@@ -2248,6 +2360,7 @@ pub async fn run_mined_task<B: ModelBackend>(
         if trial.wall.is_zero() {
             trial.wall = started.elapsed();
         }
+        persist_trial_record(config, &trial);
         match &trial.score {
             TrialScore::Resolved => resolved_count += 1,
             TrialScore::Invalid { .. } => invalid_count += 1,
@@ -6853,5 +6966,341 @@ XFAIL tests/test_cleanr.py::TestY::test_expected_fail
         assert_eq!(report.false_dones(), 1);
         assert_eq!(report.valid_denominator(), 1);
         assert!((report.resolved_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ---- trial-result.json: machine-readable per-trial record -------------
+
+    /// Read and parse `<trial_state_dir>/trial-result.json`.
+    fn read_trial_record(state_root: &Path, task_id: &str, trial: u32) -> serde_json::Value {
+        let path = super::trial_state_dir(state_root, task_id, trial).join("trial-result.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(raw.ends_with('\n'), "record must end with a newline");
+        serde_json::from_str(&raw).expect("trial-result.json parses")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn run_mined_task_writes_trial_record_per_resolved_trial() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::engine::FINISH_TOOL_NAME;
+        use crate::model::{AssistantTurn, ContentBlock, StopReason, ToolCallRequest, Usage};
+        use crate::test_support::MockBackend;
+
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "main.py", "print('x')\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir statements");
+        std::fs::write(task_dir.path().join("statements/s2.md"), "Finish, please.")
+            .expect("write s2");
+        std::fs::create_dir_all(task_dir.path().join("sealed/tests")).expect("mkdir sealed");
+        std::fs::write(
+            task_dir.path().join("sealed/tests/test_synth.py"),
+            "# sealed test\n",
+        )
+        .expect("write sealed");
+
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        task.gate_command =
+            r"printf '=== short test summary info ===\nPASSED tests/test_synth.py::T::pass_it\n=== 1 passed in 0.0s ===\n'"
+                .to_string();
+        task.fail_to_pass = vec!["T::pass_it".to_string()];
+        task.sealed = vec![SealedEntry {
+            path: "tests/test_synth.py".to_string(),
+        }];
+
+        let k = 2u32;
+        let finish_turns: Vec<AssistantTurn> = (0..k)
+            .flat_map(|_| {
+                [
+                    scratch_edit_turn(),
+                    AssistantTurn {
+                        content: vec![ContentBlock::ToolCall(ToolCallRequest {
+                            id: "c-finish".to_string(),
+                            name: FINISH_TOOL_NAME.to_string(),
+                            input: serde_json::json!({"disposition": "done", "summary": "ok"}),
+                        })],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            reasoning_tokens: None,
+                        },
+                    },
+                ]
+            })
+            .collect();
+        let backend = MockBackend::from_turns(finish_turns);
+
+        let statement = "Finish, please.".to_string();
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
+            task_dir: task_dir.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k,
+            max_iterations: 5,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+        assert_eq!(report.resolved_count, k);
+
+        for t in 0..k {
+            let rec = read_trial_record(state_root.path(), &task.id, t);
+            assert_eq!(rec["schema"], "talos-mined-trial/1");
+            assert_eq!(rec["task_id"], task.id.as_str());
+            assert_eq!(rec["trial"], t);
+            assert_eq!(rec["score"], "resolved");
+            assert_eq!(rec["claimed_done"], true);
+            assert_eq!(rec["claimed_disposition"], "Done");
+            assert_eq!(rec["k"], 2);
+            assert_eq!(rec["spec_level"], "s2");
+            assert_eq!(rec["agent_gate"], "off");
+            assert!(rec["invalid_reason"].is_null());
+            assert_eq!(rec["input_tokens"], 10);
+            assert_eq!(rec["output_tokens"], 5);
+            assert_eq!(rec["harness_version"], env!("CARGO_PKG_VERSION"));
+            assert!(rec["wall_secs"].as_f64().expect("wall_secs is f64") > 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_mined_task_writes_trial_record_for_pre_agent_invalid_trial() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "x.py", "print(1)\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir statements");
+        std::fs::write(task_dir.path().join("statements/s2.md"), "hi").expect("write s2");
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        task.env.setup = "exit 3".to_string();
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let statement = "hi".to_string();
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
+            task_dir: task_dir.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+        assert_eq!(report.invalid_count, 1);
+
+        let rec = read_trial_record(state_root.path(), &task.id, 0);
+        assert_eq!(rec["score"], "invalid");
+        assert!(
+            rec["invalid_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("setup-failed")),
+            "invalid_reason: {}",
+            rec["invalid_reason"]
+        );
+        assert_eq!(rec["claimed_disposition"], "NotRun");
+        assert_eq!(rec["claimed_done"], false);
+        assert_eq!(rec["finish_recovery_armed"], false);
+    }
+
+    #[test]
+    fn trial_record_json_unresolved_lists_and_exact_key_set() {
+        use super::{MinedRunConfig, trial_record_json};
+
+        let task = sample_task();
+        let state_root = tempdir().expect("state root");
+        let config = MinedRunConfig {
+            compact_threshold_pct: 77,
+            task_dir: state_root.path(),
+            state_root: state_root.path(),
+            task: &task,
+            statement: "s",
+            spec_level: SpecLevel::S3,
+            backend_desc: "ollama glm".to_string(),
+            k: 3,
+            max_iterations: 500,
+            agent_gate: AgentGateMode::On {
+                timeout: Duration::from_mins(15),
+            },
+            test_first: false,
+            wall_clock_secs: 3300,
+            transcripts: false,
+        };
+        let score = TrialScore::Unresolved {
+            reason: ResolveDetail {
+                fail_to_pass_status: Vec::new(),
+                unexcluded_red: vec!["b".to_string()],
+                missing_fail_to_pass: vec!["a".to_string()],
+                collection_errors: Vec::new(),
+            },
+        };
+        let mut t = trial_tel(1, score, CLAIMED_DONE, true, 2);
+        t.agent_gate_post = Some(false);
+        t.summary_count = Some(4);
+        t.wall = Duration::from_millis(1500);
+        let rec = trial_record_json(&config, &t);
+
+        assert_eq!(rec["score"], "unresolved");
+        assert_eq!(rec["missing_fail_to_pass"], serde_json::json!(["a"]));
+        assert_eq!(rec["unexcluded_red"], serde_json::json!(["b"]));
+        assert_eq!(rec["collection_errors"], serde_json::json!([]));
+        assert!(rec["invalid_reason"].is_null());
+        assert_eq!(rec["agent_gate"], "on(timeout=900s)");
+        assert_eq!(rec["spec_level"], "s3");
+        assert_eq!(rec["test_first"], false);
+        assert_eq!(rec["wall_clock_secs"], 3300);
+        assert_eq!(rec["compact_threshold_pct"], 77);
+        assert_eq!(rec["agent_gate_post"], false);
+        assert_eq!(rec["summary_count"], 4);
+        assert_eq!(rec["count_check"], "on");
+        assert_eq!(rec["gate_output_path"], "/dev/null");
+        assert!((rec["wall_secs"].as_f64().expect("f64") - 1.5).abs() < 1e-9);
+
+        let keys: std::collections::BTreeSet<&str> = rec
+            .as_object()
+            .expect("record is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "schema",
+            "task_id",
+            "trial",
+            "k",
+            "spec_level",
+            "backend_desc",
+            "max_iterations",
+            "agent_gate",
+            "test_first",
+            "wall_clock_secs",
+            "compact_threshold_pct",
+            "harness_version",
+            "score",
+            "invalid_reason",
+            "missing_fail_to_pass",
+            "unexcluded_red",
+            "collection_errors",
+            "claimed_disposition",
+            "claimed_done",
+            "iterations",
+            "input_tokens",
+            "output_tokens",
+            "wall_secs",
+            "gates_green_at_exit",
+            "nudges_fired",
+            "tree_dirty",
+            "mutating_iters",
+            "edit_file_calls_ok",
+            "bash_calls_ok",
+            "no_change_rejections",
+            "tree_baseline_unobservable",
+            "finish_recovery_armed",
+            "agent_gate_post",
+            "agent_tests_added",
+            "agent_tests_modified",
+            "sections_seen",
+            "dropped_outside_section",
+            "summary_count",
+            "count_check",
+            "gate_output_path",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected.len(), 40);
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn run_dir_is_the_grandparent_of_every_trial_state_dir() {
+        let root = Path::new("/some/root");
+        let dir = super::run_dir(root);
+        assert!(dir.ends_with(Path::new("talos/mined-eval").join(super::run_id())));
+        assert_eq!(
+            dir,
+            super::trial_state_dir(root, "t", 0)
+                .parent()
+                .expect("task dir")
+                .parent()
+                .expect("run dir")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_mined_task_trial_record_falls_back_when_state_root_is_a_file() {
+        use super::{MinedRunConfig, run_mined_task};
+        use crate::test_support::MockBackend;
+
+        let workroot = tempdir().expect("workroot");
+        let primary_src = workroot.path().join("primary");
+        std::fs::create_dir_all(&primary_src).expect("mkdir");
+        let parent = make_repo(&primary_src, "x.py", "print(1)\n", false);
+
+        let task_dir = tempdir().expect("task dir");
+        std::fs::create_dir_all(task_dir.path().join("statements")).expect("mkdir statements");
+        std::fs::write(task_dir.path().join("statements/s2.md"), "hi").expect("write s2");
+        let mut task = task_pointing_at(&primary_src, None, &parent);
+        task.env.setup = "exit 3".to_string();
+
+        let blocker = tempdir().expect("blocker root");
+        let state_root = blocker.path().join("not-a-dir");
+        std::fs::write(&state_root, "a regular file").expect("write blocker file");
+
+        let backend = MockBackend::from_turns(Vec::new());
+        let statement = "hi".to_string();
+        let config = MinedRunConfig {
+            compact_threshold_pct: crate::engine::COMPACT_THRESHOLD_PCT,
+            task_dir: task_dir.path(),
+            state_root: &state_root,
+            task: &task,
+            statement: &statement,
+            spec_level: SpecLevel::S2,
+            backend_desc: "mock".to_string(),
+            k: 1,
+            max_iterations: 3,
+            agent_gate: AgentGateMode::Off,
+            test_first: true,
+            wall_clock_secs: 0,
+            transcripts: false,
+        };
+        let mut noop = |_t: &MinedTrialResult| {};
+        let report = run_mined_task(&backend, &PytestParser, &config, &mut noop).await;
+        assert_eq!(
+            report.trials.len(),
+            1,
+            "the run completes despite the fallback"
+        );
+
+        let path = super::persist_named_output(&state_root, &task.id, 0, "trial-result.json", "{}");
+        assert!(
+            !path.starts_with(super::run_dir(&state_root)),
+            "fallback path {path:?} must live outside run_dir"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
