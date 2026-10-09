@@ -47,10 +47,10 @@ scripts/harbor-build-base.sh <harbor-tasks>
 
 ```bash
 cd harbor && OLLAMA_BASE_URL=<ollama-url> OLLAMA_MODEL=<model> TALOS_BACKEND=ollama \
-../scripts/gpu-eval.sh uv run --frozen harbor run -p <harbor-tasks> --agent-import-path talos_harbor.agent:TalosAgent -k <k> -o <jobs> --max-retries 0 --ak gate_timeout_secs=900 --ak wall_clock_secs=<n> --ak max_iterations=500
+../scripts/gpu-eval.sh uv run --frozen harbor run -p <harbor-tasks> --agent-import-path talos_harbor.agent:TalosAgent -k <k> -n 1 -o <jobs> --max-retries 0 --ak gate_timeout_secs=900 --ak wall_clock_secs=<n> --ak max_iterations=500
 ```
 
-`--max-retries 0` is required: a Harbor retry re-runs a trial that failed on infrastructure and keeps the retry's score, which would convert infra-Invalid trials into scored trials on the Harbor side only, while mined_eval never retries.
+`-n 1` is required on a single local GPU: Ollama serves one request at a time, so concurrent trials queue behind each other and the queueing time counts against each trial's wall clock, which mined_eval (serial) never pays. Set `OLLAMA_NUM_CTX` and `OLLAMA_THINK` identically on both sides too; the report's parity block does not compare them. `--max-retries 0` is required: a Harbor retry re-runs a trial that failed on infrastructure and keeps the retry's score, which would convert infra-Invalid trials into scored trials on the Harbor side only, while mined_eval never retries.
 
 4. Compare:
 
