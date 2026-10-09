@@ -43,18 +43,24 @@ EXIT_CODE_DISPOSITION = {0: "Done", 10: "Blocked", 30: "AlreadySatisfied", 40: "
 CLAIMED_DONE = "Done"
 """The disposition that counts as a claimed Done (the harness's CLAIMED_DONE constant)."""
 
-FORWARDED_ENV_KEYS = (
-    "TALOS_BACKEND",
-    "TALOS_BEDROCK",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_MODEL",
-    "OLLAMA_MODEL",
-    "OLLAMA_BASE_URL",
-    "OLLAMA_API_KEY",
-    "OLLAMA_NUM_CTX",
-    "OLLAMA_THINK",
-)
-"""Host env keys forwarded to talos when set (plus every ``AWS_*`` key and every extra_env key)."""
+FORWARDED_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "bedrock": ("TALOS_BEDROCK", "ANTHROPIC_MODEL"),
+    "ollama": (
+        "TALOS_BACKEND",
+        "OLLAMA_MODEL",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_API_KEY",
+        "OLLAMA_NUM_CTX",
+        "OLLAMA_THINK",
+    ),
+    "anthropic": ("TALOS_BACKEND", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"),
+}
+"""Per-backend host env keys forwarded to talos when set and non-empty.
+
+The backend is chosen with talos's own precedence (non-empty ``TALOS_BEDROCK``, then
+``TALOS_BACKEND=ollama``, else anthropic), so a run never carries another backend's
+credentials. The bedrock set also forwards every ``AWS_*`` key; every extra_env key is
+always forwarded unchanged."""
 
 ERROR_TAIL_BYTES = 2000
 STDERR_TAIL_BYTES = 2048
@@ -148,6 +154,7 @@ class TalosAgent(BaseInstalledAgent):
     # ------------------------------------------------------------------ install
 
     async def install(self, environment: BaseEnvironment) -> None:
+        self._select_backend()  # fail closed before any container exec
         setup_dir = self.logs_dir / "setup"
         setup_dir.mkdir(parents=True, exist_ok=True)
         install_json = setup_dir / "install.json"
@@ -207,16 +214,40 @@ class TalosAgent(BaseInstalledAgent):
 
     # ---------------------------------------------------------------------- run
 
+    def _select_backend(self) -> str:
+        """Pick the backend with talos's precedence; fail closed on junk.
+
+        extra_env wins over the host env for the two selector keys, because extra_env is
+        what the container actually receives: a ``--ae TALOS_BACKEND=ollama`` run must not
+        be classified (and credentialed) from the host's default.
+        """
+
+        def lookup(key: str) -> str | None:
+            return self._extra_env[key] if key in self._extra_env else os.environ.get(key)
+
+        if lookup("TALOS_BEDROCK"):
+            return "bedrock"
+        selected = lookup("TALOS_BACKEND")
+        if selected == "ollama":
+            return "ollama"
+        if selected in (None, "", "anthropic"):
+            return "anthropic"
+        raise ValueError(
+            f"unrecognised TALOS_BACKEND {selected!r}: expected unset, 'anthropic' or 'ollama'"
+        )
+
     def _forwarded_env(self) -> dict[str, str]:
+        backend = self._select_backend()
+        self._backend_selected = backend
         env: dict[str, str] = {}
-        for key in FORWARDED_ENV_KEYS:
-            value = self._get_env(key)
-            if value is not None:
+        for key in FORWARDED_ENV_KEYS[backend]:
+            value = os.environ.get(key)
+            if value:
                 env[key] = value
-        # Full AWS_* names (NOT _get_env_prefixed, which strips the prefix).
-        for source in (os.environ, self._extra_env):
-            for key, value in source.items():
-                if key.startswith("AWS_"):
+        if backend == "bedrock":
+            # Full AWS_* names (NOT _get_env_prefixed, which strips the prefix).
+            for key, value in os.environ.items():
+                if key.startswith("AWS_") and value:
                     env[key] = value
         env.update(self._extra_env)
         return env
@@ -228,15 +259,14 @@ class TalosAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         # Deliberately NOT @with_prompt_template: talos sees the instruction bytes verbatim.
+        env = self._forwarded_env()  # raises on a bogus TALOS_BACKEND before any exec
+        self._forwarded_env_keys = sorted(env)
         with tempfile.TemporaryDirectory(prefix="talos-harbor-") as tmp:
             local = Path(tmp) / "instruction.md"
             with local.open("w", encoding="utf-8", newline="") as fh:
                 fh.write(instruction)
             await environment.upload_file(local, INSTRUCTION_PATH)
         await self.exec_as_root(environment, f"chmod 0644 {INSTRUCTION_PATH}")
-
-        env = self._forwarded_env()
-        self._forwarded_env_keys = sorted(env)
 
         # environment.exec directly, not _exec: _exec raises on every non-zero code, and
         # talos's 10/20/30/40 are outcomes, not failures.
@@ -341,6 +371,7 @@ class TalosAgent(BaseInstalledAgent):
             "gate_command": gate_command,
             "gate_armed": gate_command is not None,
             "backend": summary_or_empty.get("backend_settings"),
+            "backend_selected": getattr(self, "_backend_selected", None),
             "forwarded_env_keys": getattr(self, "_forwarded_env_keys", None),
             "install": install if isinstance(install, dict) else None,
             "tokens": tokens,

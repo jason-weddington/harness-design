@@ -415,35 +415,96 @@ def test_run_non_outcome_codes_raise(
 # --------------------------------------------------------- AC-12 env forwarding
 
 
-def test_env_forwarding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    monkeypatch.setenv("OLLAMA_THINK", "high")
-    monkeypatch.setenv("AWS_REGION", "us-west-2")
-    monkeypatch.setenv("HOME_SECRET", "x")
-    agent = make(tmp_path, extra_env={"OLLAMA_THINK": "low", "TALOS_TOKEN_BUDGET": "5"})
+def forwarded(tmp_path: Path) -> dict[str, str]:
+    agent = make(tmp_path, extra_env={"TALOS_TOKEN_BUDGET": "5"})
     env = FakeEnvironment(scripts={"talos run": result(0)})
     run_agent(agent, env)
     (call,) = env.find("talos run")
-    assert call.env == {
-        "ANTHROPIC_API_KEY": "k",
-        "OLLAMA_THINK": "low",
+    assert call.env is not None
+    assert agent._forwarded_env_keys == sorted(call.env)
+    return dict(call.env)
+
+
+def test_env_forwarding_anthropic_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://x")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("HOME_SECRET", "x")
+    assert forwarded(tmp_path) == {"ANTHROPIC_API_KEY": "k", "TALOS_TOKEN_BUDGET": "5"}
+
+
+def test_env_forwarding_ollama(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TALOS_BACKEND", "ollama")
+    monkeypatch.setenv("OLLAMA_THINK", "high")
+    monkeypatch.setenv("OLLAMA_MODEL", "")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "m")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    assert forwarded(tmp_path) == {
+        "TALOS_BACKEND": "ollama",
+        "OLLAMA_THINK": "high",
+        "TALOS_TOKEN_BUDGET": "5",
+    }
+
+
+def test_env_forwarding_bedrock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TALOS_BEDROCK", "1")
+    monkeypatch.setenv("TALOS_BACKEND", "ollama")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "m")
+    monkeypatch.setenv("OLLAMA_MODEL", "o")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    assert forwarded(tmp_path) == {
+        "TALOS_BEDROCK": "1",
+        "ANTHROPIC_MODEL": "m",
         "AWS_REGION": "us-west-2",
         "TALOS_TOKEN_BUDGET": "5",
     }
-    assert agent._forwarded_env_keys == [
-        "ANTHROPIC_API_KEY",
-        "AWS_REGION",
-        "OLLAMA_THINK",
-        "TALOS_TOKEN_BUDGET",
-    ]
 
 
-def test_env_forwarding_extra_aws_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_forwarding_bogus_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TALOS_BACKEND", "bogus")
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    with pytest.raises(ValueError, match="bogus"):
+        run_agent(make(tmp_path), env)
+    assert not env.find("talos run")
+    with pytest.raises(ValueError, match="bogus"):
+        asyncio.run(make(tmp_path).install(env))
+    assert not env.execs and not env.uploads
+
+
+def test_env_forwarding_extra_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TALOS_BEDROCK", "1")
     monkeypatch.setenv("AWS_PROFILE", "host")
-    agent = make(tmp_path, extra_env={"AWS_PROFILE": "extra", "AWS_REGION": "eu-west-1"})
+    agent = make(tmp_path, extra_env={"AWS_PROFILE": "extra", "ANTHROPIC_API_KEY": "e"})
     env = FakeEnvironment(scripts={"talos run": result(0)})
     run_agent(agent, env)
-    assert env.find("talos run")[0].env == {"AWS_PROFILE": "extra", "AWS_REGION": "eu-west-1"}
+    assert env.find("talos run")[0].env == {
+        "TALOS_BEDROCK": "1",
+        "AWS_PROFILE": "extra",
+        "ANTHROPIC_API_KEY": "e",
+    }
+
+
+def test_env_forwarding_backend_selected_from_extra_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TALOS_BACKEND", raising=False)
+    monkeypatch.delenv("TALOS_BEDROCK", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "host-key")
+    monkeypatch.setenv("OLLAMA_MODEL", "q")
+    agent = make(tmp_path, extra_env={"TALOS_BACKEND": "ollama"})
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    run_agent(agent, env)
+    assert env.find("talos run")[0].env == {"TALOS_BACKEND": "ollama", "OLLAMA_MODEL": "q"}
+    assert agent._backend_selected == "ollama"
+
+
+def test_env_forwarding_bogus_backend_in_extra_env(tmp_path: Path) -> None:
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    with pytest.raises(ValueError, match="nope"):
+        run_agent(make(tmp_path, extra_env={"TALOS_BACKEND": "nope"}), env)
+    assert not env.find("talos run")
 
 
 # ---------------------------------------------- AC-13 populate_context_post_run
@@ -493,6 +554,7 @@ TALOS_KEYS = {
     "gate_command",
     "gate_armed",
     "backend",
+    "backend_selected",
     "forwarded_env_keys",
     "install",
     "tokens",
@@ -506,6 +568,7 @@ def test_populate_happy_path(tmp_path: Path) -> None:
     agent = make(tmp_path, version="0.14.0-gabc1234")
     agent._talos_exit_code = 0
     agent._forwarded_env_keys = ["ANTHROPIC_API_KEY"]
+    agent._backend_selected = "anthropic"
     stage(agent, gate="test -f hello.txt", stderr=True)
     context = populate(agent, AgentContext(metadata={"keep": 1}))
 
@@ -535,6 +598,7 @@ def test_populate_happy_path(tmp_path: Path) -> None:
         talos["backend"]
         == json.loads((FIXTURES / "run-summary-done.json").read_text())["backend_settings"]
     )
+    assert talos["backend_selected"] == "anthropic"
     assert talos["forwarded_env_keys"] == ["ANTHROPIC_API_KEY"]
     assert talos["install"] is None
     assert talos["tokens"] == {"input": 1200, "cache_read": 5000, "cache_write": 800, "output": 340}
@@ -601,6 +665,7 @@ def test_populate_never_ran(tmp_path: Path) -> None:
     assert talos["exit_code"] is None
     assert talos["tokens"] is None
     assert talos["forwarded_env_keys"] is None
+    assert talos["backend_selected"] is None
     assert talos["stderr_tail"] is None
     assert "run-summary.json" in talos["error"]
     assert "transcript" in talos["error"]

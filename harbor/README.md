@@ -38,9 +38,8 @@ Set `wall_clock_secs` below the task's `[agent] timeout_sec`. A Harbor agent tim
 
 Harbor's `-m` / `model_name` is ignored. talos picks its backend and model from the environment it is given, which TalosAgent forwards from the host:
 
-- each of `TALOS_BACKEND`, `TALOS_BEDROCK`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OLLAMA_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_NUM_CTX`, `OLLAMA_THINK` that is set on the host (or in `--ae`);
-- every `AWS_*` variable, with its full name;
-- every `--ae KEY=VALUE` extra, verbatim (so `--ae TALOS_TOKEN_BUDGET=5` reaches talos). An `--ae` value wins over the host value for the same key.
+- only the selected backend's keys, chosen from the host env with talos's precedence (`metadata.talos.backend_selected` records it): **bedrock** (non-empty `TALOS_BEDROCK`) forwards `TALOS_BEDROCK`, `ANTHROPIC_MODEL` and every `AWS_*` variable; **ollama** (`TALOS_BACKEND=ollama`) forwards `TALOS_BACKEND`, `OLLAMA_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_NUM_CTX`, `OLLAMA_THINK`; **anthropic** (otherwise) forwards `TALOS_BACKEND`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`. Other backends' credentials are never forwarded. A `TALOS_BACKEND` other than unset, `anthropic` or `ollama` raises `ValueError`;
+- every `--ae KEY=VALUE` extra, verbatim, in every mode (so `--ae TALOS_TOKEN_BUDGET=5` reaches talos). An `--ae` value wins over the host value for the same key.
 
 Unset keys are omitted, never sent empty. Nothing else from the host environment is forwarded.
 
@@ -89,6 +88,7 @@ Token counts go to `AgentContext`: `n_input_tokens` = input + cache read + cache
 | `gate_command` | contents of `gate-command.txt`, `None` if missing or empty. |
 | `gate_armed` | whether a gate command was given. |
 | `backend` | the run summary's `backend_settings`, verbatim. |
+| `backend_selected` | `bedrock`, `ollama` or `anthropic`: which backend's env was forwarded. |
 | `forwarded_env_keys` | the sorted names (never values) of the env keys forwarded to talos. |
 | `install` | the parsed `setup/install.json`. |
 | `tokens` | raw `{input, cache_read, cache_write, output}` from `run_end`, or `None`. |
