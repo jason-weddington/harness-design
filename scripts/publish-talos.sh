@@ -141,8 +141,12 @@ if [ "$DRY_RUN" = 0 ]; then
   # --- Toolchain preflight, before the (slow) gate.
   # `cargo zigbuild --version` is rejected (the subcommand takes no --version); ask the
   # binary directly, and check zig too so a missing zig fails here, not mid-build.
-  if ! cargo-zigbuild --version >/dev/null 2>&1 || ! zig version >/dev/null 2>&1; then
-    echo "ERROR: cargo-zigbuild not installed (cargo binstall cargo-zigbuild; plus zig: pip/uv install ziglang or a zig on PATH)" >&2
+  if ! cargo-zigbuild --version >/dev/null 2>&1; then
+    echo "ERROR: cargo-zigbuild not on PATH (cargo binstall cargo-zigbuild)" >&2
+    exit 1
+  fi
+  if ! zig version >/dev/null 2>&1; then
+    echo "ERROR: zig not on PATH (pip/uv install ziglang, or a zig binary on PATH); cargo-zigbuild needs it" >&2
     exit 1
   fi
 
