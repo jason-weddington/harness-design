@@ -55,9 +55,9 @@
 //! memory adapter ([`harness::personal_kb`]) into the engine's memory seam
 //! ([`harness::memory`]): the KB's session slice is appended to the system
 //! prompt, the KB's MCP tools (`<PERSONAL_KB_URL>/mcp`) are registered, and
-//! `bash` calls matching a KB lesson are annotated (`annotate`) or refused
-//! once per entry, at most 2 per run, with an unchanged retry allowed
-//! (`deny-once`). `--kb-project <name>` names the KB project; without it the
+//! `bash`, `edit_file` and `read_file` calls matching a KB lesson are
+//! annotated (`annotate`) or refused once per entry, at most 2 per run, with
+//! an unchanged retry allowed (`deny-once`). `--kb-project <name>` names the KB project; without it the
 //! project is the first non-comment line of the nearest `.kb_project` file
 //! at or above `--workspace`; with neither, memory is degraded.
 //!
@@ -682,9 +682,9 @@ struct RunArgs {
 
     /// Knowledge-base memory (personal-kb). Off by default. `annotate`
     /// enables the KB's session slice, the KB's MCP tools, and appends a KB
-    /// fact to each matching `bash` result; `deny-once` additionally refuses
-    /// the first matching `bash` call per KB entry, at most 2 per run, and
-    /// an unchanged retry is allowed. The `PERSONAL_KB_*` env is read only
+    /// fact to each matching `bash`, `edit_file` or `read_file` result;
+    /// `deny-once` additionally refuses the first matching call per KB entry,
+    /// at most 2 per run, and an unchanged retry is allowed. The `PERSONAL_KB_*` env is read only
     /// when the mode is not `off`. Fail-open: an unreachable KB never fails
     /// the run.
     #[arg(

@@ -3292,7 +3292,7 @@ fn memory_deny_once_fake_kb_appends_slice() {
     assert_eq!(
         slice["source"],
         format!(
-            "personal-kb 127.0.0.1:{port} project=fake-project gate=on index=1 dropped=0 truncated=0"
+            "personal-kb 127.0.0.1:{port} project=fake-project gate=on tool_map=6 index=1 dropped=0 truncated=0"
         )
     );
     assert_eq!(slice["memory_tools"], serde_json::json!([]));

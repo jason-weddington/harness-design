@@ -48,6 +48,11 @@ const TWO_WORD_PROGRAMS: [&str; 20] = [
 /// two-character separators are tried first at each position). A lone `&` is
 /// not a separator.
 fn split_segments(command: &str) -> Vec<&str> {
+    split_on(command, true)
+}
+
+/// [`split_segments`], with newline a separator only when `newline` is set.
+fn split_on(command: &str, newline: bool) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
@@ -57,7 +62,7 @@ fn split_segments(command: &str) -> Vec<&str> {
         let sep = if rest.starts_with(b"&&") || rest.starts_with(b"||") {
             2
         } else {
-            usize::from(matches!(bytes[i], b';' | b'|' | b'\n'))
+            usize::from(matches!(bytes[i], b';' | b'|') || (newline && bytes[i] == b'\n'))
         };
         if sep == 0 {
             i += 1;
@@ -153,15 +158,24 @@ pub fn bash_segments(command: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// One Bash cue from the KB's prevention index. Only cues for the KB's `Bash`
-/// tool are kept (checked when the index is parsed); every field is trimmed.
+/// The canonical Claude Code tool name the Bash matcher branch serves.
+const CANONICAL_BASH: &str = "Bash";
+
+/// Canonical tools whose target is a file path and whose class is its
+/// extension.
+const FILE_TOOLS: [&str; 5] = ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// One cue from the KB's prevention index (canonical tool names); every field
+/// is trimmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCue {
     /// The KB resolution entry the cue comes from.
     pub resolution_id: String,
-    /// The command class the cue fires on (`git push`).
+    /// The canonical Claude Code tool the cue fires on (`Bash`, `Edit`, …).
+    pub tool: String,
+    /// The class the cue fires on (`git push`, `ext:toml`).
     pub target_class: String,
-    /// Whitespace-separated args that must prefix the segment's args; blank
+    /// Whitespace-separated args that must prefix the candidate's args; blank
     /// matches any args.
     pub args_prefix: String,
     /// The earlier wrong belief the resolution replaced (may be empty).
@@ -177,23 +191,90 @@ fn prefix_matches(cue: &IndexCue, args: &[String]) -> bool {
     args.len() >= wanted.len() && args.iter().zip(&wanted).all(|(a, w)| a == w)
 }
 
-/// The first cue matching `command`: segments are tried in order, and for
-/// each segment the first cue (in slice order) whose class equals the
-/// segment's and whose args prefix matches wins. Segment order beats cue
-/// order. A port of the hook's `prevention._find_match`.
+/// The class of a non-Bash `target` for canonical `tool`: `ext:<suffix>` for
+/// file tools (`ext:none` when the path has no extension), `""` for an empty
+/// target or any other tool. A port of the hook's `cues_lite.target_class`.
 #[must_use]
-pub fn find_match<'a>(command: &str, cues: &'a [IndexCue]) -> Option<&'a IndexCue> {
-    bash_segments(command)
+pub fn target_class(tool: &str, target: &str) -> String {
+    if !FILE_TOOLS.contains(&tool) || target.is_empty() {
+        return String::new();
+    }
+    let name = target.rsplit('/').next().unwrap_or("");
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => format!("ext:{}", name[i + 1..].to_lowercase()),
+        _ => "ext:none".to_string(),
+    }
+}
+
+/// The args of a non-Bash target after its class tokens. A port of the hook's
+/// `_bash_tokens` + `bash_args_after_class`: splits on `&&`, `||`, `;` and `|`
+/// only (not newline), takes the first piece whose first token is not `cd`.
+#[must_use]
+pub fn bash_args_after_class(s: &str) -> Vec<String> {
+    let piece = split_on(s, false)
         .into_iter()
-        .find_map(|(class, args)| {
-            cues.iter()
-                .find(|cue| cue.target_class == class && prefix_matches(cue, &args))
-        })
+        .find(|p| p.split_whitespace().next().is_some_and(|t| t != "cd"));
+    let Some(piece) = piece else {
+        return Vec::new();
+    };
+    let mut tokens: &[&str] = &piece.split_whitespace().collect::<Vec<_>>();
+    while tokens.first().is_some_and(|t| is_env_assignment(t)) {
+        tokens = &tokens[1..];
+    }
+    if tokens.first() == Some(&"sudo") {
+        tokens = &tokens[1..];
+        while let Some(flag) = tokens.first().filter(|t| t.starts_with('-')) {
+            tokens = &tokens[1..];
+            if (*flag == "-u" || *flag == "-g") && !tokens.is_empty() {
+                tokens = &tokens[1..];
+            }
+        }
+    }
+    let class_len = match tokens {
+        [first, second, ..]
+            if TWO_WORD_PROGRAMS.contains(&basename(first)) && !second.starts_with('-') =>
+        {
+            2
+        }
+        [] => 0,
+        _ => 1,
+    };
+    tokens[class_len..]
+        .iter()
+        .filter(|t| !t.starts_with('-'))
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
+/// The first cue matching a call to canonical `tool` with raw `target`. For
+/// `Bash`, segments are tried in order, and for each the first cue (in slice
+/// order) whose tool and class equal and whose args prefix matches wins;
+/// segment order beats cue order. Otherwise the single candidate is
+/// (`target_class`, `bash_args_after_class`), with none when the class is
+/// empty. A port of the hook's `prevention._find_match`.
+#[must_use]
+pub fn find_match<'a>(tool: &str, target: &str, cues: &'a [IndexCue]) -> Option<&'a IndexCue> {
+    let candidates: Vec<(String, Vec<String>)> = if tool == CANONICAL_BASH {
+        bash_segments(target)
+    } else {
+        let class = target_class(tool, target);
+        if class.is_empty() {
+            Vec::new()
+        } else {
+            vec![(class, bash_args_after_class(target))]
+        }
+    };
+    candidates.into_iter().find_map(|(class, args)| {
+        cues.iter()
+            .find(|cue| cue.tool == tool && cue.target_class == class && prefix_matches(cue, &args))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexCue, TWO_WORD_PROGRAMS, bash_segments, find_match};
+    use super::{
+        IndexCue, TWO_WORD_PROGRAMS, bash_args_after_class, bash_segments, find_match, target_class,
+    };
 
     /// `CLASS[args]` rendering of one segment, matching the vector notation.
     fn render(command: &str) -> Vec<String> {
@@ -310,6 +391,7 @@ mod tests {
     fn cue(id: &str, target_class: &str, args_prefix: &str) -> IndexCue {
         IndexCue {
             resolution_id: id.to_string(),
+            tool: "Bash".to_string(),
             target_class: target_class.to_string(),
             args_prefix: args_prefix.to_string(),
             wrong_belief: String::new(),
@@ -424,13 +506,94 @@ mod tests {
     fn find_match_vectors() {
         for (specs, command, want) in MATCH_VECTORS {
             let cues: Vec<IndexCue> = specs.iter().map(|(i, t, a)| cue(i, t, a)).collect();
-            let got = find_match(command, &cues).map(|c| c.resolution_id.as_str());
+            let got = find_match("Bash", command, &cues).map(|c| c.resolution_id.as_str());
             assert_eq!(got, *want, "{command:?}");
         }
     }
 
     #[test]
     fn find_match_on_empty_cues_is_none() {
-        assert_eq!(find_match("git push github main", &[]), None);
+        assert_eq!(find_match("Bash", "git push github main", &[]), None);
+    }
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../testdata/personal_kb_contracts/matcher_vectors.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn target_class_vectors() {
+        let v = vectors();
+        let rows = v["target_class"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for r in rows {
+            let (tool, target) = (r["tool"].as_str().unwrap(), r["target"].as_str().unwrap());
+            assert_eq!(
+                target_class(tool, target),
+                r["expected"].as_str().unwrap(),
+                "{tool} {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_args_after_class_vectors() {
+        let v = vectors();
+        let rows = v["bash_args_after_class"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for r in rows {
+            let target = r["target"].as_str().unwrap();
+            let want: Vec<&str> = r["expected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap())
+                .collect();
+            assert_eq!(bash_args_after_class(target), want, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn bash_args_after_class_extra_shapes() {
+        assert!(bash_args_after_class("cd /a").is_empty());
+        assert_eq!(
+            bash_args_after_class("cd /a && FOO=1 sudo -u x -E git push -f o m"),
+            ["o", "m"]
+        );
+        assert_eq!(bash_args_after_class("ls\nfoo"), ["foo"]);
+        assert!(bash_args_after_class("sudo").is_empty());
+    }
+
+    #[test]
+    fn find_match_non_bash_vectors() {
+        let v = vectors();
+        let fm = &v["find_match"];
+        let cues: Vec<IndexCue> = fm["index"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| IndexCue {
+                resolution_id: c["resolution_id"].as_str().unwrap().to_string(),
+                tool: c["tool"].as_str().unwrap().to_string(),
+                target_class: c["target_class"].as_str().unwrap().to_string(),
+                args_prefix: c["args_prefix"].as_str().unwrap().to_string(),
+                wrong_belief: String::new(),
+                corrected_fact: "f".to_string(),
+                provenance_label: String::new(),
+            })
+            .collect();
+        let cases = fm["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let (tool, target) = (c["tool"].as_str().unwrap(), c["target"].as_str().unwrap());
+            let got = find_match(tool, target, &cues).map(|c| c.resolution_id.as_str());
+            assert_eq!(
+                got,
+                c["expected_resolution_id"].as_str(),
+                "{tool} {target:?}"
+            );
+        }
     }
 }

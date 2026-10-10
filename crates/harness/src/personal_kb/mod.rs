@@ -40,14 +40,14 @@
 //! | `prevention fetch failed: malformed response` | the body failed the hook's own shape validation |
 //!
 //! A 2xx with a parseable body is never degraded — including the KB's inert
-//! response (gate off, empty index and slice), which the route serves as a
+//! response (empty index and slice), which the route serves as a
 //! 200 on any internal failure. Three silent-but-visible states are carried
 //! in [`Memory::label`] instead, so they never read as "the KB had nothing":
 //!
-//! - `gate=off` — the KB's soft gate is disabled, so there are no cues (the
-//!   slice is still delivered);
-//! - `dropped>0` — index elements failed the Bash / observed-once / shape
-//!   filter: the expected signature of KB-side schema or tool-name drift;
+//! - `tool_map=absent` — an older KB that omits `tool_map`: the slice is
+//!   delivered but no cues are kept, so there is no advice;
+//! - `dropped>0` — index elements failed the observed-once / shape filter:
+//!   the expected signature of KB-side schema drift;
 //! - `truncated>0` — the KB itself cut the index.
 //!
 //! A failed MCP connect does not degrade the memory: the run gets no KB
@@ -84,6 +84,7 @@
 
 pub mod cues;
 
+use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -131,17 +132,6 @@ pub const KB_MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// on every MCP request. The KB keys its per-surface policy on these.
 pub const KB_HARNESS_HEADERS: [(&str, &str); 2] =
     [("X-KB-Harness", "talos"), ("X-KB-Mode", "headless")];
-
-/// The KB's canonical tool name on index cues.
-///
-/// This pair ([`KB_BASH_TOOL`] / [`TALOS_BASH_TOOL`]) is the phase-1 stand-in
-/// for the KB-side native-name map in `docs/design/11-memory.md`. The parse
-/// filter ([`parse_prevention`]) and the `before_tool` check must change
-/// together when the KB starts mapping names server-side.
-const KB_BASH_TOOL: &str = "Bash";
-
-/// talos's native bash tool name. See [`KB_BASH_TOOL`] for the pairing rule.
-const TALOS_BASH_TOOL: &str = "bash";
 
 /// The degraded reason when no project resolves.
 const NO_PROJECT: &str =
@@ -264,6 +254,8 @@ pub(crate) struct Prevention {
     pub(crate) slice_text: String,
     pub(crate) cues: Vec<IndexCue>,
     pub(crate) gate_enabled: bool,
+    /// Native tool name to the KB's canonical name; `None` when the KB omits it.
+    pub(crate) tool_map: Option<BTreeMap<String, String>>,
     pub(crate) received: usize,
     pub(crate) index_truncated: u64,
 }
@@ -278,9 +270,7 @@ fn str_field(obj: &serde_json::Map<String, Value>, key: &str) -> String {
 
 fn parse_cue(element: &Value) -> Option<IndexCue> {
     let obj = element.as_object()?;
-    if obj.get("tool").and_then(Value::as_str) != Some(KB_BASH_TOOL)
-        || obj.get("observed_once") == Some(&Value::Bool(true))
-    {
+    if obj.get("observed_once") == Some(&Value::Bool(true)) {
         return None;
     }
     let required = |key: &str| {
@@ -292,6 +282,7 @@ fn parse_cue(element: &Value) -> Option<IndexCue> {
     };
     Some(IndexCue {
         resolution_id: required("resolution_id")?,
+        tool: required("tool")?,
         target_class: required("target_class")?,
         corrected_fact: required("corrected_fact")?,
         args_prefix: str_field(obj, "args_prefix"),
@@ -316,7 +307,19 @@ pub(crate) fn parse_prevention(body: &[u8]) -> Result<Prevention, String> {
         .and_then(Value::as_array)
         .ok_or_else(malformed)?;
     let gate_enabled = gate.get("enabled") == Some(&Value::Bool(true));
-    let cues = if gate_enabled {
+    let tool_map = match obj.get("tool_map") {
+        None => None,
+        Some(Value::Object(m)) => Some(
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect::<BTreeMap<_, _>>(),
+        ),
+        Some(_) => return Err(malformed()),
+    };
+    // An older KB (no `tool_map`) gates its index on Claude Code's switch and
+    // does not normalize talos digests, so its index is not a talos contract:
+    // keep no cues from it. The gate switch itself never filters cues.
+    let cues = if tool_map.is_some() {
         index.iter().filter_map(parse_cue).collect()
     } else {
         Vec::new()
@@ -329,6 +332,7 @@ pub(crate) fn parse_prevention(body: &[u8]) -> Result<Prevention, String> {
             .to_string(),
         cues,
         gate_enabled,
+        tool_map,
         received: index.len(),
         index_truncated: obj
             .get("diagnostics")
@@ -389,7 +393,11 @@ async fn fetch_prevention(
 ) -> Result<Prevention, String> {
     let mut request = reqwest::Client::new()
         .get(format!("{}{PREVENTION_PATH}", endpoint.base_url))
-        .query(&[("project", project), ("session_id", session_id)])
+        .query(&[
+            ("project", project),
+            ("session_id", session_id),
+            ("harness", "talos"),
+        ])
         .bearer_auth(&endpoint.api_key)
         .timeout(timeout);
     for (k, v) in KB_HARNESS_HEADERS {
@@ -435,6 +443,7 @@ pub struct PersonalKbMemory {
     label: String,
     slice_text: String,
     cues: Vec<IndexCue>,
+    tool_map: BTreeMap<String, String>,
     endpoint: Option<KbEndpoint>,
     kb_tools: Vec<Arc<dyn Tool>>,
 }
@@ -467,6 +476,7 @@ impl PersonalKbMemory {
             label: degraded_label(),
             slice_text: String::new(),
             cues: Vec::new(),
+            tool_map: BTreeMap::new(),
             endpoint,
             kb_tools: Vec::new(),
         };
@@ -482,8 +492,11 @@ impl PersonalKbMemory {
             Ok(p) => {
                 let index = p.cues.len();
                 let label = format!(
-                    "personal-kb {endpoint_label} project={project_label} gate={} index={index} dropped={} truncated={}",
+                    "personal-kb {endpoint_label} project={project_label} gate={} tool_map={} index={index} dropped={} truncated={}",
                     if p.gate_enabled { "on" } else { "off" },
+                    p.tool_map
+                        .as_ref()
+                        .map_or_else(|| "absent".to_string(), |m| m.len().to_string()),
                     p.received.saturating_sub(index),
                     p.index_truncated,
                 );
@@ -492,6 +505,7 @@ impl PersonalKbMemory {
                     label,
                     slice_text: p.slice_text,
                     cues: p.cues,
+                    tool_map: p.tool_map.unwrap_or_default(),
                     endpoint: Some(endpoint),
                     kb_tools: Vec::new(),
                 }
@@ -519,6 +533,22 @@ impl PersonalKbMemory {
     }
 }
 
+/// The raw target of a native call, per the KB's `harness_tools.py` rule 3:
+/// `bash` → `command`; `edit_file` / `read_file` → `path`; `list_files` →
+/// `path` defaulting to `.`; anything else `""`. A non-string value is `""`.
+fn native_target(call: &ToolCallView) -> String {
+    let key = match call.name {
+        "bash" => "command",
+        "edit_file" | "read_file" | "list_files" => "path",
+        _ => return String::new(),
+    };
+    match call.args.get(key) {
+        Some(v) => v.as_str().unwrap_or_default().to_string(),
+        None if call.name == "list_files" => ".".to_string(),
+        None => String::new(),
+    }
+}
+
 impl Memory for PersonalKbMemory {
     fn session_slice(&self) -> Option<String> {
         if self.degraded.is_some() || self.slice_text.trim().is_empty() {
@@ -529,13 +559,13 @@ impl Memory for PersonalKbMemory {
     }
 
     fn before_tool(&self, call: &ToolCallView) -> Advice {
-        if self.degraded.is_some() || call.name != TALOS_BASH_TOOL {
+        if self.degraded.is_some() {
             return Advice::None;
         }
-        let Some(command) = call.args.get("command").and_then(Value::as_str) else {
+        let Some(canonical) = self.tool_map.get(call.name) else {
             return Advice::None;
         };
-        match find_match(command, &self.cues) {
+        match find_match(canonical, &native_target(call), &self.cues) {
             Some(cue) => Advice::DenyOnce {
                 fact: cue_fact(cue),
                 entry_id: cue.resolution_id.clone(),
@@ -563,10 +593,10 @@ impl Memory for PersonalKbMemory {
 #[cfg(test)]
 mod tests {
     use super::{
-        KB_BASH_TOOL, KB_HARNESS_HEADERS, KB_MCP_CONNECT_TIMEOUT, KB_PROJECT_FILENAME, KbEndpoint,
+        KB_HARNESS_HEADERS, KB_MCP_CONNECT_TIMEOUT, KB_PROJECT_FILENAME, KbEndpoint,
         LOCAL_KB_API_KEY, LOCAL_KB_URL, MAX_FACT_CHARS, NO_PROJECT, PREVENTION_PATH,
-        PREVENTION_TIMEOUT, PersonalKbMemory, Prevention, TALOS_BASH_TOOL, cue_fact,
-        parse_prevention, resolve_kb_project,
+        PREVENTION_TIMEOUT, PersonalKbMemory, Prevention, cue_fact, parse_prevention,
+        resolve_kb_project,
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, RunConfig, RunStats};
     use crate::mcp::McpConnectReport;
@@ -672,17 +702,11 @@ mod tests {
         assert_eq!(PREVENTION_PATH, "/api/kb/prevention");
         assert_eq!(PREVENTION_TIMEOUT, Duration::from_secs(5));
         assert_eq!(MAX_FACT_CHARS, 1000);
-        assert_eq!(KB_BASH_TOOL, "Bash");
         assert_eq!(KB_MCP_CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(
             KB_HARNESS_HEADERS,
             [("X-KB-Harness", "talos"), ("X-KB-Mode", "headless")]
         );
-    }
-
-    #[test]
-    fn talos_bash_tool_is_the_native_bash_tool_name() {
-        assert_eq!(TALOS_BASH_TOOL, crate::tools::bash::BashTool.name());
     }
 
     // ---- AC3: fixture -------------------------------------------------------
@@ -885,6 +909,7 @@ mod tests {
     fn fixture_cue() -> IndexCue {
         IndexCue {
             resolution_id: "kb-00001".into(),
+            tool: "Bash".into(),
             target_class: "git push".into(),
             args_prefix: "github".into(),
             wrong_belief: "push to github".into(),
@@ -922,6 +947,7 @@ mod tests {
                 slice_text: String::new(),
                 cues: vec![],
                 gate_enabled: false,
+                tool_map: None,
                 received: 0,
                 index_truncated: 0,
             }
@@ -936,6 +962,14 @@ mod tests {
                 slice_text: slice_text(),
                 cues: vec![fixture_cue()],
                 gate_enabled: true,
+                tool_map: Some(
+                    fixture()["tool_map"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                        .collect()
+                ),
                 received: 1,
                 index_truncated: 0,
             }
@@ -945,14 +979,169 @@ mod tests {
     #[test]
     fn parse_gate_variants() {
         let off = parse(&variant(|v| v["gate"]["enabled"] = json!(false)));
-        assert!(off.cues.is_empty());
+        assert_eq!(off.cues, vec![fixture_cue()]);
         assert!(!off.gate_enabled);
         assert_eq!(off.received, 1);
         assert_eq!(off.slice_text, slice_text());
 
         let stringly = parse(&variant(|v| v["gate"]["enabled"] = json!("true")));
         assert!(!stringly.gate_enabled);
-        assert!(stringly.cues.is_empty());
+        assert_eq!(stringly.cues, vec![fixture_cue()]);
+    }
+
+    #[test]
+    fn parse_tool_map_variants() {
+        let none = parse(&variant(|v| {
+            v.as_object_mut().unwrap().remove("tool_map");
+        }));
+        assert_eq!(none.tool_map, None);
+        assert!(none.cues.is_empty());
+        assert_eq!(none.received, 1);
+
+        let skipped = parse(&variant(|v| {
+            v["tool_map"] = json!({"bash": "Bash", "x": 5});
+        }));
+        assert_eq!(skipped.tool_map.unwrap().len(), 1);
+
+        for bad in [json!([]), json!("x"), Value::Null] {
+            let body = variant(|v| v["tool_map"] = bad.clone());
+            assert_eq!(
+                parse_prevention(body.as_bytes()),
+                Err("malformed response".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn native_targets() {
+        let t = |name: &str, args: Value| super::native_target(&view(name, &args));
+        assert_eq!(t("bash", json!({"command": "ls"})), "ls");
+        assert_eq!(t("bash", json!({"command": 5})), "");
+        assert_eq!(t("bash", json!({})), "");
+        assert_eq!(t("edit_file", json!({"path": "a.rs"})), "a.rs");
+        assert_eq!(t("read_file", json!({"path": "b.rs"})), "b.rs");
+        assert_eq!(t("list_files", json!({"path": "src"})), "src");
+        assert_eq!(t("list_files", json!({})), ".");
+        assert_eq!(t("list_files", json!({"path": 3})), "");
+        assert_eq!(t("finish", json!({"path": "x"})), "");
+        assert_eq!(t("edit_file", json!({})), "");
+    }
+
+    fn contract_example(name: &str) -> Value {
+        let c: Value = serde_json::from_str(include_str!(
+            "../../testdata/personal_kb_contracts/prevention.json"
+        ))
+        .unwrap();
+        c["response"]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()["body"]
+            .clone()
+    }
+
+    #[test]
+    fn contract_examples_all_parse() {
+        let c: Value = serde_json::from_str(include_str!(
+            "../../testdata/personal_kb_contracts/prevention.json"
+        ))
+        .unwrap();
+        let examples = c["response"]["examples"].as_array().unwrap();
+        assert!(!examples.is_empty());
+        for e in examples {
+            assert!(
+                parse_prevention(e["body"].to_string().as_bytes()).is_ok(),
+                "{}",
+                e["name"]
+            );
+        }
+    }
+
+    /// A bash command that the cue's class and args prefix match.
+    fn command_for(cue: &IndexCue) -> String {
+        format!("{} {}", cue.target_class, cue.args_prefix)
+    }
+
+    #[tokio::test]
+    async fn connect_query_keys_match_the_contract() {
+        let c: Value = serde_json::from_str(include_str!(
+            "../../testdata/personal_kb_contracts/prevention.json"
+        ))
+        .unwrap();
+        let example = c["request"]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "talos")
+            .unwrap();
+        let want: std::collections::BTreeSet<String> = example["query"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let schema = c["request"]["query_schema"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(want.iter().all(|k| schema.contains_key(k)));
+        let (server, _m) = connected(FIXTURE.to_string()).await;
+        let reqs = server.received_requests().await.unwrap();
+        let got: std::collections::BTreeSet<String> = reqs[0]
+            .url
+            .query_pairs()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert_eq!(got, want);
+        assert!(
+            reqs[0]
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "harness" && v == "talos")
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_talos_examples_deny() {
+        for name in ["talos_gate_armed", "talos_gate_switch_off"] {
+            let body = contract_example(name);
+            let p = parse_prevention(body.to_string().as_bytes()).unwrap();
+            assert_eq!(p.tool_map.as_ref().unwrap().len(), 6, "{name}");
+            let cue = p.cues.iter().find(|c| c.tool == "Bash").expect("bash cue");
+            let (_s, memory) = connected(body.to_string()).await;
+            let args = json!({"command": command_for(cue)});
+            assert_eq!(
+                memory.before_tool(&view("bash", &args)),
+                Advice::DenyOnce {
+                    fact: cue_fact(cue),
+                    entry_id: cue.resolution_id.clone()
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_empty_tool_map_keeps_cues_but_gives_no_advice() {
+        let body = contract_example("gate_armed");
+        let p = parse_prevention(body.to_string().as_bytes()).unwrap();
+        assert!(!p.cues.is_empty());
+        let cue = p.cues.iter().find(|c| c.tool == "Bash").expect("bash cue");
+        let (_s, memory) = connected(body.to_string()).await;
+        let args = json!({"command": command_for(cue)});
+        assert_eq!(memory.before_tool(&view("bash", &args)), Advice::None);
+        assert!(memory.label().contains("tool_map=0"));
+    }
+
+    #[tokio::test]
+    async fn contract_absent_tool_map_keeps_no_cues() {
+        let mut body = contract_example("talos_gate_armed");
+        body.as_object_mut().unwrap().remove("tool_map");
+        let p = parse_prevention(body.to_string().as_bytes()).unwrap();
+        assert!(p.cues.is_empty());
+        let (_s, memory) = connected(body.to_string()).await;
+        assert!(memory.label().contains("tool_map=absent"));
+        assert!(memory.session_slice().is_some() || p.slice_text.trim().is_empty());
     }
 
     #[test]
@@ -979,8 +1168,10 @@ mod tests {
         };
         let rejected = [
             with(&|e| e["observed_once"] = json!(true)),
-            with(&|e| e["tool"] = json!("Read")),
-            with(&|e| e["tool"] = json!("bash")),
+            with(&|e| e["tool"] = json!("  ")),
+            with(&|e| {
+                e.as_object_mut().unwrap().remove("tool");
+            }),
             with(&|e| e["resolution_id"] = json!("  ")),
             with(&|e| e["corrected_fact"] = json!("")),
             json!(5),
@@ -1013,6 +1204,7 @@ mod tests {
         assert_eq!(cue_fact(&fixture_cue()), FACT_1);
         let bare = |fact: String| IndexCue {
             resolution_id: "kb-x".into(),
+            tool: "Bash".into(),
             target_class: "x".into(),
             args_prefix: String::new(),
             wrong_belief: String::new(),
@@ -1183,7 +1375,7 @@ mod tests {
         assert_eq!(
             memory.label(),
             format!(
-                "personal-kb 127.0.0.1:{} project=fake-project gate=on index=1 dropped=0 truncated=0",
+                "personal-kb 127.0.0.1:{} project=fake-project gate=on tool_map=6 index=1 dropped=0 truncated=0",
                 port(&server)
             )
         );
@@ -1235,12 +1427,15 @@ mod tests {
         let (_s, off) = connected(variant(|v| v["gate"]["enabled"] = json!(false))).await;
         assert!(
             off.label()
-                .ends_with("gate=off index=0 dropped=1 truncated=0"),
+                .ends_with("gate=off tool_map=6 index=1 dropped=0 truncated=0"),
             "{}",
             off.label()
         );
         let push = json!({"command": "git push github main"});
-        assert_eq!(off.before_tool(&view("bash", &push)), Advice::None);
+        assert!(matches!(
+            off.before_tool(&view("bash", &push)),
+            Advice::DenyOnce { .. }
+        ));
         assert_eq!(off.session_slice(), Some(slice_text()));
 
         let (_s, dropped) = connected(variant(|v| {

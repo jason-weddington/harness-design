@@ -45,5 +45,13 @@
     "slice_truncated": 0,
     "index_excluded_observed_once": 0
   },
-  "surprise_capture": "off"
+  "surprise_capture": "off",
+  "tool_map": {
+    "bash": "Bash",
+    "edit_file": "Edit",
+    "read_file": "Read",
+    "list_files": "LS",
+    "run_checks": "run_checks",
+    "finish": "finish"
+  }
 }
