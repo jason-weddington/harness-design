@@ -1,0 +1,549 @@
+{
+  "contract": "turn",
+  "contract_version": 1,
+  "generated_by": "packages/kb-service/scripts/gen_contracts.py",
+  "method": "POST",
+  "path": "/api/kb/turn",
+  "request": {
+    "max_body_bytes": 65536,
+    "schema": {
+      "$defs": {
+        "TurnAssistantTextItem": {
+          "description": "Assistant prose within a turn.",
+          "properties": {
+            "kind": {
+              "const": "assistant_text",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "maxLength": 2000,
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "title": "TurnAssistantTextItem",
+          "type": "object"
+        },
+        "TurnHarnessCorrectionItem": {
+          "description": "A harness rejection and the actions that resolved it (talos).\n\nSender rules: (a) emit each correction exactly once, in the digest that holds\nits last resolving tool_call, or in the run's final digest with resolved false.\n(b) resolved_by names only tool_calls posted in that digest or in an earlier\ndigest of the same session. (c) When fitting the 200-item / 65536-byte budget,\nnever drop a harness_correction item or a tool_call that one names; drop\nreasoning items first, then tool items that no correction names. (d) A forward\nor dropped reference is recorded permanently as ungrounded/resolved_by_unmatched.",
+          "properties": {
+            "kind": {
+              "const": "harness_correction",
+              "title": "Kind",
+              "type": "string"
+            },
+            "trigger": {
+              "enum": [
+                "gate_red",
+                "claim_rejected",
+                "no_change",
+                "nudge"
+              ],
+              "title": "Trigger",
+              "type": "string"
+            },
+            "detail": {
+              "maxLength": 1500,
+              "title": "Detail",
+              "type": "string"
+            },
+            "resolved_by": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 200,
+              "title": "Resolved By",
+              "type": "array"
+            },
+            "resolved": {
+              "title": "Resolved",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "trigger",
+            "detail",
+            "resolved_by",
+            "resolved"
+          ],
+          "title": "TurnHarnessCorrectionItem",
+          "type": "object"
+        },
+        "TurnReasoningItem": {
+          "description": "Agent reasoning within a turn, sent only by harnesses that record it (talos).",
+          "properties": {
+            "kind": {
+              "const": "reasoning",
+              "title": "Kind",
+              "type": "string"
+            },
+            "text": {
+              "maxLength": 2000,
+              "title": "Text",
+              "type": "string"
+            },
+            "truncated": {
+              "title": "Truncated",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "truncated"
+          ],
+          "title": "TurnReasoningItem",
+          "type": "object"
+        },
+        "TurnToolCallItem": {
+          "description": "A tool call within a turn.",
+          "properties": {
+            "kind": {
+              "const": "tool_call",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_use_id": {
+              "minLength": 1,
+              "title": "Tool Use Id",
+              "type": "string"
+            },
+            "tool": {
+              "minLength": 1,
+              "title": "Tool",
+              "type": "string"
+            },
+            "target": {
+              "default": "",
+              "maxLength": 500,
+              "title": "Target",
+              "type": "string"
+            },
+            "target_class": {
+              "default": "",
+              "title": "Target Class",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "tool_use_id",
+            "tool"
+          ],
+          "title": "TurnToolCallItem",
+          "type": "object"
+        },
+        "TurnToolResultItem": {
+          "description": "A tool result within a turn.",
+          "properties": {
+            "kind": {
+              "const": "tool_result",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_use_id": {
+              "minLength": 1,
+              "title": "Tool Use Id",
+              "type": "string"
+            },
+            "is_error": {
+              "title": "Is Error",
+              "type": "boolean"
+            },
+            "excerpt": {
+              "default": "",
+              "maxLength": 1500,
+              "title": "Excerpt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "tool_use_id",
+            "is_error"
+          ],
+          "title": "TurnToolResultItem",
+          "type": "object"
+        }
+      },
+      "description": "``POST /api/kb/turn`` — one per-turn digest sent by the hook at Stop.",
+      "properties": {
+        "event_id": {
+          "minLength": 1,
+          "title": "Event Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "harness": {
+          "default": "claude-code",
+          "minLength": 1,
+          "title": "Harness",
+          "type": "string"
+        },
+        "mode": {
+          "default": "interactive",
+          "enum": [
+            "interactive",
+            "headless"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "engine": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Engine"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "hook_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hook Version"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project"
+        },
+        "turn_index": {
+          "minimum": 0,
+          "title": "Turn Index",
+          "type": "integer"
+        },
+        "ts": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ts"
+        },
+        "user_prompt": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User Prompt"
+        },
+        "items": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "assistant_text": "#/$defs/TurnAssistantTextItem",
+                "harness_correction": "#/$defs/TurnHarnessCorrectionItem",
+                "reasoning": "#/$defs/TurnReasoningItem",
+                "tool_call": "#/$defs/TurnToolCallItem",
+                "tool_result": "#/$defs/TurnToolResultItem"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/TurnAssistantTextItem"
+              },
+              {
+                "$ref": "#/$defs/TurnToolCallItem"
+              },
+              {
+                "$ref": "#/$defs/TurnToolResultItem"
+              },
+              {
+                "$ref": "#/$defs/TurnReasoningItem"
+              },
+              {
+                "$ref": "#/$defs/TurnHarnessCorrectionItem"
+              }
+            ]
+          },
+          "maxItems": 200,
+          "title": "Items",
+          "type": "array"
+        },
+        "final_message": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Final Message"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "event_id",
+        "session_id",
+        "turn_index"
+      ],
+      "title": "TurnDigestRequest",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "claude_code_turn",
+        "body": {
+          "event_id": "contract-session-1:3",
+          "session_id": "contract-session-1",
+          "harness": "claude-code",
+          "mode": "interactive",
+          "engine": null,
+          "host": "contract-host",
+          "hook_version": "0.0.0-contract",
+          "project": "personal-kb",
+          "turn_index": 3,
+          "ts": "2026-10-10T12:00:00+00:00",
+          "user_prompt": "Push the feature branch.",
+          "items": [
+            {
+              "kind": "assistant_text",
+              "text": "Pushing the branch now."
+            },
+            {
+              "kind": "tool_call",
+              "tool_use_id": "toolu_contract_1",
+              "tool": "Bash",
+              "target": "git push mirror feat/x",
+              "target_class": "git push"
+            },
+            {
+              "kind": "tool_result",
+              "tool_use_id": "toolu_contract_1",
+              "is_error": true,
+              "excerpt": "remote: Permission to mirror denied"
+            }
+          ],
+          "final_message": "The mirror rejected the push; pushed to origin instead.",
+          "truncated": false
+        }
+      },
+      {
+        "name": "talos_turn",
+        "body": {
+          "event_id": "contract-session-2:0",
+          "session_id": "contract-session-2",
+          "harness": "talos",
+          "mode": "headless",
+          "engine": "talos-glm-flash",
+          "host": "contract-host",
+          "hook_version": null,
+          "project": "personal-kb",
+          "turn_index": 0,
+          "ts": "2026-10-10T12:05:00+00:00",
+          "user_prompt": "Implement acceptance criterion 1.",
+          "items": [
+            {
+              "kind": "tool_call",
+              "tool_use_id": "toolu_contract_t1",
+              "tool": "bash",
+              "target": "git push mirror feat/x",
+              "target_class": ""
+            },
+            {
+              "kind": "tool_result",
+              "tool_use_id": "toolu_contract_t1",
+              "is_error": true,
+              "excerpt": "remote: Permission to mirror denied"
+            },
+            {
+              "kind": "reasoning",
+              "text": "The mirror is release-only, so origin is the right remote.",
+              "truncated": false
+            },
+            {
+              "kind": "tool_call",
+              "tool_use_id": "toolu_contract_t2",
+              "tool": "edit_file",
+              "target": "src/a.py",
+              "target_class": ""
+            },
+            {
+              "kind": "tool_result",
+              "tool_use_id": "toolu_contract_t2",
+              "is_error": false,
+              "excerpt": ""
+            },
+            {
+              "kind": "harness_correction",
+              "trigger": "gate_red",
+              "detail": "FAILED tests/test_contract.py::test_example",
+              "resolved_by": [
+                "toolu_contract_t2"
+              ],
+              "resolved": true
+            }
+          ],
+          "final_message": "Done; the gate is green.",
+          "truncated": true
+        }
+      },
+      {
+        "name": "minimal",
+        "body": {
+          "event_id": "contract-session-1:0",
+          "session_id": "contract-session-1",
+          "harness": "claude-code",
+          "mode": "interactive",
+          "engine": null,
+          "host": null,
+          "hook_version": null,
+          "project": null,
+          "turn_index": 0,
+          "ts": null,
+          "user_prompt": null,
+          "items": [],
+          "final_message": null,
+          "truncated": false
+        }
+      }
+    ]
+  },
+  "response": {
+    "schema": {
+      "description": "Response for ``POST /api/kb/turn``.",
+      "properties": {
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "recorded",
+            "duplicate",
+            "duplicate-mismatch",
+            "capture-off",
+            "redaction-unavailable",
+            "write-failed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "redactions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Redactions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "recorded",
+        "reason"
+      ],
+      "title": "TurnDigestResponse",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "recorded",
+        "body": {
+          "recorded": true,
+          "reason": "recorded",
+          "redactions": [
+            "Secret Keyword"
+          ]
+        }
+      },
+      {
+        "name": "duplicate",
+        "body": {
+          "recorded": false,
+          "reason": "duplicate",
+          "redactions": []
+        }
+      },
+      {
+        "name": "duplicate-mismatch",
+        "body": {
+          "recorded": false,
+          "reason": "duplicate-mismatch",
+          "redactions": []
+        }
+      },
+      {
+        "name": "capture-off",
+        "body": {
+          "recorded": false,
+          "reason": "capture-off",
+          "redactions": []
+        }
+      },
+      {
+        "name": "redaction-unavailable",
+        "body": {
+          "recorded": false,
+          "reason": "redaction-unavailable",
+          "redactions": []
+        }
+      },
+      {
+        "name": "write-failed",
+        "body": {
+          "recorded": false,
+          "reason": "write-failed",
+          "redactions": []
+        }
+      }
+    ]
+  }
+}

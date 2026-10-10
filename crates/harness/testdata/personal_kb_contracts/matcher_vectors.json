@@ -1,0 +1,341 @@
+{
+  "generated_by": "scripts/gen-kb-matcher-vectors.py",
+  "source": "personal_kb v1.8.0 (8e7a358): personal-kb-hook cues_lite.target_class, cues_lite.bash_args_after_class, prevention._find_match",
+  "python": "3.14.4",
+  "note": "Regenerate from the Python originals on any change to either side; never edit expectations by hand. Tool names here are CANONICAL (after tool_map translation).",
+  "target_class": [
+    {
+      "tool": "Edit",
+      "target": "src/a.py",
+      "expected": "ext:py"
+    },
+    {
+      "tool": "Edit",
+      "target": "src/A.PY",
+      "expected": "ext:py"
+    },
+    {
+      "tool": "Edit",
+      "target": "Makefile",
+      "expected": "ext:none"
+    },
+    {
+      "tool": "Edit",
+      "target": "",
+      "expected": ""
+    },
+    {
+      "tool": "Edit",
+      "target": ".env",
+      "expected": "ext:none"
+    },
+    {
+      "tool": "Edit",
+      "target": "dir/archive.tar.gz",
+      "expected": "ext:gz"
+    },
+    {
+      "tool": "Edit",
+      "target": "/abs/x.rs",
+      "expected": "ext:rs"
+    },
+    {
+      "tool": "Edit",
+      "target": "a.b/c",
+      "expected": "ext:none"
+    },
+    {
+      "tool": "Edit",
+      "target": "docs/My Notes.md",
+      "expected": "ext:md"
+    },
+    {
+      "tool": "Read",
+      "target": "Cargo.toml",
+      "expected": "ext:toml"
+    },
+    {
+      "tool": "Read",
+      "target": ".github/workflows/ci.yml",
+      "expected": "ext:yml"
+    },
+    {
+      "tool": "Write",
+      "target": "x.json",
+      "expected": "ext:json"
+    },
+    {
+      "tool": "MultiEdit",
+      "target": "y.ts",
+      "expected": "ext:ts"
+    },
+    {
+      "tool": "NotebookEdit",
+      "target": "n.ipynb",
+      "expected": "ext:ipynb"
+    },
+    {
+      "tool": "LS",
+      "target": ".",
+      "expected": ""
+    },
+    {
+      "tool": "LS",
+      "target": "src",
+      "expected": ""
+    },
+    {
+      "tool": "Glob",
+      "target": "**/*.rs",
+      "expected": ""
+    },
+    {
+      "tool": "run_checks",
+      "target": "",
+      "expected": ""
+    },
+    {
+      "tool": "finish",
+      "target": "",
+      "expected": ""
+    }
+  ],
+  "bash_args_after_class": [
+    {
+      "target": "src/a.py",
+      "expected": []
+    },
+    {
+      "target": "docs/My Notes.md",
+      "expected": [
+        "Notes.md"
+      ]
+    },
+    {
+      "target": "",
+      "expected": []
+    },
+    {
+      "target": ".",
+      "expected": []
+    },
+    {
+      "target": "git push origin main",
+      "expected": [
+        "origin",
+        "main"
+      ]
+    },
+    {
+      "target": "git push -f origin feat/x",
+      "expected": [
+        "origin",
+        "feat/x"
+      ]
+    },
+    {
+      "target": "sudo FOO=1 systemctl restart nginx",
+      "expected": [
+        "systemctl",
+        "restart",
+        "nginx"
+      ]
+    },
+    {
+      "target": "cd repo && cargo test -p harness",
+      "expected": [
+        "harness"
+      ]
+    },
+    {
+      "target": "ls -la dir",
+      "expected": [
+        "dir"
+      ]
+    },
+    {
+      "target": "python3 -m pytest tests/ -q",
+      "expected": [
+        "pytest",
+        "tests/"
+      ]
+    },
+    {
+      "target": "echo a\ngit push origin",
+      "expected": [
+        "a",
+        "git",
+        "push",
+        "origin"
+      ]
+    },
+    {
+      "target": "sudo -u dispatch FOO=1 git push x",
+      "expected": [
+        "git",
+        "push",
+        "x"
+      ]
+    },
+    {
+      "target": "cd a; cd b || make all",
+      "expected": []
+    }
+  ],
+  "find_match": {
+    "index": [
+      {
+        "resolution_id": "kb-b1",
+        "tool": "Bash",
+        "target_class": "git push",
+        "args_prefix": "github"
+      },
+      {
+        "resolution_id": "kb-b2",
+        "tool": "Bash",
+        "target_class": "git push",
+        "args_prefix": ""
+      },
+      {
+        "resolution_id": "kb-e1",
+        "tool": "Edit",
+        "target_class": "ext:toml",
+        "args_prefix": ""
+      },
+      {
+        "resolution_id": "kb-e2",
+        "tool": "Edit",
+        "target_class": "ext:py",
+        "args_prefix": ""
+      },
+      {
+        "resolution_id": "kb-r1",
+        "tool": "Read",
+        "target_class": "ext:none",
+        "args_prefix": ""
+      },
+      {
+        "resolution_id": "kb-r2",
+        "tool": "Read",
+        "target_class": "ext:md",
+        "args_prefix": "Notes.md"
+      },
+      {
+        "resolution_id": "kb-l1",
+        "tool": "LS",
+        "target_class": "ext:none",
+        "args_prefix": ""
+      }
+    ],
+    "cases": [
+      {
+        "tool": "Bash",
+        "target": "git push github main",
+        "expected_resolution_id": "kb-b1",
+        "expected_class": "git push"
+      },
+      {
+        "tool": "Bash",
+        "target": "git push origin main",
+        "expected_resolution_id": "kb-b2",
+        "expected_class": "git push"
+      },
+      {
+        "tool": "Bash",
+        "target": "cargo build && git push github",
+        "expected_resolution_id": "kb-b1",
+        "expected_class": "git push"
+      },
+      {
+        "tool": "Bash",
+        "target": "cargo test",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "Edit",
+        "target": "Cargo.toml",
+        "expected_resolution_id": "kb-e1",
+        "expected_class": "ext:toml"
+      },
+      {
+        "tool": "Edit",
+        "target": "crates/x/Cargo.TOML",
+        "expected_resolution_id": "kb-e1",
+        "expected_class": "ext:toml"
+      },
+      {
+        "tool": "Edit",
+        "target": "src/lib.rs",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "Edit",
+        "target": "tools/gen.py",
+        "expected_resolution_id": "kb-e2",
+        "expected_class": "ext:py"
+      },
+      {
+        "tool": "Edit",
+        "target": "",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "Read",
+        "target": "Cargo.toml",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "Read",
+        "target": ".env",
+        "expected_resolution_id": "kb-r1",
+        "expected_class": "ext:none"
+      },
+      {
+        "tool": "Read",
+        "target": "Makefile",
+        "expected_resolution_id": "kb-r1",
+        "expected_class": "ext:none"
+      },
+      {
+        "tool": "Read",
+        "target": "docs/My Notes.md",
+        "expected_resolution_id": "kb-r2",
+        "expected_class": "ext:md"
+      },
+      {
+        "tool": "Read",
+        "target": "docs/notes.md",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "Write",
+        "target": "a.py",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "LS",
+        "target": ".",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "LS",
+        "target": "src",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      },
+      {
+        "tool": "run_checks",
+        "target": "",
+        "expected_resolution_id": null,
+        "expected_class": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,2 @@
+Vendored from personal_kb tag v1.8.0 (8e7a358), contracts/ unchanged. Regenerate there, then re-copy; never edit by hand.
+matcher_vectors.json: produced by running personal-kb-hook cues_lite.target_class, cues_lite.bash_args_after_class and prevention._find_match at the same tag (scripts/gen-kb-matcher-vectors.py; Bash rows are dropped from target_class because the Bash path goes through bash_segments).

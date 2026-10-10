@@ -1,0 +1,596 @@
+{
+  "contract": "prevention",
+  "contract_version": 1,
+  "generated_by": "packages/kb-service/scripts/gen_contracts.py",
+  "method": "GET",
+  "path": "/api/kb/prevention",
+  "request": {
+    "query_schema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Project"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cwd"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "harness": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Harness"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "examples": [
+      {
+        "name": "project_and_cwd",
+        "query": {
+          "project": "personal-kb",
+          "cwd": "/home/dev/git/personal_kb",
+          "session_id": "contract-session-1"
+        }
+      },
+      {
+        "name": "talos",
+        "query": {
+          "project": "personal-kb",
+          "session_id": "contract-session-2",
+          "harness": "talos"
+        }
+      }
+    ]
+  },
+  "response": {
+    "schema": {
+      "$defs": {
+        "GateSettings": {
+          "description": "Server-side soft-gate switches, read per request from the environment.\n\n``max_denies_per_turn`` / ``max_denies_per_hour`` rate-limit the hook's\ndenies and ``rearm_hours`` is how long a denied lesson stays quiet before\nit may deny again. ``max_denies`` is LEGACY: hooks before the rate limits\nread it as a per-session cap, so it is served as 1000 (effectively\nuncapped) and new hooks ignore it.",
+          "properties": {
+            "enabled": {
+              "title": "Enabled",
+              "type": "boolean"
+            },
+            "shadow": {
+              "title": "Shadow",
+              "type": "boolean"
+            },
+            "max_denies": {
+              "title": "Max Denies",
+              "type": "integer"
+            },
+            "max_denies_per_turn": {
+              "default": 1,
+              "title": "Max Denies Per Turn",
+              "type": "integer"
+            },
+            "max_denies_per_hour": {
+              "default": 6,
+              "title": "Max Denies Per Hour",
+              "type": "integer"
+            },
+            "rearm_hours": {
+              "default": 24,
+              "title": "Rearm Hours",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "enabled",
+            "shadow",
+            "max_denies"
+          ],
+          "title": "GateSettings",
+          "type": "object"
+        },
+        "IndexCue": {
+          "description": "One gate-index entry: a Bash two-word-class cue the hook may deny once.\n\n``args_prefix`` ('' when absent) narrows the match: after the tokens that\nproduced ``target_class``, flags are dropped and the remaining tokens must\nstart with ``args_prefix.split()``.",
+          "properties": {
+            "resolution_id": {
+              "title": "Resolution Id",
+              "type": "string"
+            },
+            "updated_at": {
+              "title": "Updated At",
+              "type": "string"
+            },
+            "tool": {
+              "title": "Tool",
+              "type": "string"
+            },
+            "target_class": {
+              "title": "Target Class",
+              "type": "string"
+            },
+            "args_prefix": {
+              "default": "",
+              "title": "Args Prefix",
+              "type": "string"
+            },
+            "wrong_belief": {
+              "title": "Wrong Belief",
+              "type": "string"
+            },
+            "corrected_fact": {
+              "title": "Corrected Fact",
+              "type": "string"
+            },
+            "evidence": {
+              "title": "Evidence",
+              "type": "string"
+            },
+            "provenance_label": {
+              "title": "Provenance Label",
+              "type": "string"
+            },
+            "observed_once": {
+              "title": "Observed Once",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "resolution_id",
+            "updated_at",
+            "tool",
+            "target_class",
+            "wrong_belief",
+            "corrected_fact",
+            "evidence",
+            "provenance_label",
+            "observed_once"
+          ],
+          "title": "IndexCue",
+          "type": "object"
+        },
+        "PreventionDiagnostics": {
+          "description": "Load/cap counters for one ``GET /api/kb/prevention`` request.",
+          "properties": {
+            "resolutions_total": {
+              "default": 0,
+              "title": "Resolutions Total",
+              "type": "integer"
+            },
+            "skipped_malformed": {
+              "default": 0,
+              "title": "Skipped Malformed",
+              "type": "integer"
+            },
+            "skipped_observed_once": {
+              "default": 0,
+              "title": "Skipped Observed Once",
+              "type": "integer"
+            },
+            "index_truncated": {
+              "default": 0,
+              "title": "Index Truncated",
+              "type": "integer"
+            },
+            "slice_truncated": {
+              "default": 0,
+              "title": "Slice Truncated",
+              "type": "integer"
+            },
+            "index_excluded_observed_once": {
+              "default": 0,
+              "title": "Index Excluded Observed Once",
+              "type": "integer"
+            }
+          },
+          "title": "PreventionDiagnostics",
+          "type": "object"
+        },
+        "SliceItem": {
+          "description": "One line of the SessionStart gotcha slice.",
+          "properties": {
+            "entry_id": {
+              "title": "Entry Id",
+              "type": "string"
+            },
+            "corrected_fact": {
+              "title": "Corrected Fact",
+              "type": "string"
+            },
+            "wrong_belief": {
+              "title": "Wrong Belief",
+              "type": "string"
+            },
+            "provenance_label": {
+              "title": "Provenance Label",
+              "type": "string"
+            }
+          },
+          "required": [
+            "entry_id",
+            "corrected_fact",
+            "wrong_belief",
+            "provenance_label"
+          ],
+          "title": "SliceItem",
+          "type": "object"
+        }
+      },
+      "description": "``GET /api/kb/prevention`` — gate settings, gate index and gotcha slice.",
+      "properties": {
+        "project": {
+          "title": "Project",
+          "type": "string"
+        },
+        "gate": {
+          "$ref": "#/$defs/GateSettings"
+        },
+        "index": {
+          "items": {
+            "$ref": "#/$defs/IndexCue"
+          },
+          "title": "Index",
+          "type": "array"
+        },
+        "slice": {
+          "items": {
+            "$ref": "#/$defs/SliceItem"
+          },
+          "title": "Slice",
+          "type": "array"
+        },
+        "slice_text": {
+          "title": "Slice Text",
+          "type": "string"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/PreventionDiagnostics"
+        },
+        "surprise_capture": {
+          "default": "off",
+          "enum": [
+            "off",
+            "shadow",
+            "on"
+          ],
+          "title": "Surprise Capture",
+          "type": "string"
+        },
+        "tool_map": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Tool Map",
+          "type": "object"
+        }
+      },
+      "required": [
+        "project",
+        "gate",
+        "index",
+        "slice",
+        "slice_text",
+        "diagnostics"
+      ],
+      "title": "PreventionResponse",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "gate_armed",
+        "body": {
+          "project": "personal-kb",
+          "gate": {
+            "enabled": true,
+            "shadow": false,
+            "max_denies": 1000,
+            "max_denies_per_turn": 1,
+            "max_denies_per_hour": 6,
+            "rearm_hours": 24
+          },
+          "index": [
+            {
+              "resolution_id": "kb-00101",
+              "updated_at": "2026-10-02T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git push",
+              "args_prefix": "",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "evidence": "remote: Permission to mirror denied",
+              "provenance_label": "deliberate/observed",
+              "observed_once": false
+            },
+            {
+              "resolution_id": "kb-00102",
+              "updated_at": "2026-10-01T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git remote",
+              "args_prefix": "add",
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "evidence": "",
+              "provenance_label": "autonomous/observed",
+              "observed_once": false
+            }
+          ],
+          "slice": [
+            {
+              "entry_id": "kb-00101",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "provenance_label": "deliberate/observed"
+            },
+            {
+              "entry_id": "kb-00102",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "wrong_belief": "Add a new remote with git remote add.",
+              "provenance_label": "autonomous/observed"
+            },
+            {
+              "entry_id": "kb-00103",
+              "corrected_fact": "The local KB service listens on port 8765.",
+              "wrong_belief": "",
+              "provenance_label": "supersedes-edge"
+            },
+            {
+              "entry_id": "kb-00104",
+              "corrected_fact": "Run the hook tests from packages/personal-kb-hook with --project ../..",
+              "wrong_belief": "Run the hook tests from the repo root.",
+              "provenance_label": "autonomous/observed, observed once, unconfirmed"
+            }
+          ],
+          "slice_text": "Known gotchas for personal-kb from the KB (each replaces an earlier wrong belief):\n- Push feature branches to origin; the mirror remote receives release pushes only. (was: Push feature branches to the mirror remote.) [deliberate/observed; kb-00101]\n- Create remotes with ./scripts/add_remote.sh so the server-side repository exists first. (was: Add a new remote with git remote add.) [autonomous/observed; kb-00102]\n- The local KB service listens on port 8765. [supersedes-edge; kb-00103]\n- Run the hook tests from packages/personal-kb-hook with --project ../.. (was: Run the hook tests from the repo root.) [autonomous/observed, observed once, unconfirmed; kb-00104]",
+          "diagnostics": {
+            "resolutions_total": 3,
+            "skipped_malformed": 0,
+            "skipped_observed_once": 0,
+            "index_truncated": 0,
+            "slice_truncated": 0,
+            "index_excluded_observed_once": 1
+          },
+          "surprise_capture": "shadow",
+          "tool_map": {}
+        }
+      },
+      {
+        "name": "gate_disabled_slice_only",
+        "body": {
+          "project": "personal-kb",
+          "gate": {
+            "enabled": false,
+            "shadow": true,
+            "max_denies": 1000,
+            "max_denies_per_turn": 1,
+            "max_denies_per_hour": 6,
+            "rearm_hours": 24
+          },
+          "index": [],
+          "slice": [
+            {
+              "entry_id": "kb-00101",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "provenance_label": "deliberate/observed"
+            }
+          ],
+          "slice_text": "Known gotchas for personal-kb from the KB (each replaces an earlier wrong belief):\n- Push feature branches to origin; the mirror remote receives release pushes only. (was: Push feature branches to the mirror remote.) [deliberate/observed; kb-00101]",
+          "diagnostics": {
+            "resolutions_total": 1,
+            "skipped_malformed": 0,
+            "skipped_observed_once": 0,
+            "index_truncated": 0,
+            "slice_truncated": 0,
+            "index_excluded_observed_once": 0
+          },
+          "surprise_capture": "off",
+          "tool_map": {}
+        }
+      },
+      {
+        "name": "no_project",
+        "body": {
+          "project": "",
+          "gate": {
+            "enabled": false,
+            "shadow": true,
+            "max_denies": 1000,
+            "max_denies_per_turn": 1,
+            "max_denies_per_hour": 6,
+            "rearm_hours": 24
+          },
+          "index": [],
+          "slice": [],
+          "slice_text": "",
+          "diagnostics": {
+            "resolutions_total": 0,
+            "skipped_malformed": 0,
+            "skipped_observed_once": 0,
+            "index_truncated": 0,
+            "slice_truncated": 0,
+            "index_excluded_observed_once": 0
+          },
+          "surprise_capture": "on",
+          "tool_map": {}
+        }
+      },
+      {
+        "name": "talos_gate_armed",
+        "body": {
+          "project": "personal-kb",
+          "gate": {
+            "enabled": true,
+            "shadow": false,
+            "max_denies": 1000,
+            "max_denies_per_turn": 1,
+            "max_denies_per_hour": 6,
+            "rearm_hours": 24
+          },
+          "index": [
+            {
+              "resolution_id": "kb-00101",
+              "updated_at": "2026-10-02T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git push",
+              "args_prefix": "",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "evidence": "remote: Permission to mirror denied",
+              "provenance_label": "deliberate/observed",
+              "observed_once": false
+            },
+            {
+              "resolution_id": "kb-00102",
+              "updated_at": "2026-10-01T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git remote",
+              "args_prefix": "add",
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "evidence": "",
+              "provenance_label": "autonomous/observed",
+              "observed_once": false
+            }
+          ],
+          "slice": [
+            {
+              "entry_id": "kb-00101",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "provenance_label": "deliberate/observed"
+            },
+            {
+              "entry_id": "kb-00102",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "wrong_belief": "Add a new remote with git remote add.",
+              "provenance_label": "autonomous/observed"
+            },
+            {
+              "entry_id": "kb-00103",
+              "corrected_fact": "The local KB service listens on port 8765.",
+              "wrong_belief": "",
+              "provenance_label": "supersedes-edge"
+            },
+            {
+              "entry_id": "kb-00104",
+              "corrected_fact": "Run the hook tests from packages/personal-kb-hook with --project ../..",
+              "wrong_belief": "Run the hook tests from the repo root.",
+              "provenance_label": "autonomous/observed, observed once, unconfirmed"
+            }
+          ],
+          "slice_text": "Known gotchas for personal-kb from the KB (each replaces an earlier wrong belief):\n- Push feature branches to origin; the mirror remote receives release pushes only. (was: Push feature branches to the mirror remote.) [deliberate/observed; kb-00101]\n- Create remotes with ./scripts/add_remote.sh so the server-side repository exists first. (was: Add a new remote with git remote add.) [autonomous/observed; kb-00102]\n- The local KB service listens on port 8765. [supersedes-edge; kb-00103]\n- Run the hook tests from packages/personal-kb-hook with --project ../.. (was: Run the hook tests from the repo root.) [autonomous/observed, observed once, unconfirmed; kb-00104]",
+          "diagnostics": {
+            "resolutions_total": 3,
+            "skipped_malformed": 0,
+            "skipped_observed_once": 0,
+            "index_truncated": 0,
+            "slice_truncated": 0,
+            "index_excluded_observed_once": 1
+          },
+          "surprise_capture": "shadow",
+          "tool_map": {
+            "bash": "Bash",
+            "edit_file": "Edit",
+            "read_file": "Read",
+            "list_files": "LS",
+            "run_checks": "run_checks",
+            "finish": "finish"
+          }
+        }
+      },
+      {
+        "name": "talos_gate_switch_off",
+        "body": {
+          "project": "personal-kb",
+          "gate": {
+            "enabled": false,
+            "shadow": true,
+            "max_denies": 1000,
+            "max_denies_per_turn": 1,
+            "max_denies_per_hour": 6,
+            "rearm_hours": 24
+          },
+          "index": [
+            {
+              "resolution_id": "kb-00101",
+              "updated_at": "2026-10-02T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git push",
+              "args_prefix": "",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "evidence": "remote: Permission to mirror denied",
+              "provenance_label": "deliberate/observed",
+              "observed_once": false
+            },
+            {
+              "resolution_id": "kb-00102",
+              "updated_at": "2026-10-01T09:00:00+00:00",
+              "tool": "Bash",
+              "target_class": "git remote",
+              "args_prefix": "add",
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "evidence": "",
+              "provenance_label": "autonomous/observed",
+              "observed_once": false
+            }
+          ],
+          "slice": [
+            {
+              "entry_id": "kb-00101",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "provenance_label": "deliberate/observed"
+            }
+          ],
+          "slice_text": "Known gotchas for personal-kb from the KB (each replaces an earlier wrong belief):\n- Push feature branches to origin; the mirror remote receives release pushes only. (was: Push feature branches to the mirror remote.) [deliberate/observed; kb-00101]",
+          "diagnostics": {
+            "resolutions_total": 3,
+            "skipped_malformed": 0,
+            "skipped_observed_once": 0,
+            "index_truncated": 0,
+            "slice_truncated": 0,
+            "index_excluded_observed_once": 1
+          },
+          "surprise_capture": "shadow",
+          "tool_map": {
+            "bash": "Bash",
+            "edit_file": "Edit",
+            "read_file": "Read",
+            "list_files": "LS",
+            "run_checks": "run_checks",
+            "finish": "finish"
+          }
+        }
+      }
+    ]
+  }
+}
