@@ -2,7 +2,7 @@
 
 ## What this is
 
-Golden request/response fixtures for the two endpoints a harness calls, `GET /api/kb/prevention` and `POST /api/kb/turn`. They are used today by the Claude Code hook and are intended for talos to vendor (adoption is a harness-design item), so a schema change breaks the other side's tests instead of drifting silently.
+Golden request/response fixtures for the endpoints a harness calls, `GET /api/kb/prevention`, `POST /api/kb/turn` and `POST /api/kb/event`. They are used today by the Claude Code hook and are intended for talos to vendor (adoption is a harness-design item), so a schema change breaks the other side's tests instead of drifting silently.
 
 ## File format
 
@@ -41,6 +41,16 @@ Auth is `Authorization: Bearer <api key>`; with `KB_AUTH_MODE=none` the token is
 A request-side addition such as a new TurnItem kind or query param needs the kb-service release deployed before any sender uses it, because an older server answers 422 for the whole digest.
 
 The talos sender rules for `harness_correction` are in the `TurnHarnessCorrectionItem` `$defs` description.
+
+## POST /api/kb/event
+
+`event.json` lists under `fields` which fields are client-supplied (the `EventRequest` properties) and which are server-computed (`cue_key`, `normalizer_version`, `host_class`, `project_source`, `target`, `target_class`, `normalized_error`, `error_rule`, `anomaly`, `raw_error_excerpt`, `received_ts`); a client never sends the computed ones.
+
+Each request example carries its `stored` computed fields under the top-level `stored` map and its response under `response.examples`, and the route always answers 200 with the `EventResponse` shape.
+
+A mapped harness (today talos) sends its native `tool_name` and native `tool_input` argument names (`edit_file` with `path`, for instance), and the KB normalizes both to the canonical Claude Code names before computing the cue, so the stored `tool` is `Edit` and `target` is the path.
+
+`event_id` must be unique per session; a repeated `event_id` is answered `duplicate` and not stored again.
 
 ## Seeing drift in production
 

@@ -1,0 +1,452 @@
+{
+  "contract": "event",
+  "contract_version": 1,
+  "generated_by": "packages/kb-service/scripts/gen_contracts.py",
+  "method": "POST",
+  "path": "/api/kb/event",
+  "fields": {
+    "client_supplied": [
+      "type",
+      "event_id",
+      "session_id",
+      "harness",
+      "mode",
+      "engine",
+      "host",
+      "hook_version",
+      "cwd",
+      "project",
+      "ts",
+      "tool_name",
+      "tool_input",
+      "tool_use_id",
+      "error",
+      "is_error",
+      "is_interrupt",
+      "duration_ms"
+    ],
+    "server_computed": [
+      "cue_key",
+      "normalizer_version",
+      "host_class",
+      "project_source",
+      "target",
+      "target_class",
+      "normalized_error",
+      "error_rule",
+      "anomaly",
+      "raw_error_excerpt",
+      "received_ts"
+    ]
+  },
+  "request": {
+    "schema": {
+      "description": "Request body for ``POST /api/kb/event``.\n\nThe full harness-event envelope is defined here, but only ``post_tool``\nfailures are acted on today; every other ``type`` is accepted and\nanswered with ``reason='unsupported-type'``.",
+      "properties": {
+        "type": {
+          "enum": [
+            "session_start",
+            "pre_tool",
+            "post_tool",
+            "turn_end"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "event_id": {
+          "minLength": 1,
+          "title": "Event Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "harness": {
+          "default": "claude-code",
+          "title": "Harness",
+          "type": "string"
+        },
+        "mode": {
+          "default": "interactive",
+          "enum": [
+            "interactive",
+            "headless"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "engine": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Engine"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "hook_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hook Version"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cwd"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project"
+        },
+        "ts": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ts"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Name"
+        },
+        "tool_input": {
+          "additionalProperties": true,
+          "title": "Tool Input",
+          "type": "object"
+        },
+        "tool_use_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Use Id"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "is_error": {
+          "default": true,
+          "title": "Is Error",
+          "type": "boolean"
+        },
+        "is_interrupt": {
+          "default": false,
+          "title": "Is Interrupt",
+          "type": "boolean"
+        },
+        "duration_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Ms"
+        }
+      },
+      "required": [
+        "type",
+        "event_id",
+        "session_id"
+      ],
+      "title": "EventRequest",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "claude_code_bash_failure",
+        "body": {
+          "type": "post_tool",
+          "event_id": "contract-session-1:toolu_contract_1",
+          "session_id": "contract-session-1",
+          "harness": "claude-code",
+          "mode": "interactive",
+          "engine": null,
+          "host": "contract-host",
+          "hook_version": "0.0.0-contract",
+          "cwd": "/home/dev/git/personal_kb",
+          "project": "personal-kb",
+          "ts": "2026-10-10T12:00:00+00:00",
+          "tool_name": "Bash",
+          "tool_input": {
+            "command": "git push mirror feat/x"
+          },
+          "tool_use_id": "toolu_contract_1",
+          "error": "Exit code 1\nremote: Permission to mirror denied",
+          "is_error": true,
+          "is_interrupt": false,
+          "duration_ms": 120
+        }
+      },
+      {
+        "name": "talos_bash_failure",
+        "body": {
+          "type": "post_tool",
+          "event_id": "contract-session-2:toolu_contract_t1",
+          "session_id": "contract-session-2",
+          "harness": "talos",
+          "mode": "headless",
+          "engine": "talos-glm-flash",
+          "host": "contract-host",
+          "hook_version": null,
+          "cwd": "/home/dev/git/personal_kb",
+          "project": "personal-kb",
+          "ts": "2026-10-10T12:05:00+00:00",
+          "tool_name": "bash",
+          "tool_input": {
+            "command": "git push mirror feat/x"
+          },
+          "tool_use_id": "toolu_contract_t1",
+          "error": "Exit code 1\nremote: Permission to mirror denied",
+          "is_error": true,
+          "is_interrupt": false,
+          "duration_ms": 95
+        }
+      },
+      {
+        "name": "talos_edit_file_failure",
+        "body": {
+          "type": "post_tool",
+          "event_id": "contract-session-2:toolu_contract_t2",
+          "session_id": "contract-session-2",
+          "harness": "talos",
+          "mode": "headless",
+          "engine": "talos-glm-flash",
+          "host": "contract-host",
+          "hook_version": null,
+          "cwd": "/home/dev/git/personal_kb",
+          "project": "personal-kb",
+          "ts": "2026-10-10T12:06:00+00:00",
+          "tool_name": "edit_file",
+          "tool_input": {
+            "path": "src/a.py"
+          },
+          "tool_use_id": "toolu_contract_t2",
+          "error": "old_string not found in src/a.py",
+          "is_error": true,
+          "is_interrupt": false,
+          "duration_ms": null
+        }
+      }
+    ]
+  },
+  "stored": {
+    "claude_code_bash_failure": {
+      "cue_key": "93ccc92c974a2310",
+      "normalizer_version": 1,
+      "host_class": "linux",
+      "project_source": "kb_project",
+      "tool": "Bash",
+      "target": "git push mirror feat/x",
+      "target_class": "git push",
+      "normalized_error": "exit 1 | remote: permission to mirror denied",
+      "error_rule": "keyword",
+      "anomaly": null,
+      "raw_error_excerpt": "Exit code 1\nremote: Permission to mirror denied"
+    },
+    "talos_bash_failure": {
+      "cue_key": "93ccc92c974a2310",
+      "normalizer_version": 1,
+      "host_class": "linux",
+      "project_source": "kb_project",
+      "tool": "Bash",
+      "target": "git push mirror feat/x",
+      "target_class": "git push",
+      "normalized_error": "exit 1 | remote: permission to mirror denied",
+      "error_rule": "keyword",
+      "anomaly": null,
+      "raw_error_excerpt": "Exit code 1\nremote: Permission to mirror denied"
+    },
+    "talos_edit_file_failure": {
+      "cue_key": "49be3684f0e9ad3e",
+      "normalizer_version": 1,
+      "host_class": "linux",
+      "project_source": "kb_project",
+      "tool": "Edit",
+      "target": "src/a.py",
+      "target_class": "ext:py",
+      "normalized_error": "old_string not found in src/a.py",
+      "error_rule": "keyword",
+      "anomaly": null,
+      "raw_error_excerpt": "old_string not found in src/a.py"
+    }
+  },
+  "response": {
+    "schema": {
+      "description": "Response for ``POST /api/kb/event`` — record-only, no delivery content.",
+      "properties": {
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        },
+        "cue_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cue Key"
+        },
+        "normalizer_version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Normalizer Version"
+        },
+        "reason": {
+          "enum": [
+            "recorded",
+            "duplicate",
+            "not-failure",
+            "unsupported-type",
+            "missing-fields",
+            "write-failed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "recorded",
+        "reason"
+      ],
+      "title": "EventResponse",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "claude_code_bash_failure",
+        "body": {
+          "recorded": true,
+          "cue_key": "93ccc92c974a2310",
+          "normalizer_version": 1,
+          "reason": "recorded"
+        }
+      },
+      {
+        "name": "talos_bash_failure",
+        "body": {
+          "recorded": true,
+          "cue_key": "93ccc92c974a2310",
+          "normalizer_version": 1,
+          "reason": "recorded"
+        }
+      },
+      {
+        "name": "talos_edit_file_failure",
+        "body": {
+          "recorded": true,
+          "cue_key": "49be3684f0e9ad3e",
+          "normalizer_version": 1,
+          "reason": "recorded"
+        }
+      },
+      {
+        "name": "duplicate",
+        "body": {
+          "recorded": false,
+          "cue_key": null,
+          "normalizer_version": null,
+          "reason": "duplicate"
+        }
+      },
+      {
+        "name": "not-failure",
+        "body": {
+          "recorded": false,
+          "cue_key": null,
+          "normalizer_version": null,
+          "reason": "not-failure"
+        }
+      },
+      {
+        "name": "unsupported-type",
+        "body": {
+          "recorded": false,
+          "cue_key": null,
+          "normalizer_version": null,
+          "reason": "unsupported-type"
+        }
+      }
+    ]
+  }
+}
