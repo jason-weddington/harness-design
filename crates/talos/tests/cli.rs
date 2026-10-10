@@ -3066,3 +3066,290 @@ async fn mcp_tools_register_in_answer_mode() {
     assert_eq!(run.lines[1]["event"], "mcp_connected");
     assert!(tool_names(&run.lines[0]).contains(&"kb_echo".to_string()));
 }
+
+// ============================================================================
+// `--memory` (personal-kb adapter)
+// ============================================================================
+
+/// The shared `/prevention` response fixture (one copy, in the harness crate).
+const KB_FIXTURE: &str =
+    include_str!("../../harness/testdata/personal_kb/prevention_response.json");
+
+/// A one-connection fake KB: a std listener on loopback that reads ONE
+/// request head (up to CRLFCRLF), replies 200 with `body`, sends the head
+/// over the channel and exits (mirrors main.rs `fake_show_daemon`).
+fn fake_kb(body: &str) -> (u16, std::sync::mpsc::Receiver<String>) {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake kb");
+    let port = listener.local_addr().expect("addr").port();
+    let body = body.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => break,
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+    });
+    (port, rx)
+}
+
+/// What one memory spawn left behind.
+struct MemoryRun {
+    stderr: String,
+    lines: Vec<serde_json::Value>,
+}
+
+/// Spawn `talos run` with `run_start_line`'s argv and env plus `flags` and
+/// `PERSONAL_KB_URL = kb_url`; `kb_project_file` is written to the
+/// workspace's `.kb_project` when given. Asserts exit 1 (refused backend).
+fn memory_run(flags: &[&str], kb_url: &str, kb_project_file: Option<&str>) -> MemoryRun {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    if let Some(body) = kb_project_file {
+        std::fs::write(workspace.join(".kb_project"), body).unwrap();
+    }
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("run.jsonl");
+    let mut child = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--run-store",
+            dir.path().join("run.sqlite").to_str().unwrap(),
+            "--offload-dir",
+            offload_dir.to_str().unwrap(),
+            "--task-id",
+            "cli-test-memory",
+            "--attempt",
+            "1",
+            "--transcript",
+            transcript_path.to_str().unwrap(),
+            "--state-retention-days",
+            "0",
+        ])
+        .args(flags)
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env("OLLAMA_NUM_CTX", "32768")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .env_remove("TALOS_COMPACT_THRESHOLD_PCT")
+        .env_remove("TALOS_WALL_CLOCK_SECS")
+        // Hosts export a real key; never send it to a test fake.
+        .env_remove("PERSONAL_KB_API_KEY")
+        .env("PERSONAL_KB_URL", kb_url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn talos");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(valid_spec_json().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("wait for talos");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "refused backend; stderr: {stderr}"
+    );
+    let lines = std::fs::read_to_string(&transcript_path)
+        .expect("transcript file must exist")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("JSON line"))
+        .collect();
+    MemoryRun { stderr, lines }
+}
+
+fn no_kb_tools(run_start: &serde_json::Value) {
+    let tools = run_start["tools"].as_array().expect("run_start.tools");
+    assert!(
+        tools
+            .iter()
+            .all(|t| !t["name"].as_str().unwrap_or("").starts_with("kb_")),
+        "{tools:?}"
+    );
+}
+
+#[test]
+fn memory_off_makes_no_kb_connection() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().unwrap().port();
+    let run = memory_run(
+        &[],
+        &format!("http://127.0.0.1:{port}"),
+        Some("fake-project\n"),
+    );
+    let err = listener
+        .accept()
+        .expect_err("no connection with memory off");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(
+        run.lines
+            .iter()
+            .all(|l| l["event"] != "memory_slice" && l["event"] != "memory_advice")
+    );
+    assert_eq!(run.lines[0]["config"]["memory_mode"], "off");
+}
+
+#[test]
+fn memory_annotate_unreachable_kb_degrades_and_run_proceeds() {
+    let run = memory_run(
+        &["--memory", "annotate", "--kb-project", "p"],
+        "http://127.0.0.1:1",
+        None,
+    );
+    let slice = &run.lines[1];
+    assert_eq!(slice["event"], "memory_slice", "{slice}");
+    assert!(
+        slice["degraded"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("prevention fetch failed: unreachable"),
+        "{slice}"
+    );
+    assert_eq!(
+        slice["source"],
+        "personal-kb 127.0.0.1:1 project=p gate=- index=0 dropped=0 truncated=0"
+    );
+    assert_eq!(slice["memory_tools"], serde_json::json!([]));
+    assert_eq!(run.lines[0]["config"]["memory_mode"], "annotate");
+    assert!(
+        run.stderr
+            .contains("warning: memory degraded to off (prevention fetch failed: unreachable"),
+        "{}",
+        run.stderr
+    );
+    no_kb_tools(&run.lines[0]);
+}
+
+#[test]
+fn memory_deny_once_fake_kb_appends_slice() {
+    let (port, rx) = fake_kb(KB_FIXTURE);
+    let run = memory_run(
+        &["--memory", "deny-once"],
+        &format!("http://127.0.0.1:{port}"),
+        Some("# comment\n\nfake-project\n"),
+    );
+    let head = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("talos made no /prevention request");
+    let first = head.lines().next().unwrap_or("");
+    assert!(first.starts_with("GET /api/kb/prevention?"), "{head}");
+    assert!(first.contains("project=fake-project"), "{head}");
+    assert!(first.contains("session_id="), "{head}");
+    assert!(!head.contains("cwd="), "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(
+        lower.contains("authorization: bearer local-no-auth"),
+        "{head}"
+    );
+    assert!(lower.contains("x-kb-harness: talos"), "{head}");
+    assert!(lower.contains("x-kb-mode: headless"), "{head}");
+
+    let fixture: serde_json::Value = serde_json::from_str(KB_FIXTURE).unwrap();
+    let slice_text = fixture["slice_text"].as_str().unwrap();
+    let run_start = &run.lines[0];
+    assert_eq!(run_start["config"]["memory_mode"], "deny-once");
+    assert!(
+        run_start["system"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("\n\n# Knowledge base memory\n\n{slice_text}")),
+        "{}",
+        run_start["system"]
+    );
+    let slice = &run.lines[1];
+    assert_eq!(slice["event"], "memory_slice", "{slice}");
+    assert_eq!(slice["items"], 2);
+    assert_eq!(slice["chars"], 230);
+    assert_eq!(slice["degraded"], serde_json::Value::Null);
+    assert_eq!(
+        slice["source"],
+        format!(
+            "personal-kb 127.0.0.1:{port} project=fake-project gate=on index=1 dropped=0 truncated=0"
+        )
+    );
+    assert_eq!(slice["memory_tools"], serde_json::json!([]));
+    assert_eq!(slice["memory_tools_dropped"], serde_json::json!([]));
+    no_kb_tools(run_start);
+    // The fake serves one connection, so the KB MCP connect fails open.
+    assert!(
+        run.stderr.contains("\"mcp_connect_failed\"") && run.stderr.contains("PERSONAL_KB_API_KEY"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.lines
+            .iter()
+            .any(|l| l["event"] == "mcp_connect_failed" && l["name"] == "kb")
+    );
+}
+
+#[test]
+fn run_help_lists_memory_flags() {
+    let output = Command::new(TALOS_BIN)
+        .args(["run", "--help"])
+        .output()
+        .expect("spawn talos");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "--memory",
+        "--kb-project",
+        "possible values: off, annotate, deny-once",
+        "possible values: build, answer",
+    ] {
+        assert!(stdout.contains(needle), "{needle}: {stdout}");
+    }
+}
+
+#[test]
+fn memory_flag_rejects_an_unknown_mode() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let output = Command::new(TALOS_BIN)
+        .args([
+            "run",
+            "--workspace",
+            dir.path().to_str().unwrap(),
+            "--memory",
+            "deny_once",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn talos");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr.trim();
+    assert_eq!(line.lines().count(), 1, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(line).expect("JSON error line");
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("deny_once"),
+        "{v}"
+    );
+}

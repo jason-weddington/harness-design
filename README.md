@@ -91,6 +91,22 @@ The flag conflicts with `--file`, `--schema` and `--mode answer`, and stdin is n
 
 The transcript's `run_start.messages[0]` first Text block equals `# Task` + blank line + the instruction file bytes, and input mode and gate presence are recorded only in `run_start`, so pass `--transcript` when a run must be auditable.
 
+## Memory (`talos run --memory`)
+
+`--memory` connects a run to the personal knowledge base: it enables the KB's session slice (known gotchas appended to the system prompt), `before_tool` advice on `bash` calls that match a KB lesson, and the KB's MCP tools (`kb_search` and friends, from `<PERSONAL_KB_URL>/mcp`).
+
+```bash
+PERSONAL_KB_URL=http://127.0.0.1:8765 talos run --workspace /app --memory deny-once --kb-project harness-design --transcript run.jsonl < task.json
+```
+
+The three modes: `off` (the default; byte-identical to a talos without memory), `annotate` (slice, KB tools, and a KB fact appended to each matching `bash` result), and `deny-once` (as `annotate`, but the first matching `bash` call per KB entry is refused, at most 2 per run, and an unchanged retry is allowed).
+
+The KB project is `--kb-project` when given; otherwise the first non-comment line of the nearest `.kb_project` file at or above `--workspace`; with neither, memory is degraded to off.
+
+`PERSONAL_KB_URL` (default `http://127.0.0.1:8765`, no credentials in the URL) and `PERSONAL_KB_API_KEY` (sent as a Bearer token; a loopback URL with no key uses `local-no-auth`, a remote URL with no key degrades memory) are read only when `--memory` is not `off`.
+
+Memory fails open: a missing project, an unreachable or misconfigured KB, or a malformed response prints one `warning: memory degraded to off (...)` line and the run proceeds with an unchanged exit code; a failed KB MCP connect only drops the KB tools. The transcript's `memory_slice` line records the source, the slice size and any degraded reason.
+
 ## Harbor adapter
 
 `harbor/` is a small uv-managed Python package, `talos_harbor`, whose `TalosAgent` runs talos as a [Harbor](https://github.com/harbor-framework/harbor) installed agent inside a trial container (`--agent-import-path talos_harbor.agent:TalosAgent`). See [`harbor/README.md`](./harbor/README.md) for usage from another repo, the trial-image requirements, and its gate chain. Tier-2 mined tasks run on Harbor through `scripts/tier2-harbor.sh`; the runbook is [`docs/design/10-tier2-on-harbor.md`](./docs/design/10-tier2-on-harbor.md).

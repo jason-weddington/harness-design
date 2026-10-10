@@ -49,6 +49,27 @@
 //! right after `run_start`. Without `--mcp`, nothing is connected and every
 //! surface is unchanged.
 //!
+//! ## `talos run --memory`
+//!
+//! `--memory off|annotate|deny-once` (default `off`) wires the personal-kb
+//! memory adapter ([`harness::personal_kb`]) into the engine's memory seam
+//! ([`harness::memory`]): the KB's session slice is appended to the system
+//! prompt, the KB's MCP tools (`<PERSONAL_KB_URL>/mcp`) are registered, and
+//! `bash` calls matching a KB lesson are annotated (`annotate`) or refused
+//! once per entry, at most 2 per run, with an unchanged retry allowed
+//! (`deny-once`). `--kb-project <name>` names the KB project; without it the
+//! project is the first non-comment line of the nearest `.kb_project` file
+//! at or above `--workspace`; with neither, memory is degraded.
+//!
+//! Memory **fails open**: a missing project, an unreachable or misconfigured
+//! KB, or a malformed response degrades memory to off with one
+//! `warning: memory degraded to off (<reason>)` stderr line, and the run
+//! proceeds with an unchanged exit code. A failed KB MCP connect only drops
+//! the KB tools (one `mcp_connect_failed` stderr line and transcript line).
+//! `--memory off` is byte-identical to a talos without memory: no
+//! `PERSONAL_KB_*` env is read, no `.kb_project` is read, and no socket is
+//! opened.
+//!
 //! ## Exit code contract (locked)
 //!
 //! | Code | Meaning |
@@ -279,6 +300,16 @@
 //!   Same sudo-boundary caveat as `TALOS_STATE_RETENTION_DAYS` (kb-02979
 //!   shape): under `env_reset` the fleet runs the compiled default until
 //!   the worker passes the flag.
+//! - `PERSONAL_KB_URL` — the personal KB for `--memory` (default
+//!   `http://127.0.0.1:8765`); must be an http(s) URL and must not contain
+//!   credentials. Read ONLY when `--memory` is not `off`.
+//! - `PERSONAL_KB_API_KEY` — the KB bearer token for `--memory`, sent on the
+//!   `/prevention` and MCP requests. A loopback URL with no key defaults to
+//!   `local-no-auth`; a remote URL with no key degrades memory. Read ONLY
+//!   when `--memory` is not `off`. Same sudo-boundary caveat as
+//!   `TALOS_STATE_RETENTION_DAYS` (kb-02979 shape): dispatch's sudoers
+//!   `env_keep` carries only `TALOS_BACKEND`, so under `env_reset` neither
+//!   `PERSONAL_KB_*` var reaches a fleet talos.
 //! - `TALOS_MCP_TOKEN_<NAME>` — optional bearer token for the `--mcp`
 //!   server named `<NAME>`, where `<NAME>` is the flag's name with every
 //!   ASCII alphanumeric uppercased and every other character replaced by
@@ -296,15 +327,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use clap::builder::TypedValueParser as _;
 use harness::anthropic::AnthropicBackend;
 use harness::bedrock::BedrockBackend;
 use harness::engine::{AnswerSchema, LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
 use harness::mcp::{McpConnectReport, McpServerConfig};
+use harness::memory::{Memory, MemoryMode};
 use harness::model::{
     AssistantTurn, BackendError, MaxTokensSource, ModelBackend, OutputCapResolution, TurnRequest,
 };
 use harness::ollama::{OllamaBackend, ThinkLevel};
+use harness::personal_kb::{
+    KB_MCP_CONNECT_TIMEOUT, KbEndpoint, PREVENTION_TIMEOUT, PersonalKbMemory, resolve_kb_project,
+};
 use harness::prompt::{render_answer_prompt, render_task_prompt_from_spec};
 use harness::ralph::{
     DEFAULT_MAX_BACKEND_ERRORS, DEFAULT_MAX_DO_OVERS, DEFAULT_STUCK_K, RalphConfig, RalphReport,
@@ -643,6 +679,26 @@ struct RunArgs {
     /// passes this flag explicitly.
     #[arg(long)]
     compact_threshold_pct: Option<u64>,
+
+    /// Knowledge-base memory (personal-kb). Off by default. `annotate`
+    /// enables the KB's session slice, the KB's MCP tools, and appends a KB
+    /// fact to each matching `bash` result; `deny-once` additionally refuses
+    /// the first matching `bash` call per KB entry, at most 2 per run, and
+    /// an unchanged retry is allowed. The `PERSONAL_KB_*` env is read only
+    /// when the mode is not `off`. Fail-open: an unreachable KB never fails
+    /// the run.
+    #[arg(
+        long,
+        default_value = "off",
+        value_parser = clap::builder::PossibleValuesParser::new(["off", "annotate", "deny-once"])
+            .try_map(|s| s.parse::<MemoryMode>())
+    )]
+    memory: MemoryMode,
+
+    /// The KB project for `--memory`. Overrides the `.kb_project` walk-up
+    /// from `--workspace`; inert when `--memory` is `off`.
+    #[arg(long)]
+    kb_project: Option<String>,
 
     /// Connect an MCP server over Streamable HTTP and register its tools
     /// (repeatable). The bearer token comes ONLY from the
@@ -1838,6 +1894,16 @@ fn resolve_mcp_servers(
 /// [`num_ctx_stderr_line`]; `None` for a connected server. Never carries the
 /// token — only `auth` and the env var's name.
 fn mcp_connect_failed_stderr_line(report: &McpConnectReport) -> Option<String> {
+    mcp_failed_line(report, &mcp_token_env_var)
+}
+
+/// [`mcp_connect_failed_stderr_line`] with the token env var's name supplied
+/// by `token_env` (the KB's MCP server reads `PERSONAL_KB_API_KEY`, not a
+/// `TALOS_MCP_TOKEN_*` var).
+fn mcp_failed_line(
+    report: &McpConnectReport,
+    token_env: &dyn Fn(&str) -> String,
+) -> Option<String> {
     match report {
         McpConnectReport::Connected { .. } => None,
         McpConnectReport::Failed {
@@ -1853,12 +1919,56 @@ fn mcp_connect_failed_stderr_line(report: &McpConnectReport) -> Option<String> {
                     "error": error,
                     "error_kind": error_kind,
                     "auth": auth,
-                    "token_env": mcp_token_env_var(name),
+                    "token_env": token_env(name),
                 }
             })
             .to_string(),
         ),
     }
+}
+
+/// What `--memory` wired for the run.
+struct MemoryWiring {
+    /// The personal-kb memory handed to [`RunConfig::with_memory`].
+    memory: Arc<dyn Memory>,
+    /// The KB MCP connect report, `None` when the connect was skipped
+    /// (memory degraded).
+    kb_mcp_report: Option<McpConnectReport>,
+}
+
+/// Build the `--memory` adapter. With [`MemoryMode::Off`] this returns
+/// `None` WITHOUT calling `env`, touching the filesystem or opening a socket
+/// (eval isolation). Otherwise the project is `kb_project` (trimmed, when
+/// non-blank), else the `.kb_project` walk-up from `workspace_root`; then one
+/// `/prevention` fetch and, unless that degraded, the KB MCP connect. Never
+/// fails: every failure is a degraded memory or a failed report.
+async fn build_memory(
+    mode: MemoryMode,
+    kb_project: Option<&str>,
+    workspace_root: &Path,
+    session_id: &str,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Option<MemoryWiring> {
+    if mode == MemoryMode::Off {
+        return None;
+    }
+    let project = kb_project
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_kb_project(workspace_root));
+    let memory = PersonalKbMemory::connect(
+        KbEndpoint::from_env(env),
+        project,
+        session_id,
+        PREVENTION_TIMEOUT,
+    )
+    .await;
+    let (memory, kb_mcp_report) = memory.attach_kb_tools(KB_MCP_CONNECT_TIMEOUT).await;
+    Some(MemoryWiring {
+        memory: Arc::new(memory),
+        kb_mcp_report,
+    })
 }
 
 /// Validate the answer-mode flag SHAPE: `--schema` is required with
@@ -2116,6 +2226,17 @@ async fn run_cmd(args: RunArgs) {
         }
     };
     let workspace_root = workspace.root().to_path_buf();
+    // `--memory`: built before the run, after the workspace is known (the
+    // `.kb_project` walk-up starts at its root). Off returns `None` without
+    // reading any `PERSONAL_KB_*` env.
+    let memory = build_memory(
+        args.memory,
+        args.kb_project.as_deref(),
+        &workspace_root,
+        &run_id(&args.task_id, args.attempt),
+        &env_accessor,
+    )
+    .await;
 
     // 7. Build tool context with a disk-offload sink.
     let sink = DiskOffloadSink::new(offload_dir.clone());
@@ -2245,6 +2366,13 @@ async fn run_cmd(args: RunArgs) {
     // the value actually in force (the A/B experiment's proof its arms
     // really differ).
     config = config.with_compact_threshold_pct(compact_threshold_pct);
+    let kb_mcp_report = match memory {
+        Some(wiring) => {
+            config = config.with_memory(wiring.memory, args.memory);
+            wiring.kb_mcp_report
+        }
+        None => None,
+    };
     // Label is computed from `settings` BEFORE it moves into `persistence`
     // below; `--transcript` is opt-in (`args.transcript` is `None` unless the
     // flag was passed) and has no env fallback — see `RunArgs::transcript`.
@@ -2255,13 +2383,25 @@ async fn run_cmd(args: RunArgs) {
     // `--mcp`: connect each server and register its tools into whichever
     // registry the mode built. Fail-open — a failed server prints one JSON
     // stderr line and the run proceeds with the remaining tools.
+    let mut mcp_reports = Vec::new();
     if !mcp_servers.is_empty() {
         let reports =
             harness::mcp::connect_and_register(&mut tools, &mcp_servers, MCP_CONNECT_TIMEOUT).await;
         for line in reports.iter().filter_map(mcp_connect_failed_stderr_line) {
             eprintln!("{line}");
         }
-        config = config.with_mcp_reports(reports);
+        mcp_reports = reports;
+    }
+    // `--memory`: the KB MCP report rides the same transcript lines. Its
+    // tools are registered by the engine through `Memory::tools()`, not here.
+    if let Some(report) = kb_mcp_report {
+        if let Some(line) = mcp_failed_line(&report, &|_| "PERSONAL_KB_API_KEY".to_string()) {
+            eprintln!("{line}");
+        }
+        mcp_reports.push(report);
+    }
+    if !mcp_reports.is_empty() {
+        config = config.with_mcp_reports(mcp_reports);
     }
 
     // 11. Assemble persistence bundle and run.
@@ -2466,8 +2606,10 @@ mod tests {
         touch_dir_mtime, transcript_label, validate_mode_flags, with_flagged_max_tokens,
         write_ralph_error_detail,
     };
+    use super::{MemoryMode, build_memory};
     use super::{
-        mcp_connect_failed_stderr_line, mcp_token_env_var, parse_mcp_flag, resolve_mcp_servers,
+        mcp_connect_failed_stderr_line, mcp_failed_line, mcp_token_env_var, parse_mcp_flag,
+        resolve_mcp_servers,
     };
     use super::{read_instruction_file, validate_instruction_flags};
     use harness::anthropic::AnthropicBackend;
@@ -3149,6 +3291,134 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| (*v).to_string())
         }
+    }
+
+    // ---- --memory ----------------------------------------------------------
+
+    fn parse_run(cmdline: &[&str]) -> Result<super::RunArgs, clap::Error> {
+        match <super::Cli as clap::Parser>::try_parse_from(cmdline)?.command {
+            super::Command::Run(run) => Ok(run),
+            super::Command::Ralph(_) => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn memory_flags_parse() {
+        let base = ["talos", "run", "--workspace", "/w"];
+        let parsed = parse_run(&base).expect("parses");
+        assert_eq!(parsed.memory, MemoryMode::Off);
+        assert_eq!(parsed.kb_project, None);
+        let with = |extra: &[&str]| {
+            let mut cmdline = base.to_vec();
+            cmdline.extend_from_slice(extra);
+            parse_run(&cmdline)
+        };
+        assert_eq!(
+            with(&["--memory", "annotate"]).expect("parses").memory,
+            MemoryMode::Annotate
+        );
+        assert_eq!(
+            with(&["--memory", "deny-once"]).expect("parses").memory,
+            MemoryMode::DenyOnce
+        );
+        assert!(with(&["--memory", "deny_once"]).is_err());
+        assert_eq!(
+            with(&["--kb-project", "p"])
+                .expect("parses")
+                .kb_project
+                .as_deref(),
+            Some("p")
+        );
+    }
+
+    const NO_PROJECT: &str =
+        "no kb project (pass --kb-project or add a .kb_project file at or above the workspace)";
+
+    async fn memory_for(
+        kb_project: Option<&str>,
+        kb_project_file: Option<&str>,
+        url: &str,
+    ) -> std::sync::Arc<dyn harness::memory::Memory> {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        if let Some(body) = kb_project_file {
+            std::fs::write(dir.path().join(".kb_project"), body).expect("write");
+        }
+        let vars = [("PERSONAL_KB_URL", url)];
+        let wiring = build_memory(
+            MemoryMode::Annotate,
+            kb_project,
+            dir.path(),
+            "t:1",
+            &env_with(&vars),
+        )
+        .await
+        .expect("memory on");
+        assert!(
+            wiring.kb_mcp_report.is_none(),
+            "degraded skips the MCP connect"
+        );
+        wiring.memory
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_memory_off_reads_nothing() {
+        let env = |_: &str| -> Option<String> { panic!("env read with memory off") };
+        let none = build_memory(
+            MemoryMode::Off,
+            Some("p"),
+            Path::new("/nonexistent"),
+            "t:1",
+            &env,
+        )
+        .await;
+        assert!(none.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_memory_project_precedence() {
+        let flagged = memory_for(Some("flagged"), Some("file-project"), "http://127.0.0.1:1").await;
+        assert_eq!(
+            flagged.label(),
+            "personal-kb 127.0.0.1:1 project=flagged gate=- index=0 dropped=0 truncated=0"
+        );
+        let d = flagged.degraded().expect("degraded");
+        assert!(d.starts_with("prevention fetch failed: unreachable"), "{d}");
+
+        let blank = memory_for(Some("  "), Some("file-project"), "http://127.0.0.1:1").await;
+        assert!(
+            blank.label().contains(" project=file-project "),
+            "{}",
+            blank.label()
+        );
+
+        let none = memory_for(None, Some("# none\n"), "http://127.0.0.1:1").await;
+        assert_eq!(none.degraded().as_deref(), Some(NO_PROJECT));
+        assert_eq!(
+            none.label(),
+            "personal-kb 127.0.0.1:1 project=- gate=- index=0 dropped=0 truncated=0"
+        );
+
+        let remote = memory_for(Some("p"), None, "https://kb.example.com").await;
+        assert_eq!(
+            remote.degraded().as_deref(),
+            Some("PERSONAL_KB_API_KEY is unset and PERSONAL_KB_URL is not a loopback URL")
+        );
+    }
+
+    #[test]
+    fn kb_mcp_failed_line_names_the_kb_key_env() {
+        let report = McpConnectReport::Failed {
+            name: "kb".into(),
+            error: "HTTP 404: x".into(),
+            error_kind: "http_status",
+            http_status: Some(404),
+            auth: "bearer",
+            connect_ms: 1,
+        };
+        let line = mcp_failed_line(&report, &|_| "PERSONAL_KB_API_KEY".to_string()).expect("line");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(v["mcp_connect_failed"]["token_env"], "PERSONAL_KB_API_KEY");
+        assert_eq!(v["mcp_connect_failed"]["name"], "kb");
     }
 
     // ---- --mcp -------------------------------------------------------------

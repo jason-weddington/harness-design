@@ -16,6 +16,7 @@ pub mod mined_harbor;
 pub mod mined_task;
 pub mod model;
 pub mod ollama;
+pub mod personal_kb;
 pub mod prompt;
 pub mod ralph;
 pub mod run_record;

@@ -1,0 +1,49 @@
+{
+  "project": "fake-project",
+  "gate": {
+    "enabled": true,
+    "shadow": true,
+    "max_denies": 1000,
+    "max_denies_per_turn": 1,
+    "max_denies_per_hour": 6,
+    "rearm_hours": 24
+  },
+  "index": [
+    {
+      "resolution_id": "kb-00001",
+      "updated_at": "2026-10-07T00:00:00",
+      "tool": "Bash",
+      "target_class": "git push",
+      "args_prefix": "github",
+      "wrong_belief": "push to github",
+      "corrected_fact": "Push to origin; github is release-only",
+      "evidence": "",
+      "provenance_label": "deliberate/observed",
+      "observed_once": false
+    }
+  ],
+  "slice": [
+    {
+      "entry_id": "kb-00001",
+      "corrected_fact": "Push to origin; github is release-only",
+      "wrong_belief": "push to github",
+      "provenance_label": "deliberate/observed"
+    },
+    {
+      "entry_id": "kb-00002",
+      "corrected_fact": "Use cargo nextest",
+      "wrong_belief": "",
+      "provenance_label": "deliberate/asserted"
+    }
+  ],
+  "slice_text": "Known gotchas for fake-project from the KB (each replaces an earlier wrong belief):\n- Push to origin; github is release-only (was: push to github) [deliberate/observed; kb-00001]\n- Use cargo nextest [deliberate/asserted; kb-00002]",
+  "diagnostics": {
+    "resolutions_total": 2,
+    "skipped_malformed": 0,
+    "skipped_observed_once": 0,
+    "index_truncated": 0,
+    "slice_truncated": 0,
+    "index_excluded_observed_once": 0
+  },
+  "surprise_capture": "off"
+}
