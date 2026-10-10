@@ -1,7 +1,7 @@
 //! The **memory seam**: how a knowledge base reaches into the engine loop.
 //!
-//! Phase 1 of `docs/design/11-memory.md`. A [`Memory`] implementation can do
-//! three things to a run, and nothing else:
+//! Phases 1 and 3 of `docs/design/11-memory.md`. A [`Memory`] implementation
+//! can do four things to a run, and nothing else:
 //!
 //! - contribute a **session slice** — a short block of known gotchas that the
 //!   engine appends to the rendered system prompt under
@@ -12,13 +12,18 @@
 //!   or deny the call once (see [`Advice`]); the engine, not the adapter,
 //!   decides what is actually applied (see [`MemoryMode`] and the
 //!   crate-internal decision precedence documented on [`Memory`]);
-//! - register extra **tools** (typically read-only KB tools) for the run.
+//! - register extra **tools** (typically read-only KB tools) for the run;
+//! - **observe** each invoked tool call's result via [`Memory::after_tool`]
+//!   and settle any reports it started in [`Memory::flush`] — observation
+//!   only: nothing it does can change the run.
 //!
 //! Memory is OFF by default ([`MemoryMode::Off`] with [`NoMemory`]), and an
 //! Off run is byte-identical to a run on an engine without this seam.
 
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 
 use serde_json::Value;
@@ -45,19 +50,22 @@ pub const MEMORY_DENY_RETRY_SUFFIX: &str =
 /// [`NoMemory`] with [`MemoryMode::Off`], and in Off mode the engine never
 /// calls ANY method of this trait — not even [`Memory::label`].
 ///
-/// **No blocking, no I/O.** Every method is called synchronously on the async
-/// executor, inside the engine loop. An implementation MUST NOT block or
-/// perform I/O — no network, no `block_on` (a nested `block_on` inside the
-/// loop panics). An adapter does every fetch before the run, typically in its
-/// own async constructor, and reports a failed fetch through
-/// [`Memory::degraded`].
+/// **No blocking, no I/O.** Every method except [`Memory::flush`] is called
+/// synchronously on the async executor, inside the engine loop. An
+/// implementation MUST NOT block or perform I/O there — no network, no
+/// `block_on` (a nested `block_on` inside the loop panics). An adapter does
+/// every fetch before the run, typically in its own async constructor, and
+/// reports a failed fetch through [`Memory::degraded`]; a report it wants to
+/// send from [`Memory::after_tool`] is spawned, never awaited in place.
 ///
 /// **Call order.** When memory is on, the engine calls `degraded()` →
 /// `label()` → `tools()` → `session_slice()`, each at most once per loop
 /// invocation and all before the first model request; then `before_tool()`
-/// once per dispatched non-finish tool call. A `Some` from `degraded()` forces
-/// Off behaviour for the invocation: `tools()`, `session_slice()` and
-/// `before_tool()` are then never called, and the engine prints one warning.
+/// once per dispatched non-finish tool call, and `after_tool()` once per such
+/// call that was invoked (not denied); finally `flush()` once before
+/// `run_end`. A `Some` from `degraded()` forces Off behaviour for the
+/// invocation: `tools()`, `session_slice()`, `before_tool()` and
+/// `after_tool()` are then never called, and the engine prints one warning.
 ///
 /// **Decision precedence.** Each [`Advice`] is resolved against the run's
 /// [`MemoryMode`] (first match wins): Off → nothing; `Advice::None` →
@@ -109,6 +117,51 @@ pub trait Memory: Send + Sync {
     fn session_id(&self) -> Option<String> {
         None
     }
+
+    /// Observe one INVOKED non-finish tool call and its result. Called only
+    /// when memory is on and not degraded, after the tool ran; never for a
+    /// call named `finish` and never for a call memory denied (a deny is not
+    /// an observation). Must not block or await: an implementation that
+    /// reports to a store spawns the request and settles it in
+    /// [`Memory::flush`]. Default: no-op.
+    fn after_tool(&self, _call: &ToolCallView, _result: &ToolResultView) {}
+
+    /// Settle whatever [`Memory::after_tool`] started. The engine awaits it
+    /// exactly once per loop invocation, just before `run_end`, under a
+    /// bound of a few seconds; a flush still pending at the bound is
+    /// dropped, so an implementation must tolerate being cancelled. Never
+    /// called when memory is off. Default: nothing to settle.
+    fn flush(&self) -> Pin<Box<dyn Future<Output = MemoryFlush> + Send + '_>> {
+        Box::pin(std::future::ready(MemoryFlush::default()))
+    }
+}
+
+/// A read-only view of an invoked tool call's result handed to
+/// [`Memory::after_tool`].
+#[derive(Debug, Clone, Copy)]
+pub struct ToolResultView<'a> {
+    /// The model-assigned call id.
+    pub call_id: &'a str,
+    /// The engine iteration the call ran in.
+    pub iteration: u32,
+    /// Whether the tool reported an error.
+    pub is_error: bool,
+    /// The rendered result content, before any memory annotation.
+    pub content: &'a str,
+    /// The wall time of the invocation, when measured.
+    pub duration_ms: Option<u64>,
+}
+
+/// What [`Memory::flush`] settled: reports delivered, reports that failed,
+/// and reports not sent because a per-run cap was reached.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFlush {
+    /// Reports the store acknowledged.
+    pub sent: u32,
+    /// Reports that failed (transport error, timeout or non-2xx).
+    pub failed: u32,
+    /// Reports skipped because the per-run cap was reached.
+    pub capped: u32,
 }
 
 impl fmt::Debug for dyn Memory {
@@ -440,6 +493,29 @@ mod tests {
         assert!(m.tools().is_empty());
         assert_eq!(m.degraded(), None);
         assert_eq!(m.label(), "none");
+        m.after_tool(
+            &view,
+            &ToolResultView {
+                call_id: "c1",
+                iteration: 1,
+                is_error: true,
+                content: "boom",
+                duration_ms: Some(3),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn default_flush_is_zero() {
+        assert_eq!(NoMemory.flush().await, MemoryFlush::default());
+        assert_eq!(
+            MemoryFlush::default(),
+            MemoryFlush {
+                sent: 0,
+                failed: 0,
+                capped: 0
+            }
+        );
     }
 
     struct Bare;

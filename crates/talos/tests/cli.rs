@@ -2935,6 +2935,13 @@ async fn no_mcp_flag_writes_no_mcp_lines_or_warnings() {
     let stats = &run.lines[6]["stats"];
     assert_eq!(stats["mcp_tool_calls"], 0);
     assert_eq!(stats["mcp_tool_call_errors"], 0);
+    for key in [
+        "memory_events_sent",
+        "memory_events_failed",
+        "memory_events_capped",
+    ] {
+        assert_eq!(stats[key], 0, "{key}");
+    }
 }
 
 /// AC-17(a): a refused MCP server fails open — same exit, one extra line.
@@ -3229,6 +3236,15 @@ fn memory_off_makes_no_kb_connection() {
             .all(|l| l["event"] != "memory_slice" && l["event"] != "memory_advice")
     );
     assert_eq!(run.lines[0]["config"]["memory_mode"], "off");
+    let run_end = run.lines.last().expect("lines");
+    assert_eq!(run_end["event"], "run_end");
+    for key in [
+        "memory_events_sent",
+        "memory_events_failed",
+        "memory_events_capped",
+    ] {
+        assert_eq!(run_end["stats"][key], 0, "{key}");
+    }
 }
 
 #[test]

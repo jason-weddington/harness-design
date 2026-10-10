@@ -1543,6 +1543,9 @@ mod tests {
                 memory_degraded: None,
                 mcp_tool_calls: 0,
                 mcp_tool_call_errors: 0,
+                memory_events_sent: 0,
+                memory_events_failed: 0,
+                memory_events_capped: 0,
             },
             transcript_path: None,
         };
@@ -2056,6 +2059,9 @@ mod tests {
                 memory_degraded: None,
                 mcp_tool_calls: 0,
                 mcp_tool_call_errors: 0,
+                memory_events_sent: 0,
+                memory_events_failed: 0,
+                memory_events_capped: 0,
             },
             transcript_path: None,
         };

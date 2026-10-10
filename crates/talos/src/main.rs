@@ -1947,8 +1947,10 @@ fn kb_session_id(run_id: &str, unix_ms: u128, pid: u32) -> String {
 /// `None` WITHOUT calling `env`, touching the filesystem or opening a socket
 /// (eval isolation). Otherwise the project is `kb_project` (trimmed, when
 /// non-blank), else the `.kb_project` walk-up from `workspace_root`; then one
-/// `/prevention` fetch and, unless that degraded, the KB MCP connect. Never
-/// fails: every failure is a degraded memory or a failed report.
+/// `/prevention` fetch and, unless that degraded, the KB MCP connect; the
+/// adapter also gets the event context (workspace root, talos version) for
+/// failed-tool events. Never fails: every failure is a degraded memory or a
+/// failed report.
 async fn build_memory(
     mode: MemoryMode,
     kb_project: Option<&str>,
@@ -1970,7 +1972,10 @@ async fn build_memory(
         session_id,
         PREVENTION_TIMEOUT,
     )
-    .await;
+    .await
+    // Failed-tool events carry the workspace root (canonical, so absolute)
+    // as `cwd` and the talos version as `hook_version`.
+    .with_event_context(workspace_root, env!("TALOS_VERSION"));
     let (memory, kb_mcp_report) = memory.attach_kb_tools(KB_MCP_CONNECT_TIMEOUT).await;
     Some(MemoryWiring {
         memory: Arc::new(memory),

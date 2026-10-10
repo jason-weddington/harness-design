@@ -148,6 +148,10 @@ use crate::transcript::{TranscriptConfig, TranscriptWriter};
 /// matching an executed call's name against this.
 pub const FINISH_TOOL_NAME: &str = "finish";
 
+/// The bound on [`Memory::flush`] at run end: a slow memory store can delay
+/// the end of a run by at most this much.
+pub const MEMORY_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A compiled JSON Schema every `finish(answer)` payload is validated
 /// against — answer mode's mechanical verifier, playing the role a green gate
 /// plays for `finish(done)`.
@@ -1227,6 +1231,16 @@ pub struct RunStats {
     /// true. Counted since THIS loop invocation, so a resumed run starts from
     /// zero.
     pub mcp_tool_call_errors: u32,
+    /// Memory reports ([`Memory::after_tool`]) the store acknowledged, as
+    /// settled by [`Memory::flush`] at run end. Zero whenever memory is off
+    /// and when the flush hit its bound.
+    pub memory_events_sent: u32,
+    /// Memory reports that failed (transport error, timeout, non-2xx).
+    /// Zero whenever memory is off.
+    pub memory_events_failed: u32,
+    /// Memory reports not sent because the adapter's per-run cap was
+    /// reached. Zero whenever memory is off.
+    pub memory_events_capped: u32,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2437,6 +2451,9 @@ pub async fn run(
         memory_degraded: None,
         mcp_tool_calls: 0,
         mcp_tool_call_errors: 0,
+        memory_events_sent: 0,
+        memory_events_failed: 0,
+        memory_events_capped: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2531,6 +2548,9 @@ pub async fn run_persisted(
         memory_degraded: None,
         mcp_tool_calls: 0,
         mcp_tool_call_errors: 0,
+        memory_events_sent: 0,
+        memory_events_failed: 0,
+        memory_events_capped: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2621,6 +2641,16 @@ async fn run_loop_impl(
         &mut writer,
     )
     .await;
+    if config.memory_mode != MemoryMode::Off {
+        // Bounded: a slow store can delay the run's end by at most this
+        // much, and a flush cut off here aborts its own pending reports.
+        if let Ok(flushed) = tokio::time::timeout(MEMORY_FLUSH_TIMEOUT, config.memory.flush()).await
+        {
+            stats.memory_events_sent += flushed.sent;
+            stats.memory_events_failed += flushed.failed;
+            stats.memory_events_capped += flushed.capped;
+        }
+    }
     emit_run_end(
         &mut writer,
         &result,
@@ -2842,6 +2872,9 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "memory_degraded": stats.memory_degraded,
         "mcp_tool_calls": stats.mcp_tool_calls,
         "mcp_tool_call_errors": stats.mcp_tool_call_errors,
+        "memory_events_sent": stats.memory_events_sent,
+        "memory_events_failed": stats.memory_events_failed,
+        "memory_events_capped": stats.memory_events_capped,
     })
 }
 
@@ -5091,6 +5124,24 @@ async fn run_loop_body(
                 }
 
                 let mut content = render_tool_result(&result);
+                // ---- memory observation (see `Memory::after_tool`) ----
+                // Same activity condition as the advice site; never for
+                // `finish`, and a denied call never reaches here.
+                if call.name != FINISH_TOOL_NAME && memory_run.as_ref().is_some_and(|m| m.active) {
+                    config.memory.after_tool(
+                        &memory::ToolCallView {
+                            name: &call.name,
+                            args: &call.input,
+                        },
+                        &memory::ToolResultView {
+                            call_id: &call.id,
+                            iteration: stats.iterations,
+                            is_error: result.is_error,
+                            content: &content,
+                            duration_ms: Some(duration_ms),
+                        },
+                    );
+                }
                 if let Some((memory::AppliedMode::Annotate, fact, entry_id)) = &memory_applied {
                     content = format!("{content}\n\n{}", memory::annotation_block(fact, entry_id));
                 }
@@ -5670,6 +5721,9 @@ pub async fn resume(
         memory_degraded: None,
         mcp_tool_calls: 0,
         mcp_tool_call_errors: 0,
+        memory_events_sent: 0,
+        memory_events_failed: 0,
+        memory_events_capped: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -7402,6 +7456,9 @@ mod tests {
             memory_degraded: None,
             mcp_tool_calls: 0,
             mcp_tool_call_errors: 0,
+            memory_events_sent: 0,
+            memory_events_failed: 0,
+            memory_events_capped: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -14562,6 +14619,9 @@ mod tests {
             memory_degraded: None,
             mcp_tool_calls: 0,
             mcp_tool_call_errors: 0,
+            memory_events_sent: 0,
+            memory_events_failed: 0,
+            memory_events_capped: 0,
         }
     }
 
@@ -19360,13 +19420,18 @@ mod tests {
 
     mod memory_seam {
         use super::*;
+        use crate::engine::MEMORY_FLUSH_TIMEOUT;
         use crate::memory::{
-            Advice, MEMORY_SLICE_HEADING, Memory, MemoryMode, ToolCallView, annotation_block,
-            append_session_slice, deny_content,
+            Advice, MEMORY_SLICE_HEADING, Memory, MemoryFlush, MemoryMode, ToolCallView,
+            ToolResultView, annotation_block, append_session_slice, deny_content,
         };
         use crate::task_spec::{FileToModify, TaskSpec};
         use serde_json::{Value, json};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
 
         const SLICE: &str = "Known gotchas for p from the KB (each replaces an earlier wrong belief):\n- use nextest [observed; kb-1]\n- no fixer hooks [observed; kb-2]\n";
 
@@ -19414,7 +19479,13 @@ mod tests {
             tools: AtomicU32,
             slice: AtomicU32,
             before: AtomicU32,
+            after: AtomicU32,
+            flush: AtomicU32,
         }
+
+        /// One `after_tool` observation:
+        /// `(name, call_id, iteration, is_error, content, duration_ms)`.
+        type Observed = (String, String, u32, bool, String, Option<u64>);
 
         type AdviceFn = Box<dyn Fn(&ToolCallView) -> Advice + Send + Sync>;
 
@@ -19427,6 +19498,9 @@ mod tests {
             /// `(name, description, output, runs)` per memory tool.
             tools: Vec<(String, String, String, Arc<AtomicU32>)>,
             advice: AdviceFn,
+            observed: Arc<Mutex<Vec<Observed>>>,
+            /// What `flush` returns; `None` means it never resolves.
+            flush_result: Option<MemoryFlush>,
         }
 
         impl FakeMemory {
@@ -19438,7 +19512,13 @@ mod tests {
                     label: "fake".into(),
                     tools: Vec::new(),
                     advice: Box::new(|_| Advice::None),
+                    observed: Arc::new(Mutex::new(Vec::new())),
+                    flush_result: Some(MemoryFlush::default()),
                 }
+            }
+            fn flush_result(mut self, r: Option<MemoryFlush>) -> Self {
+                self.flush_result = r;
+                self
             }
             fn slice(mut self, s: &str) -> Self {
                 self.slice = Some(s.into());
@@ -19499,6 +19579,24 @@ mod tests {
             fn label(&self) -> String {
                 self.counters.label.fetch_add(1, Ordering::SeqCst);
                 self.label.clone()
+            }
+            fn after_tool(&self, call: &ToolCallView, result: &ToolResultView) {
+                self.counters.after.fetch_add(1, Ordering::SeqCst);
+                self.observed.lock().unwrap().push((
+                    call.name.to_string(),
+                    result.call_id.to_string(),
+                    result.iteration,
+                    result.is_error,
+                    result.content.to_string(),
+                    result.duration_ms,
+                ));
+            }
+            fn flush(&self) -> Pin<Box<dyn Future<Output = MemoryFlush> + Send + '_>> {
+                self.counters.flush.fetch_add(1, Ordering::SeqCst);
+                match self.flush_result {
+                    Some(r) => Box::pin(std::future::ready(r)),
+                    None => Box::pin(std::future::pending()),
+                }
             }
         }
 
@@ -19677,6 +19775,8 @@ mod tests {
                 &counters.tools,
                 &counters.slice,
                 &counters.before,
+                &counters.after,
+                &counters.flush,
             ] {
                 assert_eq!(c.load(Ordering::SeqCst), 0);
             }
@@ -19721,6 +19821,7 @@ mod tests {
             assert_eq!(counters.tools.load(Ordering::SeqCst), 0);
             assert_eq!(counters.slice.load(Ordering::SeqCst), 0);
             assert_eq!(counters.before.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.after.load(Ordering::SeqCst), 0);
             assert_eq!(backend.systems_seen(), plain.systems_seen());
             assert_eq!(backend.tools_seen(), plain.tools_seen());
             assert_eq!(backend.messages_seen(), plain.messages_seen());
@@ -20339,6 +20440,96 @@ mod tests {
                 assert_eq!(lines[0]["config"]["memory_mode"], expected);
                 assert_eq!(lines[0]["transcript_version"], 5);
             }
+        }
+
+        #[tokio::test]
+        async fn after_tool_observes_invoked_calls_and_flush_feeds_stats() {
+            let dir = TempDir::new().expect("tempdir");
+            let (tools, _) = registry_with_bash();
+            let fake = bash_deny_memory().flush_result(Some(MemoryFlush {
+                sent: 2,
+                failed: 1,
+                capped: 3,
+            }));
+            let counters = Arc::clone(&fake.counters);
+            let observed = Arc::clone(&fake.observed);
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(Arc::new(fake), MemoryMode::DenyOnce)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let script = vec![
+                one_call("c1", "bash", cmd("cargo test")),
+                one_call("c2", "bash", cmd("cargo test")),
+                one_call("c3", "echo", json!({"i": 3})),
+                finish_blocked("cf"),
+            ];
+            let (res, _, lines) = go(script, &tools, &config).await;
+            assert!(matches!(
+                res.outcome,
+                LoopOutcome::Finished(Disposition::Blocked { .. })
+            ));
+            // c1 was denied (not an observation); finish is never observed;
+            // the content is the tool's own, before the annotation.
+            let observed = observed.lock().unwrap().clone();
+            let shape: Vec<_> = observed
+                .iter()
+                .map(|(n, id, it, err, content, d)| {
+                    (
+                        n.as_str(),
+                        id.as_str(),
+                        *it,
+                        *err,
+                        content.as_str(),
+                        d.is_some(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                shape,
+                [
+                    ("bash", "c2", 2, false, "ran", true),
+                    ("echo", "c3", 3, false, "{\"i\":3}", true),
+                ]
+            );
+            assert_eq!(counters.flush.load(Ordering::SeqCst), 1);
+            let s = &res.stats;
+            assert_eq!(
+                (
+                    s.memory_events_sent,
+                    s.memory_events_failed,
+                    s.memory_events_capped
+                ),
+                (2, 1, 3)
+            );
+            let end = run_end_stats(&lines);
+            assert_eq!(end["memory_events_sent"], 2);
+            assert_eq!(end["memory_events_failed"], 1);
+            assert_eq!(end["memory_events_capped"], 3);
+        }
+
+        #[tokio::test]
+        async fn a_hanging_flush_is_cut_off_at_the_bound() {
+            assert_eq!(MEMORY_FLUSH_TIMEOUT, Duration::from_secs(3));
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().flush_result(None);
+            let counters = Arc::clone(&fake.counters);
+            let config =
+                RunConfig::new("do the task", 5).with_memory(Arc::new(fake), MemoryMode::Annotate);
+            let started = Instant::now();
+            let (res, _, _) = go(echo_script(), &tools, &config).await;
+            let elapsed = started.elapsed();
+            assert!(elapsed >= MEMORY_FLUSH_TIMEOUT, "{elapsed:?}");
+            assert!(
+                elapsed < MEMORY_FLUSH_TIMEOUT + Duration::from_secs(2),
+                "{elapsed:?}"
+            );
+            assert!(matches!(
+                res.outcome,
+                LoopOutcome::Finished(Disposition::Blocked { .. })
+            ));
+            assert_eq!(counters.flush.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.after.load(Ordering::SeqCst), 1);
+            assert_eq!(res.stats.memory_events_sent, 0);
+            assert_eq!(res.stats.memory_events_failed, 0);
         }
 
         #[tokio::test]

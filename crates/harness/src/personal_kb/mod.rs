@@ -86,15 +86,17 @@ pub mod cues;
 
 use std::collections::BTreeMap;
 use std::error::Error as _;
+use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::mcp::{McpConnectReport, McpServerConfig};
-use crate::memory::{Advice, Memory, ToolCallView};
+use crate::memory::{Advice, Memory, MemoryFlush, ToolCallView, ToolResultView};
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
 use cues::{IndexCue, find_match};
 
@@ -132,6 +134,22 @@ pub const KB_MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// on every MCP request. The KB keys its per-surface policy on these.
 pub const KB_HARNESS_HEADERS: [(&str, &str); 2] =
     [("X-KB-Harness", "talos"), ("X-KB-Mode", "headless")];
+
+/// The KB's harness-event route (failed tool calls).
+pub const EVENT_PATH: &str = "/api/kb/event";
+
+/// The per-request bound on one `/api/kb/event` post.
+pub const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The most `/api/kb/event` posts one run sends; later qualifying calls are
+/// counted as capped.
+pub const MAX_EVENTS_PER_RUN: u32 = 50;
+
+/// The longest `command` / `error` sent in an event, in chars.
+pub const MAX_EVENT_FIELD_CHARS: usize = 2000;
+
+/// Where the host name is read from for the event `host` field.
+const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
 
 /// The degraded reason when no project resolves.
 const NO_PROJECT: &str =
@@ -447,6 +465,98 @@ pub struct PersonalKbMemory {
     endpoint: Option<KbEndpoint>,
     kb_tools: Vec<Arc<dyn Tool>>,
     session_id: String,
+    project: Option<String>,
+    /// Where failed-tool events go: `(url, api key)`. `Some` only when not
+    /// degraded AND the `/prevention` body carried a `tool_map` key — an
+    /// older KB without it gets no events (same rule as digests).
+    event_target: Option<(String, String)>,
+    events: EventContext,
+    posts: Mutex<PostState>,
+}
+
+/// The static part of every event body, fixed before the run.
+#[derive(Default)]
+struct EventContext {
+    cwd: Option<String>,
+    client_version: Option<String>,
+    host: Option<String>,
+}
+
+/// Spawned event posts and the per-run counters.
+#[derive(Default)]
+struct PostState {
+    /// Posts started this run (≤ [`MAX_EVENTS_PER_RUN`]).
+    started: u32,
+    capped: u32,
+    /// Each pending post resolves to `true` when the KB answered 2xx.
+    pending: Vec<tokio::task::JoinHandle<bool>>,
+}
+
+/// Aborts every post still pending when dropped — the engine's flush bound
+/// cancels [`Memory::flush`] by dropping it.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<bool>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// The trimmed contents of `path`, or `None` when unreadable or blank.
+fn read_host(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `s` cut to its first `max` chars (on a char boundary).
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// The `tool_input` of an event: only the call's target argument, never
+/// edit contents. `None` for a tool that is not posted.
+fn event_tool_input(call: &ToolCallView) -> Option<Value> {
+    let arg = |key: &str| call.args.get(key).cloned().unwrap_or(Value::Null);
+    Some(match call.name {
+        "bash" => {
+            let command = match call.args.get("command") {
+                Some(Value::String(c)) => Value::String(truncate_chars(c, MAX_EVENT_FIELD_CHARS)),
+                Some(other) => other.clone(),
+                None => Value::Null,
+            };
+            serde_json::json!({ "command": command })
+        }
+        "edit_file" | "read_file" => serde_json::json!({ "path": arg("path") }),
+        "list_files" => {
+            let path = call
+                .args
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| Value::String(".".to_string()));
+            serde_json::json!({ "path": path })
+        }
+        _ => return None,
+    })
+}
+
+/// POST one event; `true` when the KB answered 2xx (whatever its `reason`).
+async fn post_event(url: String, api_key: String, body: Value) -> bool {
+    let mut request = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(api_key)
+        .timeout(EVENT_TIMEOUT)
+        .json(&body);
+    for (k, v) in KB_HARNESS_HEADERS {
+        request = request.header(k, v);
+    }
+    matches!(request.send().await, Ok(r) if r.status().is_success())
 }
 
 impl PersonalKbMemory {
@@ -481,6 +591,10 @@ impl PersonalKbMemory {
             endpoint,
             kb_tools: Vec::new(),
             session_id: session_id.to_string(),
+            project: None,
+            event_target: None,
+            events: EventContext::default(),
+            posts: Mutex::new(PostState::default()),
         };
         let endpoint = match endpoint {
             Ok(e) => e,
@@ -507,13 +621,70 @@ impl PersonalKbMemory {
                     label,
                     slice_text: p.slice_text,
                     cues: p.cues,
+                    event_target: p.tool_map.is_some().then(|| {
+                        (
+                            format!("{}{EVENT_PATH}", endpoint.base_url),
+                            endpoint.api_key.clone(),
+                        )
+                    }),
                     tool_map: p.tool_map.unwrap_or_default(),
                     endpoint: Some(endpoint),
                     kb_tools: Vec::new(),
                     session_id: session_id.to_string(),
+                    project: Some(project),
+                    events: EventContext::default(),
+                    posts: Mutex::new(PostState::default()),
                 }
             }
         }
+    }
+
+    /// Set the run context every `/api/kb/event` body carries: `cwd` (the
+    /// workspace root, as given — the caller makes it absolute) and
+    /// `client_version` (sent as `hook_version`). Also reads the host name
+    /// from `/proc/sys/kernel/hostname` once; unreadable or blank → `null`.
+    #[must_use]
+    pub fn with_event_context(self, cwd: &Path, client_version: &str) -> Self {
+        self.with_event_context_from(cwd, client_version, Path::new(HOSTNAME_PATH))
+    }
+
+    fn with_event_context_from(mut self, cwd: &Path, client_version: &str, host: &Path) -> Self {
+        self.events = EventContext {
+            cwd: Some(cwd.display().to_string()),
+            client_version: Some(client_version.to_string()),
+            host: read_host(host),
+        };
+        self
+    }
+
+    /// The `/api/kb/event` body for one failed call — exactly the contract's
+    /// `fields.client_supplied` keys.
+    fn event_body(
+        &self,
+        call: &ToolCallView,
+        result: &ToolResultView,
+        tool_input: &Value,
+    ) -> Value {
+        serde_json::json!({
+            "type": "post_tool",
+            "event_id": format!("{}:{}:{}", self.session_id, result.iteration, result.call_id),
+            "session_id": self.session_id,
+            "harness": "talos",
+            "mode": "headless",
+            "engine": Value::Null,
+            "host": self.events.host,
+            "hook_version": self.events.client_version,
+            "cwd": self.events.cwd,
+            "project": self.project,
+            "ts": crate::time::format_rfc3339(SystemTime::now()),
+            "tool_name": call.name,
+            "tool_input": tool_input,
+            "tool_use_id": result.call_id,
+            "error": truncate_chars(result.content, MAX_EVENT_FIELD_CHARS),
+            "is_error": true,
+            "is_interrupt": false,
+            "duration_ms": result.duration_ms,
+        })
     }
 
     /// Connect to the KB's MCP endpoint ([`KbEndpoint::mcp_server_config`])
@@ -595,10 +766,69 @@ impl Memory for PersonalKbMemory {
     fn session_id(&self) -> Option<String> {
         Some(self.session_id.clone())
     }
+
+    /// Post a failed `bash` / `edit_file` / `read_file` / `list_files` call
+    /// to `/api/kb/event` — spawned, never awaited here. Nothing is posted
+    /// when degraded or when the KB sent no `tool_map`; past
+    /// [`MAX_EVENTS_PER_RUN`] posts a qualifying call is only counted.
+    fn after_tool(&self, call: &ToolCallView, result: &ToolResultView) {
+        if !result.is_error {
+            return;
+        }
+        let Some((url, api_key)) = self.event_target.as_ref() else {
+            return;
+        };
+        // `None` for every tool but bash / edit_file / read_file / list_files.
+        let Some(tool_input) = event_tool_input(call) else {
+            return;
+        };
+        let mut posts = self.posts.lock().unwrap_or_else(PoisonError::into_inner);
+        if posts.started >= MAX_EVENTS_PER_RUN {
+            posts.capped += 1;
+            return;
+        }
+        posts.started += 1;
+        let body = self.event_body(call, result, &tool_input);
+        let handle = tokio::spawn(post_event(url.clone(), api_key.clone(), body));
+        posts.pending.push(handle);
+    }
+
+    /// Await every pending post. Dropping this future (the engine's bound)
+    /// aborts the posts still running; those count as neither sent nor
+    /// failed.
+    fn flush(&self) -> Pin<Box<dyn Future<Output = MemoryFlush> + Send + '_>> {
+        let (pending, capped) = {
+            let mut posts = self.posts.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                std::mem::take(&mut posts.pending),
+                std::mem::take(&mut posts.capped),
+            )
+        };
+        Box::pin(async move {
+            let mut guard = AbortOnDrop(pending);
+            let mut flushed = MemoryFlush {
+                capped,
+                ..MemoryFlush::default()
+            };
+            while let Some(handle) = guard.0.last_mut() {
+                if matches!(handle.await, Ok(true)) {
+                    flushed.sent += 1;
+                } else {
+                    flushed.failed += 1;
+                }
+                guard.0.pop();
+            }
+            flushed
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        EVENT_PATH, EVENT_TIMEOUT, HOSTNAME_PATH, MAX_EVENT_FIELD_CHARS, MAX_EVENTS_PER_RUN,
+        event_tool_input, read_host, truncate_chars,
+    };
     use super::{
         KB_HARNESS_HEADERS, KB_MCP_CONNECT_TIMEOUT, KB_PROJECT_FILENAME, KbEndpoint,
         LOCAL_KB_API_KEY, LOCAL_KB_URL, MAX_FACT_CHARS, NO_PROJECT, PREVENTION_PATH,
@@ -607,7 +837,9 @@ mod tests {
     };
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, RunConfig, RunStats};
     use crate::mcp::McpConnectReport;
-    use crate::memory::{self, Advice, Memory, MemoryMode, ToolCallView};
+    use crate::memory::{
+        self, Advice, Memory, MemoryFlush, MemoryMode, ToolCallView, ToolResultView,
+    };
     use crate::model::{
         AssistantTurn, ContentBlock, Message, StopReason, ToolCallRequest, Usage, UserBlock,
     };
@@ -616,6 +848,7 @@ mod tests {
     use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
     use async_trait::async_trait;
     use serde_json::{Value, json};
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -1889,5 +2122,497 @@ mod tests {
                 .iter()
                 .all(|s| s["name"] != "kb_search")
         );
+    }
+
+    // ---- failed-tool events (POST /api/kb/event) ---------------------------
+
+    const EVENT_CONTRACT: &str = include_str!("../../testdata/personal_kb_contracts/event.json");
+
+    fn event_contract() -> Value {
+        serde_json::from_str(EVENT_CONTRACT).expect("event.json is JSON")
+    }
+
+    fn event_example(name: &str) -> Value {
+        event_contract()["request"]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()["body"]
+            .clone()
+    }
+
+    fn client_supplied() -> std::collections::BTreeSet<String> {
+        event_contract()["fields"]["client_supplied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A native tool that succeeds iff its input contains `OK`.
+    struct FlakyTool(&'static str);
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn schema(&self) -> Value {
+            json!({"name": self.0, "description": "flaky", "input_schema": {"type": "object"}})
+        }
+
+        async fn run(&self, input: Value, _ctx: &ToolCtx) -> ToolResult {
+            if input.to_string().contains("OK") {
+                ToolResult::ok("fine")
+            } else {
+                ToolResult::error(format!("{} failed", self.0))
+            }
+        }
+    }
+
+    fn flaky_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in ["bash", "edit_file", "read_file", "list_files", "run_checks"] {
+            registry.register(name, Arc::new(FlakyTool(name)));
+        }
+        registry.register(FINISH_TOOL_NAME, Arc::new(FinishTool::default()));
+        registry
+    }
+
+    fn finish_turn() -> AssistantTurn {
+        call_turn(
+            "cf",
+            FINISH_TOOL_NAME,
+            json!({"disposition": "blocked", "decision_needed": "q"}),
+        )
+    }
+
+    /// One turn carrying every `(id, name, input)` call.
+    fn calls_turn(calls: Vec<(String, &str, Value)>) -> AssistantTurn {
+        AssistantTurn {
+            content: calls
+                .into_iter()
+                .map(|(id, name, input)| {
+                    ContentBlock::ToolCall(ToolCallRequest {
+                        id,
+                        name: name.to_string(),
+                        input,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            usage: usage(),
+        }
+    }
+
+    /// A fake KB serving `prevention` and answering events with `event`.
+    async fn event_kb(prevention: Value, event: ResponseTemplate) -> MockServer {
+        let server = prevention_server(200, prevention.to_string()).await;
+        Mock::given(method("POST"))
+            .and(path(EVENT_PATH))
+            .respond_with(event)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn event_memory(server: &MockServer) -> Arc<dyn Memory> {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let host = dir.path().join("hostname");
+        std::fs::write(&host, "  test-host\n").expect("write");
+        let memory = connect_to(&server.uri(), Some("fake-project"))
+            .await
+            .with_event_context_from(Path::new("/ws/root"), "9.9.9-test", &host);
+        Arc::new(memory)
+    }
+
+    async fn event_requests(server: &MockServer) -> Vec<Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == EVENT_PATH)
+            .collect()
+    }
+
+    async fn event_bodies(server: &MockServer) -> Vec<Value> {
+        event_requests(server)
+            .await
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    async fn run_events(
+        server: &MockServer,
+        mode: MemoryMode,
+        turns: Vec<AssistantTurn>,
+    ) -> crate::engine::RunResult {
+        let memory = event_memory(server).await;
+        crate::engine::run(
+            &MockBackend::from_turns(turns),
+            &flaky_registry(),
+            &ToolCtx::stub(),
+            &RunConfig::new("t", 10).with_memory(memory, mode),
+        )
+        .await
+    }
+
+    fn assert_blocked(result: &crate::engine::RunResult) {
+        assert!(
+            matches!(
+                result.outcome,
+                crate::engine::LoopOutcome::Finished(
+                    crate::run_record::Disposition::Blocked { .. }
+                )
+            ),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    fn ok_event() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "recorded": true, "cue_key": "x", "normalizer_version": 1, "reason": "recorded"
+        }))
+    }
+
+    #[test]
+    fn event_constants_are_pinned() {
+        assert_eq!(EVENT_PATH, "/api/kb/event");
+        assert_eq!(EVENT_PATH, event_contract()["path"]);
+        assert_eq!(event_contract()["method"], "POST");
+        assert_eq!(EVENT_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(MAX_EVENTS_PER_RUN, 50);
+        assert_eq!(MAX_EVENT_FIELD_CHARS, 2000);
+    }
+
+    #[test]
+    fn event_helpers() {
+        assert_eq!(truncate_chars("héllo", 2), "hé");
+        assert_eq!(truncate_chars("hé", 5), "hé");
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(read_host(&dir.path().join("missing")), None);
+        std::fs::write(dir.path().join("blank"), " \n").unwrap();
+        assert_eq!(read_host(&dir.path().join("blank")), None);
+        std::fs::write(dir.path().join("h"), "box-1\n").unwrap();
+        assert_eq!(read_host(&dir.path().join("h")).as_deref(), Some("box-1"));
+
+        let input = |name: &str, args: Value| event_tool_input(&view(name, &args));
+        let long = "é".repeat(MAX_EVENT_FIELD_CHARS + 5);
+        assert_eq!(
+            input("bash", json!({"command": long, "timeout": 5})),
+            Some(json!({"command": "é".repeat(MAX_EVENT_FIELD_CHARS)}))
+        );
+        assert_eq!(
+            input("bash", json!({"command": 3})),
+            Some(json!({"command": 3}))
+        );
+        assert_eq!(input("bash", json!({})), Some(json!({"command": null})));
+        assert_eq!(
+            input(
+                "edit_file",
+                json!({"path": "a", "old_string": "x", "new_string": "y"})
+            ),
+            Some(json!({"path": "a"}))
+        );
+        assert_eq!(input("read_file", json!({})), Some(json!({"path": null})));
+        assert_eq!(input("list_files", json!({})), Some(json!({"path": "."})));
+        assert_eq!(
+            input("list_files", json!({"path": "src"})),
+            Some(json!({"path": "src"}))
+        );
+        assert_eq!(input("run_checks", json!({})), None);
+        assert_eq!(input("kb_search", json!({})), None);
+    }
+
+    #[test]
+    fn event_context_uses_the_proc_hostname() {
+        let m = futures_free_degraded().with_event_context(Path::new("/w"), "1.0");
+        assert_eq!(m.events.cwd.as_deref(), Some("/w"));
+        assert_eq!(m.events.client_version.as_deref(), Some("1.0"));
+        assert_eq!(
+            m.events.host,
+            read_host(Path::new(HOSTNAME_PATH)),
+            "host comes from {HOSTNAME_PATH}"
+        );
+    }
+
+    /// A degraded memory built without a runtime (no request is made).
+    fn futures_free_degraded() -> PersonalKbMemory {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(PersonalKbMemory::connect(
+            Err("x".into()),
+            None,
+            "t:1",
+            PREVENTION_TIMEOUT,
+        ))
+    }
+
+    // AC7 (a)
+    #[tokio::test]
+    async fn failing_bash_posts_one_contract_shaped_event() {
+        let server = event_kb(contract_example("talos_gate_armed"), ok_event()).await;
+        let result = run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![
+                call_turn("c1", "bash", json!({"command": "git push mirror feat/x"})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        assert_blocked(&result);
+        let requests = event_requests(&server).await;
+        assert_eq!(requests.len(), 1);
+        let r = &requests[0];
+        assert_eq!(r.method.as_str(), "POST");
+        assert_eq!(r.headers["authorization"], "Bearer local-no-auth");
+        for (k, v) in KB_HARNESS_HEADERS {
+            assert_eq!(r.headers[k], v);
+        }
+        let body: Value = serde_json::from_slice(&r.body).unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            body.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, client_supplied());
+        let example = event_example("talos_bash_failure");
+        for k in [
+            "type",
+            "harness",
+            "mode",
+            "tool_name",
+            "tool_input",
+            "is_error",
+            "is_interrupt",
+        ] {
+            assert_eq!(body[k], example[k], "{k}");
+        }
+        assert_eq!(body["event_id"], "t:1:1:c1");
+        assert_eq!(body["session_id"], "t:1");
+        assert_eq!(body["tool_use_id"], "c1");
+        assert_eq!(body["engine"], Value::Null);
+        assert_eq!(body["host"], "test-host");
+        assert_eq!(body["hook_version"], "9.9.9-test");
+        assert_eq!(body["cwd"], "/ws/root");
+        assert_eq!(body["project"], "fake-project");
+        assert!(body["duration_ms"].is_u64(), "{body}");
+        assert!(body["ts"].as_str().unwrap().ends_with('Z'), "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("bash failed"), "{error}");
+        assert_eq!(result.stats.memory_events_sent, 1);
+        assert_eq!(result.stats.memory_events_failed, 0);
+        assert_eq!(result.stats.memory_events_capped, 0);
+    }
+
+    // AC7 (b)
+    #[tokio::test]
+    async fn failing_edit_file_sends_only_the_path() {
+        let server = event_kb(contract_example("talos_gate_armed"), ok_event()).await;
+        run_events(
+            &server,
+            MemoryMode::DenyOnce,
+            vec![
+                call_turn(
+                    "e1",
+                    "edit_file",
+                    json!({"path": "src/a.py", "old_string": "secret", "new_string": "body"}),
+                ),
+                finish_turn(),
+            ],
+        )
+        .await;
+        let bodies = event_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["tool_input"], json!({"path": "src/a.py"}));
+        assert_eq!(bodies[0]["tool_name"], "edit_file");
+        let example = event_example("talos_edit_file_failure");
+        assert_eq!(bodies[0]["tool_input"], example["tool_input"]);
+    }
+
+    // AC7 (c)
+    #[tokio::test]
+    async fn success_run_checks_and_denied_calls_post_nothing() {
+        let server = event_kb(contract_example("talos_gate_armed"), ok_event()).await;
+        let result = run_events(
+            &server,
+            MemoryMode::DenyOnce,
+            vec![
+                call_turn("ok", "bash", json!({"command": "echo OK"})),
+                call_turn("rc", "run_checks", json!({})),
+                call_turn("deny", "bash", json!({"command": "git push mirror feat/x"})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        assert_blocked(&result);
+        assert_eq!(result.stats.memory_denies, 1);
+        assert!(event_requests(&server).await.is_empty());
+        assert_eq!(result.stats.memory_events_sent, 0);
+        assert_eq!(result.stats.memory_events_failed, 0);
+    }
+
+    // AC7 (d)
+    #[tokio::test]
+    async fn no_tool_map_posts_nothing() {
+        let mut body = contract_example("talos_gate_armed");
+        body.as_object_mut().unwrap().remove("tool_map");
+        let server = event_kb(body, ok_event()).await;
+        run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        assert!(event_requests(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn degraded_memory_posts_nothing_even_when_called_directly() {
+        let memory = connect_to("http://127.0.0.1:1", None).await;
+        let args = json!({"command": "false"});
+        memory.after_tool(
+            &view("bash", &args),
+            &ToolResultView {
+                call_id: "c1",
+                iteration: 1,
+                is_error: true,
+                content: "boom",
+                duration_ms: None,
+            },
+        );
+        assert_eq!(memory.flush().await, MemoryFlush::default());
+    }
+
+    // AC7 (e)
+    #[tokio::test]
+    async fn same_call_id_in_two_iterations_gets_distinct_event_ids() {
+        let server = event_kb(contract_example("talos_gate_armed"), ok_event()).await;
+        run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![
+                call_turn("ollama-call-0", "read_file", json!({"path": "a"})),
+                call_turn("ollama-call-0", "list_files", json!({})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        let mut ids: Vec<String> = event_bodies(&server)
+            .await
+            .iter()
+            .map(|b| b["event_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["t:1:1:ollama-call-0", "t:1:2:ollama-call-0"]);
+    }
+
+    // AC7 (f)
+    #[tokio::test]
+    async fn a_slow_kb_does_not_hold_the_run() {
+        let server = event_kb(
+            contract_example("talos_gate_armed"),
+            ok_event().set_delay(Duration::from_secs(10)),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let result = run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_blocked(&result);
+        assert_eq!(result.stats.memory_events_sent, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_flush_aborts_its_pending_posts() {
+        let server = event_kb(
+            contract_example("talos_gate_armed"),
+            ok_event().set_delay(Duration::from_secs(10)),
+        )
+        .await;
+        let memory = event_memory(&server).await;
+        let args = json!({"command": "false"});
+        memory.after_tool(
+            &view("bash", &args),
+            &ToolResultView {
+                call_id: "c1",
+                iteration: 1,
+                is_error: true,
+                content: "boom",
+                duration_ms: Some(1),
+            },
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(200), memory.flush()).await;
+        assert!(cut.is_err(), "flush must still be pending");
+        // The aborted post is gone: a second flush has nothing to settle.
+        assert_eq!(memory.flush().await, MemoryFlush::default());
+    }
+
+    // AC7 (g)
+    #[tokio::test]
+    async fn a_500_counts_as_failed() {
+        let server = event_kb(
+            contract_example("talos_gate_armed"),
+            ResponseTemplate::new(500),
+        )
+        .await;
+        let result = run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ],
+        )
+        .await;
+        assert_blocked(&result);
+        assert_eq!(event_requests(&server).await.len(), 1);
+        assert_eq!(result.stats.memory_events_failed, 1);
+        assert_eq!(result.stats.memory_events_sent, 0);
+    }
+
+    // AC7 (h)
+    #[tokio::test]
+    async fn the_51st_failure_is_capped() {
+        let server = event_kb(contract_example("talos_gate_armed"), ok_event()).await;
+        let calls = (0..=MAX_EVENTS_PER_RUN)
+            .map(|i| {
+                (
+                    format!("c{i}"),
+                    "bash",
+                    json!({"command": format!("false {i}")}),
+                )
+            })
+            .collect();
+        let result = run_events(
+            &server,
+            MemoryMode::Annotate,
+            vec![calls_turn(calls), finish_turn()],
+        )
+        .await;
+        assert_blocked(&result);
+        assert_eq!(event_requests(&server).await.len(), 50);
+        assert_eq!(result.stats.memory_events_sent, 50);
+        assert_eq!(result.stats.memory_events_capped, 1);
+        assert_eq!(result.stats.memory_events_failed, 0);
     }
 }

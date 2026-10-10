@@ -388,7 +388,8 @@
 //!   `post_compaction_reasoning_chars`, `memory_annotations`,
 //!   `memory_denies`, `memory_kb_tool_calls`, `memory_deny_overrides`,
 //!   `memory_degraded` (a string or `null`), `mcp_tool_calls`,
-//!   `mcp_tool_call_errors` — matching
+//!   `mcp_tool_call_errors`, `memory_events_sent`, `memory_events_failed`,
+//!   `memory_events_capped` — matching
 //!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
@@ -423,7 +424,9 @@
 //!             "post_compaction_reasoning_chars":[],
 //!             "memory_annotations":0,"memory_denies":0,"memory_kb_tool_calls":0,
 //!             "memory_deny_overrides":0,"memory_degraded":null,
-//!             "mcp_tool_calls":0,"mcp_tool_call_errors":0}}
+//!             "mcp_tool_calls":0,"mcp_tool_call_errors":0,
+//!             "memory_events_sent":0,"memory_events_failed":0,
+//!             "memory_events_capped":0}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -581,7 +584,9 @@ use serde_json::{Map, Value};
 /// `run_start.config.memory_mode`, and the five memory keys on
 /// `run_end.stats`. 5 adds the `mcp_connected` / `mcp_connect_failed`
 /// events (and the additive `mcp_tool_calls` / `mcp_tool_call_errors` keys on
-/// `run_end.stats`).
+/// `run_end.stats`). The `memory_events_sent` / `memory_events_failed` /
+/// `memory_events_capped` keys on `run_end.stats` are additive too, so they
+/// did not bump it.
 pub const TRANSCRIPT_VERSION: u32 = 5;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
