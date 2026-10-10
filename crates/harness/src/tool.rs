@@ -228,7 +228,7 @@ pub trait Tool: Send + Sync {
 /// Maps tool names to tools. The registered set *is* the agent's capability
 /// boundary — there is no separate permission layer. Backed by a [`BTreeMap`]
 /// so `list()` is deterministically ordered.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }

@@ -59,7 +59,10 @@
 //!   resolution), `mode`
 //!   — `"answer"` when the run has an answer schema configured, `"build"`
 //!   otherwise, so an audit can select answer runs without inspecting the
-//!   schema — `checks` — the check command display string, or `null` —
+//!   schema — `change_observer` (the configured
+//!   [`crate::exec::ChangeObserver::label`]: `"git"` by default, `"custom"`
+//!   or a provider's own label otherwise), `checks` — the check command
+//!   display string, or `null` —
 //!   `answer_schema` (the compiled answer-mode result schema VERBATIM, so a
 //!   reader can re-verify any `finish(answer)` verdict off the record; `null`
 //!   in build mode), `wall_clock_secs`, `token_budget` (the per-invocation
@@ -71,11 +74,14 @@
 //!   context window at which the previous turn's raw prompt triggers
 //!   compaction; `0` = disabled; the compiled default is
 //!   [`crate::engine::COMPACT_THRESHOLD_PCT`]. This is how an A/B experiment
-//!   proves its two arms really differ rather than assuming it).
+//!   proves its two arms really differ rather than assuming it),
+//!   `memory_mode` (the run's [`crate::memory::MemoryMode::as_str`]: `"off"`,
+//!   `"annotate"` or `"deny-once"`; always present, and `"off"` never calls
+//!   the memory to produce it).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
-//!    "transcript_version":3,"harness_version":"0.10.0","label":"claude-sonnet-5",
+//!    "transcript_version":4,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
 //!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
@@ -83,9 +89,47 @@
 //!    "system":"You are an autonomous coding agent...","tools":[{"name":"echo","...":"..."}],
 //!    "messages":[{"User":{"content":[{"Text":"do the task"}]}}],
 //!    "config":{"max_iterations":10,"max_tokens":128000,"max_tokens_source":"table","mode":"build",
-//!              "checks":"cargo test","answer_schema":null,
+//!              "change_observer":"git","checks":"cargo test","answer_schema":null,
 //!              "wall_clock_secs":0,"token_budget":0,"static_tree_k":3,"max_nudges":2,"max_retries":3,
-//!              "compact_threshold_pct":90}}
+//!              "compact_threshold_pct":90,"memory_mode":"off"}}
+//!   ```
+//!
+//! - **`memory_slice`** — emitted once per invocation, immediately after
+//!   `run_start`, and ONLY when `run_start.config.memory_mode != "off"` (see
+//!   [`crate::memory`]). Fields: exactly `items` (the number of `- ` item
+//!   lines in the trimmed session slice; `0` when there is none), `chars`
+//!   (the trimmed slice's char count; `0` when there is none), `degraded`
+//!   (the [`crate::memory::Memory::degraded`] reason string when the memory
+//!   failed open to Off for this invocation, else `null`), `source` (the
+//!   [`crate::memory::Memory::label`]), `memory_tools` (the sorted names of
+//!   the memory tools actually registered) and `memory_tools_dropped` (the
+//!   sorted names dropped because they collided with a registered tool).
+//!   A degraded memory always records `items: 0`, `chars: 0` and empty tool
+//!   lists. The slice text itself is in `run_start.system`.
+//!
+//!   ```json
+//!   {"event":"memory_slice","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
+//!    "items":2,"chars":137,"degraded":null,"source":"kb@host/project",
+//!    "memory_tools":["kb_search"],"memory_tools_dropped":[]}
+//!   ```
+//!
+//! - **`memory_advice`** — emitted once per non-`None` memory decision on a
+//!   dispatched non-finish tool call, immediately after the decision and
+//!   BEFORE that call's `tool_result` (and before the tool is invoked).
+//!   Fields: exactly `iteration`, `call_id`, `tool` (the tool name),
+//!   `entry_id`, `advised` (what the memory advised: `"annotate"` or
+//!   `"deny_once"`), `mode_applied` (what the engine applied:
+//!   `"annotate"`, `"deny_once"` or `"suppressed"`) and `reason` (why:
+//!   `"as_advised"`, `"mode_ceiling"`, `"entry_already_denied"`,
+//!   `"deny_cap_reached"`, `"blank_advice"` or `"retry_of_denied"`). A
+//!   `deny_once` call's `tool_result` carries the deny message, `is_error:
+//!   true`, `offload_path: null` and `duration_ms: 0`; an `annotate` call's
+//!   `tool_result.content` ends with the `[KB memory] …` annotation block.
+//!
+//!   ```json
+//!   {"event":"memory_advice","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
+//!    "iteration":1,"call_id":"c1","tool":"bash","entry_id":"kb-1",
+//!    "advised":"deny_once","mode_applied":"deny_once","reason":"as_advised"}
 //!   ```
 //!
 //! - **`compaction`** — emitted at the top of a pass whose previous-turn raw
@@ -309,7 +353,9 @@
 //!   `tool_results_elided`, `compaction_elided_rereads`,
 //!   `compaction_repeated_calls`, `compaction_orphan_tool_results`,
 //!   `compaction_pre_reasoning_chars_sum`, `compaction_pre_reasoning_turns`,
-//!   `post_compaction_reasoning_chars` — matching
+//!   `post_compaction_reasoning_chars`, `memory_annotations`,
+//!   `memory_denies`, `memory_kb_tool_calls`, `memory_deny_overrides`,
+//!   `memory_degraded` (a string or `null`) — matching
 //!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
@@ -341,7 +387,9 @@
 //!             "tool_results_elided":0,"compaction_elided_rereads":0,
 //!             "compaction_repeated_calls":0,"compaction_orphan_tool_results":0,
 //!             "compaction_pre_reasoning_chars_sum":0,"compaction_pre_reasoning_turns":0,
-//!             "post_compaction_reasoning_chars":[]}}
+//!             "post_compaction_reasoning_chars":[],
+//!             "memory_annotations":0,"memory_denies":0,"memory_kb_tool_calls":0,
+//!             "memory_deny_overrides":0,"memory_degraded":null}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -421,7 +469,7 @@
 //! The full message history is reconstructible from one run block using only
 //! `run_start.messages` + `model_response` + `tool_result` +
 //! `harness_message` + `compaction` (a reader ignores `model_request`,
-//! `backend_error`, and `iteration_end`):
+//! `backend_error`, `iteration_end`, `memory_slice` and `memory_advice`):
 //!
 //! 1. Start from `run_start.messages`.
 //! 2. On `model_response`, push `Message::Assistant { content }`.
@@ -495,8 +543,10 @@ use serde_json::{Map, Value};
 /// — so NO bump was written for it either: `budget_breach` already exists
 /// (the token variant is discriminated by field set plus `run_end.detail`,
 /// not by a new tag) and `EVENT_KINDS` is unchanged. [`TRANSCRIPT_VERSION`]
-/// stays 3.
-pub const TRANSCRIPT_VERSION: u32 = 3;
+/// stayed 3. 4 adds the `memory_slice` and `memory_advice` events,
+/// `run_start.config.memory_mode`, and the five memory keys on
+/// `run_end.stats`.
+pub const TRANSCRIPT_VERSION: u32 = 4;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
 /// carry — see the module docs for each event's fields. `contract_violation`
@@ -504,8 +554,8 @@ pub const TRANSCRIPT_VERSION: u32 = 3;
 /// choke point and documented, but absent from this array before v2.
 /// `budget_breach` joins at v3, documented with its emission (no
 /// previously-emitted hole this time — the event and its array entry land
-/// together).
-pub const EVENT_KINDS: [&str; 11] = [
+/// together). `memory_slice` and `memory_advice` join at v4.
+pub const EVENT_KINDS: [&str; 13] = [
     "run_start",
     "compaction",
     "model_request",
@@ -517,6 +567,8 @@ pub const EVENT_KINDS: [&str; 11] = [
     "run_end",
     "contract_violation",
     "budget_breach",
+    "memory_slice",
+    "memory_advice",
 ];
 
 /// Opt-in configuration for a run's transcript sink.

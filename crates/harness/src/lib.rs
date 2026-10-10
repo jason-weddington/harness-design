@@ -10,6 +10,7 @@ pub mod bedrock;
 pub mod engine;
 pub mod eval;
 pub mod exec;
+pub mod memory;
 pub mod mined_harbor;
 pub mod mined_task;
 pub mod model;

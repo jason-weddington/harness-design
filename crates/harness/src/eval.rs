@@ -1536,6 +1536,11 @@ mod tests {
                 compaction_pre_reasoning_chars_sum: 0,
                 compaction_pre_reasoning_turns: 0,
                 post_compaction_reasoning_chars: Vec::new(),
+                memory_annotations: 0,
+                memory_denies: 0,
+                memory_kb_tool_calls: 0,
+                memory_deny_overrides: 0,
+                memory_degraded: None,
             },
             transcript_path: None,
         };
@@ -2042,6 +2047,11 @@ mod tests {
                 compaction_pre_reasoning_chars_sum: 0,
                 compaction_pre_reasoning_turns: 0,
                 post_compaction_reasoning_chars: Vec::new(),
+                memory_annotations: 0,
+                memory_denies: 0,
+                memory_kb_tool_calls: 0,
+                memory_deny_overrides: 0,
+                memory_degraded: None,
             },
             transcript_path: None,
         };

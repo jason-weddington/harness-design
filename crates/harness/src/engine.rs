@@ -131,6 +131,7 @@ use crate::exec::{
     self, ChangeEvidence, ChangeObserver, CheckReport, ChecksRunner, GitTreeObserver,
     TreeObservation,
 };
+use crate::memory::{self, Memory, MemoryMode, NoMemory};
 use crate::model::{self, Message, SamplingParams, TurnRequest, UserBlock};
 use crate::prompt;
 use crate::run_record::{
@@ -394,6 +395,15 @@ pub struct RunConfig {
     /// Defaults to [`COMPACT_THRESHOLD_PCT`] (the pinned 90). Override via
     /// [`RunConfig::with_compact_threshold_pct`].
     pub compact_threshold_pct: u64,
+    /// The knowledge-base memory consulted by the loop (see
+    /// [`crate::memory`]). Defaults to [`NoMemory`]; it is never called while
+    /// [`RunConfig::memory_mode`] is [`MemoryMode::Off`]. Set via
+    /// [`RunConfig::with_memory`].
+    pub memory: Arc<dyn Memory>,
+    /// How much of [`RunConfig::memory`]'s advice the loop may apply.
+    /// Defaults to [`MemoryMode::Off`], under which every surface is
+    /// byte-identical to a run without the memory seam.
+    pub memory_mode: MemoryMode,
 }
 
 /// The fallback per-turn output cap — re-exported from
@@ -460,6 +470,8 @@ impl RunConfig {
             transcript: None,
             answer_schema: None,
             compact_threshold_pct: COMPACT_THRESHOLD_PCT,
+            memory: Arc::new(NoMemory),
+            memory_mode: MemoryMode::Off,
         }
     }
 
@@ -591,6 +603,15 @@ impl RunConfig {
     #[must_use]
     pub fn with_compact_threshold_pct(mut self, pct: u64) -> Self {
         self.compact_threshold_pct = pct;
+        self
+    }
+
+    /// Attach a knowledge-base [`Memory`] and the [`MemoryMode`] ceiling for
+    /// applying its advice. [`MemoryMode::Off`] keeps the memory uncalled.
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>, mode: MemoryMode) -> Self {
+        self.memory = memory;
+        self.memory_mode = mode;
         self
     }
 }
@@ -1165,6 +1186,26 @@ pub struct RunStats {
     /// [`Self::compaction_pre_reasoning_chars_sum`] for the chars-not-tokens
     /// deviation. Counted since THIS loop invocation.
     pub post_compaction_reasoning_chars: Vec<u64>,
+    /// Memory decisions applied as an annotation (see [`crate::memory`]).
+    /// Counted since THIS loop invocation; zero whenever memory is off.
+    pub memory_annotations: u32,
+    /// Tool calls denied by memory (not executed). Counted since THIS loop
+    /// invocation; zero whenever memory is off.
+    pub memory_denies: u32,
+    /// Calls to a tool registered by the memory, counted whether the call
+    /// is then denied, errors or succeeds. Counted since THIS loop
+    /// invocation; zero whenever memory is off.
+    pub memory_kb_tool_calls: u32,
+    /// Decisions with reason `retry_of_denied`: unchanged retries of a
+    /// denied call, which are allowed. Counted since THIS loop invocation;
+    /// zero whenever memory is off.
+    pub memory_deny_overrides: u32,
+    /// `Some(reason)` when memory was on but [`Memory::degraded`] reported a
+    /// failure, so the invocation fell back to Off behaviour. Counted since
+    /// THIS loop invocation; `None` whenever memory is off. An `Option`, not
+    /// a bool: `RunStats` already carries the clippy-pedantic maximum of
+    /// three bools.
+    pub memory_degraded: Option<String>,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2368,6 +2409,11 @@ pub async fn run(
         compaction_pre_reasoning_chars_sum: 0,
         compaction_pre_reasoning_turns: 0,
         post_compaction_reasoning_chars: Vec::new(),
+        memory_annotations: 0,
+        memory_denies: 0,
+        memory_kb_tool_calls: 0,
+        memory_deny_overrides: 0,
+        memory_degraded: None,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2455,6 +2501,11 @@ pub async fn run_persisted(
         compaction_pre_reasoning_chars_sum: 0,
         compaction_pre_reasoning_turns: 0,
         post_compaction_reasoning_chars: Vec::new(),
+        memory_annotations: 0,
+        memory_denies: 0,
+        memory_kb_tool_calls: 0,
+        memory_deny_overrides: 0,
+        memory_degraded: None,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2702,6 +2753,11 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "compaction_pre_reasoning_chars_sum": stats.compaction_pre_reasoning_chars_sum,
         "compaction_pre_reasoning_turns": stats.compaction_pre_reasoning_turns,
         "post_compaction_reasoning_chars": stats.post_compaction_reasoning_chars,
+        "memory_annotations": stats.memory_annotations,
+        "memory_denies": stats.memory_denies,
+        "memory_kb_tool_calls": stats.memory_kb_tool_calls,
+        "memory_deny_overrides": stats.memory_deny_overrides,
+        "memory_degraded": stats.memory_degraded,
     })
 }
 
@@ -3613,6 +3669,86 @@ async fn write_budget_exhausted_terminal(
     Ok(LoopOutcome::BudgetExhausted { summary })
 }
 
+/// What the memory run-start sequence produced for one loop invocation.
+/// Only built when `config.memory_mode != Off`.
+struct MemoryRun {
+    /// On and not degraded: `before_tool` is consulted per call.
+    active: bool,
+    /// The caller's registry plus the memory tools, when active.
+    registry: Option<ToolRegistry>,
+    /// The memory-tool names actually registered (collisions excluded).
+    tool_names: Vec<String>,
+    /// The trimmed, non-blank session slice, if any.
+    slice: Option<String>,
+    /// The `memory_slice` transcript payload.
+    slice_event: Value,
+}
+
+/// The memory run-start sequence: `degraded()` → `label()` → (when not
+/// degraded) `tools()` → `session_slice()`, each exactly once. A degraded
+/// memory fails open to Off behaviour with one stderr warning.
+fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunStats) -> MemoryRun {
+    let degraded = memory.degraded();
+    let source = memory.label();
+    if let Some(reason) = degraded {
+        eprintln!("warning: memory degraded to off ({reason})");
+        stats.memory_degraded = Some(reason.clone());
+        return MemoryRun {
+            active: false,
+            registry: None,
+            tool_names: Vec::new(),
+            slice: None,
+            slice_event: json!({
+                "items": 0,
+                "chars": 0,
+                "degraded": reason,
+                "source": source,
+                "memory_tools": [],
+                "memory_tools_dropped": [],
+            }),
+        };
+    }
+    let mut registry = tools.clone();
+    let mut tool_names = Vec::new();
+    let mut dropped = Vec::new();
+    for boxed in memory.tools() {
+        let name = boxed.name().to_string();
+        if registry.get(&name).is_some() {
+            eprintln!(
+                "warning: memory tool '{name}' collides with a registered tool; keeping the registered one"
+            );
+            dropped.push(name);
+        } else {
+            registry.register(name.clone(), Arc::from(boxed));
+            tool_names.push(name);
+        }
+    }
+    tool_names.sort();
+    dropped.sort();
+    let slice = memory
+        .session_slice()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (items, chars) = slice
+        .as_deref()
+        .map_or((0, 0), |s| (memory::slice_item_count(s), s.chars().count()));
+    let slice_event = json!({
+        "items": items,
+        "chars": chars,
+        "degraded": Value::Null,
+        "source": source,
+        "memory_tools": tool_names,
+        "memory_tools_dropped": dropped,
+    });
+    MemoryRun {
+        active: true,
+        registry: Some(registry),
+        tool_names,
+        slice,
+        slice_event,
+    }
+}
+
 /// The engine loop body proper — the renamed former `run_loop_impl`, now
 /// taking an extra `writer` so it can emit per-iteration transcript events.
 /// See [`run_loop_impl`] for the wrapper that opens `writer` and emits
@@ -3642,6 +3778,20 @@ async fn run_loop_body(
     // no second mode field to drift out of sync with it.
     let answer_mode = config.answer_schema.is_some();
 
+    // ---- memory seam: run-start sequence (see `crate::memory`) ----
+    // Off means the Memory is never called: every surface stays
+    // byte-identical to an engine without the seam.
+    let memory_run = if config.memory_mode == MemoryMode::Off {
+        None
+    } else {
+        Some(memory_run_start(config.memory.as_ref(), tools, stats))
+    };
+    let tools: &ToolRegistry = memory_run
+        .as_ref()
+        .and_then(|m| m.registry.as_ref())
+        .unwrap_or(tools);
+    let mut memory_state = memory::MemoryRunState::default();
+
     // Render the system prompt ONCE and reuse verbatim every iteration —
     // the prompt-cache correctness invariant (D9). Answer mode renders its
     // OWN template (`answer_system_prompt.md`): a read-only analyst frame
@@ -3659,6 +3809,14 @@ async fn run_loop_body(
                 .map(ChecksRunner::command_display)
                 .as_deref(),
         )
+    };
+
+    // The session slice is folded in AFTER the template render, so the
+    // tier-1 perfect-spec surface (the templates) is untouched, and it lives
+    // in the system prompt, so compaction can never elide it.
+    let system = match memory_run.as_ref().and_then(|m| m.slice.as_deref()) {
+        Some(slice) => memory::append_session_slice(&system, slice),
+        None => system,
     };
 
     let mut messages = initial_messages;
@@ -3810,9 +3968,13 @@ async fn run_loop_body(
                     // (0 = disabled) — what an A/B experiment reads to prove
                     // the two arms really differ.
                     "compact_threshold_pct": config.compact_threshold_pct,
+                    "memory_mode": config.memory_mode.as_str(),
                 },
             }),
         );
+        if let Some(m) = &memory_run {
+            writer.emit("memory_slice", m.slice_event.clone());
+        }
     }
 
     // ---- finish-recovery detection state (loop-local) ----
@@ -4672,6 +4834,115 @@ async fn run_loop_body(
                 }
                 debug_assert!(answer_schema_streak <= ANSWER_SCHEMA_REJECTION_STREAK_CAP);
             } else {
+                // ---- memory advice (see `crate::memory`) ----
+                // Only when memory is on and not degraded; never for a call
+                // named `finish` (a later finish in the batch lands here).
+                let mut memory_applied: Option<(memory::AppliedMode, String, String)> = None;
+                if let Some(m) = memory_run.as_ref().filter(|m| m.active) {
+                    if m.tool_names.contains(&call.name) {
+                        stats.memory_kb_tool_calls += 1;
+                    }
+                    if call.name != FINISH_TOOL_NAME {
+                        let view = memory::ToolCallView {
+                            name: &call.name,
+                            args: &call.input,
+                        };
+                        let advice = config.memory.before_tool(&view);
+                        if let Some(decision) =
+                            memory::decide(config.memory_mode, &advice, &view, &memory_state)
+                        {
+                            let advised = advice.as_str();
+                            let (fact, entry_id) = match advice {
+                                memory::Advice::Annotate { fact, entry_id }
+                                | memory::Advice::DenyOnce { fact, entry_id } => (fact, entry_id),
+                                memory::Advice::None => {
+                                    unreachable!("decide returns None for Advice::None")
+                                }
+                            };
+                            if writer.is_enabled() {
+                                writer.emit(
+                                    "memory_advice",
+                                    json!({
+                                        "iteration": stats.iterations,
+                                        "call_id": call.id,
+                                        "tool": call.name,
+                                        "entry_id": entry_id,
+                                        "advised": advised,
+                                        "mode_applied": decision.applied.as_str(),
+                                        "reason": decision.reason.as_str(),
+                                    }),
+                                );
+                            }
+                            memory_applied = Some((decision.applied, fact, entry_id));
+                            match decision.applied {
+                                memory::AppliedMode::Annotate => stats.memory_annotations += 1,
+                                memory::AppliedMode::DenyOnce => stats.memory_denies += 1,
+                                memory::AppliedMode::Suppressed => {}
+                            }
+                            if decision.reason == memory::DecisionReason::RetryOfDenied {
+                                stats.memory_deny_overrides += 1;
+                            }
+                        }
+                    }
+                }
+
+                // A denied call is NOT executed and is not an observation:
+                // it skips invoke and the finish-recovery bookkeeping.
+                if let Some((memory::AppliedMode::DenyOnce, fact, entry_id)) = &memory_applied {
+                    let content = memory::deny_content(fact, entry_id);
+                    let result = ToolResult::error(content.clone());
+                    if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
+                        p.store
+                            .append_event(
+                                &ctx.rid,
+                                Event::ToolCallStarted {
+                                    seq: 0,
+                                    name: call.name.clone(),
+                                    args: call.input.clone(),
+                                    call_id: call.id.clone(),
+                                },
+                            )
+                            .await?;
+                        p.store
+                            .append_event(
+                                &ctx.rid,
+                                Event::ToolCallResult {
+                                    seq: 0,
+                                    name: call.name.clone(),
+                                    is_error: true,
+                                    summary: result.summary.clone(),
+                                    offload_path: None,
+                                },
+                            )
+                            .await?;
+                    }
+                    if writer.is_enabled() {
+                        writer.emit(
+                            "tool_result",
+                            json!({
+                                "iteration": stats.iterations,
+                                "call_id": call.id,
+                                "tool_name": call.name,
+                                "is_error": true,
+                                "content": content,
+                                "offload_path": Value::Null,
+                                "duration_ms": 0,
+                            }),
+                        );
+                    }
+                    results.push(UserBlock::ToolResult {
+                        call_id: call.id.clone(),
+                        content,
+                        is_error: true,
+                    });
+                    memory_state.denied_entry_ids.insert(entry_id.clone());
+                    memory_state
+                        .denied_calls
+                        .push((call.name.clone(), call.input.clone()));
+                    memory_state.denies += 1;
+                    continue;
+                }
+
                 // Non-finish tool call: append ToolCallStarted before invoke,
                 // ToolCallResult after invoke (log-then-snapshot discipline).
                 if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
@@ -4712,7 +4983,10 @@ async fn run_loop_body(
                         .await?;
                 }
 
-                let content = render_tool_result(&result);
+                let mut content = render_tool_result(&result);
+                if let Some((memory::AppliedMode::Annotate, fact, entry_id)) = &memory_applied {
+                    content = format!("{content}\n\n{}", memory::annotation_block(fact, entry_id));
+                }
                 if writer.is_enabled() {
                     writer.emit(
                         "tool_result",
@@ -5282,6 +5556,11 @@ pub async fn resume(
         compaction_pre_reasoning_chars_sum: 0,
         compaction_pre_reasoning_turns: 0,
         post_compaction_reasoning_chars: Vec::new(),
+        memory_annotations: 0,
+        memory_denies: 0,
+        memory_kb_tool_calls: 0,
+        memory_deny_overrides: 0,
+        memory_degraded: None,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -7007,6 +7286,11 @@ mod tests {
             compaction_pre_reasoning_chars_sum: 0,
             compaction_pre_reasoning_turns: 0,
             post_compaction_reasoning_chars: Vec::new(),
+            memory_annotations: 0,
+            memory_denies: 0,
+            memory_kb_tool_calls: 0,
+            memory_deny_overrides: 0,
+            memory_degraded: None,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -13252,7 +13536,8 @@ mod tests {
                         other => panic!("unknown harness_message placement {other}"),
                     }
                 }
-                "iteration_end" | "backend_error" | "run_end" => {}
+                "iteration_end" | "backend_error" | "run_end" | "memory_slice"
+                | "memory_advice" => {}
                 other => panic!("unexpected event kind in reconstruction: {other}"),
             }
         }
@@ -14159,6 +14444,11 @@ mod tests {
             compaction_pre_reasoning_chars_sum: 0,
             compaction_pre_reasoning_turns: 0,
             post_compaction_reasoning_chars: Vec::new(),
+            memory_annotations: 0,
+            memory_denies: 0,
+            memory_kb_tool_calls: 0,
+            memory_deny_overrides: 0,
+            memory_degraded: None,
         }
     }
 
@@ -18951,5 +19241,1021 @@ mod tests {
         assert_eq!(stats.already_satisfied_check_rejections, 0);
         assert_eq!(stats.no_change_rejections, 0);
         assert_eq!(stub.calls(), 2);
+    }
+
+    // ---- memory seam (crate::memory; design 11, phase 1) ----------------
+
+    mod memory_seam {
+        use super::*;
+        use crate::memory::{
+            Advice, MEMORY_SLICE_HEADING, Memory, MemoryMode, ToolCallView, annotation_block,
+            append_session_slice, deny_content,
+        };
+        use crate::task_spec::{FileToModify, TaskSpec};
+        use serde_json::{Value, json};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const SLICE: &str = "Known gotchas for p from the KB (each replaces an earlier wrong belief):\n- use nextest [observed; kb-1]\n- no fixer hooks [observed; kb-2]\n";
+
+        /// A named test tool that returns a fixed summary and counts runs.
+        struct TestTool {
+            name: String,
+            description: String,
+            output: String,
+            runs: Arc<AtomicU32>,
+        }
+
+        impl TestTool {
+            fn new(name: &str, description: &str, output: &str) -> Self {
+                Self {
+                    name: name.into(),
+                    description: description.into(),
+                    output: output.into(),
+                    runs: Arc::new(AtomicU32::new(0)),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Tool for TestTool {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn schema(&self) -> Value {
+                json!({
+                    "name": self.name,
+                    "description": self.description,
+                    "input_schema": { "type": "object" },
+                })
+            }
+            async fn run(&self, _input: Value, _ctx: &ToolCtx) -> ToolResult {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                ToolResult::ok(self.output.clone())
+            }
+        }
+
+        #[derive(Default)]
+        struct Counters {
+            degraded: AtomicU32,
+            label: AtomicU32,
+            tools: AtomicU32,
+            slice: AtomicU32,
+            before: AtomicU32,
+        }
+
+        type AdviceFn = Box<dyn Fn(&ToolCallView) -> Advice + Send + Sync>;
+
+        /// A scriptable in-test memory counting every method call.
+        struct FakeMemory {
+            counters: Arc<Counters>,
+            slice: Option<String>,
+            degraded: Option<String>,
+            label: String,
+            /// `(name, description, output, runs)` per memory tool.
+            tools: Vec<(String, String, String, Arc<AtomicU32>)>,
+            advice: AdviceFn,
+        }
+
+        impl FakeMemory {
+            fn new() -> Self {
+                Self {
+                    counters: Arc::new(Counters::default()),
+                    slice: None,
+                    degraded: None,
+                    label: "fake".into(),
+                    tools: Vec::new(),
+                    advice: Box::new(|_| Advice::None),
+                }
+            }
+            fn slice(mut self, s: &str) -> Self {
+                self.slice = Some(s.into());
+                self
+            }
+            fn degraded(mut self, s: &str) -> Self {
+                self.degraded = Some(s.into());
+                self
+            }
+            fn tool(mut self, name: &str, description: &str, output: &str) -> Self {
+                self.tools.push((
+                    name.into(),
+                    description.into(),
+                    output.into(),
+                    Arc::new(AtomicU32::new(0)),
+                ));
+                self
+            }
+            fn advice(
+                mut self,
+                f: impl Fn(&ToolCallView) -> Advice + Send + Sync + 'static,
+            ) -> Self {
+                self.advice = Box::new(f);
+                self
+            }
+            fn tool_runs(&self, i: usize) -> Arc<AtomicU32> {
+                Arc::clone(&self.tools[i].3)
+            }
+        }
+
+        impl Memory for FakeMemory {
+            fn session_slice(&self) -> Option<String> {
+                self.counters.slice.fetch_add(1, Ordering::SeqCst);
+                self.slice.clone()
+            }
+            fn before_tool(&self, call: &ToolCallView) -> Advice {
+                self.counters.before.fetch_add(1, Ordering::SeqCst);
+                (self.advice)(call)
+            }
+            fn tools(&self) -> Vec<Box<dyn Tool>> {
+                self.counters.tools.fetch_add(1, Ordering::SeqCst);
+                self.tools
+                    .iter()
+                    .map(|(n, d, o, runs)| {
+                        Box::new(TestTool {
+                            name: n.clone(),
+                            description: d.clone(),
+                            output: o.clone(),
+                            runs: Arc::clone(runs),
+                        }) as Box<dyn Tool>
+                    })
+                    .collect()
+            }
+            fn degraded(&self) -> Option<String> {
+                self.counters.degraded.fetch_add(1, Ordering::SeqCst);
+                self.degraded.clone()
+            }
+            fn label(&self) -> String {
+                self.counters.label.fetch_add(1, Ordering::SeqCst);
+                self.label.clone()
+            }
+        }
+
+        fn deny(fact: &str, entry_id: &str) -> Advice {
+            Advice::DenyOnce {
+                fact: fact.into(),
+                entry_id: entry_id.into(),
+            }
+        }
+
+        fn annotate(fact: &str, entry_id: &str) -> Advice {
+            Advice::Annotate {
+                fact: fact.into(),
+                entry_id: entry_id.into(),
+            }
+        }
+
+        fn finish_blocked(id: &str) -> AssistantTurn {
+            finish_call(
+                id,
+                json!({"disposition": "blocked", "decision_needed": "q"}),
+            )
+        }
+
+        fn one_call(id: &str, name: &str, input: Value) -> AssistantTurn {
+            turn_with(vec![tool_call(id, name, input)], StopReason::ToolUse)
+        }
+
+        fn echo_script() -> Vec<AssistantTurn> {
+            vec![
+                one_call("c1", "echo", json!({"i": 1})),
+                finish_blocked("cf"),
+            ]
+        }
+
+        fn spec_task() -> String {
+            prompt::render_task_prompt_from_spec(&TaskSpec {
+                title: "Add a thing".into(),
+                description: "Do the thing.".into(),
+                acceptance_criteria: vec!["the thing exists".into(), "the gate is green".into()],
+                files_to_modify: vec![FileToModify {
+                    path: "src/lib.rs".into(),
+                    change: "add the thing".into(),
+                }],
+                gate_command: "cargo test".into(),
+            })
+        }
+
+        /// Run `script` on `tools` with `config`, returning the result, the
+        /// backend and the transcript lines (empty when no transcript).
+        async fn go(
+            script: Vec<AssistantTurn>,
+            tools: &ToolRegistry,
+            config: &RunConfig,
+        ) -> (RunResult, MockBackend, Vec<Value>) {
+            let backend = MockBackend::from_turns(script);
+            let ctx = ToolCtx::stub();
+            let result = run(&backend, tools, &ctx, config).await;
+            let lines = config
+                .transcript
+                .as_ref()
+                .map(|t| read_transcript_lines(&t.path))
+                .unwrap_or_default();
+            (result, backend, lines)
+        }
+
+        fn events_named<'a>(lines: &'a [Value], event: &str) -> Vec<&'a Value> {
+            lines.iter().filter(|l| l["event"] == event).collect()
+        }
+
+        fn advice_for<'a>(lines: &'a [Value], call_id: &str) -> &'a Value {
+            lines
+                .iter()
+                .find(|l| l["event"] == "memory_advice" && l["call_id"] == call_id)
+                .unwrap_or_else(|| panic!("no memory_advice for {call_id}"))
+        }
+
+        fn index_of(lines: &[Value], event: &str, call_id: &str) -> usize {
+            lines
+                .iter()
+                .position(|l| l["event"] == event && l["call_id"] == call_id)
+                .unwrap_or_else(|| panic!("no {event} for {call_id}"))
+        }
+
+        /// The fed-back `ToolResult` block for `call_id`, across every request.
+        fn fed_back(backend: &MockBackend, call_id: &str) -> (String, bool) {
+            for history in backend.messages_seen().iter().rev() {
+                for m in history {
+                    if let Message::User { content } = m {
+                        for b in content {
+                            if let UserBlock::ToolResult {
+                                call_id: id,
+                                content,
+                                is_error,
+                            } = b
+                                && id == call_id
+                            {
+                                return (content.clone(), *is_error);
+                            }
+                        }
+                    }
+                }
+            }
+            panic!("no fed-back result for {call_id}");
+        }
+
+        fn assert_advice(line: &Value, advised: &str, applied: &str, reason: &str) {
+            assert_eq!(line["advised"], advised, "{line}");
+            assert_eq!(line["mode_applied"], applied, "{line}");
+            assert_eq!(line["reason"], reason, "{line}");
+        }
+
+        fn run_end_stats(lines: &[Value]) -> &Value {
+            &lines.last().expect("lines")["stats"]
+        }
+
+        fn registry_with_bash() -> (ToolRegistry, Arc<AtomicU32>) {
+            let mut tools = registry_with_finish_and_echo();
+            let bash = TestTool::new("bash", "run a command", "ran");
+            let runs = Arc::clone(&bash.runs);
+            tools.register("bash", Arc::new(bash));
+            (tools, runs)
+        }
+
+        fn bash_deny_memory() -> FakeMemory {
+            FakeMemory::new().advice(|c| {
+                if c.name == "bash" {
+                    deny("use cargo nextest", "kb-1")
+                } else {
+                    Advice::None
+                }
+            })
+        }
+
+        fn cmd(c: &str) -> Value {
+            json!({ "command": c })
+        }
+
+        #[test]
+        fn run_config_defaults_memory_off() {
+            let config = RunConfig::new("t", 1);
+            assert_eq!(config.memory_mode, MemoryMode::Off);
+            let debug = format!("{:?}", RunConfig::new("t", 1));
+            assert!(debug.contains("dyn Memory"), "{debug}");
+            assert!(debug.contains("memory_mode: Off"), "{debug}");
+            let with = RunConfig::new("t", 1)
+                .with_memory(Arc::new(FakeMemory::new()), MemoryMode::DenyOnce);
+            assert_eq!(with.memory_mode, MemoryMode::DenyOnce);
+        }
+
+        #[tokio::test]
+        async fn memory_off_is_byte_identical_to_no_memory() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new()
+                .slice(SLICE)
+                .degraded("x")
+                .tool("kb_search", "search the KB", "hits")
+                .advice(|_| deny("f", "kb-1"));
+            let counters = Arc::clone(&fake.counters);
+
+            let config_a =
+                RunConfig::new(spec_task(), 5).with_transcript(dir.path().join("a.jsonl"), "t");
+            let config_b = RunConfig::new(spec_task(), 5)
+                .with_memory(Arc::new(fake), MemoryMode::Off)
+                .with_transcript(dir.path().join("b.jsonl"), "t");
+            let (_, a, lines_a) = go(echo_script(), &tools, &config_a).await;
+            let (res_b, b, lines_b) = go(echo_script(), &tools, &config_b).await;
+
+            assert_eq!(a.systems_seen(), b.systems_seen());
+            assert_eq!(a.messages_seen(), b.messages_seen());
+            assert_eq!(a.tools_seen(), b.tools_seen());
+            for c in [
+                &counters.degraded,
+                &counters.label,
+                &counters.tools,
+                &counters.slice,
+                &counters.before,
+            ] {
+                assert_eq!(c.load(Ordering::SeqCst), 0);
+            }
+            let s = &res_b.stats;
+            assert_eq!(
+                (
+                    s.memory_annotations,
+                    s.memory_denies,
+                    s.memory_kb_tool_calls,
+                    s.memory_deny_overrides
+                ),
+                (0, 0, 0, 0)
+            );
+            assert_eq!(s.memory_degraded, None);
+            let ev = |ls: &[Value]| ls.iter().map(|l| l["event"].clone()).collect::<Vec<_>>();
+            assert_eq!(ev(&lines_a), ev(&lines_b));
+            for key in ["system", "tools", "messages", "config"] {
+                assert_eq!(lines_a[0][key], lines_b[0][key], "run_start.{key}");
+            }
+            assert_eq!(lines_a[0]["config"]["memory_mode"], "off");
+            assert_eq!(lines_b[0]["config"]["memory_mode"], "off");
+        }
+
+        #[tokio::test]
+        async fn memory_degraded_falls_back_to_off() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new()
+                .degraded("kb unreachable")
+                .slice(SLICE)
+                .tool("kb_search", "search the KB", "hits")
+                .advice(|_| deny("f", "kb-1"));
+            let counters = Arc::clone(&fake.counters);
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(echo_script(), &tools, &config).await;
+            let (_, plain, _) = go(echo_script(), &tools, &RunConfig::new("do the task", 5)).await;
+
+            assert_eq!(counters.degraded.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.label.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.tools.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.slice.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.before.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.systems_seen(), plain.systems_seen());
+            assert_eq!(backend.tools_seen(), plain.tools_seen());
+            assert_eq!(backend.messages_seen(), plain.messages_seen());
+
+            assert_eq!(lines[1]["event"], "memory_slice");
+            assert_eq!(lines[1]["items"], 0);
+            assert_eq!(lines[1]["chars"], 0);
+            assert_eq!(lines[1]["degraded"], "kb unreachable");
+            assert_eq!(lines[1]["source"], "fake");
+            assert_eq!(lines[1]["memory_tools"], json!([]));
+            assert_eq!(lines[1]["memory_tools_dropped"], json!([]));
+            assert!(events_named(&lines, "memory_advice").is_empty());
+            assert_eq!(res.stats.memory_degraded, Some("kb unreachable".into()));
+            let end = run_end_stats(&lines);
+            assert_eq!(end["memory_degraded"], "kb unreachable");
+            for k in [
+                "memory_annotations",
+                "memory_denies",
+                "memory_kb_tool_calls",
+                "memory_deny_overrides",
+            ] {
+                assert_eq!(end[k], 0, "{k}");
+            }
+            let s = &res.stats;
+            assert_eq!(
+                (
+                    s.memory_annotations,
+                    s.memory_denies,
+                    s.memory_kb_tool_calls,
+                    s.memory_deny_overrides
+                ),
+                (0, 0, 0, 0)
+            );
+            assert_eq!(lines[0]["config"]["memory_mode"], "annotate");
+        }
+
+        #[tokio::test]
+        async fn session_slice_is_appended_to_the_system_prompt() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let (_, plain, _) = go(echo_script(), &tools, &RunConfig::new("do the task", 5)).await;
+            let base = plain.systems_seen()[0].clone().unwrap();
+
+            let fake = FakeMemory::new().slice(SLICE);
+            let counters = Arc::clone(&fake.counters);
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (_, backend, lines) = go(echo_script(), &tools, &config).await;
+            let expected = append_session_slice(&base, SLICE);
+            let systems = backend.systems_seen();
+            assert_eq!(systems[0].as_deref(), Some(expected.as_str()));
+            assert!(
+                systems
+                    .iter()
+                    .all(|s| s.as_deref() == Some(expected.as_str()))
+            );
+            assert_eq!(lines[0]["system"], expected);
+            assert_eq!(lines[1]["event"], "memory_slice");
+            assert_eq!(lines[1]["items"], 2);
+            assert_eq!(lines[1]["chars"], 137);
+            assert!(lines[1]["degraded"].is_null());
+            assert_eq!(lines[1]["source"], "fake");
+            // Each run-start method once; before_tool once (the echo call).
+            assert_eq!(counters.degraded.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.label.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.tools.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.slice.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.before.load(Ordering::SeqCst), 1);
+            // Advice::None emits no memory_advice and leaves content alone.
+            assert!(events_named(&lines, "memory_advice").is_empty());
+            assert_eq!(fed_back(&backend, "c1").0, r#"{"i":1}"#);
+        }
+
+        #[tokio::test]
+        async fn absent_or_blank_slice_leaves_the_system_prompt_alone() {
+            let tools = registry_with_finish_and_echo();
+            let (_, plain, _) = go(echo_script(), &tools, &RunConfig::new("do the task", 5)).await;
+            let base = plain.systems_seen()[0].clone();
+            for slice in [None, Some("  \n ")] {
+                let dir = TempDir::new().expect("tempdir");
+                let mut fake = FakeMemory::new();
+                fake.slice = slice.map(str::to_string);
+                let config = RunConfig::new("do the task", 5)
+                    .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                    .with_transcript(dir.path().join("t.jsonl"), "t");
+                let (_, backend, lines) = go(echo_script(), &tools, &config).await;
+                assert_eq!(backend.systems_seen()[0], base);
+                assert_eq!(lines[1]["event"], "memory_slice");
+                assert_eq!(lines[1]["items"], 0);
+                assert_eq!(lines[1]["chars"], 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn session_slice_is_appended_in_answer_mode() {
+            let tools = registry_with_finish_and_echo();
+            let script = || vec![finish_blocked("cf")];
+            let answer = RunConfig::new("q", 5).with_answer_schema(verdict_schema());
+            let (_, plain, _) = go(script(), &tools, &answer).await;
+            let answer_base = plain.systems_seen()[0].clone().unwrap();
+            let config = answer.clone().with_memory(
+                Arc::new(FakeMemory::new().slice(SLICE)),
+                MemoryMode::Annotate,
+            );
+            let (_, backend, _) = go(script(), &tools, &config).await;
+            assert_eq!(
+                backend.systems_seen()[0].as_deref(),
+                Some(append_session_slice(&answer_base, SLICE).as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn session_slice_survives_compaction() {
+            let mut script = eleven_hot_echo_turns();
+            script.push(finish_call(
+                "cf",
+                json!({ "disposition": "done", "summary": "ok" }),
+            ));
+            let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+            let tools = registry_with_finish_and_echo();
+            let ctx = ToolCtx::stub();
+            let config = RunConfig::new("do the task", 20).with_memory(
+                Arc::new(FakeMemory::new().slice(SLICE)),
+                MemoryMode::Annotate,
+            );
+            let RunResult { stats, .. } = run(&backend, &tools, &ctx, &config).await;
+            assert_eq!(stats.compactions, 1);
+            let systems = backend.systems_seen();
+            assert_eq!(systems.len(), 12);
+            assert!(systems.iter().all(|s| s.is_some() && *s == systems[0]));
+            for s in &systems {
+                let s = s.as_deref().unwrap();
+                assert!(s.contains(MEMORY_SLICE_HEADING));
+                assert!(s.contains("use nextest [observed; kb-1]"));
+            }
+        }
+
+        #[tokio::test]
+        async fn finish_calls_never_reach_before_tool() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().advice(|_| deny("f", "kb-1"));
+            let counters = Arc::clone(&fake.counters);
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::DenyOnce)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let blocked = json!({"disposition": "blocked", "decision_needed": "q"});
+            let script = vec![turn_with(
+                vec![
+                    tool_call("cf1", FINISH_TOOL_NAME, blocked.clone()),
+                    tool_call("cf2", FINISH_TOOL_NAME, blocked),
+                ],
+                StopReason::ToolUse,
+            )];
+            let (res, _, lines) = go(script, &tools, &config).await;
+            assert!(
+                matches!(
+                    res.outcome,
+                    LoopOutcome::Finished(Disposition::Blocked { .. })
+                ),
+                "{:?}",
+                res.outcome
+            );
+            assert_eq!(counters.before.load(Ordering::SeqCst), 0);
+            assert!(events_named(&lines, "memory_advice").is_empty());
+        }
+
+        #[tokio::test]
+        async fn annotate_appends_the_block_to_the_tool_result() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().advice(|c| {
+                if c.name == "echo" {
+                    annotate("use cargo nextest", "kb-1")
+                } else {
+                    Advice::None
+                }
+            });
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(echo_script(), &tools, &config).await;
+            let expected = "{\"i\":1}\n\n[KB memory] use cargo nextest (kb: kb-1)";
+            let seen = backend.messages_seen();
+            let Some(Message::User { content }) = seen[1].last() else {
+                panic!("expected a trailing user message");
+            };
+            assert_eq!(
+                content.last(),
+                Some(&UserBlock::ToolResult {
+                    call_id: "c1".into(),
+                    content: expected.into(),
+                    is_error: false,
+                })
+            );
+            assert_eq!(res.stats.memory_annotations, 1);
+            assert_eq!(res.stats.memory_denies, 0);
+            let adv = advice_for(&lines, "c1");
+            assert_eq!(*adv, {
+                let mut v = json!({
+                    "iteration": 1, "call_id": "c1", "tool": "echo", "entry_id": "kb-1",
+                    "advised": "annotate", "mode_applied": "annotate", "reason": "as_advised",
+                });
+                v["event"] = adv["event"].clone();
+                v["ts"] = adv["ts"].clone();
+                v["elapsed_ms"] = adv["elapsed_ms"].clone();
+                v
+            });
+            let tr = index_of(&lines, "tool_result", "c1");
+            assert!(index_of(&lines, "memory_advice", "c1") < tr);
+            assert_eq!(lines[tr]["content"], expected);
+        }
+
+        #[tokio::test]
+        async fn deny_once_scenario() {
+            let dir = TempDir::new().expect("tempdir");
+            let (tools, runs) = registry_with_bash();
+            let fake = bash_deny_memory();
+            let counters = Arc::clone(&fake.counters);
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(Arc::new(fake), MemoryMode::DenyOnce)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let script = vec![
+                one_call("c1", "bash", cmd("cargo test")),
+                one_call("c2", "bash", cmd("cargo test")),
+                one_call("c3", "bash", cmd("cargo test --all")),
+                finish_blocked("cf"),
+            ];
+            let (res, backend, lines) = go(script, &tools, &config).await;
+            let denied = deny_content("use cargo nextest", "kb-1");
+            let annotated = "ran\n\n[KB memory] use cargo nextest (kb: kb-1)".to_string();
+
+            assert_eq!(fed_back(&backend, "c1"), (denied.clone(), true));
+            assert_advice(
+                advice_for(&lines, "c1"),
+                "deny_once",
+                "deny_once",
+                "as_advised",
+            );
+            assert_eq!(fed_back(&backend, "c2"), (annotated.clone(), false));
+            assert_advice(
+                advice_for(&lines, "c2"),
+                "deny_once",
+                "annotate",
+                "retry_of_denied",
+            );
+            assert_eq!(fed_back(&backend, "c3"), (annotated, false));
+            assert_advice(
+                advice_for(&lines, "c3"),
+                "deny_once",
+                "annotate",
+                "entry_already_denied",
+            );
+
+            let tr = &lines[index_of(&lines, "tool_result", "c1")];
+            assert_eq!(tr["content"], denied);
+            assert_eq!(tr["is_error"], true);
+            assert!(tr["offload_path"].is_null());
+            assert_eq!(tr["duration_ms"], 0);
+
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            assert_eq!(counters.before.load(Ordering::SeqCst), 3);
+            let s = &res.stats;
+            assert_eq!(s.memory_denies, 1);
+            assert_eq!(s.memory_annotations, 2);
+            assert_eq!(s.memory_deny_overrides, 1);
+            assert_eq!(s.memory_kb_tool_calls, 0);
+            assert_eq!(s.bash_calls_ok, 2);
+            let end = run_end_stats(&lines);
+            assert_eq!(end["memory_denies"], 1);
+            assert_eq!(end["memory_annotations"], 2);
+            assert_eq!(end["memory_deny_overrides"], 1);
+            assert_eq!(end["memory_kb_tool_calls"], 0);
+            assert!(end["memory_degraded"].is_null());
+        }
+
+        #[tokio::test]
+        async fn deny_cap_downgrades_the_third_deny() {
+            let dir = TempDir::new().expect("tempdir");
+            let (tools, _) = registry_with_bash();
+            let fake = FakeMemory::new().advice(|c| match c.args["command"].as_str() {
+                Some("a") => deny("f", "kb-1"),
+                Some("b") => deny("f", "kb-2"),
+                Some("c") => deny("f", "kb-3"),
+                _ => Advice::None,
+            });
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(Arc::new(fake), MemoryMode::DenyOnce)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let script = vec![
+                one_call("c1", "bash", cmd("a")),
+                one_call("c2", "bash", cmd("b")),
+                one_call("c3", "bash", cmd("c")),
+                finish_blocked("cf"),
+            ];
+            let (res, _, lines) = go(script, &tools, &config).await;
+            assert_advice(
+                advice_for(&lines, "c1"),
+                "deny_once",
+                "deny_once",
+                "as_advised",
+            );
+            assert_advice(
+                advice_for(&lines, "c2"),
+                "deny_once",
+                "deny_once",
+                "as_advised",
+            );
+            assert_advice(
+                advice_for(&lines, "c3"),
+                "deny_once",
+                "annotate",
+                "deny_cap_reached",
+            );
+            assert_eq!(res.stats.memory_denies, 2);
+            assert_eq!(res.stats.memory_annotations, 1);
+        }
+
+        #[tokio::test]
+        async fn same_batch_duplicate_is_a_retry_of_the_denied_call() {
+            let dir = TempDir::new().expect("tempdir");
+            let (tools, runs) = registry_with_bash();
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(Arc::new(bash_deny_memory()), MemoryMode::DenyOnce)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let script = vec![
+                turn_with(
+                    vec![
+                        tool_call("c1", "bash", cmd("cargo test")),
+                        tool_call("c2", "bash", cmd("cargo test")),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                finish_blocked("cf"),
+            ];
+            let (res, backend, lines) = go(script, &tools, &config).await;
+            assert_advice(
+                advice_for(&lines, "c1"),
+                "deny_once",
+                "deny_once",
+                "as_advised",
+            );
+            assert!(fed_back(&backend, "c1").1);
+            assert_advice(
+                advice_for(&lines, "c2"),
+                "deny_once",
+                "annotate",
+                "retry_of_denied",
+            );
+            assert_eq!(
+                fed_back(&backend, "c2"),
+                (
+                    "ran\n\n[KB memory] use cargo nextest (kb: kb-1)".into(),
+                    false
+                )
+            );
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            assert_eq!(res.stats.memory_denies, 1);
+            assert_eq!(res.stats.memory_deny_overrides, 1);
+        }
+
+        #[tokio::test]
+        async fn a_denied_bash_is_not_an_observation() {
+            let (tools, runs) = registry_with_bash();
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(Arc::new(bash_deny_memory()), MemoryMode::DenyOnce);
+            let script = vec![
+                one_call("c1", "bash", cmd("cargo test")),
+                finish_blocked("cf"),
+            ];
+            let (res, _, _) = go(script, &tools, &config).await;
+            assert_eq!(runs.load(Ordering::SeqCst), 0);
+            assert_eq!(res.stats.bash_calls_ok, 0);
+            assert!(!res.stats.tree_dirty);
+            assert_eq!(res.stats.memory_denies, 1);
+        }
+
+        #[tokio::test]
+        async fn a_denied_run_checks_leaves_the_gate_oracle_alone() {
+            let mut tools = registry_with_finish_and_echo();
+            tools.register(
+                "run_checks",
+                Arc::new(TestTool::new("run_checks", "gate", "green")),
+            );
+            let fake = FakeMemory::new().advice(|c| {
+                if c.args.get("x").is_some() {
+                    deny("f", "kb-9")
+                } else {
+                    Advice::None
+                }
+            });
+            let config =
+                RunConfig::new("do the task", 10).with_memory(Arc::new(fake), MemoryMode::DenyOnce);
+            let script = vec![
+                turn_with(
+                    vec![
+                        tool_call("c1", "run_checks", json!({})),
+                        tool_call("c2", "run_checks", json!({"x": 1})),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                finish_blocked("cf"),
+            ];
+            let (res, backend, _) = go(script, &tools, &config).await;
+            assert!(fed_back(&backend, "c2").1, "c2 is denied");
+            assert_eq!(res.stats.memory_denies, 1);
+            assert!(res.stats.gates_green_at_exit);
+        }
+
+        #[tokio::test]
+        async fn annotate_mode_is_a_ceiling_on_deny() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().advice(|c| {
+                if c.name == "echo" {
+                    deny("use cargo nextest", "kb-1")
+                } else {
+                    Advice::None
+                }
+            });
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(echo_script(), &tools, &config).await;
+            assert_advice(
+                advice_for(&lines, "c1"),
+                "deny_once",
+                "annotate",
+                "mode_ceiling",
+            );
+            assert_eq!(
+                fed_back(&backend, "c1"),
+                (
+                    format!(
+                        "{{\"i\":1}}\n\n{}",
+                        annotation_block("use cargo nextest", "kb-1")
+                    ),
+                    false
+                )
+            );
+            assert_eq!(res.stats.memory_denies, 0);
+            assert_eq!(res.stats.memory_annotations, 1);
+        }
+
+        #[tokio::test]
+        async fn blank_advice_is_suppressed() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().advice(|c| {
+                if c.name == "echo" {
+                    annotate("  ", "kb-1")
+                } else {
+                    Advice::None
+                }
+            });
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(echo_script(), &tools, &config).await;
+            assert_advice(
+                advice_for(&lines, "c1"),
+                "annotate",
+                "suppressed",
+                "blank_advice",
+            );
+            assert_eq!(fed_back(&backend, "c1"), (r#"{"i":1}"#.into(), false));
+            assert_eq!(res.stats.memory_annotations, 0);
+            assert_eq!(res.stats.memory_denies, 0);
+        }
+
+        fn kb_search_schema() -> Value {
+            json!({"name": "kb_search", "description": "search the KB", "input_schema": {"type": "object"}})
+        }
+
+        fn kb_script() -> Vec<AssistantTurn> {
+            vec![
+                one_call("k1", "kb_search", json!({"q": "x"})),
+                finish_blocked("cf"),
+            ]
+        }
+
+        #[tokio::test]
+        async fn memory_tools_are_registered_and_counted() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().tool("kb_search", "search the KB", "hits");
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(kb_script(), &tools, &config).await;
+            assert!(backend.tools_seen()[0].contains(&kb_search_schema()));
+            assert!(
+                backend.systems_seen()[0]
+                    .as_deref()
+                    .unwrap()
+                    .contains("- kb_search — search the KB")
+            );
+            assert_eq!(lines[1]["memory_tools"], json!(["kb_search"]));
+            assert_eq!(fed_back(&backend, "k1"), ("hits".into(), false));
+            assert_eq!(res.stats.memory_kb_tool_calls, 1);
+            assert_eq!(run_end_stats(&lines)["memory_kb_tool_calls"], 1);
+        }
+
+        #[tokio::test]
+        async fn memory_tools_are_absent_when_off() {
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().tool("kb_search", "search the KB", "hits");
+            let config =
+                RunConfig::new("do the task", 5).with_memory(Arc::new(fake), MemoryMode::Off);
+            let (res, backend, _) = go(kb_script(), &tools, &config).await;
+            assert!(!backend.tools_seen()[0].contains(&kb_search_schema()));
+            let (content, is_error) = fed_back(&backend, "k1");
+            assert!(content.starts_with("unknown tool `"), "{content}");
+            assert!(is_error);
+            assert_eq!(res.stats.memory_kb_tool_calls, 0);
+        }
+
+        #[tokio::test]
+        async fn a_denied_memory_tool_call_still_counts() {
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new()
+                .tool("kb_search", "search the KB", "hits")
+                .advice(|c| {
+                    if c.name == "kb_search" {
+                        deny("f", "kb-1")
+                    } else {
+                        Advice::None
+                    }
+                });
+            let kb_runs = fake.tool_runs(0);
+            let config =
+                RunConfig::new("do the task", 5).with_memory(Arc::new(fake), MemoryMode::DenyOnce);
+            let (res, backend, _) = go(kb_script(), &tools, &config).await;
+            assert!(fed_back(&backend, "k1").1);
+            assert_eq!(kb_runs.load(Ordering::SeqCst), 0);
+            assert_eq!(res.stats.memory_kb_tool_calls, 1);
+            assert_eq!(res.stats.memory_denies, 1);
+        }
+
+        #[tokio::test]
+        async fn a_colliding_memory_tool_is_dropped() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with_finish_and_echo();
+            let fake = FakeMemory::new().tool("echo", "fake echo", "fake");
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(fake), MemoryMode::Annotate)
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let (res, backend, lines) = go(echo_script(), &tools, &config).await;
+            let schemas = backend.tools_seen()[0].clone();
+            assert!(schemas.contains(&EchoTool.schema()));
+            assert_eq!(
+                EchoTool.schema()["description"],
+                "Returns its JSON input unchanged as the result summary."
+            );
+            assert!(!Value::Array(schemas).to_string().contains("fake echo"));
+            assert_eq!(lines[1]["memory_tools"], json!([]));
+            assert_eq!(lines[1]["memory_tools_dropped"], json!(["echo"]));
+            assert_eq!(fed_back(&backend, "c1"), (r#"{"i":1}"#.into(), false));
+            assert_eq!(res.stats.memory_kb_tool_calls, 0);
+        }
+
+        #[tokio::test]
+        async fn a_denied_call_is_persisted_as_started_then_errored() {
+            let (tools, _) = registry_with_bash();
+            let store = Arc::new(SqliteRunStore::open_in_memory().expect("open"));
+            let pers = make_persistence(store.clone());
+            let config = RunConfig::new("do the task", 5)
+                .with_memory(Arc::new(bash_deny_memory()), MemoryMode::DenyOnce);
+            let backend = MockBackend::from_turns(vec![
+                one_call("c1", "bash", cmd("cargo test")),
+                finish_blocked("cf"),
+            ]);
+            let ctx = ToolCtx::stub();
+            run_persisted(&backend, &tools, &ctx, &config, &pers)
+                .await
+                .expect("no store error");
+            let events = store.list_events(FIXTURE_RID).await.expect("list events");
+            let at = events
+                .iter()
+                .position(|e| {
+                    matches!(e, Event::ToolCallStarted { name, call_id, .. } if name == "bash" && call_id == "c1")
+                })
+                .expect("ToolCallStarted for c1");
+            match &events[at + 1] {
+                Event::ToolCallResult {
+                    name,
+                    is_error,
+                    summary,
+                    offload_path,
+                    ..
+                } => {
+                    assert_eq!(name, "bash");
+                    assert!(*is_error);
+                    assert_eq!(summary, &deny_content("use cargo nextest", "kb-1"));
+                    assert!(offload_path.is_none());
+                }
+                other => panic!("expected ToolCallResult; got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn run_start_config_records_the_memory_mode() {
+            for (config, expected) in [
+                (RunConfig::new("do the task", 5), "off"),
+                (
+                    RunConfig::new("do the task", 5)
+                        .with_memory(Arc::new(FakeMemory::new()), MemoryMode::DenyOnce),
+                    "deny-once",
+                ),
+            ] {
+                let dir = TempDir::new().expect("tempdir");
+                let config = config.with_transcript(dir.path().join("t.jsonl"), "t");
+                let (_, _, lines) =
+                    go(echo_script(), &registry_with_finish_and_echo(), &config).await;
+                assert_eq!(lines[0]["config"]["memory_mode"], expected);
+                assert_eq!(lines[0]["transcript_version"], 4);
+            }
+        }
+
+        #[tokio::test]
+        async fn memory_transcript_reconstructs() {
+            let dir = TempDir::new().expect("tempdir");
+            let (tools, _) = registry_with_bash();
+            let config = RunConfig::new("do the task", 10)
+                .with_memory(
+                    Arc::new(bash_deny_memory().slice(SLICE)),
+                    MemoryMode::DenyOnce,
+                )
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let script = vec![
+                one_call("c1", "bash", cmd("cargo test")),
+                one_call("c2", "bash", cmd("cargo test")),
+                one_call("c3", "bash", cmd("cargo test --all")),
+                finish_blocked("cf"),
+            ];
+            let (_, backend, lines) = go(script, &tools, &config).await;
+            for line in &lines {
+                let event = line["event"].as_str().expect("event");
+                assert!(crate::transcript::EVENT_KINDS.contains(&event), "{event}");
+            }
+            assert_reconstruction_matches(&lines, &backend);
+            assert!(
+                backend.systems_seen()[0]
+                    .as_deref()
+                    .unwrap()
+                    .contains(MEMORY_SLICE_HEADING)
+            );
+        }
     }
 }
