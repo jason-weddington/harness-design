@@ -103,6 +103,12 @@ pub trait Memory: Send + Sync {
     fn label(&self) -> String {
         "custom".to_string()
     }
+
+    /// The session id this memory reports to its backing store, recorded as
+    /// `memory_slice.kb_session_id` when `Some`. Default `None` (no store).
+    fn session_id(&self) -> Option<String> {
+        None
+    }
 }
 
 impl fmt::Debug for dyn Memory {

@@ -446,6 +446,7 @@ pub struct PersonalKbMemory {
     tool_map: BTreeMap<String, String>,
     endpoint: Option<KbEndpoint>,
     kb_tools: Vec<Arc<dyn Tool>>,
+    session_id: String,
 }
 
 impl PersonalKbMemory {
@@ -479,6 +480,7 @@ impl PersonalKbMemory {
             tool_map: BTreeMap::new(),
             endpoint,
             kb_tools: Vec::new(),
+            session_id: session_id.to_string(),
         };
         let endpoint = match endpoint {
             Ok(e) => e,
@@ -508,6 +510,7 @@ impl PersonalKbMemory {
                     tool_map: p.tool_map.unwrap_or_default(),
                     endpoint: Some(endpoint),
                     kb_tools: Vec::new(),
+                    session_id: session_id.to_string(),
                 }
             }
         }
@@ -587,6 +590,10 @@ impl Memory for PersonalKbMemory {
 
     fn label(&self) -> String {
         self.label.clone()
+    }
+
+    fn session_id(&self) -> Option<String> {
+        Some(self.session_id.clone())
     }
 }
 

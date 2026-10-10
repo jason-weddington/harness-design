@@ -1936,6 +1936,13 @@ struct MemoryWiring {
     kb_mcp_report: Option<McpConnectReport>,
 }
 
+/// The KB session id for one talos invocation: unique per process start, so
+/// concurrent or repeated runs sharing a `--task-id` (e.g. Harbor's `harbor`)
+/// never collapse into one KB session.
+fn kb_session_id(run_id: &str, unix_ms: u128, pid: u32) -> String {
+    format!("talos:{run_id}:{unix_ms}:{pid}")
+}
+
 /// Build the `--memory` adapter. With [`MemoryMode::Off`] this returns
 /// `None` WITHOUT calling `env`, touching the filesystem or opening a socket
 /// (eval isolation). Otherwise the project is `kb_project` (trimmed, when
@@ -2229,11 +2236,18 @@ async fn run_cmd(args: RunArgs) {
     // `--memory`: built before the run, after the workspace is known (the
     // `.kb_project` walk-up starts at its root). Off returns `None` without
     // reading any `PERSONAL_KB_*` env.
+    let kb_session = kb_session_id(
+        &run_id(&args.task_id, args.attempt),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+        std::process::id(),
+    );
     let memory = build_memory(
         args.memory,
         args.kb_project.as_deref(),
         &workspace_root,
-        &run_id(&args.task_id, args.attempt),
+        &kb_session,
         &env_accessor,
     )
     .await;
@@ -2595,6 +2609,14 @@ async fn run_ralph_cmd(args: RalphArgs) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kb_session_id_format() {
+        assert_eq!(
+            super::kb_session_id("harbor:1", 1_760_140_800_123, 4242),
+            "talos:harbor:1:1760140800123:4242"
+        );
+    }
+
     use super::{
         Backend, DEFAULT_TOKEN_BUDGET, DEFAULT_WALL_CLOCK_SECS, MAX_REPORT_NAMES, PruneReport,
         RalphSummary, RunConfig, RunMode, RunSummary, SECS_PER_DAY, backend_from_env,

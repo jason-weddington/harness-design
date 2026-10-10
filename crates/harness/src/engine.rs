@@ -3774,6 +3774,13 @@ struct MemoryRun {
 fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunStats) -> MemoryRun {
     let degraded = memory.degraded();
     let source = memory.label();
+    let kb_session_id = memory.session_id();
+    let with_session = |mut ev: Value| {
+        if let Some(id) = &kb_session_id {
+            ev["kb_session_id"] = json!(id);
+        }
+        ev
+    };
     if let Some(reason) = degraded {
         eprintln!("warning: memory degraded to off ({reason})");
         stats.memory_degraded = Some(reason.clone());
@@ -3782,14 +3789,14 @@ fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunSt
             registry: None,
             tool_names: Vec::new(),
             slice: None,
-            slice_event: json!({
+            slice_event: with_session(json!({
                 "items": 0,
                 "chars": 0,
                 "degraded": reason,
                 "source": source,
                 "memory_tools": [],
                 "memory_tools_dropped": [],
-            }),
+            })),
         };
     }
     let mut registry = tools.clone();
@@ -3816,14 +3823,14 @@ fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunSt
     let (items, chars) = slice
         .as_deref()
         .map_or((0, 0), |s| (memory::slice_item_count(s), s.chars().count()));
-    let slice_event = json!({
+    let slice_event = with_session(json!({
         "items": items,
         "chars": chars,
         "degraded": Value::Null,
         "source": source,
         "memory_tools": tool_names,
         "memory_tools_dropped": dropped,
-    });
+    }));
     MemoryRun {
         active: true,
         registry: Some(registry),

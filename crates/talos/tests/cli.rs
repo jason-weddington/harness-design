@@ -3277,6 +3277,15 @@ fn memory_deny_once_fake_kb_appends_slice() {
     assert!(first.starts_with("GET /api/kb/prevention?"), "{head}");
     assert!(first.contains("project=fake-project"), "{head}");
     assert!(first.contains("session_id="), "{head}");
+    let sent_session = first
+        .split(['?', '&', ' '])
+        .find_map(|kv| kv.strip_prefix("session_id="))
+        .expect("session_id query param")
+        .replace("%3A", ":");
+    assert!(
+        sent_session.starts_with("talos:cli-test-memory:1:"),
+        "{head}"
+    );
     assert!(!head.contains("cwd="), "{head}");
     let lower = head.to_ascii_lowercase();
     assert!(
@@ -3311,6 +3320,7 @@ fn memory_deny_once_fake_kb_appends_slice() {
     );
     assert_eq!(slice["memory_tools"], serde_json::json!([]));
     assert_eq!(slice["memory_tools_dropped"], serde_json::json!([]));
+    assert_eq!(slice["kb_session_id"], sent_session.as_str(), "{slice}");
     no_kb_tools(run_start);
     // The fake serves one connection, so the KB MCP connect fails open.
     assert!(

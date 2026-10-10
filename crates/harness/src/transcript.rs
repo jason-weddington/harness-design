@@ -104,6 +104,8 @@
 //!   [`crate::memory::Memory::label`]), `memory_tools` (the sorted names of
 //!   the memory tools actually registered) and `memory_tools_dropped` (the
 //!   sorted names dropped because they collided with a registered tool).
+//!   Plus `kb_session_id` (string) when the memory reports a session id to
+//!   a backing store ([`crate::memory::Memory::session_id`]); absent otherwise.
 //!   A degraded memory always records `items: 0`, `chars: 0` and empty tool
 //!   lists. The slice text itself is in `run_start.system`.
 //!
