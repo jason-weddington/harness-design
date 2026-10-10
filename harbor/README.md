@@ -29,6 +29,8 @@ uv run harbor run -p <task-or-dataset> --agent-import-path talos_harbor.agent:Ta
 | `max_iterations` | unset | Passed as `talos run --max-iterations`. |
 | `wall_clock_secs` | unset | Passed as `talos run --wall-clock-secs`. |
 | `gate_timeout_secs` | unset | Passed as `talos run --gate-timeout-secs`. |
+| `memory` | `"off"` | `off`, `annotate` or `deny-once`; anything else (another casing, `deny_once`, `null`, a bool or a number) raises `ValueError` when the agent is constructed, before any container exec. `off` passes no flag; `annotate` and `deny-once` pass `talos run --memory <mode>`. In a Harbor YAML job config the value must be quoted (`memory: "off"`), because YAML 1.1 reads a bare `off` as false, which is rejected. |
+| `kb_project` | `None` | A KB project ref passed as `talos run --kb-project`, and only with memory on: with `memory=off` it raises `ValueError`. It must match `[A-Za-z0-9][A-Za-z0-9._-]*`. When it is unset, talos resolves the project by walking up from the workspace to `.kb_project`. |
 
 One of `talos_path` or `artifact_base`/`TALOS_ARTIFACT_BASE` is required; the constructor raises `ValueError` otherwise. The binary is downloaded on the host (consumer images often have neither curl nor wget), into a host temp dir rather than the logs dir, and then uploaded into the container. Unset `max_iterations`/`wall_clock_secs`/`gate_timeout_secs` emit no flag, so talos's own defaults apply.
 
@@ -53,6 +55,26 @@ env = { AGENT_GATE_COMMAND = "uv run pytest -q" }
 ```
 
 A task with its own `docker-compose.yaml` does not get `[environment] env` on its execs, so it must also set `AGENT_GATE_COMMAND` in the main service's `environment:`. An unset or empty `AGENT_GATE_COMMAND` runs talos with no checks; `metadata.talos.gate_armed` records which happened.
+
+### Memory (personal-kb)
+
+Memory is off by default and `off` emits no flag, so any talos binary works and tier-2 runs are unchanged.
+
+`annotate` and `deny-once` need a talos binary whose `talos run` has `--memory`. An older binary exits with a CLI usage error, which raises `NonZeroAgentExitCodeError` (an Invalid trial).
+
+TalosAgent never forwards `PERSONAL_KB_URL` or `PERSONAL_KB_API_KEY` from the host; set them with `--ae`. A trial image's own `ENV` also reaches talos, because the exec inherits it, and `metadata.talos.forwarded_env_keys` cannot show that.
+
+For kb-bench's seeded in-container KB daemon, pass both explicitly as `--ae PERSONAL_KB_URL=http://127.0.0.1:8765 --ae PERSONAL_KB_API_KEY=local-no-auth`, the same pair kb-bench's Claude Code arm uses; inside the trial container, 127.0.0.1 is the container's own loopback. A real key goes in the template form `--ae 'PERSONAL_KB_API_KEY=${PERSONAL_KB_API_KEY}'`, so the key never appears on the command line: Harbor resolves `${VAR}` from the host env when it creates the agent.
+
+TalosAgent does not configure the KB daemon. kb-service returns a Bash cue index only when its soft gate is enabled (`KB_SOFT_GATE_ENABLED=TRUE` in the daemon's environment). Otherwise only the session slice reaches talos and per-call advice never fires. In kb-bench those daemon switches are set by kb-bench's own arm wrapper (`kb-bench-seed configure`), not by TalosAgent.
+
+Eval isolation: tier-2 and kb-bench run with memory off, or against a seeded offline KB daemon, never the live KB. TalosAgent does not enforce this. The field to audit is `metadata.talos.memory.source`, talos's own `memory_slice.source`, which names the KB talos actually used. kb-bench's contamination audit reads `agent/trajectory.json`, which TalosAgent does not write, so it reports talos trials as unaudited.
+
+Fail-open: if the KB is unreachable, auth fails or the response is malformed, talos runs the whole trial with memory off. `metadata.talos.memory.memory_degraded` then carries the reason, and `metadata.talos.error` gains `memory degraded to off (<reason>)`. kb-service answers a server-side failure or an unresolvable project with an empty 200 response, not an error, so that case need not show as degraded; its signature is `memory.slice_items == 0` with memory on.
+
+`talos_harbor.tier2_report` prints `metadata.talos.error` as `WARN: talos-error` lines and does not reclassify the trial. A memory-arm analysis must report as Invalid every trial whose `metadata.talos.memory.memory_degraded` is set or whose `metadata.talos.error` contains `memory`.
+
+kb-bench scenarios write `/app/.kb_project`, so `kb_project` is normally left unset there.
 
 ### Trial-image requirements
 
@@ -93,8 +115,9 @@ Token counts go to `AgentContext`: `n_input_tokens` = input + cache read + cache
 | `install` | the parsed `setup/install.json`. |
 | `tokens` | raw `{input, cache_read, cache_write, output}` from `run_end`, or `None`. |
 | `compactions`, `highest_compaction_tier` | from the run summary. |
+| `memory` | a 13-key record: `mode`, `kb_project`, `effective_mode`, `memory_annotations`, `memory_denies`, `memory_kb_tool_calls`, `memory_deny_overrides`, `memory_degraded`, `source`, `slice_items`, `slice_chars`, `memory_tools`, `memory_tools_dropped`. `mode` and `kb_project` are the agent kwargs as passed: `kb_project` is `None` when unset, even when talos resolved a project from `.kb_project`. `effective_mode` is `run_start.config.memory_mode`, the mode talos actually ran in, or `None` when it is absent. The four counters come from `run_end` stats and are `None` when `run_end` or the key is missing. `memory_degraded` is the degradation reason or `None`. `source`, `slice_items`, `slice_chars`, `memory_tools` and `memory_tools_dropped` come from the transcript's `memory_slice` event and are `None` when it is absent. |
 | `stderr_tail` | the last 2048 bytes of `talos-stderr.log`, only when the run did not reach an outcome or `run_end` is missing. |
-| `error` | present only when something is off: missing or unparsable outputs, no exit code, an exit-code/disposition mismatch, or an install token that differs from the binary's version. |
+| `error` | present only when something is off: missing or unparsable outputs, no exit code, an exit-code/disposition mismatch, an install token that differs from the binary's version, or a memory cause: memory on but `run_end` lacks the counters, memory degraded, `run_start` lacks `memory_mode`, a mode mismatch, memory on with no `memory_slice`, memory off with memory activity, or an invariant violation. |
 
 ### Exit codes and Invalid trials
 

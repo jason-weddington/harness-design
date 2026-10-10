@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -61,6 +62,25 @@ The backend is chosen with talos's own precedence (non-empty ``TALOS_BEDROCK``, 
 ``TALOS_BACKEND=ollama``, else anthropic), so a run never carries another backend's
 credentials. The bedrock set also forwards every ``AWS_*`` key; every extra_env key is
 always forwarded unchanged."""
+
+MEMORY_MODES: tuple[str, ...] = ("off", "annotate", "deny-once")
+"""The ``talos run --memory`` values, spelled exactly like the harness ``MemoryMode::as_str``."""
+
+KB_PROJECT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+"""Shape of a KB project ref, always applied with ``fullmatch``.
+
+A ref matching it is one shell word that clap cannot read as a flag."""
+
+MEMORY_STAT_KEYS: tuple[str, ...] = (
+    "memory_annotations",
+    "memory_denies",
+    "memory_kb_tool_calls",
+    "memory_deny_overrides",
+)
+"""The ``run_end.stats`` memory counter keys the harness emits."""
+
+MAX_MEMORY_DENIES = 2
+"""Mirrors the harness constant ``MAX_MEMORY_DENIES`` in crates/harness/src/memory.rs."""
 
 ERROR_TAIL_BYTES = 2000
 STDERR_TAIL_BYTES = 2048
@@ -120,8 +140,26 @@ class TalosAgent(BaseInstalledAgent):
         talos_path: str | None = None,
         talos_version: str = "latest",
         artifact_base: str | None = None,
+        memory: str = "off",
+        kb_project: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if not (isinstance(memory, str) and memory in MEMORY_MODES):
+            raise ValueError(
+                f"invalid memory {memory!r}: expected one of 'off', 'annotate', 'deny-once'"
+            )
+        if kb_project is not None and not (
+            isinstance(kb_project, str) and KB_PROJECT_PATTERN.fullmatch(kb_project)
+        ):
+            raise ValueError(
+                f"invalid kb_project {kb_project!r}: expected a KB project ref matching "
+                "[A-Za-z0-9][A-Za-z0-9._-]*"
+            )
+        if kb_project is not None and memory == "off":
+            raise ValueError(
+                f"kb_project {kb_project!r} needs memory 'annotate' or 'deny-once', "
+                "but memory is 'off'"
+            )
         super().__init__(logs_dir, *args, **kwargs)
         if artifact_base is None:
             artifact_base = os.environ.get("TALOS_ARTIFACT_BASE")
@@ -135,6 +173,17 @@ class TalosAgent(BaseInstalledAgent):
         self.talos_path = talos_path
         self.talos_version = talos_version
         self.artifact_base = artifact_base or None
+        self.memory = memory
+        self.kb_project = kb_project
+
+    def build_cli_flags(self) -> str:
+        """Base CLI flags, then ``--memory`` and ``--kb-project`` when memory is on."""
+        parts = [super().build_cli_flags()]
+        if self.memory != "off":
+            parts.append(f"--memory {self.memory}")
+            if self.kb_project is not None:
+                parts.append(f"--kb-project {self.kb_project}")
+        return " ".join(part for part in parts if part)
 
     @staticmethod
     def name() -> str:
@@ -300,7 +349,7 @@ class TalosAgent(BaseInstalledAgent):
         exit_code: int | None = getattr(self, "_talos_exit_code", None)
 
         summary = self._read_summary(errors)
-        run_end = self._read_run_end(errors)
+        run_start, memory_slice, run_end = self._read_transcript(errors)
 
         disposition: str | None = None
         if summary is not None:
@@ -345,6 +394,13 @@ class TalosAgent(BaseInstalledAgent):
                 f"binary={version}"
             )
 
+        memory = self._memory_metadata(run_start, memory_slice, stats)
+        errors.extend(
+            self._memory_errors(
+                memory, memory_slice, run_start is not None, run_end is not None, stats
+            )
+        )
+
         gate_command = self._read_text(self.logs_dir / "gate-command.txt") or None
 
         stderr_tail: str | None = None
@@ -377,6 +433,7 @@ class TalosAgent(BaseInstalledAgent):
             "tokens": tokens,
             "compactions": summary_or_empty.get("compactions"),
             "highest_compaction_tier": summary_or_empty.get("highest_compaction_tier"),
+            "memory": memory,
             "stderr_tail": stderr_tail,
         }
         if errors:
@@ -397,22 +454,115 @@ class TalosAgent(BaseInstalledAgent):
             return None
         return parsed
 
-    def _read_run_end(self, errors: list[str]) -> dict[str, Any] | None:
+    def _read_transcript(
+        self, errors: list[str]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """One read of the transcript: first run_start, first memory_slice, last run_end."""
         path = self.logs_dir / "transcript.jsonl"
         if not path.is_file():
             errors.append("transcript.jsonl missing")
-            return None
+            return None, None, None
+        run_start: dict[str, Any] | None = None
+        memory_slice: dict[str, Any] | None = None
         run_end: dict[str, Any] | None = None
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue  # a truncated final line, or noise
-            if isinstance(event, dict) and event.get("event") == "run_end":
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("event")
+            if kind == "run_start" and run_start is None:
+                run_start = event
+            elif kind == "memory_slice" and memory_slice is None:
+                memory_slice = event
+            elif kind == "run_end":
                 run_end = event
         if run_end is None:
             errors.append("transcript.jsonl has no run_end event (token counts unavailable)")
-        return run_end
+        return run_start, memory_slice, run_end
+
+    def _memory_metadata(
+        self,
+        run_start: dict[str, Any] | None,
+        memory_slice: dict[str, Any] | None,
+        stats: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The 13-key ``metadata.talos.memory`` record."""
+        effective_mode: str | None = None
+        if run_start is not None:
+            config = run_start.get("config")
+            if isinstance(config, dict) and isinstance(config.get("memory_mode"), str):
+                effective_mode = config["memory_mode"]
+        degraded = stats.get("memory_degraded")
+        source = memory_slice.get("source") if memory_slice is not None else None
+        return {
+            "mode": self.memory,
+            "kb_project": self.kb_project,
+            "effective_mode": effective_mode,
+            **{key: _opt_int(stats, key) for key in MEMORY_STAT_KEYS},
+            "memory_degraded": degraded if isinstance(degraded, str) and degraded else None,
+            "source": source if isinstance(source, str) and source else None,
+            "slice_items": _opt_int(memory_slice, "items"),
+            "slice_chars": _opt_int(memory_slice, "chars"),
+            "memory_tools": _str_list(memory_slice.get("memory_tools"))
+            if memory_slice is not None
+            else None,
+            "memory_tools_dropped": _str_list(memory_slice.get("memory_tools_dropped"))
+            if memory_slice is not None
+            else None,
+        }
+
+    def _memory_errors(
+        self,
+        memory: dict[str, Any],
+        memory_slice: dict[str, Any] | None,
+        has_run_start: bool,
+        has_run_end: bool,
+        stats: dict[str, Any],
+    ) -> list[str]:
+        """Memory telemetry consistency checks, in their pinned order."""
+        errors: list[str] = []
+        on = self.memory != "off"
+        effective = memory["effective_mode"]
+        degraded = memory["memory_degraded"]
+        counters = [memory[key] for key in MEMORY_STAT_KEYS]
+        missing = [key for key in MEMORY_STAT_KEYS if key not in stats]
+        if has_run_end and on and missing:
+            errors.append(
+                f"run_end stats lack memory telemetry with memory={self.memory}: "
+                f"missing {', '.join(missing)}"
+            )
+        if degraded is not None:
+            errors.append(f"memory degraded to off ({degraded})")
+        if on and effective is None and has_run_start:
+            errors.append(f"run_start config lacks memory_mode with memory={self.memory}")
+        if effective is not None and effective != self.memory:
+            errors.append(
+                f"memory mode mismatch: requested {self.memory} but "
+                f"run_start.config.memory_mode={effective}"
+            )
+        if on and effective == self.memory and memory_slice is None:
+            errors.append("memory on but transcript has no memory_slice event")
+        if not on and (memory_slice is not None or any(c is not None and c > 0 for c in counters)):
+            errors.append("memory off requested but transcript shows memory activity")
+        if all(c is not None for c in counters):
+            annotations, denies, _calls, overrides = counters
+            violations: list[str] = []
+            if denies > MAX_MEMORY_DENIES:
+                violations.append(f"memory_denies={denies} > {MAX_MEMORY_DENIES}")
+            if self.memory == "annotate" and denies > 0:
+                violations.append(f"memory_denies={denies} under annotate")
+            if overrides > annotations:
+                violations.append(
+                    f"memory_deny_overrides={overrides} > memory_annotations={annotations}"
+                )
+            if degraded is not None and any(c > 0 for c in counters):
+                violations.append("counters non-zero while degraded")
+            if violations:
+                errors.append(f"memory invariant violated: {', '.join(violations)}")
+        return errors
 
     @staticmethod
     def _read_json(path: Path) -> Any:
@@ -434,6 +584,20 @@ def _as_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return 0
     return int(value)
+
+
+def _opt_int(container: dict[str, Any] | None, key: str) -> int | None:
+    """``_as_int`` of ``container[key]``; None when the container or the key is absent."""
+    if container is None or key not in container:
+        return None
+    return _as_int(container[key])
+
+
+def _str_list(value: Any) -> list[str] | None:
+    """``value`` when it is a list of strings (possibly empty), else None."""
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return None
 
 
 def _exit_disposition_mismatch(exit_code: int, disposition: str) -> bool:

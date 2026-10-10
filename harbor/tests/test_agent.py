@@ -42,6 +42,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TALOS_ARTIFACT_BASE", raising=False)
     for key in FORWARDED:
         monkeypatch.delenv(key, raising=False)
+    for key in ("PERSONAL_KB_URL", "PERSONAL_KB_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
     for key in list(os.environ):
         if key.startswith("AWS_"):
             monkeypatch.delenv(key, raising=False)
@@ -560,6 +562,7 @@ TALOS_KEYS = {
     "tokens",
     "compactions",
     "highest_compaction_tier",
+    "memory",
     "stderr_tail",
 }
 
@@ -764,3 +767,443 @@ def test_populate_tolerates_odd_stats(tmp_path: Path) -> None:
         "cache_write": 0,
         "output": 0,
     }
+
+
+# ------------------------------------------------------------------- memory kwarg
+
+SLICE_EVENT = {
+    "items": 2,
+    "chars": 137,
+    "degraded": None,
+    "source": "fake-kb p1",
+    "memory_tools": ["kb_search"],
+    "memory_tools_dropped": [],
+}
+ZERO_STATS = {
+    "memory_annotations": 0,
+    "memory_denies": 0,
+    "memory_kb_tool_calls": 0,
+    "memory_deny_overrides": 0,
+    "memory_degraded": None,
+}
+
+
+def edit_transcript(
+    agent: TalosAgent,
+    *,
+    config: dict[str, Any] | None = None,
+    memory_slice: dict[str, Any] | None = None,
+    stats: dict[str, Any] | None = None,
+) -> None:
+    path = agent.logs_dir / "transcript.jsonl"
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            out.append(line)
+            continue
+        if isinstance(event, dict) and event.get("event") == "run_start":
+            if config is not None:
+                event["config"] = {**event.get("config", {}), **config}
+            out.append(json.dumps(event))
+            if memory_slice is not None:
+                out.append(json.dumps({"event": "memory_slice", **memory_slice}))
+            continue
+        if isinstance(event, dict) and event.get("event") == "run_end" and stats is not None:
+            event["stats"].update(stats)
+        out.append(json.dumps(event))
+    path.write_text("".join(f"{x}\n" for x in out), encoding="utf-8")
+
+
+def test_memory_defaults_off(tmp_path: Path) -> None:
+    a = make(tmp_path)
+    assert a.memory == "off"
+    assert a.kb_project is None
+    assert a.build_cli_flags() == ""
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, ""),
+        ({"memory": "off"}, ""),
+        ({"memory": "annotate"}, "--memory annotate"),
+        ({"memory": "deny-once"}, "--memory deny-once"),
+        (
+            {"memory": "annotate", "kb_project": "harness-design"},
+            "--memory annotate --kb-project harness-design",
+        ),
+        (
+            {"max_iterations": 7, "memory": "deny-once", "kb_project": "kb.bench_1"},
+            "--max-iterations 7 --memory deny-once --kb-project kb.bench_1",
+        ),
+    ],
+)
+def test_memory_cli_flags(tmp_path: Path, kwargs: dict[str, Any], expected: str) -> None:
+    assert make(tmp_path, **kwargs).build_cli_flags() == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["ON", "Annotate", "deny_once", "", " annotate", "annotate\n", "none", None, True, False, 1],
+)
+def test_memory_invalid_raises_at_construction(tmp_path: Path, value: Any) -> None:
+    with pytest.raises(ValueError) as exc:
+        make(tmp_path, memory=value)
+    assert "invalid memory" in str(exc.value)
+    assert "'deny-once'" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "value", ["", "has space", "p1;id", "$(id)", "-p", ".hidden", "a/b", "p1\n", 7, True]
+)
+def test_kb_project_invalid_raises(tmp_path: Path, value: Any) -> None:
+    with pytest.raises(ValueError) as exc:
+        make(tmp_path, memory="annotate", kb_project=value)
+    assert "invalid kb_project" in str(exc.value)
+
+
+def test_kb_project_without_memory_raises(tmp_path: Path) -> None:
+    for kwargs in ({}, {"memory": "off"}):
+        with pytest.raises(ValueError) as exc:
+            make(tmp_path, kb_project="harness-design", **kwargs)
+        assert "needs memory" in str(exc.value)
+
+
+def test_memory_validation_precedes_binary_source_check(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        TalosAgent(logs_dir=tmp_path, memory="bogus")
+    assert "invalid memory" in str(exc.value)
+    assert "talos_path" not in str(exc.value)
+
+
+def test_memory_validation_order(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make(tmp_path, memory="bogus", kb_project="has space")
+    assert "invalid memory" in str(exc.value)
+    assert "invalid kb_project" not in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        make(tmp_path, kb_project="has space")
+    assert "invalid kb_project" in str(exc.value)
+    assert "needs memory" not in str(exc.value)
+
+
+def test_run_passes_memory_flags(tmp_path: Path) -> None:
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    agent = make(tmp_path, memory="deny-once", kb_project="p1")
+    run_agent(agent, env)
+    (call,) = env.find("talos run")
+    assert call.command == build_run_command(
+        "/installed-agent", "/logs/agent", "--memory deny-once --kb-project p1"
+    )
+
+
+def test_run_command_memory_argv(tmp_path: Path) -> None:
+    proc, argv, _logs, _ws = run_built(
+        tmp_path,
+        {"AGENT_GATE_COMMAND": "true"},
+        "--memory annotate --kb-project harness-design",
+    )
+    assert proc.returncode == 0
+    assert argv[argv.index("--memory") + 1] == "annotate"
+    assert argv[argv.index("--kb-project") + 1] == "harness-design"
+    assert argv[argv.index("--gate-command") + 1] == "true"
+    assert argv.count("--memory") == 1
+
+
+def _kb_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("PERSONAL_KB_URL", "http://kb.example.invalid:8765")
+    monkeypatch.setenv("PERSONAL_KB_API_KEY", "host-key")
+
+
+def test_memory_env_never_forwarded_from_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _kb_host_env(monkeypatch)
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    run_agent(make(tmp_path, memory="annotate"), env)
+    assert env.find("talos run")[0].env == {"ANTHROPIC_API_KEY": "k"}
+
+
+def test_memory_env_forwarded_from_extra_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _kb_host_env(monkeypatch)
+    env = FakeEnvironment(scripts={"talos run": result(0)})
+    agent = make(
+        tmp_path,
+        memory="deny-once",
+        extra_env={"PERSONAL_KB_URL": "http://127.0.0.1:9000", "PERSONAL_KB_API_KEY": "extra-key"},
+    )
+    run_agent(agent, env)
+    assert env.find("talos run")[0].env == {
+        "ANTHROPIC_API_KEY": "k",
+        "PERSONAL_KB_URL": "http://127.0.0.1:9000",
+        "PERSONAL_KB_API_KEY": "extra-key",
+    }
+    assert agent._forwarded_env_keys == [
+        "ANTHROPIC_API_KEY",
+        "PERSONAL_KB_API_KEY",
+        "PERSONAL_KB_URL",
+    ]
+
+
+def staged(tmp_path: Path, transcript: str = "transcript-done.jsonl", **kwargs: Any) -> TalosAgent:
+    agent = make(tmp_path, **kwargs)
+    agent._talos_exit_code = 0
+    stage(agent, transcript=transcript)
+    return agent
+
+
+def memory_of(agent: TalosAgent) -> tuple[dict[str, Any], dict[str, Any]]:
+    context = populate(agent)
+    assert context.metadata is not None
+    talos = context.metadata["talos"]
+    return talos["memory"], talos
+
+
+def cfg(mode: str) -> dict[str, Any]:
+    return {"memory_mode": mode}
+
+
+def test_populate_memory_off_defaults(tmp_path: Path) -> None:
+    agent = staged(tmp_path)
+    memory, talos = memory_of(agent)
+    assert memory == {
+        "mode": "off",
+        "kb_project": None,
+        "effective_mode": None,
+        "memory_annotations": None,
+        "memory_denies": None,
+        "memory_kb_tool_calls": None,
+        "memory_deny_overrides": None,
+        "memory_degraded": None,
+        "source": None,
+        "slice_items": None,
+        "slice_chars": None,
+        "memory_tools": None,
+        "memory_tools_dropped": None,
+    }
+    assert "error" not in talos
+    edit_transcript(agent, config=cfg("off"), stats=ZERO_STATS)
+    memory, talos = memory_of(agent)
+    assert memory["effective_mode"] == "off"
+    assert [memory[k] for k in agent_mod.MEMORY_STAT_KEYS] == [0, 0, 0, 0]
+    assert "error" not in talos
+
+
+def test_populate_memory_on_with_stats(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="deny-once", kb_project="p1")
+    edit_transcript(
+        agent,
+        config=cfg("deny-once"),
+        memory_slice=SLICE_EVENT,
+        stats={
+            "memory_annotations": 2,
+            "memory_denies": 1,
+            "memory_kb_tool_calls": 3,
+            "memory_deny_overrides": 1,
+            "memory_degraded": None,
+        },
+    )
+    memory, talos = memory_of(agent)
+    assert memory == {
+        "mode": "deny-once",
+        "kb_project": "p1",
+        "effective_mode": "deny-once",
+        "memory_annotations": 2,
+        "memory_denies": 1,
+        "memory_kb_tool_calls": 3,
+        "memory_deny_overrides": 1,
+        "memory_degraded": None,
+        "source": "fake-kb p1",
+        "slice_items": 2,
+        "slice_chars": 137,
+        "memory_tools": ["kb_search"],
+        "memory_tools_dropped": [],
+    }
+    assert "error" not in talos
+
+
+def test_populate_memory_degraded(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="annotate")
+    edit_transcript(
+        agent,
+        config=cfg("annotate"),
+        memory_slice={
+            **SLICE_EVENT,
+            "items": 0,
+            "chars": 0,
+            "degraded": "kb unreachable",
+            "memory_tools": [],
+        },
+        stats={**ZERO_STATS, "memory_degraded": "kb unreachable"},
+    )
+    memory, talos = memory_of(agent)
+    assert memory["memory_degraded"] == "kb unreachable"
+    assert memory["memory_tools"] == []
+    assert talos["error"] == "memory degraded to off (kb unreachable)"
+
+
+def test_populate_memory_on_missing_telemetry(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="annotate")
+    edit_transcript(agent, config=cfg("annotate"), memory_slice=SLICE_EVENT)
+    memory, talos = memory_of(agent)
+    assert [memory[k] for k in agent_mod.MEMORY_STAT_KEYS] == [None] * 4
+    assert talos["error"] == (
+        "run_end stats lack memory telemetry with memory=annotate: missing "
+        "memory_annotations, memory_denies, memory_kb_tool_calls, memory_deny_overrides"
+    )
+    edit_transcript(agent, stats={"memory_annotations": 1})
+    memory, talos = memory_of(agent)
+    assert memory["memory_annotations"] == 1
+    assert talos["error"] == (
+        "run_end stats lack memory telemetry with memory=annotate: missing "
+        "memory_denies, memory_kb_tool_calls, memory_deny_overrides"
+    )
+
+
+def test_populate_memory_on_no_run_end(tmp_path: Path) -> None:
+    agent = staged(tmp_path, transcript="transcript-truncated.jsonl", memory="annotate")
+    memory, talos = memory_of(agent)
+    assert [memory[k] for k in agent_mod.MEMORY_STAT_KEYS] == [None] * 4
+    assert memory["memory_degraded"] is None
+    assert memory["effective_mode"] is None
+    assert talos["error"] == (
+        "transcript.jsonl has no run_end event (token counts unavailable); "
+        "run_start config lacks memory_mode with memory=annotate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwarg", "effective", "slice_event"),
+    [
+        ("deny-once", "off", None),
+        ("off", "annotate", None),
+        ("annotate", "deny-once", SLICE_EVENT),
+    ],
+)
+def test_populate_memory_mode_mismatch(
+    tmp_path: Path, kwarg: str, effective: str, slice_event: dict[str, Any] | None
+) -> None:
+    agent = staged(tmp_path, memory=kwarg)
+    edit_transcript(agent, config=cfg(effective), memory_slice=slice_event, stats=ZERO_STATS)
+    _memory, talos = memory_of(agent)
+    assert talos["error"] == (
+        f"memory mode mismatch: requested {kwarg} but run_start.config.memory_mode={effective}"
+    )
+
+
+def test_populate_memory_run_start_lacks_mode(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="annotate")
+    edit_transcript(agent, memory_slice=SLICE_EVENT, stats=ZERO_STATS)
+    _memory, talos = memory_of(agent)
+    assert talos["error"] == "run_start config lacks memory_mode with memory=annotate"
+    edit_transcript(agent, config={"memory_mode": 5})
+    memory, talos = memory_of(agent)
+    assert memory["effective_mode"] is None
+    assert talos["error"] == "run_start config lacks memory_mode with memory=annotate"
+
+
+def test_populate_memory_on_no_slice(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="annotate")
+    edit_transcript(agent, config=cfg("annotate"), stats=ZERO_STATS)
+    _memory, talos = memory_of(agent)
+    assert talos["error"] == "memory on but transcript has no memory_slice event"
+
+
+@pytest.mark.parametrize(
+    ("slice_event", "stats"),
+    [(SLICE_EVENT, ZERO_STATS), (None, {**ZERO_STATS, "memory_denies": 1})],
+)
+def test_populate_memory_off_activity(
+    tmp_path: Path, slice_event: dict[str, Any] | None, stats: dict[str, Any]
+) -> None:
+    agent = staged(tmp_path)
+    edit_transcript(agent, config=cfg("off"), memory_slice=slice_event, stats=stats)
+    _memory, talos = memory_of(agent)
+    assert talos["error"] == "memory off requested but transcript shows memory activity"
+
+
+@pytest.mark.parametrize(
+    ("mode", "overrides", "expected"),
+    [
+        ("deny-once", {"memory_denies": 3}, "memory invariant violated: memory_denies=3 > 2"),
+        (
+            "annotate",
+            {"memory_denies": 1},
+            "memory invariant violated: memory_denies=1 under annotate",
+        ),
+        (
+            "annotate",
+            {"memory_denies": 3},
+            "memory invariant violated: memory_denies=3 > 2, memory_denies=3 under annotate",
+        ),
+        (
+            "deny-once",
+            {"memory_deny_overrides": 2, "memory_annotations": 1},
+            "memory invariant violated: memory_deny_overrides=2 > memory_annotations=1",
+        ),
+        (
+            "annotate",
+            {"memory_annotations": 1, "memory_degraded": "kb unreachable"},
+            "memory degraded to off (kb unreachable); "
+            "memory invariant violated: counters non-zero while degraded",
+        ),
+        (
+            "deny-once",
+            {"memory_annotations": 2, "memory_denies": 2, "memory_deny_overrides": 1},
+            None,
+        ),
+    ],
+)
+def test_populate_memory_invariants(
+    tmp_path: Path, mode: str, overrides: dict[str, Any], expected: str | None
+) -> None:
+    agent = staged(tmp_path, memory=mode)
+    edit_transcript(
+        agent, config=cfg(mode), memory_slice=SLICE_EVENT, stats={**ZERO_STATS, **overrides}
+    )
+    _memory, talos = memory_of(agent)
+    if expected is None:
+        assert "error" not in talos
+    else:
+        assert talos["error"] == expected
+
+
+def test_populate_memory_odd_values(tmp_path: Path) -> None:
+    agent = staged(tmp_path, memory="deny-once")
+    edit_transcript(
+        agent,
+        config=cfg("deny-once"),
+        memory_slice={
+            "items": True,
+            "chars": "137",
+            "degraded": None,
+            "source": "",
+            "memory_tools": ["kb_search", 3],
+            "memory_tools_dropped": "echo",
+        },
+        stats={
+            "memory_annotations": True,
+            "memory_denies": 2.0,
+            "memory_kb_tool_calls": "3",
+            "memory_deny_overrides": None,
+            "memory_degraded": "",
+        },
+    )
+    memory, talos = memory_of(agent)
+    assert [memory[k] for k in agent_mod.MEMORY_STAT_KEYS] == [0, 2, 0, 0]
+    assert memory["memory_degraded"] is None
+    assert memory["source"] is None
+    assert memory["slice_items"] == 0
+    assert memory["slice_chars"] == 0
+    assert memory["memory_tools"] is None
+    assert memory["memory_tools_dropped"] is None
+    assert "error" not in talos
+    edit_transcript(agent, stats={"memory_degraded": 5})
+    memory, talos = memory_of(agent)
+    assert memory["memory_degraded"] is None
+    assert "error" not in talos
