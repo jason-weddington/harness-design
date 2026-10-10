@@ -42,6 +42,8 @@ A run measures the same row as the calibration of record: spec level s2, test-fi
 
 One local GPU serves one request at a time, so concurrent trials queue behind each other and the queueing time burns each trial's wall clock. The script therefore refuses `-n` other than 1 when it wraps the run in the GPU lock. Hosted backends (Anthropic, Bedrock, Ollama cloud) may raise `-n`. `scripts/gpu-eval.sh`'s lock only serialises runs launched on the host that holds `GPU_LOCK_FILE`; a run launched elsewhere against the same GPU is not stopped by it.
 
+For any long local-GPU run, also set `GPU_TELEMETRY_SSH=<gpu-host>` (and `GPU_TELEMETRY_UNIT=<fan-controller unit>` if the host runs one, with `GPU_TELEMETRY_DIR=<jobs>/gpu-telemetry` to keep it beside the run). `gpu-eval.sh` then samples temperature, power, SM clock and the clock-event-reason bitmask every 5 s on the GPU host, saves the unit's journal for the run window, and prints one summary line counting thermal-slowdown samples (bits `0x20`/`0x40`). The cooling on the shared 5090 is tuned for noise against a no-throttling constraint, so a run that shows thermal slowdown, or coolant settling above 46 °C in the fan log, is worth reporting to whoever owns the host's fan curve; it may also have slowed the trials.
+
 ## Image reuse
 
 Harbor 0.9.0's default `--delete` runs `docker compose down --rmi all` after every trial, so each task image is removed when its trial ends, while the base image `talos-evals-base:1` persists. A later build of the same task reuses Docker's build cache, so the `env.setup` and baseline-tripwire layers are not re-run; this is reliance on the build cache, not a measured guarantee. `docker build --no-cache` (or `docker builder prune`) resamples the tripwire.
