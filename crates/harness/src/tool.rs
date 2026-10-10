@@ -223,6 +223,13 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool against `input`, using `ctx` for run-scoped plumbing.
     async fn run(&self, input: Value, ctx: &ToolCtx) -> ToolResult;
+
+    /// Whether this tool is proxied to an MCP server (see [`crate::mcp`]).
+    /// True only for those tools; it drives the `RunStats` MCP counters
+    /// (`mcp_tool_calls` / `mcp_tool_call_errors`). Defaults to `false`.
+    fn is_mcp(&self) -> bool {
+        false
+    }
 }
 
 /// Maps tool names to tools. The registered set *is* the agent's capability

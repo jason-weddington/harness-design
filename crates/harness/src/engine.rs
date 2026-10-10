@@ -404,6 +404,11 @@ pub struct RunConfig {
     /// Defaults to [`MemoryMode::Off`], under which every surface is
     /// byte-identical to a run without the memory seam.
     pub memory_mode: MemoryMode,
+    /// Per-server MCP connect reports from [`crate::mcp::connect_and_register`]
+    /// (empty by default). The loop re-emits each as an `mcp_connected` /
+    /// `mcp_connect_failed` transcript line after `run_start` on every
+    /// invocation. Set via [`RunConfig::with_mcp_reports`].
+    pub mcp_reports: Vec<crate::mcp::McpConnectReport>,
 }
 
 /// The fallback per-turn output cap — re-exported from
@@ -472,6 +477,7 @@ impl RunConfig {
             compact_threshold_pct: COMPACT_THRESHOLD_PCT,
             memory: Arc::new(NoMemory),
             memory_mode: MemoryMode::Off,
+            mcp_reports: Vec::new(),
         }
     }
 
@@ -612,6 +618,14 @@ impl RunConfig {
     pub fn with_memory(mut self, memory: Arc<dyn Memory>, mode: MemoryMode) -> Self {
         self.memory = memory;
         self.memory_mode = mode;
+        self
+    }
+
+    /// Attach the MCP connect reports the transcript records after
+    /// `run_start` (see [`RunConfig::mcp_reports`]).
+    #[must_use]
+    pub fn with_mcp_reports(mut self, reports: Vec<crate::mcp::McpConnectReport>) -> Self {
+        self.mcp_reports = reports;
         self
     }
 }
@@ -1206,6 +1220,13 @@ pub struct RunStats {
     /// a bool: `RunStats` already carries the clippy-pedantic maximum of
     /// three bools.
     pub memory_degraded: Option<String>,
+    /// Invocations of tools whose [`crate::tool::Tool::is_mcp`] is true.
+    /// Counted since THIS loop invocation, so a resumed run starts from zero.
+    pub mcp_tool_calls: u32,
+    /// The subset of [`Self::mcp_tool_calls`] whose `ToolResult.is_error` is
+    /// true. Counted since THIS loop invocation, so a resumed run starts from
+    /// zero.
+    pub mcp_tool_call_errors: u32,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2414,6 +2435,8 @@ pub async fn run(
         memory_kb_tool_calls: 0,
         memory_deny_overrides: 0,
         memory_degraded: None,
+        mcp_tool_calls: 0,
+        mcp_tool_call_errors: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2506,6 +2529,8 @@ pub async fn run_persisted(
         memory_kb_tool_calls: 0,
         memory_deny_overrides: 0,
         memory_degraded: None,
+        mcp_tool_calls: 0,
+        mcp_tool_call_errors: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2720,6 +2745,63 @@ fn emit_run_end(
 /// (`run`/`run_persisted`/`resume`) sets it only AFTER `run_loop_impl` (and
 /// therefore this event) returns, so it would always be zero here. Every
 /// other field is emitted, and the transcript module doc enumerates them.
+/// Emit one MCP connect report as an `mcp_connected` / `mcp_connect_failed`
+/// transcript line.
+fn emit_mcp_report(
+    writer: &mut TranscriptWriter,
+    tools: &ToolRegistry,
+    report: &crate::mcp::McpConnectReport,
+) {
+    use crate::mcp::McpConnectReport;
+    match report {
+        McpConnectReport::Connected {
+            name,
+            tools: names,
+            protocol_version,
+            server_name,
+            server_version,
+            auth,
+            connect_ms,
+        } => {
+            let unregistered: Vec<&String> = names
+                .iter()
+                .filter(|n| !tools.get(n).is_some_and(|t| t.is_mcp()))
+                .collect();
+            writer.emit(
+                "mcp_connected",
+                json!({
+                    "name": name,
+                    "tools": names,
+                    "protocol_version": protocol_version,
+                    "server_name": server_name,
+                    "server_version": server_version,
+                    "auth": auth,
+                    "connect_ms": connect_ms,
+                    "unregistered": unregistered,
+                }),
+            );
+        }
+        McpConnectReport::Failed {
+            name,
+            error,
+            error_kind,
+            http_status,
+            auth,
+            connect_ms,
+        } => writer.emit(
+            "mcp_connect_failed",
+            json!({
+                "name": name,
+                "error": error,
+                "error_kind": error_kind,
+                "http_status": http_status,
+                "auth": auth,
+                "connect_ms": connect_ms,
+            }),
+        ),
+    }
+}
+
 fn render_run_end_stats(stats: &RunStats) -> Value {
     json!({
         "iterations": stats.iterations,
@@ -2758,6 +2840,8 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "memory_kb_tool_calls": stats.memory_kb_tool_calls,
         "memory_deny_overrides": stats.memory_deny_overrides,
         "memory_degraded": stats.memory_degraded,
+        "mcp_tool_calls": stats.mcp_tool_calls,
+        "mcp_tool_call_errors": stats.mcp_tool_call_errors,
     })
 }
 
@@ -3977,6 +4061,16 @@ async fn run_loop_body(
         }
     }
 
+    // MCP connect reports — re-emitted after `run_start` on EVERY loop
+    // invocation (resume included) so each transcript block describes
+    // itself. `unregistered` is a runtime tripwire: a reported tool that is
+    // missing from the registry, or present but not an MCP tool.
+    if writer.is_enabled() {
+        for report in &config.mcp_reports {
+            emit_mcp_report(writer, tools, report);
+        }
+    }
+
     // ---- finish-recovery detection state (loop-local) ----
     // The done-oracle is `last_gate_green`, driven ONLY by `run_checks`'s
     // `is_error` flag (never a model self-report). A successful mutating tool
@@ -4961,6 +5055,12 @@ async fn run_loop_body(
 
                 let call_start = Instant::now();
                 let result = tools.invoke(&call.name, call.input.clone(), ctx).await;
+                if tools.get(&call.name).is_some_and(|t| t.is_mcp()) {
+                    stats.mcp_tool_calls += 1;
+                    if result.is_error {
+                        stats.mcp_tool_call_errors += 1;
+                    }
+                }
                 let duration_ms =
                     u64::try_from(call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -5561,6 +5661,8 @@ pub async fn resume(
         memory_kb_tool_calls: 0,
         memory_deny_overrides: 0,
         memory_degraded: None,
+        mcp_tool_calls: 0,
+        mcp_tool_call_errors: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -7291,6 +7393,8 @@ mod tests {
             memory_kb_tool_calls: 0,
             memory_deny_overrides: 0,
             memory_degraded: None,
+            mcp_tool_calls: 0,
+            mcp_tool_call_errors: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -14449,6 +14553,8 @@ mod tests {
             memory_kb_tool_calls: 0,
             memory_deny_overrides: 0,
             memory_degraded: None,
+            mcp_tool_calls: 0,
+            mcp_tool_call_errors: 0,
         }
     }
 
@@ -20224,7 +20330,7 @@ mod tests {
                 let (_, _, lines) =
                     go(echo_script(), &registry_with_finish_and_echo(), &config).await;
                 assert_eq!(lines[0]["config"]["memory_mode"], expected);
-                assert_eq!(lines[0]["transcript_version"], 4);
+                assert_eq!(lines[0]["transcript_version"], 5);
             }
         }
 
@@ -20256,6 +20362,207 @@ mod tests {
                     .unwrap()
                     .contains(MEMORY_SLICE_HEADING)
             );
+        }
+    }
+
+    mod mcp_seam {
+        use super::*;
+        use crate::mcp::McpConnectReport;
+        use crate::transcript::EVENT_KINDS;
+        use serde_json::{Value, json};
+
+        /// A test-local tool that claims to be MCP-proxied. Errors when its
+        /// input carries `"fail": true`.
+        struct FakeMcpTool(&'static str);
+
+        #[async_trait]
+        impl Tool for FakeMcpTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+
+            fn schema(&self) -> Value {
+                json!({"name": self.0, "description": "fake mcp", "input_schema": {"type": "object"}})
+            }
+
+            fn is_mcp(&self) -> bool {
+                true
+            }
+
+            async fn run(&self, input: Value, _ctx: &ToolCtx) -> ToolResult {
+                if input["fail"] == json!(true) {
+                    ToolResult::error(format!("{} returned an error", self.0))
+                } else {
+                    ToolResult::ok(format!("{} ok", self.0))
+                }
+            }
+        }
+
+        fn one_call(id: &str, name: &str, input: Value) -> AssistantTurn {
+            turn_with(vec![tool_call(id, name, input)], StopReason::ToolUse)
+        }
+
+        fn finish_blocked(id: &str) -> AssistantTurn {
+            finish_call(
+                id,
+                json!({"disposition": "blocked", "decision_needed": "q"}),
+            )
+        }
+
+        fn registry_with(tool: &'static str) -> ToolRegistry {
+            let mut tools = registry_with_finish_and_echo();
+            tools.register(tool, Arc::new(FakeMcpTool(tool)));
+            tools
+        }
+
+        fn keys(line: &Value) -> Vec<String> {
+            let mut k: Vec<String> = line.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        }
+
+        fn expected_keys(fields: &[&str]) -> Vec<String> {
+            let mut k: Vec<String> = fields
+                .iter()
+                .chain(&["event", "ts", "elapsed_ms"])
+                .map(|s| (*s).to_string())
+                .collect();
+            k.sort();
+            k
+        }
+
+        #[test]
+        fn run_config_defaults_to_no_mcp_reports() {
+            assert!(RunConfig::new("t", 1).mcp_reports.is_empty());
+        }
+
+        #[tokio::test]
+        async fn mcp_tool_calls_are_counted_and_never_touch_the_mutation_latches() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with("remote_echo");
+            let config =
+                RunConfig::new("do the task", 10).with_transcript(dir.path().join("t.jsonl"), "t");
+            let backend = MockBackend::from_turns(vec![
+                one_call("c1", "remote_echo", json!({})),
+                one_call("c2", "remote_echo", json!({"fail": true})),
+                one_call("c3", "echo", json!({})),
+                finish_blocked("cf"),
+            ]);
+            let ctx = ToolCtx::stub();
+            let res = run(&backend, &tools, &ctx, &config).await;
+            assert_eq!(res.stats.mcp_tool_calls, 2);
+            assert_eq!(res.stats.mcp_tool_call_errors, 1);
+            assert_eq!(res.stats.bash_calls_ok, 0);
+            assert_eq!(res.stats.edit_file_calls_ok, 0);
+            assert!(!res.stats.tree_dirty);
+            let lines = read_transcript_lines(&dir.path().join("t.jsonl"));
+            let end = lines.last().expect("run_end");
+            assert_eq!(end["event"], "run_end");
+            assert_eq!(end["stats"]["mcp_tool_calls"], 2);
+            assert_eq!(end["stats"]["mcp_tool_call_errors"], 1);
+        }
+
+        #[tokio::test]
+        async fn mcp_reports_are_emitted_after_run_start() {
+            let dir = TempDir::new().expect("tempdir");
+            let tools = registry_with("kb_echo");
+            let config = RunConfig::new("do the task", 5)
+                .with_mcp_reports(vec![
+                    McpConnectReport::Connected {
+                        name: "kb".into(),
+                        tools: vec!["kb_echo".into()],
+                        protocol_version: "2025-11-25".into(),
+                        server_name: Some("fake".into()),
+                        server_version: Some("1.0".into()),
+                        auth: "bearer",
+                        connect_ms: 5,
+                    },
+                    McpConnectReport::Failed {
+                        name: "gtd".into(),
+                        error: "HTTP 401: nope".into(),
+                        error_kind: "http_status",
+                        http_status: Some(401),
+                        auth: "none",
+                        connect_ms: 3,
+                    },
+                ])
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let backend = MockBackend::from_turns(vec![finish_blocked("cf")]);
+            let ctx = ToolCtx::stub();
+            let _ = run(&backend, &tools, &ctx, &config).await;
+            let lines = read_transcript_lines(&dir.path().join("t.jsonl"));
+            assert_eq!(lines[0]["event"], "run_start");
+            let c = &lines[1];
+            assert_eq!(c["event"], "mcp_connected");
+            assert_eq!(c["name"], "kb");
+            assert_eq!(c["tools"], json!(["kb_echo"]));
+            assert_eq!(c["protocol_version"], "2025-11-25");
+            assert_eq!(c["server_name"], "fake");
+            assert_eq!(c["server_version"], "1.0");
+            assert_eq!(c["auth"], "bearer");
+            assert_eq!(c["connect_ms"], 5);
+            assert_eq!(c["unregistered"], json!([]));
+            assert_eq!(
+                keys(c),
+                expected_keys(&[
+                    "name",
+                    "tools",
+                    "protocol_version",
+                    "server_name",
+                    "server_version",
+                    "auth",
+                    "connect_ms",
+                    "unregistered",
+                ])
+            );
+            let f = &lines[2];
+            assert_eq!(f["event"], "mcp_connect_failed");
+            assert_eq!(f["name"], "gtd");
+            assert_eq!(f["error"], "HTTP 401: nope");
+            assert_eq!(f["error_kind"], "http_status");
+            assert_eq!(f["http_status"], 401);
+            assert_eq!(f["auth"], "none");
+            assert_eq!(f["connect_ms"], 3);
+            assert_eq!(
+                keys(f),
+                expected_keys(&[
+                    "name",
+                    "error",
+                    "error_kind",
+                    "http_status",
+                    "auth",
+                    "connect_ms",
+                ])
+            );
+            for line in &lines {
+                let event = line["event"].as_str().expect("event");
+                assert!(EVENT_KINDS.contains(&event), "{event}");
+            }
+        }
+
+        #[tokio::test]
+        async fn unregistered_reports_a_missing_tool() {
+            let dir = TempDir::new().expect("tempdir");
+            // `echo` is registered but is not an MCP tool; `ghost` is absent.
+            let tools = registry_with_finish_and_echo();
+            let config = RunConfig::new("do the task", 5)
+                .with_mcp_reports(vec![McpConnectReport::Connected {
+                    name: "x".into(),
+                    tools: vec!["ghost".into(), "echo".into()],
+                    protocol_version: "2025-11-25".into(),
+                    server_name: None,
+                    server_version: None,
+                    auth: "none",
+                    connect_ms: 0,
+                }])
+                .with_transcript(dir.path().join("t.jsonl"), "t");
+            let backend = MockBackend::from_turns(vec![finish_blocked("cf")]);
+            let ctx = ToolCtx::stub();
+            let _ = run(&backend, &tools, &ctx, &config).await;
+            let lines = read_transcript_lines(&dir.path().join("t.jsonl"));
+            assert_eq!(lines[1]["event"], "mcp_connected");
+            assert_eq!(lines[1]["unregistered"], json!(["ghost", "echo"]));
+            assert!(lines[1]["server_name"].is_null());
         }
     }
 }

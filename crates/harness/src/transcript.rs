@@ -81,7 +81,7 @@
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
-//!    "transcript_version":4,"harness_version":"0.10.0","label":"claude-sonnet-5",
+//!    "transcript_version":5,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
 //!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
@@ -130,6 +130,36 @@
 //!   {"event":"memory_advice","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
 //!    "iteration":1,"call_id":"c1","tool":"bash","entry_id":"kb-1",
 //!    "advised":"deny_once","mode_applied":"deny_once","reason":"as_advised"}
+//!   ```
+//!
+//! - **`mcp_connected`** — emitted once per connected MCP server (see
+//!   [`crate::mcp`] and [`crate::engine::RunConfig::with_mcp_reports`]),
+//!   after `run_start` (and `memory_slice`, when present), on EVERY loop
+//!   invocation including a resume, in report order. Fields: exactly `name`,
+//!   `tools` (the registered tool names in server listing order),
+//!   `protocol_version`, `server_name` and `server_version` (string or
+//!   `null`), `auth` (`"bearer"` or `"none"` — never the token), `connect_ms`
+//!   and `unregistered` (the reported tool names that are missing from the
+//!   registry or are not MCP tools; `[]` when healthy — a runtime tripwire).
+//!
+//!   ```json
+//!   {"event":"mcp_connected","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
+//!    "name":"docs","tools":["search"],"protocol_version":"2025-11-25",
+//!    "server_name":"docs-server","server_version":"1.0","auth":"bearer",
+//!    "connect_ms":42,"unregistered":[]}
+//!   ```
+//!
+//! - **`mcp_connect_failed`** — emitted once per MCP server whose connect or
+//!   registration failed (the run proceeds without its tools), alongside the
+//!   `mcp_connected` lines in report order. Fields: exactly `name`, `error`
+//!   (the [`crate::mcp::McpError`] Display, bearer token redacted),
+//!   `error_kind` ([`crate::mcp::McpError::kind`]), `http_status` (integer or
+//!   `null`), `auth` and `connect_ms`.
+//!
+//!   ```json
+//!   {"event":"mcp_connect_failed","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
+//!    "name":"docs","error":"HTTP 401: unauthorized","error_kind":"http_status",
+//!    "http_status":401,"auth":"none","connect_ms":3}
 //!   ```
 //!
 //! - **`compaction`** — emitted at the top of a pass whose previous-turn raw
@@ -355,7 +385,8 @@
 //!   `compaction_pre_reasoning_chars_sum`, `compaction_pre_reasoning_turns`,
 //!   `post_compaction_reasoning_chars`, `memory_annotations`,
 //!   `memory_denies`, `memory_kb_tool_calls`, `memory_deny_overrides`,
-//!   `memory_degraded` (a string or `null`) — matching
+//!   `memory_degraded` (a string or `null`), `mcp_tool_calls`,
+//!   `mcp_tool_call_errors` — matching
 //!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
@@ -389,7 +420,8 @@
 //!             "compaction_pre_reasoning_chars_sum":0,"compaction_pre_reasoning_turns":0,
 //!             "post_compaction_reasoning_chars":[],
 //!             "memory_annotations":0,"memory_denies":0,"memory_kb_tool_calls":0,
-//!             "memory_deny_overrides":0,"memory_degraded":null}}
+//!             "memory_deny_overrides":0,"memory_degraded":null,
+//!             "mcp_tool_calls":0,"mcp_tool_call_errors":0}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -545,8 +577,10 @@ use serde_json::{Map, Value};
 /// not by a new tag) and `EVENT_KINDS` is unchanged. [`TRANSCRIPT_VERSION`]
 /// stayed 3. 4 adds the `memory_slice` and `memory_advice` events,
 /// `run_start.config.memory_mode`, and the five memory keys on
-/// `run_end.stats`.
-pub const TRANSCRIPT_VERSION: u32 = 4;
+/// `run_end.stats`. 5 adds the `mcp_connected` / `mcp_connect_failed`
+/// events (and the additive `mcp_tool_calls` / `mcp_tool_call_errors` keys on
+/// `run_end.stats`).
+pub const TRANSCRIPT_VERSION: u32 = 5;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
 /// carry — see the module docs for each event's fields. `contract_violation`
@@ -555,7 +589,8 @@ pub const TRANSCRIPT_VERSION: u32 = 4;
 /// `budget_breach` joins at v3, documented with its emission (no
 /// previously-emitted hole this time — the event and its array entry land
 /// together). `memory_slice` and `memory_advice` join at v4.
-pub const EVENT_KINDS: [&str; 13] = [
+/// `mcp_connected` and `mcp_connect_failed` join at v5.
+pub const EVENT_KINDS: [&str; 15] = [
     "run_start",
     "compaction",
     "model_request",
@@ -569,6 +604,8 @@ pub const EVENT_KINDS: [&str; 13] = [
     "budget_breach",
     "memory_slice",
     "memory_advice",
+    "mcp_connected",
+    "mcp_connect_failed",
 ];
 
 /// Opt-in configuration for a run's transcript sink.

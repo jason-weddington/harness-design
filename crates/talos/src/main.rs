@@ -24,6 +24,31 @@
 //! gate presence are recorded only in `run_start`, so pass `--transcript` when
 //! a run must be auditable.
 //!
+//! ## `talos run --mcp`
+//!
+//! `--mcp NAME=URL` (repeatable) connects to an MCP server over Streamable
+//! HTTP at run start (see [`harness::mcp`]), discovers its tools with
+//! `tools/list`, and registers each one under the server's own name beside
+//! the native tools, in both `--mode build` and `--mode answer`. `NAME` is
+//! the caller's label; `URL` must start with `http://` or `https://`. A
+//! malformed flag, or two flags whose names map to the same token env var,
+//! exits 1 with a JSON error before stdin is read. The bearer token comes
+//! ONLY from the `TALOS_MCP_TOKEN_<NAME>` env var (see below) — no flag
+//! accepts a token.
+//!
+//! Connecting **fails open**: each server gets [`MCP_CONNECT_TIMEOUT`]
+//! (10 s, servers connected one after another), and a server that fails to
+//! connect, lists an invalid tool, or lists a name that collides with a
+//! native, reserved or earlier server's tool registers nothing — the run
+//! proceeds with the remaining tools, and neither the exit code nor the
+//! outcome changes. Each failure prints exactly one compact JSON stderr line,
+//! `{"mcp_connect_failed":{"name":..,"error":..,"error_kind":..,"auth":..,
+//! "token_env":..}}` (printed before any `{"error":..}` line, so the
+//! dispatch worker's last-line parse is unaffected). With `--transcript`,
+//! each server also gets an `mcp_connected` or `mcp_connect_failed` line
+//! right after `run_start`. Without `--mcp`, nothing is connected and every
+//! surface is unchanged.
+//!
 //! ## Exit code contract (locked)
 //!
 //! | Code | Meaning |
@@ -254,6 +279,16 @@
 //!   Same sudo-boundary caveat as `TALOS_STATE_RETENTION_DAYS` (kb-02979
 //!   shape): under `env_reset` the fleet runs the compiled default until
 //!   the worker passes the flag.
+//! - `TALOS_MCP_TOKEN_<NAME>` — optional bearer token for the `--mcp`
+//!   server named `<NAME>`, where `<NAME>` is the flag's name with every
+//!   ASCII alphanumeric uppercased and every other character replaced by
+//!   `_` (`--mcp agent-gtd=...` reads `TALOS_MCP_TOKEN_AGENT_GTD`). The
+//!   value is trimmed; unset, empty or whitespace-only means no
+//!   `Authorization` header. The token is never printed — reports carry only
+//!   `auth: "bearer"|"none"` and the env var's name. Same sudo-boundary
+//!   caveat as `TALOS_STATE_RETENTION_DAYS` (kb-02979 shape): dispatch's
+//!   sudoers `env_keep` does not carry it, so under `env_reset` the token
+//!   never reaches the process until `env_keep` lists it.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -265,6 +300,7 @@ use harness::anthropic::AnthropicBackend;
 use harness::bedrock::BedrockBackend;
 use harness::engine::{AnswerSchema, LoopOutcome, Persistence, RunConfig, run_id, run_persisted};
 use harness::exec::{CheckCommand, ChecksRunner, shell_checks_runner};
+use harness::mcp::{McpConnectReport, McpServerConfig};
 use harness::model::{
     AssistantTurn, BackendError, MaxTokensSource, ModelBackend, OutputCapResolution, TurnRequest,
 };
@@ -607,6 +643,14 @@ struct RunArgs {
     /// passes this flag explicitly.
     #[arg(long)]
     compact_threshold_pct: Option<u64>,
+
+    /// Connect an MCP server over Streamable HTTP and register its tools
+    /// (repeatable). The bearer token comes ONLY from the
+    /// `TALOS_MCP_TOKEN_<NAME>` env var — no flag accepts a token. A server
+    /// that fails to connect is skipped (fail-open) with a one-line JSON
+    /// stderr warning.
+    #[arg(long = "mcp", value_name = "NAME=URL")]
+    mcp: Vec<String>,
 }
 
 /// Arguments for `talos ralph`.
@@ -1722,6 +1766,101 @@ enum BuildInput {
     Instruction(String),
 }
 
+/// Per-server connect timeout for `--mcp` (the whole initialize + tools/list
+/// sequence). Servers are connected sequentially.
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parse one `--mcp NAME=URL` flag, splitting at the FIRST `=`.
+fn parse_mcp_flag(raw: &str) -> Result<(String, String), String> {
+    let Some((name, url)) = raw.split_once('=').filter(|(n, _)| !n.is_empty()) else {
+        return Err(format!("--mcp expects NAME=URL, got `{raw}`"));
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "--mcp `{name}`: url must start with http:// or https://"
+        ));
+    }
+    Ok((name.to_string(), url.to_string()))
+}
+
+/// The env var holding the bearer token for the `--mcp` server `name`:
+/// `TALOS_MCP_TOKEN_` + the name with ASCII alphanumerics uppercased and
+/// every other char replaced by `_`.
+fn mcp_token_env_var(name: &str) -> String {
+    let suffix: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("TALOS_MCP_TOKEN_{suffix}")
+}
+
+/// Resolve the `--mcp` flags (in order) into server configs, reading each
+/// bearer token from its [`mcp_token_env_var`] through `env` (trimmed; unset,
+/// empty or whitespace-only is `None`). Two flags mapping to the same env var
+/// are an error — they would silently share one token.
+fn resolve_mcp_servers(
+    flags: &[String],
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<McpServerConfig>, String> {
+    let mut servers: Vec<McpServerConfig> = Vec::with_capacity(flags.len());
+    for raw in flags {
+        let (name, url) = parse_mcp_flag(raw)?;
+        let env_var = mcp_token_env_var(&name);
+        if let Some(prev) = servers
+            .iter()
+            .find(|s| mcp_token_env_var(&s.name) == env_var)
+        {
+            return Err(format!(
+                "--mcp `{}` and `{name}` both read {env_var}",
+                prev.name
+            ));
+        }
+        let bearer_token = env(&env_var)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        servers.push(McpServerConfig {
+            name,
+            url,
+            bearer_token,
+            headers: Vec::new(),
+        });
+    }
+    Ok(servers)
+}
+
+/// The one-line JSON stderr warning for a failed `--mcp` server, mirroring
+/// [`num_ctx_stderr_line`]; `None` for a connected server. Never carries the
+/// token — only `auth` and the env var's name.
+fn mcp_connect_failed_stderr_line(report: &McpConnectReport) -> Option<String> {
+    match report {
+        McpConnectReport::Connected { .. } => None,
+        McpConnectReport::Failed {
+            name,
+            error,
+            error_kind,
+            auth,
+            ..
+        } => Some(
+            serde_json::json!({
+                "mcp_connect_failed": {
+                    "name": name,
+                    "error": error,
+                    "error_kind": error_kind,
+                    "auth": auth,
+                    "token_env": mcp_token_env_var(name),
+                }
+            })
+            .to_string(),
+        ),
+    }
+}
+
 /// Validate the answer-mode flag SHAPE: `--schema` is required with
 /// `--mode answer` and rejected without it.
 ///
@@ -1823,6 +1962,13 @@ async fn run_cmd(args: RunArgs) {
         stderr_json_error(&e);
         std::process::exit(1);
     }
+    let mcp_servers = match resolve_mcp_servers(&args.mcp, &|k: &str| std::env::var(k).ok()) {
+        Ok(servers) => servers,
+        Err(e) => {
+            stderr_json_error(&e);
+            std::process::exit(1);
+        }
+    };
 
     // 2. `--schema`, BEFORE stdin and before the store is opened. Keeps the
     //    raw text (what the model is shown) next to the compiled validator
@@ -2011,7 +2157,7 @@ async fn run_cmd(args: RunArgs) {
 
     // 9/10. Registry + seed prompt + RunConfig, per mode. The seed is always
     //       byte-for-byte from a renderer, never hand-formatted.
-    let (tools, mut config) = match (answer_schema, build_input) {
+    let (mut tools, mut config) = match (answer_schema, build_input) {
         (Some((schema_text, compiled)), _) => {
             // ANSWER mode wires NO gate and NO nudges this cut. There is no
             // TaskSpec, hence no `gate_command`, hence no `ChecksRunner` — so
@@ -2105,6 +2251,17 @@ async fn run_cmd(args: RunArgs) {
     if let Some(path) = resolve_transcript_path(args.transcript.clone(), &state_dir) {
         let label = transcript_label(&settings);
         config = config.with_transcript(path, label);
+    }
+    // `--mcp`: connect each server and register its tools into whichever
+    // registry the mode built. Fail-open — a failed server prints one JSON
+    // stderr line and the run proceeds with the remaining tools.
+    if !mcp_servers.is_empty() {
+        let reports =
+            harness::mcp::connect_and_register(&mut tools, &mcp_servers, MCP_CONNECT_TIMEOUT).await;
+        for line in reports.iter().filter_map(mcp_connect_failed_stderr_line) {
+            eprintln!("{line}");
+        }
+        config = config.with_mcp_reports(reports);
     }
 
     // 11. Assemble persistence bundle and run.
@@ -2309,11 +2466,15 @@ mod tests {
         touch_dir_mtime, transcript_label, validate_mode_flags, with_flagged_max_tokens,
         write_ralph_error_detail,
     };
+    use super::{
+        mcp_connect_failed_stderr_line, mcp_token_env_var, parse_mcp_flag, resolve_mcp_servers,
+    };
     use super::{read_instruction_file, validate_instruction_flags};
     use harness::anthropic::AnthropicBackend;
     use harness::bedrock::BedrockBackend;
     use harness::engine::LoopOutcome;
     use harness::exec::ChangeEvidence;
+    use harness::mcp::McpConnectReport;
     use harness::model::{
         BackendError, MaxTokensSource, ModelBackend, OutputCapResolution, TerminalKind,
         TransientKind,
@@ -2988,6 +3149,113 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| (*v).to_string())
         }
+    }
+
+    // ---- --mcp -------------------------------------------------------------
+
+    #[test]
+    fn parse_mcp_flag_splits_at_first_equals() {
+        assert_eq!(
+            parse_mcp_flag("kb=http://h/mcp?a=b"),
+            Ok(("kb".to_string(), "http://h/mcp?a=b".to_string()))
+        );
+        assert_eq!(
+            parse_mcp_flag("kb=https://h"),
+            Ok(("kb".to_string(), "https://h".to_string()))
+        );
+        assert_eq!(
+            parse_mcp_flag("kb"),
+            Err("--mcp expects NAME=URL, got `kb`".to_string())
+        );
+        assert_eq!(
+            parse_mcp_flag("=http://h"),
+            Err("--mcp expects NAME=URL, got `=http://h`".to_string())
+        );
+        assert_eq!(
+            parse_mcp_flag("kb=ftp://x"),
+            Err("--mcp `kb`: url must start with http:// or https://".to_string())
+        );
+    }
+
+    #[test]
+    fn mcp_token_env_var_normalises_the_name() {
+        assert_eq!(mcp_token_env_var("kb"), "TALOS_MCP_TOKEN_KB");
+        assert_eq!(mcp_token_env_var("agent-gtd"), "TALOS_MCP_TOKEN_AGENT_GTD");
+        assert_eq!(mcp_token_env_var("kb.v2"), "TALOS_MCP_TOKEN_KB_V2");
+    }
+
+    #[test]
+    fn resolve_mcp_servers_reads_trimmed_tokens_in_order() {
+        let flags = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let env = env_with(&[
+            ("TALOS_MCP_TOKEN_KB", "  tok \n"),
+            ("TALOS_MCP_TOKEN_WS", "   "),
+        ]);
+        let servers = resolve_mcp_servers(
+            &flags(&["kb=http://x", "ws=http://y", "other=http://z"]),
+            &env,
+        )
+        .expect("ok");
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("tok"));
+        assert_eq!(servers[1].bearer_token, None);
+        assert_eq!(servers[2].bearer_token, None);
+        assert!(servers.iter().all(|s| s.headers.is_empty()));
+
+        let servers =
+            resolve_mcp_servers(&flags(&["b=http://x", "a=http://y"]), &env_with(&[])).expect("ok");
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["b", "a"]);
+        assert_eq!(servers[0].url, "http://x");
+
+        assert_eq!(
+            resolve_mcp_servers(&flags(&["kb=http://a", "KB=http://b"]), &env_with(&[]))
+                .map(|_| ()),
+            Err("--mcp `kb` and `KB` both read TALOS_MCP_TOKEN_KB".to_string())
+        );
+        assert_eq!(
+            resolve_mcp_servers(&flags(&["kb"]), &env_with(&[])).map(|_| ()),
+            Err("--mcp expects NAME=URL, got `kb`".to_string())
+        );
+        assert!(
+            resolve_mcp_servers(&[], &env_with(&[]))
+                .expect("ok")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mcp_connect_failed_stderr_line_shapes() {
+        let failed = McpConnectReport::Failed {
+            name: "agent-gtd".into(),
+            error: "HTTP 401: no".into(),
+            error_kind: "http_status",
+            http_status: Some(401),
+            auth: "bearer",
+            connect_ms: 3,
+        };
+        let line = mcp_connect_failed_stderr_line(&failed).expect("some");
+        assert!(!line.contains('\n'));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(
+            v,
+            serde_json::json!({"mcp_connect_failed": {
+                "name": "agent-gtd",
+                "error": "HTTP 401: no",
+                "error_kind": "http_status",
+                "auth": "bearer",
+                "token_env": "TALOS_MCP_TOKEN_AGENT_GTD",
+            }})
+        );
+        let connected = McpConnectReport::Connected {
+            name: "kb".into(),
+            tools: vec![],
+            protocol_version: "2025-11-25".into(),
+            server_name: None,
+            server_version: None,
+            auth: "none",
+            connect_ms: 1,
+        };
+        assert_eq!(mcp_connect_failed_stderr_line(&connected), None);
     }
 
     #[tokio::test]

@@ -2693,3 +2693,376 @@ fn instruction_file_explicit_mode_build_matches_default() {
     );
     assert_instruction_run_start(&run_start, "fix the bug", None);
 }
+
+// ============================================================================
+// --mcp: generic MCP client wiring (fail-open)
+// ============================================================================
+
+/// What one spawned `talos run` produced.
+struct McpRun {
+    code: Option<i32>,
+    stderr: String,
+    transcript: String,
+    lines: Vec<serde_json::Value>,
+    store_exists: bool,
+}
+
+/// Spawn `talos run` on the refused-port Ollama backend (the
+/// `transcript_flag_writes_pinned_seven_lines_on_backend_error` setup) with
+/// `extra` args. `token` sets `TALOS_MCP_TOKEN_KB`; otherwise it is removed.
+/// `answer` switches to `--mode answer --schema <file>` with a free-text
+/// question on stdin.
+fn run_talos_mcp(extra: &[&str], token: Option<&str>, answer: bool) -> McpRun {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store_path = dir.path().join("run.sqlite");
+    let offload_dir = dir.path().join("offload");
+    std::fs::create_dir_all(&offload_dir).unwrap();
+    let transcript_path = dir.path().join("t").join("run.jsonl");
+    let schema_path = dir.path().join("schema.json");
+    std::fs::write(&schema_path, answer_schema_json()).unwrap();
+
+    let mut args: Vec<String> = [
+        "run",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--run-store",
+        store_path.to_str().unwrap(),
+        "--offload-dir",
+        offload_dir.to_str().unwrap(),
+        "--task-id",
+        "cli-test-mcp",
+        "--attempt",
+        "1",
+        "--transcript",
+        transcript_path.to_str().unwrap(),
+        "--state-retention-days",
+        "0",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    if answer {
+        args.extend(
+            [
+                "--mode",
+                "answer",
+                "--schema",
+                schema_path.to_str().unwrap(),
+            ]
+            .map(str::to_string),
+        );
+    }
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+
+    let mut cmd = Command::new(TALOS_BIN);
+    cmd.args(&args)
+        .env("TALOS_BACKEND", "ollama")
+        .env("OLLAMA_MODEL", "x")
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .env("OLLAMA_NUM_CTX", "32768")
+        .env_remove("OLLAMA_THINK")
+        .env_remove("TALOS_BEDROCK")
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
+        .env("HOME", dir.path())
+        .env_remove("TALOS_STATE_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match token {
+        Some(t) => cmd.env("TALOS_MCP_TOKEN_KB", t),
+        None => cmd.env_remove("TALOS_MCP_TOKEN_KB"),
+    };
+    let mut child = cmd.spawn().expect("spawn talos");
+    let input = if answer {
+        "What is in this repo?"
+    } else {
+        valid_spec_json()
+    };
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("wait for talos");
+    let transcript = std::fs::read_to_string(&transcript_path).unwrap_or_default();
+    let lines = transcript
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each transcript line is valid JSON"))
+        .collect();
+    McpRun {
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        transcript,
+        lines,
+        store_exists: store_path.exists(),
+    }
+}
+
+fn mcp_events(lines: &[serde_json::Value]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l["event"].as_str().expect("event").to_string())
+        .collect()
+}
+
+fn tool_names(run_start: &serde_json::Value) -> Vec<String> {
+    run_start["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+/// The 8-line refused-backend shape with one MCP line at index 1.
+fn assert_eight_lines(lines: &[serde_json::Value], mcp_event: &str) {
+    let expected: Vec<String> = [
+        "run_start",
+        mcp_event,
+        "model_request",
+        "backend_error",
+        "backend_error",
+        "backend_error",
+        "backend_error",
+        "run_end",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    assert_eq!(mcp_events(lines), expected);
+}
+
+fn mcp_body(req: &wiremock::Request) -> serde_json::Value {
+    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null)
+}
+
+/// A fake MCP server listing one tool, `kb_echo`. `init_status` != 200
+/// makes `initialize` fail with that status and a body echoing the
+/// Authorization header.
+async fn fake_mcp_server(init_status: u16) -> wiremock::MockServer {
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let ok = |req: &wiremock::Request, result: serde_json::Value| {
+        ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"jsonrpc": "2.0", "id": mcp_body(req)["id"], "result": result}),
+        )
+    };
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "initialize"}),
+        ))
+        .respond_with(move |req: &wiremock::Request| {
+            if init_status == 200 {
+                ok(
+                    req,
+                    serde_json::json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1.0"},
+                    }),
+                )
+            } else {
+                let auth = req
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none")
+                    .to_string();
+                ResponseTemplate::new(init_status).set_body_string(format!("denied: {auth}"))
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "tools/list"}),
+        ))
+        .respond_with(move |req: &wiremock::Request| {
+            ok(
+                req,
+                serde_json::json!({"tools": [{
+                    "name": "kb_echo",
+                    "description": "Echo for tests",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                }]}),
+            )
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+fn mcp_flag(server: &wiremock::MockServer) -> String {
+    format!("kb={}/mcp", server.uri())
+}
+
+/// AC-15: without `--mcp`, no `mcp_*` line and no stderr warning.
+#[tokio::test(flavor = "current_thread")]
+async fn no_mcp_flag_writes_no_mcp_lines_or_warnings() {
+    let run = run_talos_mcp(&[], None, false);
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.lines.len(), 7);
+    assert!(!run.stderr.contains("mcp_connect_failed"), "{}", run.stderr);
+    assert!(
+        mcp_events(&run.lines)
+            .iter()
+            .all(|e| !e.starts_with("mcp_"))
+    );
+    let stats = &run.lines[6]["stats"];
+    assert_eq!(stats["mcp_tool_calls"], 0);
+    assert_eq!(stats["mcp_tool_call_errors"], 0);
+}
+
+/// AC-17(a): a refused MCP server fails open — same exit, one extra line.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_refused_server_fails_open() {
+    let run = run_talos_mcp(&["--mcp", "kb=http://127.0.0.1:1/mcp"], None, false);
+    assert_eq!(run.code, Some(1), "BackendError must exit 1");
+    assert_eight_lines(&run.lines, "mcp_connect_failed");
+    let f = &run.lines[1];
+    assert_eq!(f["name"], "kb");
+    assert!(!f["error"].as_str().expect("error").is_empty());
+    assert_eq!(f["error_kind"], "transport");
+    assert_eq!(f["auth"], "none");
+    assert!(f["connect_ms"].is_u64());
+
+    let warning: serde_json::Value = run
+        .stderr
+        .lines()
+        .find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .filter(|v| v.get("mcp_connect_failed").is_some())
+        })
+        .expect("one mcp_connect_failed stderr line");
+    assert_eq!(warning["mcp_connect_failed"]["name"], "kb");
+    assert_eq!(warning["mcp_connect_failed"]["auth"], "none");
+    assert_eq!(
+        warning["mcp_connect_failed"]["token_env"],
+        "TALOS_MCP_TOKEN_KB"
+    );
+    assert_eq!(run.stderr.matches("mcp_connect_failed").count(), 1);
+
+    let plain = run_talos_mcp(&[], None, false);
+    assert_eq!(tool_names(&run.lines[0]), tool_names(&plain.lines[0]));
+    assert_eq!(run.lines[0]["system"], plain.lines[0]["system"]);
+}
+
+/// AC-17(b): a connected server's tool is advertised like a native one.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_connected_server_registers_its_tools() {
+    let server = fake_mcp_server(200).await;
+    let run = run_talos_mcp(&["--mcp", &mcp_flag(&server)], None, false);
+    assert_eq!(run.code, Some(1));
+    assert_eight_lines(&run.lines, "mcp_connected");
+    let c = &run.lines[1];
+    assert_eq!(c["tools"], serde_json::json!(["kb_echo"]));
+    assert_eq!(c["auth"], "none");
+    assert_eq!(c["unregistered"], serde_json::json!([]));
+    assert_eq!(c["server_name"], "fake");
+    let tool = run.lines[0]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "kb_echo")
+        .expect("kb_echo advertised");
+    let mut keys: Vec<&String> = tool.as_object().expect("obj").keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["description", "input_schema", "name"]);
+    assert_eq!(tool["description"], "Echo for tests");
+    assert_eq!(
+        tool["input_schema"],
+        serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
+    );
+    assert!(
+        run.lines[0]["system"]
+            .as_str()
+            .expect("system")
+            .contains("- kb_echo — Echo for tests")
+    );
+    assert!(!run.stderr.contains("mcp_connect_failed"), "{}", run.stderr);
+}
+
+/// AC-17(c): the token is sent, reported as `bearer`, and never printed.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_token_is_sent_and_never_printed() {
+    let server = fake_mcp_server(200).await;
+    let run = run_talos_mcp(&["--mcp", &mcp_flag(&server)], Some("secret-tok"), false);
+    let received = server.received_requests().await.expect("captured");
+    let init = received
+        .iter()
+        .find(|r| mcp_body(r)["method"] == "initialize")
+        .expect("initialize");
+    assert_eq!(
+        init.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer secret-tok")
+    );
+    assert_eq!(run.lines[1]["event"], "mcp_connected");
+    assert_eq!(run.lines[1]["auth"], "bearer");
+    assert!(!run.transcript.contains("secret-tok"));
+    assert!(!run.stderr.contains("secret-tok"));
+}
+
+/// AC-17(c2): an echoed token in a 401 body is redacted everywhere.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_401_echoing_the_token_is_redacted() {
+    let server = fake_mcp_server(401).await;
+    let run = run_talos_mcp(&["--mcp", &mcp_flag(&server)], Some("secret-tok"), false);
+    assert_eq!(run.code, Some(1));
+    assert_eight_lines(&run.lines, "mcp_connect_failed");
+    assert_eq!(run.lines[1]["http_status"], 401);
+    assert_eq!(run.lines[1]["auth"], "bearer");
+    assert!(run.stderr.contains("mcp_connect_failed"));
+    assert!(!run.transcript.contains("secret-tok"));
+    assert!(!run.stderr.contains("secret-tok"));
+}
+
+/// AC-17(d)/(e): malformed or ambiguous `--mcp` flags exit 1 before any I/O.
+#[test]
+fn mcp_bad_flags_exit_1_before_the_store() {
+    for (flags, want) in [
+        (vec!["--mcp", "kb"], "--mcp expects NAME=URL"),
+        (
+            vec!["--mcp", "kb=ftp://x"],
+            "url must start with http:// or https://",
+        ),
+        (
+            vec!["--mcp", "kb=http://a", "--mcp", "KB=http://b"],
+            "both read TALOS_MCP_TOKEN_KB",
+        ),
+    ] {
+        let run = run_talos_mcp(&flags, None, false);
+        assert_eq!(run.code, Some(1), "{flags:?}");
+        let last = run.stderr.lines().last().expect("stderr line");
+        let v: serde_json::Value = serde_json::from_str(last).expect("JSON error");
+        assert!(
+            v["error"].as_str().expect("error").contains(want),
+            "{flags:?}: {last}"
+        );
+        assert!(!run.store_exists, "{flags:?}");
+        assert!(run.lines.is_empty(), "{flags:?}");
+    }
+}
+
+/// AC-17(f): answer mode registers MCP tools too.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_tools_register_in_answer_mode() {
+    let server = fake_mcp_server(200).await;
+    let run = run_talos_mcp(&["--mcp", &mcp_flag(&server)], None, true);
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.lines[0]["config"]["mode"], "answer");
+    assert_eq!(run.lines[1]["event"], "mcp_connected");
+    assert!(tool_names(&run.lines[0]).contains(&"kb_echo".to_string()));
+}

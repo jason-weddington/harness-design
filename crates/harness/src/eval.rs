@@ -1541,6 +1541,8 @@ mod tests {
                 memory_kb_tool_calls: 0,
                 memory_deny_overrides: 0,
                 memory_degraded: None,
+                mcp_tool_calls: 0,
+                mcp_tool_call_errors: 0,
             },
             transcript_path: None,
         };
@@ -2052,6 +2054,8 @@ mod tests {
                 memory_kb_tool_calls: 0,
                 memory_deny_overrides: 0,
                 memory_degraded: None,
+                mcp_tool_calls: 0,
+                mcp_tool_call_errors: 0,
             },
             transcript_path: None,
         };
