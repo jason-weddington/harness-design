@@ -429,6 +429,45 @@ pub fn tier2_task_prompt(
 
 #[cfg(test)]
 mod tests {
+
+    /// Inherited git-hook env (`GIT_INDEX_FILE` & co.) makes a raw git spawn
+    /// resolve against the OUTER repo when the suite runs under a hook, so
+    /// every git spawn must go through `git_command()`.
+    #[test]
+    fn no_raw_git_command_spawns_outside_git_command() {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let needle = concat!("Command::new(", "\"git\"", ")");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut offenders = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let allowed = f.file_name().unwrap() == "mined_task.rs";
+            let mut in_git_command = false;
+            for (n, line) in text.lines().enumerate() {
+                if line.contains("fn git_command()") {
+                    in_git_command = true;
+                }
+                if line.contains(needle) && !(allowed && in_git_command) {
+                    offenders.push(format!("{}:{}", f.display(), n + 1));
+                }
+                if in_git_command && line == "}" {
+                    in_git_command = false;
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "raw git spawns: {offenders:?}");
+    }
     use super::{
         AgentGateMode, DEFAULT_AGENT_GATE_TIMEOUT, MINED_SETUP_TIMEOUT, MinedTask, SealedEntry,
         SpecLevel, expand_home, load_statement, load_task, resolve_agent_gate_command,

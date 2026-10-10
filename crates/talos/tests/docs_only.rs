@@ -15,12 +15,32 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// Git exports these into hook processes; inheriting them makes `git` (and the
+/// script, which runs git) resolve against the outer repo instead of the temp one.
+const GIT_HOOK_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
+
+/// A `Command` for `program` with the inherited git-hook env removed.
+fn scrubbed(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    for var in GIT_HOOK_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// The predicate script, resolved from this crate's manifest dir.
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/docs-only.sh");
 
 /// Runs the script with `args`, optionally in `cwd`, and returns its output.
 fn run_script(args: &[&str], cwd: &Path) -> Output {
-    Command::new(SCRIPT)
+    scrubbed(SCRIPT)
         .args(args)
         .env("HOME", cwd)
         .current_dir(cwd)
@@ -31,7 +51,7 @@ fn run_script(args: &[&str], cwd: &Path) -> Output {
 /// Runs the script through an explicit `sh` interpreter (what lefthook's
 /// `skip:` resolves to in practice) and returns its output.
 fn run_via_sh(args: &[&str], cwd: &Path) -> Output {
-    Command::new("sh")
+    scrubbed("sh")
         .arg(SCRIPT)
         .args(args)
         .env("HOME", cwd)
@@ -42,7 +62,7 @@ fn run_via_sh(args: &[&str], cwd: &Path) -> Output {
 
 /// Runs `git` inside `dir` with the isolation flags every spawn here uses.
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = scrubbed("git")
         .args([
             "-c",
             "commit.gpgsign=false",

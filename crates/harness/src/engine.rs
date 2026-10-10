@@ -14560,7 +14560,7 @@ mod tests {
 
     /// `git init` `root` and return a `ToolCtx` rooted there.
     fn git_ctx(root: &std::path::Path) -> ToolCtx {
-        let out = std::process::Command::new("git")
+        let out = crate::mined_task::git_command()
             .args(["init", "-q"])
             .current_dir(root)
             .output()
@@ -14573,7 +14573,7 @@ mod tests {
     /// Run `git` with `args` in `dir`, asserting success. Commits carry an
     /// explicit identity so no global git config is required.
     fn git_in(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::mined_task::git_command()
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -14744,7 +14744,7 @@ mod tests {
         // Pin the load-bearing fail-open assumption with a test rather than
         // leaving it to the ambient environment: this root really is NOT a
         // git work tree.
-        let probe = std::process::Command::new("git")
+        let probe = crate::mined_task::git_command()
             .args(["rev-parse", "--is-inside-work-tree"])
             .current_dir(&root_path)
             .output()
@@ -16661,7 +16661,7 @@ mod tests {
     async fn answer_in_a_non_git_workspace_fails_open_and_records_it() {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canonicalize");
-        let probe = std::process::Command::new("git")
+        let probe = crate::mined_task::git_command()
             .args(["rev-parse", "--is-inside-work-tree"])
             .current_dir(&root_path)
             .output()
@@ -16718,7 +16718,7 @@ mod tests {
         let root_path = root.path().canonicalize().expect("canonicalize");
         // Pin the workspace-mode precondition: the root really is NOT a git
         // work tree — the tree was Unobservable here before the child scan.
-        let probe = std::process::Command::new("git")
+        let probe = crate::mined_task::git_command()
             .args(["rev-parse", "--is-inside-work-tree"])
             .current_dir(&root_path)
             .output()
@@ -19179,7 +19179,7 @@ mod tests {
             other => panic!("expected Finished(Done{{TreeChanged}}); got {other:?}"),
         }
 
-        let direct = std::process::Command::new("git")
+        let direct = crate::mined_task::git_command()
             .args(["status", "--porcelain"])
             .current_dir(&root_path)
             .output()

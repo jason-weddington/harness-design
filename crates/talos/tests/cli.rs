@@ -1551,6 +1551,22 @@ fn ralph_whitespace_stop_when_exits_1_with_json_error() {
     );
 }
 
+/// `git` with inherited git-hook env removed, so it targets its own cwd repo.
+fn scrubbed_git() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Deterministic no-API-key ralph run: `git init` a temp workspace, run with
 /// `TALOS_BACKEND=ollama` + `OLLAMA_MODEL=x` + `OLLAMA_BASE_URL` pointing at a
 /// refused-connection port, `--stop-when 'false'`, `--max-ralph-iterations 1`.
@@ -1563,8 +1579,6 @@ fn ralph_whitespace_stop_when_exits_1_with_json_error() {
 /// for the refused-connection setup.
 #[test]
 fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
-    use std::process::Command as StdCommand;
-
     let dir = tempfile::tempdir().expect("create temp dir");
     let workspace = dir.path();
     let offload_dir = dir.path().join("offload");
@@ -1575,7 +1589,7 @@ fn ralph_refused_ollama_exhausts_max_iterations_exit_20() {
     // first iteration's `git status --porcelain` is empty, so no commit is
     // attempted, and the progress signal is empty so stuck advances — but
     // with max_outer_iterations=1 the loop exhausts before stuck_k fires).
-    StdCommand::new("git")
+    scrubbed_git()
         .arg("init")
         .current_dir(workspace)
         .stdout(Stdio::null())

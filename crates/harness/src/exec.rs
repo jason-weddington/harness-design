@@ -1146,25 +1146,10 @@ mod tests {
 
     /// Run `git` with `args` in `dir`, asserting it succeeded.
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::mined_task::git_command()
             .args(args)
             .current_dir(dir)
-            // Git exports these into every hook process, so a test that shells
-            // out to `git` inherits them when the suite runs from a pre-commit
-            // hook and not when it runs directly. That difference is invisible
-            // until it bites: `GIT_INDEX_FILE` arrives as the RELATIVE path
-            // `.git/index`, `git worktree add` then resolves it inside the new
-            // worktree — whose `.git` is a FILE, not a directory — and the
-            // command dies with `index file open failed: Not a directory`.
-            // The suite passed the dispatch host's `gate_command` (run
-            // directly) and failed the identical command under `lefthook`.
-            // Clear the ambient repo pointers so these fixtures always describe
-            // their own temp repos.
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_PREFIX")
-            .env_remove("GIT_COMMON_DIR")
+            // git_command() scrubs inherited git-hook env (see its docs).
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1337,7 +1322,7 @@ mod tests {
     async fn git_tree_observer_delegates_to_observe_tree_on_a_real_git_repo() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
-        let out = std::process::Command::new("git")
+        let out = crate::mined_task::git_command()
             .args(["init", "-q"])
             .current_dir(root)
             .output()
@@ -1584,7 +1569,7 @@ mod tests {
         // The root's own status, straight from git: the untracked child
         // directory shows up as `?? child/` — a ROOT line, not a prefixed
         // child line.
-        let own_status = std::process::Command::new("git")
+        let own_status = crate::mined_task::git_command()
             .args(["status", "--porcelain"])
             .current_dir(root)
             .output()
@@ -1595,7 +1580,7 @@ mod tests {
             .trim()
             .to_string();
         let own_head = {
-            let out = std::process::Command::new("git")
+            let out = crate::mined_task::git_command()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(root)
                 .output()
@@ -1712,7 +1697,7 @@ mod tests {
         git(&outer, &["commit", "-qm", "ignore inner"]);
 
         let outer_head = {
-            let out = std::process::Command::new("git")
+            let out = crate::mined_task::git_command()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&outer)
                 .output()

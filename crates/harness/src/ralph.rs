@@ -1142,7 +1142,7 @@ mod tests {
     /// `git init` a temp dir into a work tree (no global git config needed;
     /// commits pass `-c user.name/-c user.email`).
     fn git_init(root: &std::path::Path) {
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .arg("init")
             .current_dir(root)
             .output()
@@ -1496,7 +1496,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -1824,7 +1824,7 @@ mod tests {
         git_init(&root_path);
         // An initial empty commit so HEAD is born (rev-list works in the
         // stop_command and the repo is a valid work tree).
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -1873,7 +1873,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -1929,12 +1929,12 @@ mod tests {
     /// into the work tree is STAGED first, so a test can seed a tracked file
     /// before the run starts. No global git config is needed.
     fn initial_commit(root: &std::path::Path) {
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args(["add", "-A"])
             .current_dir(root)
             .output()
             .expect("git add");
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -2254,7 +2254,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -2309,7 +2309,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -2359,7 +2359,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",
@@ -2424,7 +2424,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let root_path = root.path().canonicalize().expect("canon root");
         git_init(&root_path);
-        std::process::Command::new("git")
+        crate::mined_task::git_command()
             .args([
                 "-c",
                 "user.name=t",

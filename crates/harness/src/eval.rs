@@ -687,7 +687,7 @@ pub fn git_init_trial_workspace(root: &Path) {
             "fixture baseline",
         ],
     ] {
-        let status = std::process::Command::new("git")
+        let status = crate::mined_task::git_command()
             .args(&args)
             .current_dir(root)
             .stdout(std::process::Stdio::null())
