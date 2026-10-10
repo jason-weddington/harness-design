@@ -773,10 +773,9 @@ impl ChecksRunner {
 /// `/bin/sh -c ' '` exits-0 rubber-stamp false-Done vector.
 ///
 /// `/bin/sh -c` is used (NOT direct exec) so the gate string can contain
-/// shell operators like `&&` and pipes. Shared by talos production dispatch
-/// (`crates/talos/src/main.rs`'s `build_checks_runner`) and the tier-2
-/// `agent_gate_command` path (`crate::mined_eval`), so both surfaces build
-/// the identical `/bin/sh -c <cmd>` shape from one place.
+/// shell operators like `&&` and pipes. Used by talos production dispatch
+/// (`crates/talos/src/main.rs`'s `build_checks_runner`), which is also what
+/// runs a tier-2 task's `agent_gate_command` inside a Harbor trial.
 #[must_use]
 pub fn shell_checks_runner(
     gate_command: &str,

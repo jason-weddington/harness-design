@@ -2,6 +2,8 @@
 
 *Drafted 2026-08-13; decisions ratified 2026-08-14. Status: **design of record — pilot next.** Inputs: research track [08-discriminating-evals](../research/08-discriminating-evals.md) and the six-repo feasibility probe (kb-03197). Sessions: kb-03196.*
 
+*The in-process runner this doc describes was retired 2026-10-10; tier-2 runs on Harbor — see [10-tier2-on-harbor.md](10-tier2-on-harbor.md).*
+
 ## Problem
 
 The 10-fixture suite (tier-1) is pass-rate-saturated five models deep: Opus 4.8, Sonnet 5, GLM-5.2, Haiku 4.5, and qwen3.6:35b all score ~100%. It remains valuable as a fast **routing gate** (it kicked out gpt-oss:20b and caught nemotron's false-dones) but cannot discriminate within the top tier — which is where our engine-routing questions now live (Opus vs Sonnet, GLM vs Opus, talos vs Claude Code).

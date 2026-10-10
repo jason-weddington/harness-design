@@ -1561,10 +1561,11 @@ fn classify_and_maybe_remove(
 /// directory's immediate children. This is because a directory's own mtime
 /// refreshes whenever a child is added, so treating an aggregator as a
 /// single unit would either never expire it (while evals run) or delete
-/// every historical capture at once the moment it finally did age out. Both
-/// current producers of this shape write `<state>/talos/<aggregate>/<run-id>/...`:
-/// [`harness::mined_eval`]'s `trial_state_dir` (not `pub`, hence not linked)
-/// and the `coding_eval` example's `coding_eval_transcripts_root`. Any future
+/// every historical capture at once the moment it finally did age out.
+/// Producers of this shape write `<state>/talos/<aggregate>/<run-id>/...`:
+/// the `coding_eval` example's `coding_eval_transcripts_root` and, until its
+/// retirement on 2026-10-10, the in-process tier-2 runner, whose leftover
+/// `mined-eval` captures are still pruned. Any future
 /// writer of a `<state>/talos/<aggregator>/<run-id>/...` tree must add its
 /// directory name to [`AGGREGATE_DIRS`]. Note that an aggregate directory's
 /// immediate children are a MIX of shapes (well-formed `<run-id>` dirs and

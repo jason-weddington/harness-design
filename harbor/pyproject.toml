@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = ["harbor==0.9.0"]
 
 [project.scripts]
-talos-harbor-calibrate = "talos_harbor.calibrate:main"
+talos-harbor-tier2-report = "talos_harbor.tier2_report:main"
 
 [build-system]
 requires = ["hatchling"]

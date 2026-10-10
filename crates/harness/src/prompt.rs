@@ -1139,8 +1139,9 @@ mod tests {
 
     /// The two surfaces that carry test-first guidance must carry the SAME
     /// bytes. `task_spec_prompt.md` `{% include %}`s the shared template for
-    /// the groomed-item path; tier-2's mined-eval appends
-    /// [`render_test_first_approach`] to the raw statement. If someone edits
+    /// the groomed-item path; tier-2's [`crate::mined_task::tier2_task_prompt`]
+    /// (the Harbor `instruction.md`) appends [`render_test_first_approach`] to
+    /// the raw statement. If someone edits
     /// one and paraphrases the other, the eval stops measuring what dispatch
     /// ships — and that failure is invisible at runtime.
     #[test]

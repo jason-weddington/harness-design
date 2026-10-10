@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gpu-eval.sh <cmd> [args...] — run an eval command that drives a shared local GPU.
 #
-# Opt-in wrapper for mined_eval / `harbor run` against a local Ollama GPU that other eval
+# Opt-in wrapper for `harbor run` (scripts/tier2-harbor.sh) against a local Ollama GPU that other eval
 # sessions share. It (1) takes an exclusive, non-blocking flock on GPU_LOCK_FILE (default
 # $HOME/.cache/gpu-locks/rtx5090.lock) and holds it for the whole child run, (2) refuses to
 # start unless every model Ollama currently has loaded is $OLLAMA_MODEL, a name variant of it

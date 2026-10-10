@@ -13,8 +13,8 @@
 //! `/api/ps` are out of scope here. Context-length resolution IS in scope:
 //! the shared [`resolve_num_ctx`] (built on the `POST /api/show` probe
 //! [`resolve_context_length`]) is used by talos (`crates/talos/src/main.rs`)
-//! AND both eval runners (`examples/coding_eval.rs`,
-//! `examples/mined_eval.rs`) — one implementation, so the `num_ctx`
+//! AND the tier-1 eval runner (`examples/coding_eval.rs`); tier-2 runs the
+//! talos binary itself on Harbor — one implementation, so the `num_ctx`
 //! precedence cannot drift between the shipped lane and the measured lane,
 //! and a local model's window is set from the model's own advertised
 //! `{arch}.context_length` rather than a hardcoded fallback.

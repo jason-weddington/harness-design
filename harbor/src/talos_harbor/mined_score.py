@@ -1,11 +1,11 @@
 """Self-contained Harbor verifier for talos tier-2 mined tasks.
 
-A stdlib-only Python port of the tier-2 scorer. The source of truth is
-``crates/harness/src/mined_eval.rs`` (``PytestParser``, ``resolve``,
-``parse_authored_tests`` and their helpers). The Rust scorer and this script are
-parallel implementations with no mechanism keeping them in sync: **a scoring
-change must land in BOTH files**, or tier-2 numbers from the two paths stop
-being comparable.
+A stdlib-only Python port of the tier-2 scorer. It began as a port of the Rust
+scorer in the retired in-process runner
+(``crates/harness/src/mined_eval.rs``: ``PytestParser``, ``resolve``,
+``parse_authored_tests`` and their helpers) and is now the only tier-2 scorer.
+The harness embeds it verbatim (``MINED_SCORE_PY`` in
+``crates/harness/src/mined_harbor.rs``), so a scoring change lands here alone.
 
 This file is copied ALONE into a trial container and run as::
 

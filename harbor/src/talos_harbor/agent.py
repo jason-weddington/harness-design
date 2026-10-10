@@ -41,7 +41,7 @@ EXIT_CODE_DISPOSITION = {0: "Done", 10: "Blocked", 30: "AlreadySatisfied", 40: "
 """Exit code -> the one disposition it implies; 20 covers every other disposition."""
 
 CLAIMED_DONE = "Done"
-"""The disposition that counts as a claimed Done (the harness's CLAIMED_DONE constant)."""
+"""The disposition that counts as a claimed Done (talos's ``Done`` disposition)."""
 
 FORWARDED_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "bedrock": ("TALOS_BEDROCK", "ANTHROPIC_MODEL"),

@@ -5,10 +5,9 @@
 //! **Default OFF everywhere.** This module only defines the interface and
 //! writes the file; it is wired into the engine loop opt-in via
 //! [`crate::engine::RunConfig::with_transcript`], and from there into `talos
-//! run --transcript <path>`, `coding_eval` (`CODING_EVAL_TRANSCRIPTS`), and
-//! `mined_eval` (`MINED_EVAL_TRANSCRIPTS`). Writing is **best-effort**: a
-//! filesystem failure at any point silently disables the writer for the rest
-//! of the run — it can never change a run's outcome, its [`crate::engine::RunStats`],
+//! run --transcript <path>` and `coding_eval` (`CODING_EVAL_TRANSCRIPTS`).
+//! Writing is **best-effort**: a filesystem failure at any point silently
+//! disables the writer for the rest of the run — it can never change a run's outcome, its [`crate::engine::RunStats`],
 //! or the messages sent to the model. Timestamps are observational only: they
 //! read `std::time::SystemTime`/`std::time::Instant` directly, never the
 //! injected [`crate::time::Clock`] (routing them through the clock would

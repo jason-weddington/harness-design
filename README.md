@@ -93,7 +93,7 @@ The transcript's `run_start.messages[0]` first Text block equals `# Task` + blan
 
 ## Harbor adapter
 
-`harbor/` is a small uv-managed Python package, `talos_harbor`, whose `TalosAgent` runs talos as a [Harbor](https://github.com/harbor-framework/harbor) installed agent inside a trial container (`--agent-import-path talos_harbor.agent:TalosAgent`). See [`harbor/README.md`](./harbor/README.md) for usage from another repo, the trial-image requirements, and its gate chain.
+`harbor/` is a small uv-managed Python package, `talos_harbor`, whose `TalosAgent` runs talos as a [Harbor](https://github.com/harbor-framework/harbor) installed agent inside a trial container (`--agent-import-path talos_harbor.agent:TalosAgent`). See [`harbor/README.md`](./harbor/README.md) for usage from another repo, the trial-image requirements, and its gate chain. Tier-2 mined tasks run on Harbor through `scripts/tier2-harbor.sh`; the runbook is [`docs/design/10-tier2-on-harbor.md`](./docs/design/10-tier2-on-harbor.md).
 
 ## Ralph mode (`talos ralph`)
 

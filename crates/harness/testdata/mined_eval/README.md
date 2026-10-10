@@ -1,6 +1,6 @@
-# Fixture files for mined_eval tests
+# Gate-output captures for the tier-2 scorer tests
 
-These files are verbatim gate-output captures (stdout + stderr from the sealed re-gate) used as test input to pin specific scorer defects. They MUST NOT be hand-edited — a new case gets a new capture, never a mutation of an existing one.
+These files are verbatim gate-output captures (stdout + stderr from the sealed re-gate), read by `harbor/tests/test_mined_score.py` as test input to pin specific scorer defects. The test reads them by this path, which is why the directory keeps its name. They MUST NOT be hand-edited — a new case gets a new capture, never a mutation of an existing one.
 
 Fixtures may only be sourced from a `<task-id>` directory that also exists under `~/git/talos-evals/tasks/`, NEVER from a `synth-task-*` directory (there are 120+ such test-residue dirs under the same state root, and they are exactly the headerless shape this change is defending against).
 

@@ -102,10 +102,6 @@ talos exit codes 0 (Done), 10 (Blocked), 20 (Failed / stopped / out of budget), 
 
 Harbor still runs the verifier after `NonZeroAgentExitCodeError`. Treat a trial whose `exception_info` is `NonZeroAgentExitCodeError` or `AgentTimeoutError`, or whose `metadata.talos.outcome` is `BackendError`, as an infra failure and report it as Invalid, not as a model failure.
 
-## Calibration report
-
-`talos-harbor-calibrate --harbor-job <jobs> --mined-run <run_dir>` compares a Harbor job against a `mined_eval` run over the same tasks: it classifies every trial on both sides, checks config parity, prints a per-task table and pooled Wilson intervals, and ends with `MATCH` or `MISMATCH: <reasons>`. Exit codes are 0 (MATCH), 3 (MATCH but comparability DEGRADED), 1 (MISMATCH) and 2 (input error). The runbook, including the parity knobs and the exact command sequence, is [`docs/design/09-harbor-calibration.md`](../docs/design/09-harbor-calibration.md).
-
 ## Development
 
 The package's gate chain, run from `harbor/` (lefthook runs it on commits touching `harbor/**` and on every push, and CI runs it as the `harbor` job):
@@ -126,17 +122,16 @@ The recipe, on a host that has the talos-evals checkout and the source repos:
 
 ```bash
 cargo run -p harness --example mined_to_harbor -- --tasks-dir ~/git/talos-evals/tasks --out /tmp/harbor-tasks   # [--task <ID>] [--spec-level s1|s2|s3], default s2
-scripts/harbor-build-base.sh /tmp/harbor-tasks
-cd harbor && ANTHROPIC_API_KEY=... uv run --frozen harbor run -p /tmp/harbor-tasks --agent-import-path talos_harbor.agent:TalosAgent --ak max_iterations=500 --ak gate_timeout_secs=900 --ak wall_clock_secs=3300 -o <jobs>
+TALOS_BACKEND=anthropic ANTHROPIC_API_KEY=... TALOS_ARTIFACT_BASE=... scripts/tier2-harbor.sh --tasks /tmp/harbor-tasks --jobs /tmp/harbor-jobs
 ```
 
-The emitter prints the exact `harbor:` line for its `--out`; prefix it with the backend env TalosAgent forwards (see above). It also prints a `paired mined_eval:` line, the env for a `mined_eval` run that measures the same row: `MINED_EVAL_TASKS_DIR=<tasks-dir> MINED_EVAL_SPEC_LEVEL=<slug> MINED_EVAL_MAX_ITERATIONS=500 MINED_EVAL_WALL_CLOCK_SECS=3300 MINED_EVAL_AGENT_GATE=1 MINED_EVAL_GATE_TIMEOUT_SECS=900 MINED_EVAL_TEST_FIRST=1`. Any `--ak` change on the Harbor side must be mirrored in that line, or the two runs stop being comparable. Each task.toml records `spec_level`, `test_first` and `agent_gate` in `[metadata]`, and the calibration report (item D) compares them against the SUMMARY header of the paired mined_eval run.
+The emitter prints a `tier2:` line, the `scripts/tier2-harbor.sh` invocation for its `--out` (runbook: [docs/design/10-tier2-on-harbor.md](../docs/design/10-tier2-on-harbor.md)). Each task.toml records `spec_level`, `test_first` and `agent_gate` in `[metadata]`.
 
 `scripts/harbor-build-base.sh` builds `<out>/_base` as `talos-evals-base:1`, which every emitted Dockerfile builds `FROM`. The image is never pushed, so the build must use the default `docker` buildx driver (the local image store); a `docker-container` builder makes the task builds fail with 'pull access denied'.
 
 A task whose `uv.lock` (the primary's at `parent_sha`, or a sibling's at its pin) has a `source = { git = "<url>" }` over ssh (`ssh://…` or scp-style `user@host:path`) gets that dependency vendored, because the image build has no ssh client or keys and must not get them. The emitter clones the url on the host (the only network access, and only in this opt-in tool) and writes the pinned commit's ancestry to `environment/gitdeps/<name>.bundle`; the Dockerfile unpacks it into a local bare repo and sets `url."file://…".insteadOf "<url>"` system-wide, so `uv sync --frozen` resolves offline from the pinned commit. A missing commit fails the build with `TALOS_EVAL_INVALID reason=gitdep-missing-commit`. An ssh source without a `#<sha>` pin, or one url pinned at two commits, is an emit error. https git sources and registry deps are left alone.
 
-Each task's image build is also its environment check. A bundle whose `HEAD` is not the expected sha, a failing `env.setup`, or an agent gate that is red at the parent commit fails the image build with a `TALOS_EVAL_INVALID reason=<prefix>` line (`baseline-head-mismatch`, `setup-failed`, `agent-gate-red-at-parent`) in the trial's exception message; item D classifies those trials as Invalid, not as model failures. The agent-gate tripwire runs once per image build, not per trial, so a cached image does not re-check it; `docker build --no-cache` resamples it.
+Each task's image build is also its environment check. A bundle whose `HEAD` is not the expected sha, a failing `env.setup`, or an agent gate that is red at the parent commit fails the image build with a `TALOS_EVAL_INVALID reason=<prefix>` line (`baseline-head-mismatch`, `setup-failed`, `agent-gate-red-at-parent`) in the trial's exception message; `talos-harbor-tier2-report` classifies those trials as Invalid, not as model failures. The agent-gate tripwire runs once per image build, not per trial, so a cached image does not re-check it; `docker build --no-cache` resamples it.
 
 The verifier (`tests/test.sh`) writes its outputs to `/logs/verifier`:
 
@@ -151,4 +146,4 @@ The verifier (`tests/test.sh`) writes its outputs to `/logs/verifier`:
 | `gate.out`, `gate.err` | stdout and stderr of the sealed scoring gate. |
 | `reward.txt`, `score.json` | the scorer's verdict. |
 
-A failed sealed copy, sealed check or gate-command read exits before the scorer, so no reward file is written and Harbor raises `RewardFileNotFoundError`; item D counts those trials as Invalid.
+A failed sealed copy, sealed check or gate-command read exits before the scorer, so no reward file is written and Harbor raises `RewardFileNotFoundError`; `talos-harbor-tier2-report` counts those trials as Invalid.

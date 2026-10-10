@@ -723,7 +723,8 @@ def test_mined_score_imports_are_stdlib_only() -> None:
     doc = ast.get_docstring(tree)
     assert doc is not None
     assert "crates/harness/src/mined_eval.rs" in doc
-    assert "BOTH" in doc
+    assert "the only tier-2 scorer" in doc
+    assert "BOTH" not in doc
     assert src.endswith('if __name__ == "__main__":\n    sys.exit(main())\n')
     assert "type: ignore" not in src
 

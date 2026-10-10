@@ -1,5 +1,7 @@
 # 09 — Harbor calibration: does the Harbor path score the same as mined_eval?
 
+*Retired 2026-10-10: after this result of record the in-process runner and talos-harbor-calibrate were removed; tier-2 now runs on Harbor — see [10-tier2-on-harbor.md](10-tier2-on-harbor.md).*
+
 ## Purpose
 
 The tier-2 mined tasks now run two ways: in-process through `mined_eval` (the harness drives talos's engine against a local worktree and re-gates with the sealed tests), and through Harbor (`mined_to_harbor` emits a Harbor task dir per mined task, `TalosAgent` runs the talos binary in a trial container, and `mined_score.py` scores it in the verifier). Before any Harbor number is trusted as a tier-2 number, the two paths have to be shown to score the same tasks the same way. `talos-harbor-calibrate` is that check: it reads one Harbor job and one `mined_eval` run over the same tasks and says whether their resolved rates are statistically compatible.

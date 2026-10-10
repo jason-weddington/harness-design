@@ -11,7 +11,7 @@
 //!
 //! Its output must never be committed: every emitted task carries git bundles of private repos. The emitter refuses any `--out` inside a git work tree.
 //!
-//! Exit codes: 0 on success (or `--help`), 1 when emitting fails, 2 on a usage error. See `harness::mined_harbor` for the parity contract with `mined_eval`.
+//! Exit codes: 0 on success (or `--help`), 1 when emitting fails, 2 on a usage error. See `harness::mined_harbor` for the parity contract.
 
 use std::process::ExitCode;
 
@@ -49,8 +49,6 @@ fn main() -> ExitCode {
     }
     let out = args.out.display();
     println!("base image: {out}/_base (build with scripts/harbor-build-base.sh {out})");
-    for line in mined_harbor::run_hints(&args.out, &args.tasks_dir, args.spec_level) {
-        println!("{line}");
-    }
+    println!("{}", mined_harbor::run_hint(&args.out));
     ExitCode::SUCCESS
 }

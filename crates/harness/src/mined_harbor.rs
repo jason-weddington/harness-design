@@ -1,15 +1,16 @@
 //! Emit Harbor task directories from talos-evals tier-2 mined tasks.
 //!
-//! One mined task dir (see [`crate::mined_eval`] for the schema) becomes one Harbor task dir: `task.toml`, `instruction.md`, `environment/` (a `Dockerfile` plus `setup.sh`, `agent-gate.sh` and git bundles of the source repos and of any ssh-sourced `uv.lock` git dependencies) and `tests/` (the verifier `test.sh`, the scorer `mined_score.py`, a trimmed `task_score.json` and the sealed files). The `examples/mined_to_harbor.rs` CLI drives [`parse_emit_args`] and [`emit_all`].
+//! One mined task dir (see [`crate::mined_task`] for the schema) becomes one Harbor task dir: `task.toml`, `instruction.md`, `environment/` (a `Dockerfile` plus `setup.sh`, `agent-gate.sh` and git bundles of the source repos and of any ssh-sourced `uv.lock` git dependencies) and `tests/` (the verifier `test.sh`, the scorer `mined_score.py`, a trimmed `task_score.json` and the sealed files). The `examples/mined_to_harbor.rs` CLI drives [`parse_emit_args`] and [`emit_all`].
 //!
-//! ## Parity contract with `mined_eval`
+//! ## Parity contract
 //!
-//! A Harbor trial of an emitted task must measure the same thing as a `mined_eval` trial of the source task, so nothing that decides a verdict is restated here:
+//! A Harbor trial of an emitted task must measure the same row as the in-process runner it replaced (the calibration of record in docs/design/09-harbor-calibration.md), so nothing that decides a verdict is restated here:
 //!
-//! - `instruction.md` is [`crate::mined_eval::tier2_task_prompt`] over the chosen statement, with test-first guidance on and the agent gate's `## Verification` section, byte for byte.
-//! - The agent gate is whatever [`crate::mined_eval::resolve_agent_gate_command`] accepts under its default On mode, and it runs under `/bin/sh` (as talos's `shell_checks_runner` does), both for the image-build baseline tripwire and for the post-run gate in `test.sh`. Every emitted task is gated; there is no ungated emit.
+//! - `instruction.md` is [`crate::mined_task::tier2_task_prompt`] over the chosen statement, with test-first guidance on and the agent gate's `## Verification` section, byte for byte.
+//! - The agent gate is whatever [`crate::mined_task::resolve_agent_gate_command`] accepts under its default On mode, and it runs under `/bin/sh` (as talos's `shell_checks_runner` does), both for the image-build baseline tripwire and for the post-run gate in `test.sh`. Every emitted task is gated; there is no ungated emit.
 //! - The scorer is `harbor/src/talos_harbor/mined_score.py`, embedded verbatim as [`MINED_SCORE_PY`].
-//! - Timeouts are formatted from [`crate::mined_eval::MINED_SETUP_TIMEOUT`], [`crate::mined_eval::DEFAULT_AGENT_GATE_TIMEOUT`] and [`crate::eval::CODING_CHECK_TIMEOUT`], never retyped.
+//! - Timeouts are formatted from [`crate::mined_task::MINED_SETUP_TIMEOUT`], [`crate::mined_task::DEFAULT_AGENT_GATE_TIMEOUT`] and [`crate::eval::CODING_CHECK_TIMEOUT`], never retyped.
+//! - The run-time knobs (`-n` (default 1), `--max-retries 0`, and the `--ak` values formatted from [`HARBOR_MAX_ITERATIONS`], [`DEFAULT_AGENT_GATE_TIMEOUT`] and [`HARBOR_WALL_CLOCK_SECS`]) live in `scripts/tier2-harbor.sh` and are pinned to these constants by the test `tier2_script_carries_the_parity_kwargs`.
 //! - Bundles carry the parent ancestry only (a `talos-baseline` branch at `parent_sha`, or at the sibling's resolved pin), and the primary is contamination-audited: `fix_sha` must not be an ancestor of `parent_sha`, and `parent_sha` must be an ancestor of `fix_sha`.
 //!
 //! ## Golden fixture
@@ -19,7 +20,7 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::mined_eval::{
+use crate::mined_task::{
     AgentGateMode, DEFAULT_AGENT_GATE_TIMEOUT, MINED_SETUP_TIMEOUT, MinedTask, SpecLevel,
     expand_home, git_command, load_statement, load_task, resolve_agent_gate_command,
     tier2_task_prompt,
@@ -36,7 +37,7 @@ pub const AGENT_TIMEOUT_SEC: u64 = 3600;
 pub const VERIFIER_TIMEOUT_SEC: u64 = 1800;
 /// `[environment] build_timeout_sec`: the image build runs setup and the baseline tripwire.
 pub const BUILD_TIMEOUT_SEC: u64 = 1800;
-/// Iteration cap handed to `TalosAgent` (mirrors `examples/mined_eval.rs`).
+/// Iteration cap handed to `TalosAgent` as `--ak max_iterations` (pinned against `scripts/tier2-harbor.sh` by a test).
 pub const HARBOR_MAX_ITERATIONS: u64 = 500;
 /// Wall-clock budget handed to `TalosAgent`; under [`AGENT_TIMEOUT_SEC`] so talos stops itself first.
 pub const HARBOR_WALL_CLOCK_SECS: u64 = 3300;
@@ -677,7 +678,7 @@ fn bundle_heads(bundle: &Path, what: &str) -> Result<String, String> {
     )
 }
 
-/// Source repo path of the primary and of each sibling (siblings sit next to the primary, as `prepare_worktrees` lays them out).
+/// Source repo path of the primary and of each sibling (siblings sit next to the primary, as [`crate::mined_task::SiblingRepo`] documents).
 fn source_repos(task: &MinedTask) -> Result<(PathBuf, Vec<PathBuf>), String> {
     let primary = PathBuf::from(expand_home(&task.repo_path));
     let parent = primary
@@ -1217,21 +1218,13 @@ pub fn emitted_line(args: &EmitArgs, id: &str, path: &Path) -> Result<String, St
     Ok(format_emitted_line(id, args.spec_level, &shas, path))
 }
 
-/// The `harbor run` line and the paired `mined_eval` line for an emitted dir.
+/// The `tier2:` hint for an emitted dir: the `scripts/tier2-harbor.sh` invocation for `out`.
 #[must_use]
-pub fn run_hints(out: &Path, tasks_dir: &Path, level: SpecLevel) -> [String; 2] {
-    let gate = DEFAULT_AGENT_GATE_TIMEOUT.as_secs();
-    [
-        format!(
-            "harbor: uv run --frozen harbor run -p {} --agent-import-path talos_harbor.agent:TalosAgent --ak max_iterations={HARBOR_MAX_ITERATIONS} --ak gate_timeout_secs={gate} --ak wall_clock_secs={HARBOR_WALL_CLOCK_SECS} -o <jobs>",
-            out.display()
-        ),
-        format!(
-            "paired mined_eval: MINED_EVAL_TASKS_DIR={} MINED_EVAL_SPEC_LEVEL={} MINED_EVAL_MAX_ITERATIONS={HARBOR_MAX_ITERATIONS} MINED_EVAL_WALL_CLOCK_SECS={HARBOR_WALL_CLOCK_SECS} MINED_EVAL_AGENT_GATE=1 MINED_EVAL_GATE_TIMEOUT_SECS={gate} MINED_EVAL_TEST_FIRST=1",
-            tasks_dir.display(),
-            level.slug()
-        ),
-    ]
+pub fn run_hint(out: &Path) -> String {
+    format!(
+        "tier2: scripts/tier2-harbor.sh --tasks {} --jobs <jobs>",
+        out.display()
+    )
 }
 
 #[cfg(test)]
@@ -2194,14 +2187,25 @@ mod tests {
             format_emitted_line("x", SpecLevel::S1, &[], Path::new("/o/x")),
             "emitted task=x level=s1 gate=armed siblings=- -> /o/x"
         );
-        let [harbor, paired] = run_hints(Path::new("/o"), Path::new("/t/tasks"), SpecLevel::S3);
         assert_eq!(
-            harbor,
-            "harbor: uv run --frozen harbor run -p /o --agent-import-path talos_harbor.agent:TalosAgent --ak max_iterations=500 --ak gate_timeout_secs=900 --ak wall_clock_secs=3300 -o <jobs>"
+            run_hint(Path::new("/o")),
+            "tier2: scripts/tier2-harbor.sh --tasks /o --jobs <jobs>"
         );
-        assert_eq!(
-            paired,
-            "paired mined_eval: MINED_EVAL_TASKS_DIR=/t/tasks MINED_EVAL_SPEC_LEVEL=s3 MINED_EVAL_MAX_ITERATIONS=500 MINED_EVAL_WALL_CLOCK_SECS=3300 MINED_EVAL_AGENT_GATE=1 MINED_EVAL_GATE_TIMEOUT_SECS=900 MINED_EVAL_TEST_FIRST=1"
+    }
+
+    /// The tier-2 script must hand Harbor the same run-time knobs the Rust
+    /// constants (and the calibration of record) use; a drift on either side fails here.
+    #[test]
+    fn tier2_script_carries_the_parity_kwargs() {
+        const SCRIPT: &str = include_str!("../../../scripts/tier2-harbor.sh");
+        let kwargs = format!(
+            "-n \"$N\" --max-retries 0 --ak gate_timeout_secs={} --ak wall_clock_secs={HARBOR_WALL_CLOCK_SECS} --ak max_iterations={HARBOR_MAX_ITERATIONS}",
+            DEFAULT_AGENT_GATE_TIMEOUT.as_secs()
+        );
+        assert!(SCRIPT.contains(&kwargs), "script lacks `{kwargs}`");
+        assert!(
+            SCRIPT.lines().any(|l| l == "N=1"),
+            "script must default -n to 1"
         );
     }
 
