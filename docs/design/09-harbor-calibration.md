@@ -89,3 +89,9 @@ The mined record's `input_tokens` is raw input on successful turns and EXCLUDES 
 ## What MATCH does not prove
 
 MATCH is a statistical-compatibility check at small k, not a proof of equivalence. At k = 3 over a handful of tasks the Wilson intervals are wide, so two paths that differ by a real 10–20 points can still MATCH. Treat MATCH as "no evidence the Harbor path scores differently", read the per-task table and the invalid breakdown alongside it, and re-run with a larger k before relying on a close call.
+
+## Result of record — 2026-10-10
+
+MATCH, comparability ok. qwen3.8:27b on one local RTX 5090 (num_ctx 262144, think on), s2, k=5, all eight tier-2 tasks, talos 0.14.0-10-g625f71f. Harbor 37/40 (0.925, Wilson [0.801, 0.974]) against mined_eval 36/40 (0.900, [0.769, 0.960]); no task differs by more than 1 of 5, and on the one task both sides find hard (photoqueue-privacy-metadata, 2/5 vs 3/5) the unresolved trials miss the same sealed tests. Every trial on both sides claimed Done, so the false dones are the unresolved trials (3 vs 4), and neither side has an Invalid trial in the final data.
+
+Read it as "no gross divergence for this model", not as fine-grained equivalence: overlapping intervals at n=40 still admit differences of about 15 points. The first mined_eval pass lost five tasks to host drift (missing node/npm and redis-stack-server after an OS reinstall, plus a git server that refused fetch-by-hash on a cold uv cache), and those tasks were re-run after the fixes; the Harbor side had no Invalid trials at all, which is the practical argument for Harbor as the instrument going forward. Full numbers and assembly notes: KB `harness-design` entry "Harbor tier-2 calibration: MATCH vs in-process mined_eval".
