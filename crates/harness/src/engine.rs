@@ -1241,6 +1241,14 @@ pub struct RunStats {
     /// Memory reports not sent because the adapter's per-run cap was
     /// reached. Zero whenever memory is off.
     pub memory_events_capped: u32,
+    /// Turn digests the store acknowledged, as settled by [`Memory::flush`]
+    /// at run end. Zero whenever memory is off and when the flush hit its
+    /// bound.
+    pub memory_digests_sent: u32,
+    /// Turn digests that failed (transport error, timeout, non-2xx, or
+    /// unfittable). Zero whenever memory is off and when the flush hit its
+    /// bound.
+    pub memory_digests_failed: u32,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -1999,6 +2007,34 @@ fn checks_rejected(
     }
 }
 
+/// The harness correction a handled `finish` call represents, if any:
+/// a tree-unchanged `done` is `no_change`; a red-checks `already_satisfied`
+/// or `done` is `claim_rejected`; every other outcome (accepted, schema,
+/// modified-workspace, wrong-mode, invalid, missing-reason) is `None`.
+fn finish_correction(
+    outcome: &FinishOutcome,
+    input: &Value,
+) -> Option<(memory::CorrectionTrigger, String)> {
+    let field = |key: &str| input[key].as_str().unwrap_or_default().to_string();
+    match outcome.rejection {
+        Some(FinishRejection::NoChange) => Some((
+            memory::CorrectionTrigger::NoChange,
+            no_change_rejection_content(),
+        )),
+        Some(FinishRejection::AlreadySatisfiedChecks) => Some((
+            memory::CorrectionTrigger::ClaimRejected,
+            format!("finish(already_satisfied): {}", field("reason")),
+        )),
+        None if outcome.finish.is_none() && outcome.report.as_ref().is_some_and(|r| !r.passed) => {
+            Some((
+                memory::CorrectionTrigger::ClaimRejected,
+                format!("finish(done): {}", field("summary")),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Handle a `finish` call: verify a `done` claim against `config.checks`
 /// when configured, or accept it on trust when not — and, on a green verdict,
 /// additionally require that the workspace actually moved since the run
@@ -2454,6 +2490,8 @@ pub async fn run(
         memory_events_sent: 0,
         memory_events_failed: 0,
         memory_events_capped: 0,
+        memory_digests_sent: 0,
+        memory_digests_failed: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2551,6 +2589,8 @@ pub async fn run_persisted(
         memory_events_sent: 0,
         memory_events_failed: 0,
         memory_events_capped: 0,
+        memory_digests_sent: 0,
+        memory_digests_failed: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2649,6 +2689,8 @@ async fn run_loop_impl(
             stats.memory_events_sent += flushed.sent;
             stats.memory_events_failed += flushed.failed;
             stats.memory_events_capped += flushed.capped;
+            stats.memory_digests_sent += flushed.digests_sent;
+            stats.memory_digests_failed += flushed.digests_failed;
         }
     }
     emit_run_end(
@@ -2833,7 +2875,7 @@ fn emit_mcp_report(
 }
 
 fn render_run_end_stats(stats: &RunStats) -> Value {
-    json!({
+    let mut rendered = json!({
         "iterations": stats.iterations,
         "input_tokens": stats.input_tokens,
         "output_tokens": stats.output_tokens,
@@ -2875,7 +2917,12 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "memory_events_sent": stats.memory_events_sent,
         "memory_events_failed": stats.memory_events_failed,
         "memory_events_capped": stats.memory_events_capped,
-    })
+    });
+    // Added outside the `json!` literal: one more key there exceeds the
+    // macro's recursion limit.
+    rendered["memory_digests_sent"] = json!(stats.memory_digests_sent);
+    rendered["memory_digests_failed"] = json!(stats.memory_digests_failed);
+    rendered
 }
 
 // ======================================================================
@@ -3802,9 +3849,15 @@ struct MemoryRun {
 }
 
 /// The memory run-start sequence: `degraded()` → `label()` → (when not
-/// degraded) `tools()` → `session_slice()`, each exactly once. A degraded
-/// memory fails open to Off behaviour with one stderr warning.
-fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunStats) -> MemoryRun {
+/// degraded) `tools()` → `session_slice()` → `observe(RunStart)`, each
+/// exactly once. A degraded memory fails open to Off behaviour with one
+/// stderr warning.
+fn memory_run_start(
+    memory: &dyn Memory,
+    tools: &ToolRegistry,
+    stats: &mut RunStats,
+    task: &str,
+) -> MemoryRun {
     let degraded = memory.degraded();
     let source = memory.label();
     let kb_session_id = memory.session_id();
@@ -3853,6 +3906,7 @@ fn memory_run_start(memory: &dyn Memory, tools: &ToolRegistry, stats: &mut RunSt
         .session_slice()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    memory.observe(&memory::Observation::RunStart { task });
     let (items, chars) = slice
         .as_deref()
         .map_or((0, 0), |s| (memory::slice_item_count(s), s.chars().count()));
@@ -3908,7 +3962,12 @@ async fn run_loop_body(
     let memory_run = if config.memory_mode == MemoryMode::Off {
         None
     } else {
-        Some(memory_run_start(config.memory.as_ref(), tools, stats))
+        Some(memory_run_start(
+            config.memory.as_ref(),
+            tools,
+            stats,
+            &config.task,
+        ))
     };
     let tools: &ToolRegistry = memory_run
         .as_ref()
@@ -4541,6 +4600,22 @@ async fn run_loop_body(
         // for nudge-status telemetry if this turn follows a nudge without
         // producing an accepted finish(done).
         let turn_text = turn.text();
+        if memory_run.as_ref().is_some_and(|m| m.active) {
+            let reasoning = turn
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    model::ContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            config.memory.observe(&memory::Observation::Turn {
+                iteration: stats.iterations,
+                reasoning: &reasoning,
+                text: &turn_text,
+            });
+        }
         if writer.is_enabled() {
             writer.emit(
                 "model_response",
@@ -4684,6 +4759,13 @@ async fn run_loop_body(
                     });
                     nudges_fired += 1;
                     stats.nudges_fired += 1;
+                    if memory_run.as_ref().is_some_and(|m| m.active) {
+                        config.memory.observe(&memory::Observation::Correction {
+                            trigger: memory::CorrectionTrigger::Nudge,
+                            iteration: stats.iterations,
+                            detail: &nudge_text,
+                        });
+                    }
                     nudge_awaiting_status = true;
                     if writer.is_enabled() {
                         writer.emit(
@@ -4897,6 +4979,30 @@ async fn run_loop_body(
                                 .map(FinishRejection::as_str),
                         }),
                     );
+                }
+                // ---- memory observation (see `Memory::observe`) ----
+                if memory_run.as_ref().is_some_and(|m| m.active) {
+                    let UserBlock::ToolResult {
+                        content, is_error, ..
+                    } = &outcome.result
+                    else {
+                        unreachable!("handle_finish_call always returns a ToolResult");
+                    };
+                    config.memory.observe(&memory::Observation::Finish {
+                        call_id: &call.id,
+                        iteration: stats.iterations,
+                        args: &call.input,
+                        is_error: *is_error,
+                        content,
+                        accepted: outcome.finish.as_ref(),
+                    });
+                    if let Some((trigger, detail)) = finish_correction(&outcome, &call.input) {
+                        config.memory.observe(&memory::Observation::Correction {
+                            trigger,
+                            iteration: stats.iterations,
+                            detail: &detail,
+                        });
+                    }
                 }
                 // Discriminate the two verified-but-rejected outcomes off
                 // `FinishOutcome`, the same shape `invalid_raw` already uses.
@@ -5141,6 +5247,13 @@ async fn run_loop_body(
                             duration_ms: Some(duration_ms),
                         },
                     );
+                    if call.name == "run_checks" && result.is_error {
+                        config.memory.observe(&memory::Observation::Correction {
+                            trigger: memory::CorrectionTrigger::GateRed,
+                            iteration: stats.iterations,
+                            detail: &content,
+                        });
+                    }
                 }
                 if let Some((memory::AppliedMode::Annotate, fact, entry_id)) = &memory_applied {
                     content = format!("{content}\n\n{}", memory::annotation_block(fact, entry_id));
@@ -5292,6 +5405,13 @@ async fn run_loop_body(
                     content.push(UserBlock::Text(nudge_text.clone()));
                     nudges_fired += 1;
                     stats.nudges_fired += 1;
+                    if memory_run.as_ref().is_some_and(|m| m.active) {
+                        config.memory.observe(&memory::Observation::Correction {
+                            trigger: memory::CorrectionTrigger::Nudge,
+                            iteration: stats.iterations,
+                            detail: &nudge_text,
+                        });
+                    }
                     if writer.is_enabled() {
                         writer.emit(
                             "harness_message",
@@ -5724,6 +5844,8 @@ pub async fn resume(
         memory_events_sent: 0,
         memory_events_failed: 0,
         memory_events_capped: 0,
+        memory_digests_sent: 0,
+        memory_digests_failed: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -5846,9 +5968,11 @@ mod tests {
         no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
         run, run_id, run_persisted, should_compact, token_budget_breached,
     };
+    use super::{finish_correction, handle_finish_call};
     use crate::exec::{
         ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, TreeObservation,
     };
+    use crate::memory::CorrectionTrigger;
     use crate::model::{
         AssistantTurn, BackendError, ContentBlock, MaxTokensSource, Message, OutputCapResolution,
         StopReason, TerminalKind, ToolCallRequest, TransientKind, Usage, UserBlock,
@@ -7459,6 +7583,8 @@ mod tests {
             memory_events_sent: 0,
             memory_events_failed: 0,
             memory_events_capped: 0,
+            memory_digests_sent: 0,
+            memory_digests_failed: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -14622,6 +14748,8 @@ mod tests {
             memory_events_sent: 0,
             memory_events_failed: 0,
             memory_events_capped: 0,
+            memory_digests_sent: 0,
+            memory_digests_failed: 0,
         }
     }
 
@@ -18915,6 +19043,63 @@ mod tests {
         }
     }
 
+    /// AC3: which handled `finish` outcomes are harness corrections.
+    #[tokio::test]
+    async fn finish_correction_table() {
+        type Case<'a> = (
+            serde_json::Value,
+            Option<&'a ChecksRunner>,
+            Option<(CorrectionTrigger, String)>,
+        );
+        let ctx = ToolCtx::stub();
+        let baseline = observed("?? a");
+        let failing = failing_runner();
+        let passing = passing_runner();
+        let cases: Vec<Case<'_>> = vec![
+            (
+                serde_json::json!({"disposition": "done", "summary": "all set"}),
+                Some(&failing),
+                Some((
+                    CorrectionTrigger::ClaimRejected,
+                    "finish(done): all set".into(),
+                )),
+            ),
+            (
+                serde_json::json!({"disposition": "already_satisfied", "reason": "r"}),
+                Some(&failing),
+                Some((
+                    CorrectionTrigger::ClaimRejected,
+                    "finish(already_satisfied): r".into(),
+                )),
+            ),
+            (
+                serde_json::json!({"disposition": "done", "summary": "nothing"}),
+                Some(&passing),
+                Some((CorrectionTrigger::NoChange, no_change_rejection_content())),
+            ),
+            (
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+                None,
+                None,
+            ),
+            (serde_json::json!({"disposition": "complete"}), None, None),
+            (
+                serde_json::json!({"disposition": "blocked", "decision_needed": "q"}),
+                None,
+                None,
+            ),
+        ];
+        for (i, (input, checks, expected)) in cases.into_iter().enumerate() {
+            // Case 2 (no_change) sees an identical tree; the accepted `done`
+            // sees a changed one.
+            let current = if i == 2 { "?? a" } else { "?? a\n?? b" };
+            let stub = StubChangeObserver::new(vec![observed(current)]);
+            let outcome =
+                handle_finish_call("cf", &input, checks, None, &baseline, &stub, &ctx).await;
+            assert_eq!(finish_correction(&outcome, &input), expected, "case {i}");
+        }
+    }
+
     fn unobserved(reason: &str) -> TreeObservation {
         TreeObservation::Unobservable {
             reason: reason.to_string(),
@@ -19422,8 +19607,8 @@ mod tests {
         use super::*;
         use crate::engine::MEMORY_FLUSH_TIMEOUT;
         use crate::memory::{
-            Advice, MEMORY_SLICE_HEADING, Memory, MemoryFlush, MemoryMode, ToolCallView,
-            ToolResultView, annotation_block, append_session_slice, deny_content,
+            Advice, MEMORY_SLICE_HEADING, Memory, MemoryFlush, MemoryMode, Observation,
+            ToolCallView, ToolResultView, annotation_block, append_session_slice, deny_content,
         };
         use crate::task_spec::{FileToModify, TaskSpec};
         use serde_json::{Value, json};
@@ -19481,6 +19666,7 @@ mod tests {
             before: AtomicU32,
             after: AtomicU32,
             flush: AtomicU32,
+            observe: AtomicU32,
         }
 
         /// One `after_tool` observation:
@@ -19499,6 +19685,8 @@ mod tests {
             tools: Vec<(String, String, String, Arc<AtomicU32>)>,
             advice: AdviceFn,
             observed: Arc<Mutex<Vec<Observed>>>,
+            /// Every `observe` and `after_tool`, in call order, rendered.
+            log: Arc<Mutex<Vec<String>>>,
             /// What `flush` returns; `None` means it never resolves.
             flush_result: Option<MemoryFlush>,
         }
@@ -19513,6 +19701,7 @@ mod tests {
                     tools: Vec::new(),
                     advice: Box::new(|_| Advice::None),
                     observed: Arc::new(Mutex::new(Vec::new())),
+                    log: Arc::new(Mutex::new(Vec::new())),
                     flush_result: Some(MemoryFlush::default()),
                 }
             }
@@ -19580,8 +19769,46 @@ mod tests {
                 self.counters.label.fetch_add(1, Ordering::SeqCst);
                 self.label.clone()
             }
+            fn observe(&self, observation: &Observation<'_>) {
+                self.counters.observe.fetch_add(1, Ordering::SeqCst);
+                let entry = match observation {
+                    Observation::RunStart { task } => format!("run_start:{task}"),
+                    Observation::Turn {
+                        iteration,
+                        reasoning,
+                        text,
+                    } => format!("turn:{iteration}:{reasoning}:{text}"),
+                    Observation::Finish {
+                        call_id,
+                        iteration,
+                        is_error,
+                        accepted,
+                        ..
+                    } => {
+                        let accepted = match accepted {
+                            None => "none",
+                            Some(Disposition::Done { .. }) => "done",
+                            Some(Disposition::AlreadySatisfied { .. }) => "already_satisfied",
+                            Some(Disposition::Blocked { .. }) => "blocked",
+                            Some(Disposition::Failed { .. }) => "failed",
+                            Some(Disposition::Answer { .. }) => "answer",
+                        };
+                        format!("finish:{call_id}:{iteration}:{is_error}:{accepted}")
+                    }
+                    Observation::Correction {
+                        trigger,
+                        iteration,
+                        detail,
+                    } => format!("correction:{}:{iteration}:{detail}", trigger.as_str()),
+                };
+                self.log.lock().unwrap().push(entry);
+            }
             fn after_tool(&self, call: &ToolCallView, result: &ToolResultView) {
                 self.counters.after.fetch_add(1, Ordering::SeqCst);
+                self.log.lock().unwrap().push(format!(
+                    "after:{}:{}:{}",
+                    call.name, result.iteration, result.is_error
+                ));
                 self.observed.lock().unwrap().push((
                     call.name.to_string(),
                     result.call_id.to_string(),
@@ -19777,6 +20004,7 @@ mod tests {
                 &counters.before,
                 &counters.after,
                 &counters.flush,
+                &counters.observe,
             ] {
                 assert_eq!(c.load(Ordering::SeqCst), 0);
             }
@@ -19822,6 +20050,7 @@ mod tests {
             assert_eq!(counters.slice.load(Ordering::SeqCst), 0);
             assert_eq!(counters.before.load(Ordering::SeqCst), 0);
             assert_eq!(counters.after.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.observe.load(Ordering::SeqCst), 0);
             assert_eq!(backend.systems_seen(), plain.systems_seen());
             assert_eq!(backend.tools_seen(), plain.tools_seen());
             assert_eq!(backend.messages_seen(), plain.messages_seen());
@@ -20450,6 +20679,8 @@ mod tests {
                 sent: 2,
                 failed: 1,
                 capped: 3,
+                digests_sent: 4,
+                digests_failed: 5,
             }));
             let counters = Arc::clone(&fake.counters);
             let observed = Arc::clone(&fake.observed);
@@ -20500,10 +20731,13 @@ mod tests {
                 ),
                 (2, 1, 3)
             );
+            assert_eq!((s.memory_digests_sent, s.memory_digests_failed), (4, 5));
             let end = run_end_stats(&lines);
             assert_eq!(end["memory_events_sent"], 2);
             assert_eq!(end["memory_events_failed"], 1);
             assert_eq!(end["memory_events_capped"], 3);
+            assert_eq!(end["memory_digests_sent"], 4);
+            assert_eq!(end["memory_digests_failed"], 5);
         }
 
         #[tokio::test]
@@ -20560,6 +20794,212 @@ mod tests {
                     .unwrap()
                     .contains(MEMORY_SLICE_HEADING)
             );
+        }
+
+        // ---- Memory::observe call sites (AC4) -------------------------------
+
+        /// A `run_checks` stand-in: red unless its input has `"ok": true`.
+        struct RunChecksTool;
+
+        #[async_trait]
+        impl Tool for RunChecksTool {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "run_checks"
+            }
+            fn schema(&self) -> Value {
+                json!({
+                    "name": "run_checks",
+                    "description": "run the gate",
+                    "input_schema": { "type": "object" },
+                })
+            }
+            async fn run(&self, input: Value, _ctx: &ToolCtx) -> ToolResult {
+                if input["ok"] == json!(true) {
+                    ToolResult::ok("checks passed")
+                } else {
+                    ToolResult::error("checks FAILED")
+                }
+            }
+        }
+
+        fn gate_registry() -> ToolRegistry {
+            let mut tools = registry_with_finish_and_echo();
+            tools.register("run_checks", Arc::new(RunChecksTool));
+            tools.register(
+                "edit_file",
+                Arc::new(TestTool::new("edit_file", "edit", "edited")),
+            );
+            tools
+        }
+
+        /// Run `script` under an Annotate `FakeMemory` built by `config`
+        /// from the task `do the task`; return the observe/after log.
+        async fn observe_log(
+            script: Vec<AssistantTurn>,
+            tools: &ToolRegistry,
+            config: impl FnOnce(RunConfig) -> RunConfig,
+        ) -> Vec<String> {
+            let fake = FakeMemory::new();
+            let log = Arc::clone(&fake.log);
+            let config = config(
+                RunConfig::new("do the task", 10).with_memory(Arc::new(fake), MemoryMode::Annotate),
+            );
+            go(script, tools, &config).await;
+            log.lock().unwrap().clone()
+        }
+
+        #[tokio::test]
+        async fn observe_reports_a_red_gate() {
+            let script = vec![
+                one_call("rc1", "run_checks", json!({})),
+                one_call("e1", "edit_file", json!({"path": "a"})),
+                one_call("rc2", "run_checks", json!({"ok": true})),
+                finish_blocked("cf"),
+            ];
+            let log = observe_log(script, &gate_registry(), |c| c).await;
+            assert_eq!(
+                log,
+                [
+                    "run_start:do the task",
+                    "turn:1::",
+                    "after:run_checks:1:true",
+                    "correction:gate_red:1:checks FAILED",
+                    "turn:2::",
+                    "after:edit_file:2:false",
+                    "turn:3::",
+                    "after:run_checks:3:false",
+                    "turn:4::",
+                    "finish:cf:4:false:blocked",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn observe_reports_a_rejected_claim() {
+            let script = vec![
+                finish_call("c1", json!({"disposition": "done", "summary": "all set"})),
+                finish_blocked("c2"),
+            ];
+            let log = observe_log(script, &registry_with_finish_and_echo(), |c| {
+                c.with_checks(failing_runner())
+            })
+            .await;
+            assert_eq!(
+                log,
+                [
+                    "run_start:do the task",
+                    "turn:1::",
+                    "finish:c1:1:true:none",
+                    "correction:claim_rejected:1:finish(done): all set",
+                    "turn:2::",
+                    "finish:c2:2:false:blocked",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn observe_reports_a_no_change_rejection() {
+            let script = vec![
+                finish_call("c1", json!({"disposition": "done", "summary": "nothing"})),
+                finish_blocked("c2"),
+            ];
+            let stub = Arc::new(StubChangeObserver::new(vec![
+                observed("?? a"),
+                observed("?? a"),
+            ]));
+            let log = observe_log(script, &registry_with_finish_and_echo(), |c| {
+                c.with_checks(passing_runner())
+                    .with_change_observer(stub as Arc<dyn ChangeObserver>)
+            })
+            .await;
+            assert_eq!(
+                log,
+                [
+                    "run_start:do the task".to_string(),
+                    "turn:1::".to_string(),
+                    "finish:c1:1:true:none".to_string(),
+                    format!("correction:no_change:1:{}", no_change_rejection_content()),
+                    "turn:2::".to_string(),
+                    "finish:c2:2:false:blocked".to_string(),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn observe_reports_a_stop_terminal_nudge() {
+            let (tools, _) = registry_with_bash();
+            let script = vec![
+                one_call("b1", "bash", cmd("touch a")),
+                turn_with(
+                    vec![ContentBlock::Text("all done".into())],
+                    StopReason::EndTurn,
+                ),
+                finish_blocked("cf"),
+            ];
+            let log = observe_log(script, &tools, |c| c).await;
+            let expected = [
+                "turn:2::all done".to_string(),
+                format!(
+                    "correction:nudge:2:{}",
+                    prompt::render_nudge_prompt_unverified()
+                ),
+                "turn:3::".to_string(),
+                "finish:cf:3:false:blocked".to_string(),
+            ];
+            let mut at = 0;
+            for want in &expected {
+                let found = log[at..]
+                    .iter()
+                    .position(|e| e == want)
+                    .unwrap_or_else(|| panic!("{want} missing in order from {log:?}"));
+                at += found + 1;
+            }
+        }
+
+        #[tokio::test]
+        async fn observe_reports_a_green_static_nudge() {
+            let script = vec![
+                one_call("rc", "run_checks", json!({"ok": true})),
+                finish_blocked("cf"),
+            ];
+            let log = observe_log(script, &gate_registry(), |c| c.with_static_tree_k(1)).await;
+            assert_eq!(
+                log,
+                [
+                    "run_start:do the task".to_string(),
+                    "turn:1::".to_string(),
+                    "after:run_checks:1:false".to_string(),
+                    format!("correction:nudge:1:{}", prompt::render_nudge_prompt()),
+                    "turn:2::".to_string(),
+                    "finish:cf:2:false:blocked".to_string(),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn observe_joins_reasoning_blocks() {
+            let script = vec![
+                turn_with(
+                    vec![
+                        ContentBlock::Reasoning {
+                            text: "r1".into(),
+                            opaque: None,
+                        },
+                        ContentBlock::Text("t1".into()),
+                        ContentBlock::Reasoning {
+                            text: "r2".into(),
+                            opaque: Some("sig".into()),
+                        },
+                        tool_call("c1", "echo", json!({"i": 1})),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                finish_blocked("cf"),
+            ];
+            let log = observe_log(script, &registry_with_finish_and_echo(), |c| c).await;
+            let turn = log.iter().find(|e| e.starts_with("turn:1:")).expect("turn");
+            assert_eq!(turn, "turn:1:r1\n\nr2:t1");
         }
     }
 

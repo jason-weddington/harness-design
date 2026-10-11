@@ -1,5 +1,6 @@
 //! The **personal-kb adapter** for the [`crate::memory`] seam: phase 1 of
-//! `docs/design/11-memory.md` (the read path).
+//! `docs/design/11-memory.md` (the read path) and phase 3's native capture
+//! (failed-tool events and turn digests).
 //!
 //! [`PersonalKbMemory::connect`] makes ONE `GET /api/kb/prevention` request
 //! per run, before the run starts, and keeps the result: the KB's rendered
@@ -81,8 +82,57 @@
 //! **Fixture.** `testdata/personal_kb/prevention_response.json` is the
 //! interim stand-in for the golden `/prevention` fixture kb-service will
 //! publish; replace it when that lands.
+//!
+//! ## Turn digests
+//!
+//! Phase 3 native capture: the session is posted to `POST /api/kb/turn`
+//! ([`TURN_PATH`]) as periodic digests, contract-checked against the vendored
+//! `testdata/personal_kb_contracts/turn.json`.
+//!
+//! - **Gating.** Digests go to `turn_target`, which is `Some` under exactly
+//!   the condition failed-tool events use: not degraded AND the `/prevention`
+//!   body carried a `tool_map` key. Otherwise [`Memory::observe`] and
+//!   [`Memory::after_tool`] buffer nothing for digests and
+//!   [`Memory::flush`] posts none. Only calls whose native name is a
+//!   `tool_map` key become `tool_call`/`tool_result` items, with
+//!   `tool_use_id` = `<iteration>:<call id>`.
+//! - **Headers.** Every event and digest POST sends the bearer token,
+//!   [`KB_HARNESS_HEADERS`] and, when the engine id given to
+//!   [`PersonalKbMemory::with_event_context`] is a non-blank valid header
+//!   value, [`KB_ENGINE_HEADER`]; digests also send
+//!   `Content-Type: application/json`.
+//! - **Body.** The contract's 14 keys; `event_id` = `<session_id>:<turn_index>`,
+//!   `turn_index` 0, 1, 2, ... per closed digest (a failed or unfittable
+//!   digest still consumes its index), `user_prompt` only on index 0,
+//!   `final_message` only on the final digest. The bytes budgeted are the
+//!   bytes posted.
+//! - **Items.** A turn contributes `reasoning` then `assistant_text` (each
+//!   when non-blank); a call contributes `tool_call` + `tool_result` (the
+//!   excerpt only on an error) and then the corrections it resolves. Fields
+//!   are cut to the contract's `maxLength`s.
+//! - **Corrections.** The adapter owns the lifecycle: open on
+//!   `observe(Correction)`, fold a repeat of an open trigger, resolve every
+//!   open correction at the next green `run_checks` or accepted
+//!   `done`/`already_satisfied`/`answer` with `resolved_by` = the posted calls
+//!   in between (last [`MAX_RESOLVED_BY`]), carry still-open ones into the
+//!   final digest with `resolved: false`.
+//! - **Closing.** A digest closes when the next group would exceed
+//!   [`MAX_TURN_ITEMS`] or [`MAX_TURN_BODY_BYTES`], or at a turn once
+//!   [`DIGEST_PERIOD`] has passed since it opened; it is never closed empty
+//!   mid-run, and a closed digest is spawned, never awaited in the loop.
+//!   `flush` always sends a final digest, even an empty one.
+//! - **Budget fallback.** A lone group that does not fit an empty digest is
+//!   fitted by dropping text items, then tool items no correction names,
+//!   then tool results (sender rule c); `truncated` marks a digest that lost
+//!   items, and one that still does not fit is not posted and counts as
+//!   failed.
+//! - **Flush.** Awaits every event and digest POST (each digest bounded by
+//!   [`TURN_TIMEOUT`]) and reports `digests_sent` / `digests_failed`; POSTs
+//!   still pending when the engine's bound drops the flush are aborted and
+//!   count as neither. A second flush posts nothing.
 
 pub mod cues;
+mod digest;
 
 use std::collections::BTreeMap;
 use std::error::Error as _;
@@ -90,15 +140,16 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::mcp::{McpConnectReport, McpServerConfig};
-use crate::memory::{Advice, Memory, MemoryFlush, ToolCallView, ToolResultView};
+use crate::memory::{Advice, Memory, MemoryFlush, Observation, ToolCallView, ToolResultView};
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
 use cues::{IndexCue, find_match};
+use digest::{Closed, DigestBuffer, Envelope};
 
 /// The KB URL used when `PERSONAL_KB_URL` is unset or blank.
 pub const LOCAL_KB_URL: &str = "http://127.0.0.1:8765";
@@ -147,6 +198,41 @@ pub const MAX_EVENTS_PER_RUN: u32 = 50;
 
 /// The longest `command` / `error` sent in an event, in chars.
 pub const MAX_EVENT_FIELD_CHARS: usize = 2000;
+
+/// The KB's turn-digest route.
+pub const TURN_PATH: &str = "/api/kb/turn";
+
+/// The per-request bound on one `/api/kb/turn` post — inside the engine's
+/// 3 s flush bound.
+pub const TURN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a digest stays open before it closes at the next iteration
+/// boundary.
+pub const DIGEST_PERIOD: Duration = Duration::from_mins(10);
+
+/// The most items one digest carries (the contract's `items.maxItems`).
+pub const MAX_TURN_ITEMS: usize = 200;
+
+/// The largest digest body, in bytes (the contract's `max_body_bytes`).
+pub const MAX_TURN_BODY_BYTES: usize = 65_536;
+
+/// The longest `reasoning` / `assistant_text` item text, in chars.
+pub const MAX_TURN_TEXT_CHARS: usize = 2000;
+
+/// The longest `tool_result` excerpt and correction `detail`, in chars.
+pub const MAX_TURN_EXCERPT_CHARS: usize = 1500;
+
+/// The longest `tool_call` target, in chars.
+pub const MAX_TURN_TARGET_CHARS: usize = 500;
+
+/// The longest `user_prompt` / `final_message`, in chars.
+pub const MAX_TURN_PROMPT_CHARS: usize = 4000;
+
+/// The most ids one correction's `resolved_by` names (the last ones kept).
+pub const MAX_RESOLVED_BY: usize = 200;
+
+/// The header carrying the model id on every event and digest post.
+pub const KB_ENGINE_HEADER: &str = "X-KB-Engine";
 
 /// Where the host name is read from for the event `host` field.
 const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
@@ -470,8 +556,12 @@ pub struct PersonalKbMemory {
     /// degraded AND the `/prevention` body carried a `tool_map` key — an
     /// older KB without it gets no events (same rule as digests).
     event_target: Option<(String, String)>,
+    /// Where turn digests go: `(url, api key)`. `Some` under exactly the
+    /// condition `event_target` is.
+    turn_target: Option<(String, String)>,
     events: EventContext,
     posts: Mutex<PostState>,
+    digest: Mutex<DigestBuffer>,
 }
 
 /// The static part of every event body, fixed before the run.
@@ -480,9 +570,11 @@ struct EventContext {
     cwd: Option<String>,
     client_version: Option<String>,
     host: Option<String>,
+    /// The `X-KB-Engine` header value, when valid and non-blank.
+    engine: Option<String>,
 }
 
-/// Spawned event posts and the per-run counters.
+/// Spawned event and digest posts and the per-run counters.
 #[derive(Default)]
 struct PostState {
     /// Posts started this run (≤ [`MAX_EVENTS_PER_RUN`]).
@@ -490,6 +582,10 @@ struct PostState {
     capped: u32,
     /// Each pending post resolves to `true` when the KB answered 2xx.
     pending: Vec<tokio::task::JoinHandle<bool>>,
+    /// Spawned digest posts, same convention.
+    digests: Vec<tokio::task::JoinHandle<bool>>,
+    /// Digests closed but not posted because they could not be fitted.
+    unfittable: u32,
 }
 
 /// Aborts every post still pending when dropped — the engine's flush bound
@@ -546,17 +642,42 @@ fn event_tool_input(call: &ToolCallView) -> Option<Value> {
     })
 }
 
-/// POST one event; `true` when the KB answered 2xx (whatever its `reason`).
-async fn post_event(url: String, api_key: String, body: Value) -> bool {
-    let mut request = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(api_key)
-        .timeout(EVENT_TIMEOUT)
-        .json(&body);
+/// A POST to the KB carrying the bearer token, [`KB_HARNESS_HEADERS`] and,
+/// when kept, [`KB_ENGINE_HEADER`].
+fn kb_post(url: String, api_key: &str, engine: Option<&str>) -> reqwest::RequestBuilder {
+    let mut request = reqwest::Client::new().post(url).bearer_auth(api_key);
     for (k, v) in KB_HARNESS_HEADERS {
         request = request.header(k, v);
     }
+    if let Some(engine) = engine {
+        request = request.header(KB_ENGINE_HEADER, engine);
+    }
+    request
+}
+
+/// POST one event; `true` when the KB answered 2xx (whatever its `reason`).
+async fn post_event(url: String, api_key: String, engine: Option<String>, body: Value) -> bool {
+    let request = kb_post(url, &api_key, engine.as_deref())
+        .timeout(EVENT_TIMEOUT)
+        .json(&body);
     matches!(request.send().await, Ok(r) if r.status().is_success())
+}
+
+/// POST one digest's exact bytes; `true` when the KB answered 2xx.
+async fn post_turn(url: String, api_key: String, engine: Option<String>, body: Vec<u8>) -> bool {
+    let request = kb_post(url, &api_key, engine.as_deref())
+        .timeout(TURN_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    matches!(request.send().await, Ok(r) if r.status().is_success())
+}
+
+/// The engine id kept for [`KB_ENGINE_HEADER`]: trimmed, non-blank and a
+/// valid header value.
+fn header_engine(engine: &str) -> Option<String> {
+    let engine = engine.trim();
+    (!engine.is_empty() && reqwest::header::HeaderValue::from_str(engine).is_ok())
+        .then(|| engine.to_string())
 }
 
 impl PersonalKbMemory {
@@ -593,8 +714,14 @@ impl PersonalKbMemory {
             session_id: session_id.to_string(),
             project: None,
             event_target: None,
+            turn_target: None,
             events: EventContext::default(),
             posts: Mutex::new(PostState::default()),
+            digest: Mutex::new(DigestBuffer::new(
+                Envelope::default(),
+                std::collections::BTreeSet::new(),
+                DIGEST_PERIOD,
+            )),
         };
         let endpoint = match endpoint {
             Ok(e) => e,
@@ -616,45 +743,109 @@ impl PersonalKbMemory {
                     p.received.saturating_sub(index),
                     p.index_truncated,
                 );
+                let target = |route: &str| {
+                    p.tool_map.is_some().then(|| {
+                        (
+                            format!("{}{route}", endpoint.base_url),
+                            endpoint.api_key.clone(),
+                        )
+                    })
+                };
+                let event_target = target(EVENT_PATH);
+                let turn_target = target(TURN_PATH);
+                let tool_map = p.tool_map.unwrap_or_default();
+                let digest = DigestBuffer::new(
+                    Envelope {
+                        session_id: session_id.to_string(),
+                        host: None,
+                        hook_version: None,
+                        project: Some(project.clone()),
+                    },
+                    tool_map.keys().cloned().collect(),
+                    DIGEST_PERIOD,
+                );
                 PersonalKbMemory {
                     degraded: None,
                     label,
                     slice_text: p.slice_text,
                     cues: p.cues,
-                    event_target: p.tool_map.is_some().then(|| {
-                        (
-                            format!("{}{EVENT_PATH}", endpoint.base_url),
-                            endpoint.api_key.clone(),
-                        )
-                    }),
-                    tool_map: p.tool_map.unwrap_or_default(),
+                    event_target,
+                    turn_target,
+                    tool_map,
                     endpoint: Some(endpoint),
                     kb_tools: Vec::new(),
                     session_id: session_id.to_string(),
                     project: Some(project),
                     events: EventContext::default(),
                     posts: Mutex::new(PostState::default()),
+                    digest: Mutex::new(digest),
                 }
             }
         }
     }
 
-    /// Set the run context every `/api/kb/event` body carries: `cwd` (the
-    /// workspace root, as given — the caller makes it absolute) and
-    /// `client_version` (sent as `hook_version`). Also reads the host name
+    /// Set the run context every `/api/kb/event` and `/api/kb/turn` body
+    /// carries: `cwd` (the workspace root, as given — the caller makes it
+    /// absolute; events only) and `client_version` (sent as
+    /// `hook_version`), plus `engine`, the model id sent as
+    /// [`KB_ENGINE_HEADER`] on every event and digest post (trimmed; dropped
+    /// when blank or not a valid header value). Also reads the host name
     /// from `/proc/sys/kernel/hostname` once; unreadable or blank → `null`.
     #[must_use]
-    pub fn with_event_context(self, cwd: &Path, client_version: &str) -> Self {
-        self.with_event_context_from(cwd, client_version, Path::new(HOSTNAME_PATH))
+    pub fn with_event_context(self, cwd: &Path, client_version: &str, engine: &str) -> Self {
+        self.with_event_context_from(cwd, client_version, engine, Path::new(HOSTNAME_PATH))
     }
 
-    fn with_event_context_from(mut self, cwd: &Path, client_version: &str, host: &Path) -> Self {
+    fn with_event_context_from(
+        mut self,
+        cwd: &Path,
+        client_version: &str,
+        engine: &str,
+        host: &Path,
+    ) -> Self {
         self.events = EventContext {
             cwd: Some(cwd.display().to_string()),
             client_version: Some(client_version.to_string()),
             host: read_host(host),
+            engine: header_engine(engine),
         };
+        self.digest
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_context(self.events.host.clone(), self.events.client_version.clone());
         self
+    }
+
+    /// Override [`DIGEST_PERIOD`] (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_digest_period(mut self, period: Duration) -> Self {
+        self.digest
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_period(period);
+        self
+    }
+
+    /// Spawn a POST for every closed digest; count the unfittable ones.
+    fn post_digests(&self, closed: Vec<Closed>) {
+        let Some((url, api_key)) = self.turn_target.as_ref() else {
+            return;
+        };
+        if closed.is_empty() {
+            return;
+        }
+        let mut posts = self.posts.lock().unwrap_or_else(PoisonError::into_inner);
+        for digest in closed {
+            match digest {
+                Closed::Body(bytes) => posts.digests.push(tokio::spawn(post_turn(
+                    url.clone(),
+                    api_key.clone(),
+                    self.events.engine.clone(),
+                    bytes,
+                ))),
+                Closed::Unfittable => posts.unfittable += 1,
+            }
+        }
     }
 
     /// The `/api/kb/event` body for one failed call — exactly the contract's
@@ -772,6 +963,14 @@ impl Memory for PersonalKbMemory {
     /// when degraded or when the KB sent no `tool_map`; past
     /// [`MAX_EVENTS_PER_RUN`] posts a qualifying call is only counted.
     fn after_tool(&self, call: &ToolCallView, result: &ToolResultView) {
+        if self.turn_target.is_some() {
+            let closed = self
+                .digest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .after_tool(call, result);
+            self.post_digests(closed);
+        }
         if !result.is_error {
             return;
         }
@@ -789,34 +988,75 @@ impl Memory for PersonalKbMemory {
         }
         posts.started += 1;
         let body = self.event_body(call, result, &tool_input);
-        let handle = tokio::spawn(post_event(url.clone(), api_key.clone(), body));
+        let handle = tokio::spawn(post_event(
+            url.clone(),
+            api_key.clone(),
+            self.events.engine.clone(),
+            body,
+        ));
         posts.pending.push(handle);
     }
 
-    /// Await every pending post. Dropping this future (the engine's bound)
-    /// aborts the posts still running; those count as neither sent nor
-    /// failed.
+    /// Feed the turn-digest buffer (see the module doc's `## Turn
+    /// digests`); a digest closed here is spawned, never awaited.
+    fn observe(&self, observation: &Observation<'_>) {
+        if self.turn_target.is_none() {
+            return;
+        }
+        let closed = self
+            .digest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(observation, Instant::now());
+        self.post_digests(closed);
+    }
+
+    /// Send the final digest, then await every pending event and digest
+    /// post. Dropping this future (the engine's bound) aborts the posts
+    /// still running; those count as neither sent nor failed. A second call
+    /// posts nothing.
     fn flush(&self) -> Pin<Box<dyn Future<Output = MemoryFlush> + Send + '_>> {
-        let (pending, capped) = {
-            let mut posts = self.posts.lock().unwrap_or_else(PoisonError::into_inner);
-            (
-                std::mem::take(&mut posts.pending),
-                std::mem::take(&mut posts.capped),
-            )
+        let final_digests = if self.turn_target.is_some() {
+            self.digest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finish()
+        } else {
+            Vec::new()
         };
         Box::pin(async move {
-            let mut guard = AbortOnDrop(pending);
+            self.post_digests(final_digests);
+            let (pending, digests, capped, unfittable) = {
+                let mut posts = self.posts.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    std::mem::take(&mut posts.pending),
+                    std::mem::take(&mut posts.digests),
+                    std::mem::take(&mut posts.capped),
+                    std::mem::take(&mut posts.unfittable),
+                )
+            };
+            let mut events = AbortOnDrop(pending);
+            let mut digests = AbortOnDrop(digests);
             let mut flushed = MemoryFlush {
                 capped,
+                digests_failed: unfittable,
                 ..MemoryFlush::default()
             };
-            while let Some(handle) = guard.0.last_mut() {
+            while let Some(handle) = events.0.last_mut() {
                 if matches!(handle.await, Ok(true)) {
                     flushed.sent += 1;
                 } else {
                     flushed.failed += 1;
                 }
-                guard.0.pop();
+                events.0.pop();
+            }
+            while let Some(handle) = digests.0.last_mut() {
+                if matches!(handle.await, Ok(true)) {
+                    flushed.digests_sent += 1;
+                } else {
+                    flushed.digests_failed += 1;
+                }
+                digests.0.pop();
             }
             flushed
         })
@@ -826,8 +1066,10 @@ impl Memory for PersonalKbMemory {
 #[cfg(test)]
 mod tests {
     use super::{
-        EVENT_PATH, EVENT_TIMEOUT, HOSTNAME_PATH, MAX_EVENT_FIELD_CHARS, MAX_EVENTS_PER_RUN,
-        event_tool_input, read_host, truncate_chars,
+        DIGEST_PERIOD, EVENT_PATH, EVENT_TIMEOUT, HOSTNAME_PATH, KB_ENGINE_HEADER,
+        MAX_EVENT_FIELD_CHARS, MAX_EVENTS_PER_RUN, MAX_RESOLVED_BY, MAX_TURN_BODY_BYTES,
+        MAX_TURN_EXCERPT_CHARS, MAX_TURN_ITEMS, MAX_TURN_PROMPT_CHARS, MAX_TURN_TARGET_CHARS,
+        MAX_TURN_TEXT_CHARS, TURN_PATH, TURN_TIMEOUT, event_tool_input, read_host, truncate_chars,
     };
     use super::{
         KB_HARNESS_HEADERS, KB_MCP_CONNECT_TIMEOUT, KB_PROJECT_FILENAME, KbEndpoint,
@@ -838,7 +1080,8 @@ mod tests {
     use crate::engine::{FINISH_TOOL_NAME, FinishTool, RunConfig, RunStats};
     use crate::mcp::McpConnectReport;
     use crate::memory::{
-        self, Advice, Memory, MemoryFlush, MemoryMode, ToolCallView, ToolResultView,
+        self, Advice, CorrectionTrigger, Memory, MemoryFlush, MemoryMode, Observation,
+        ToolCallView, ToolResultView,
     };
     use crate::model::{
         AssistantTurn, ContentBlock, Message, StopReason, ToolCallRequest, Usage, UserBlock,
@@ -2225,7 +2468,12 @@ mod tests {
         std::fs::write(&host, "  test-host\n").expect("write");
         let memory = connect_to(&server.uri(), Some("fake-project"))
             .await
-            .with_event_context_from(Path::new("/ws/root"), "9.9.9-test", &host);
+            .with_event_context_from(
+                Path::new("/ws/root"),
+                "9.9.9-test",
+                "glm-5.3-flash:cloud",
+                &host,
+            );
         Arc::new(memory)
     }
 
@@ -2332,9 +2580,10 @@ mod tests {
 
     #[test]
     fn event_context_uses_the_proc_hostname() {
-        let m = futures_free_degraded().with_event_context(Path::new("/w"), "1.0");
+        let m = futures_free_degraded().with_event_context(Path::new("/w"), "1.0", " m-1 ");
         assert_eq!(m.events.cwd.as_deref(), Some("/w"));
         assert_eq!(m.events.client_version.as_deref(), Some("1.0"));
+        assert_eq!(m.events.engine.as_deref(), Some("m-1"));
         assert_eq!(
             m.events.host,
             read_host(Path::new(HOSTNAME_PATH)),
@@ -2614,5 +2863,798 @@ mod tests {
         assert_eq!(result.stats.memory_events_sent, 50);
         assert_eq!(result.stats.memory_events_capped, 1);
         assert_eq!(result.stats.memory_events_failed, 0);
+    }
+
+    // ---- turn digests (POST /api/kb/turn) ----------------------------------
+
+    const TURN_CONTRACT: &str = include_str!("../../testdata/personal_kb_contracts/turn.json");
+
+    fn turn_contract() -> Value {
+        serde_json::from_str(TURN_CONTRACT).expect("turn.json is JSON")
+    }
+
+    fn turn_example(name: &str) -> Value {
+        turn_contract()["request"]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()["body"]
+            .clone()
+    }
+
+    fn keys_of(v: &Value) -> std::collections::BTreeSet<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// Validate `body` against turn.json's request schema and assert exact
+    /// key sets for the body and for every item (unknown keys are dropped
+    /// silently by the KB, so the schema alone cannot catch them).
+    fn assert_turn_contract(body: &Value) {
+        let contract = turn_contract();
+        let schema = &contract["request"]["schema"];
+        let validator = jsonschema::validator_for(schema).expect("schema compiles");
+        let errors: Vec<String> = validator
+            .iter_errors(body)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "schema errors: {errors:#?}\n{body}");
+        assert_eq!(keys_of(body), keys_of(&schema["properties"]), "{body}");
+        let mapping = &schema["properties"]["items"]["items"]["discriminator"]["mapping"];
+        for item in body["items"].as_array().expect("items") {
+            let kind = item["kind"].as_str().expect("kind");
+            let def = mapping[kind]
+                .as_str()
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+                .unwrap_or_else(|| panic!("unknown kind {kind}"));
+            assert_eq!(
+                keys_of(item),
+                keys_of(&schema["$defs"][def]["properties"]),
+                "{item}"
+            );
+        }
+    }
+
+    fn recorded() -> ResponseTemplate {
+        let body = turn_contract()["response"]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "recorded")
+            .unwrap()["body"]
+            .clone();
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    /// A fake KB serving `prevention`, answering events 200 and digests with
+    /// `turn`.
+    async fn turn_kb(prevention: Value, turn: ResponseTemplate) -> MockServer {
+        let server = event_kb(prevention, ok_event()).await;
+        Mock::given(method("POST"))
+            .and(path(TURN_PATH))
+            .respond_with(turn)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn digest_memory(server: &MockServer, engine: &str) -> PersonalKbMemory {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let host = dir.path().join("hostname");
+        std::fs::write(&host, "test-host\n").expect("write");
+        connect_to(&server.uri(), Some("fake-project"))
+            .await
+            .with_event_context_from(Path::new("/ws/root"), "9.9.9-test", engine, &host)
+    }
+
+    /// Turn requests sorted by `turn_index`, every body contract-checked.
+    async fn turn_requests(server: &MockServer) -> Vec<Request> {
+        let mut requests: Vec<Request> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == TURN_PATH)
+            .collect();
+        requests.sort_by_key(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["turn_index"]
+                .as_u64()
+                .unwrap()
+        });
+        for r in &requests {
+            assert_turn_contract(&serde_json::from_slice(&r.body).unwrap());
+        }
+        requests
+    }
+
+    async fn digests(server: &MockServer) -> Vec<Value> {
+        turn_requests(server)
+            .await
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    async fn run_digests(
+        memory: PersonalKbMemory,
+        mode: MemoryMode,
+        turns: Vec<AssistantTurn>,
+        max_iterations: u32,
+    ) -> (MockBackend, crate::engine::RunResult) {
+        let backend = MockBackend::from_turns(turns);
+        let result = crate::engine::run(
+            &backend,
+            &flaky_registry(),
+            &ToolCtx::stub(),
+            &RunConfig::new("t", max_iterations).with_memory(Arc::new(memory), mode),
+        )
+        .await;
+        (backend, result)
+    }
+
+    fn tc(id: &str, tool: &str, target: &str) -> Value {
+        json!({"kind": "tool_call", "tool_use_id": id, "tool": tool, "target": target, "target_class": ""})
+    }
+
+    fn tr(id: &str, is_error: bool, excerpt: &str) -> Value {
+        json!({"kind": "tool_result", "tool_use_id": id, "is_error": is_error, "excerpt": excerpt})
+    }
+
+    fn corr(trigger: &str, detail: &str, resolved_by: &[&str], resolved: bool) -> Value {
+        json!({
+            "kind": "harness_correction", "trigger": trigger, "detail": detail,
+            "resolved_by": resolved_by, "resolved": resolved
+        })
+    }
+
+    fn items(body: &Value) -> Vec<Value> {
+        body["items"].as_array().unwrap().clone()
+    }
+
+    fn turn_of(content: Vec<ContentBlock>) -> AssistantTurn {
+        AssistantTurn {
+            content,
+            stop_reason: StopReason::ToolUse,
+            usage: usage(),
+        }
+    }
+
+    fn tool(id: &str, name: &str, input: Value) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCallRequest {
+            id: id.into(),
+            name: name.into(),
+            input,
+        })
+    }
+
+    #[test]
+    fn turn_constants_are_pinned() {
+        let c = turn_contract();
+        let schema = &c["request"]["schema"];
+        let defs = &schema["$defs"];
+        assert_eq!(TURN_PATH, "/api/kb/turn");
+        assert_eq!(TURN_PATH, c["path"]);
+        assert_eq!(c["method"], "POST");
+        assert_eq!(TURN_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(DIGEST_PERIOD.as_secs(), 600);
+        assert_eq!(KB_ENGINE_HEADER, "X-KB-Engine");
+        assert_eq!(MAX_TURN_BODY_BYTES, 65_536);
+        assert_eq!(MAX_TURN_BODY_BYTES as u64, c["request"]["max_body_bytes"]);
+        assert_eq!(MAX_TURN_ITEMS, 200);
+        assert_eq!(
+            MAX_TURN_ITEMS as u64,
+            schema["properties"]["items"]["maxItems"]
+        );
+        assert_eq!(MAX_TURN_TEXT_CHARS, 2000);
+        for def in ["TurnReasoningItem", "TurnAssistantTextItem"] {
+            assert_eq!(
+                MAX_TURN_TEXT_CHARS as u64,
+                defs[def]["properties"]["text"]["maxLength"]
+            );
+        }
+        assert_eq!(MAX_TURN_EXCERPT_CHARS, 1500);
+        assert_eq!(
+            MAX_TURN_EXCERPT_CHARS as u64,
+            defs["TurnToolResultItem"]["properties"]["excerpt"]["maxLength"]
+        );
+        assert_eq!(
+            MAX_TURN_EXCERPT_CHARS as u64,
+            defs["TurnHarnessCorrectionItem"]["properties"]["detail"]["maxLength"]
+        );
+        assert_eq!(MAX_RESOLVED_BY, 200);
+        assert_eq!(
+            MAX_RESOLVED_BY as u64,
+            defs["TurnHarnessCorrectionItem"]["properties"]["resolved_by"]["maxItems"]
+        );
+        assert_eq!(MAX_TURN_TARGET_CHARS, 500);
+        assert_eq!(
+            MAX_TURN_TARGET_CHARS as u64,
+            defs["TurnToolCallItem"]["properties"]["target"]["maxLength"]
+        );
+        assert_eq!(MAX_TURN_PROMPT_CHARS, 4000);
+        for key in ["user_prompt", "final_message"] {
+            assert_eq!(
+                MAX_TURN_PROMPT_CHARS as u64,
+                schema["properties"][key]["anyOf"][0]["maxLength"]
+            );
+        }
+    }
+
+    #[test]
+    fn turn_contract_checker_accepts_the_vendored_talos_example() {
+        let example = turn_example("talos_turn");
+        assert_turn_contract(&example);
+        let mut extra = example;
+        extra["items"][0]["surprise"] = json!(1);
+        let caught = std::panic::catch_unwind(|| assert_turn_contract(&extra));
+        assert!(caught.is_err(), "an extra item key must fail the checker");
+    }
+
+    // AC15 (a)
+    #[tokio::test]
+    async fn a_talos_run_posts_one_contract_shaped_digest() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "glm-5.3-flash:cloud").await;
+        let turns = vec![
+            turn_of(vec![
+                ContentBlock::Reasoning {
+                    text: "weighing the remote".into(),
+                    opaque: None,
+                },
+                ContentBlock::Text("Pushing now.".into()),
+                tool("c1", "bash", json!({"command": "git push mirror feat/x"})),
+            ]),
+            call_turn(
+                "e1",
+                "edit_file",
+                json!({"path": "src/a.py", "old_string": "x", "new_string": "OK"}),
+            ),
+            finish_turn(),
+        ];
+        let (_, result) = run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        assert_blocked(&result);
+        let requests = turn_requests(&server).await;
+        assert_eq!(requests.len(), 1);
+        let r = &requests[0];
+        assert_eq!(r.headers["authorization"], "Bearer local-no-auth");
+        assert_eq!(r.headers["x-kb-harness"], "talos");
+        assert_eq!(r.headers["x-kb-mode"], "headless");
+        assert_eq!(r.headers["x-kb-engine"], "glm-5.3-flash:cloud");
+        assert_eq!(r.headers["content-type"], "application/json");
+        let body: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["event_id"], "t:1:0");
+        assert_eq!(body["session_id"], "t:1");
+        assert_eq!(body["turn_index"], 0);
+        assert_eq!(body["harness"], "talos");
+        assert_eq!(body["mode"], "headless");
+        assert_eq!(body["engine"], Value::Null);
+        assert_eq!(body["host"], "test-host");
+        assert_eq!(body["hook_version"], "9.9.9-test");
+        assert_eq!(body["project"], "fake-project");
+        assert_eq!(body["user_prompt"], "t");
+        assert_eq!(body["final_message"], "q");
+        assert_eq!(body["truncated"], false);
+        assert!(body["ts"].as_str().unwrap().ends_with('Z'), "{body}");
+        assert_eq!(
+            items(&body),
+            vec![
+                json!({"kind": "reasoning", "text": "weighing the remote", "truncated": false}),
+                json!({"kind": "assistant_text", "text": "Pushing now."}),
+                tc("1:c1", "bash", "git push mirror feat/x"),
+                tr("1:c1", true, "bash failed"),
+                tc("2:e1", "edit_file", "src/a.py"),
+                tr("2:e1", false, ""),
+                tc("3:cf", "finish", ""),
+                tr("3:cf", false, ""),
+            ]
+        );
+        assert_eq!(result.stats.memory_digests_sent, 1);
+        assert_eq!(result.stats.memory_digests_failed, 0);
+        let events = event_requests(&server).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].headers["x-kb-engine"], "glm-5.3-flash:cloud");
+    }
+
+    // AC15 (b)
+    #[tokio::test]
+    async fn digests_close_on_the_period_and_a_correction_names_an_earlier_digest() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m")
+            .await
+            .with_digest_period(Duration::ZERO);
+        let turns = vec![
+            call_turn("rc1", "run_checks", json!({})),
+            call_turn("e1", "edit_file", json!({"path": "OK"})),
+            call_turn("rc2", "run_checks", json!({"x": "OK"})),
+            finish_turn(),
+        ];
+        let (_, result) = run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        let bodies = digests(&server).await;
+        let ids: Vec<&str> = bodies
+            .iter()
+            .map(|b| b["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["t:1:0", "t:1:1", "t:1:2", "t:1:3"]);
+        assert_eq!(
+            items(&bodies[0]),
+            vec![
+                tc("1:rc1", "run_checks", ""),
+                tr("1:rc1", true, "run_checks failed")
+            ]
+        );
+        assert_eq!(
+            items(&bodies[1]),
+            vec![tc("2:e1", "edit_file", "OK"), tr("2:e1", false, "")]
+        );
+        assert_eq!(
+            items(&bodies[2]),
+            vec![
+                tc("3:rc2", "run_checks", ""),
+                tr("3:rc2", false, ""),
+                corr("gate_red", "run_checks failed", &["2:e1"], true),
+            ]
+        );
+        assert_eq!(
+            items(&bodies[3]),
+            vec![tc("4:cf", "finish", ""), tr("4:cf", false, "")]
+        );
+        assert_eq!(bodies[0]["user_prompt"], "t");
+        for b in &bodies[1..] {
+            assert_eq!(b["user_prompt"], Value::Null);
+        }
+        for b in &bodies[..3] {
+            assert_eq!(b["final_message"], Value::Null);
+        }
+        assert_eq!(bodies[3]["final_message"], "q");
+        assert_eq!(result.stats.memory_digests_sent, 4);
+    }
+
+    // AC15 (c)
+    #[tokio::test]
+    async fn an_unresolved_correction_lands_in_the_final_digest() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let turns = vec![call_turn("rc1", "run_checks", json!({})), finish_turn()];
+        run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        let bodies = digests(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            items(&bodies[0]).last().unwrap(),
+            &corr("gate_red", "run_checks failed", &[], false)
+        );
+    }
+
+    // AC15 (d)
+    #[tokio::test]
+    async fn a_repeat_trigger_folds_and_an_accepted_done_resolves() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let turns = vec![
+            call_turn("rc1", "run_checks", json!({})),
+            call_turn("rc2", "run_checks", json!({})),
+            call_turn("b1", "bash", json!({"command": "echo OK"})),
+            call_turn(
+                "cf",
+                FINISH_TOOL_NAME,
+                json!({"disposition": "done", "summary": "fixed"}),
+            ),
+        ];
+        let (_, result) = run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        assert!(
+            matches!(
+                result.outcome,
+                crate::engine::LoopOutcome::Finished(crate::run_record::Disposition::Done { .. })
+            ),
+            "{:?}",
+            result.outcome
+        );
+        let bodies = digests(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let all = items(&bodies[0]);
+        let corrections: Vec<&Value> = all
+            .iter()
+            .filter(|i| i["kind"] == "harness_correction")
+            .collect();
+        assert_eq!(
+            corrections,
+            [&corr(
+                "gate_red",
+                "run_checks failed",
+                &["2:rc2", "3:b1"],
+                true
+            )]
+        );
+        let at = all
+            .iter()
+            .position(|i| i == &tr("4:cf", false, ""))
+            .unwrap();
+        assert_eq!(all[at + 1], *corrections[0]);
+        assert_eq!(bodies[0]["final_message"], "fixed");
+    }
+
+    // AC15 (e)
+    #[tokio::test]
+    async fn a_digest_closes_at_the_item_budget() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let calls = (0..=100)
+            .map(|i| {
+                (
+                    format!("r{i}"),
+                    "read_file",
+                    json!({"path": format!("OK{i}")}),
+                )
+            })
+            .collect();
+        run_digests(
+            memory,
+            MemoryMode::Annotate,
+            vec![calls_turn(calls), finish_turn()],
+            10,
+        )
+        .await;
+        let bodies = digests(&server).await;
+        assert_eq!(bodies.len(), 2);
+        let expected: Vec<Value> = (0..100)
+            .flat_map(|i| {
+                let id = format!("1:r{i}");
+                [tc(&id, "read_file", &format!("OK{i}")), tr(&id, false, "")]
+            })
+            .collect();
+        assert_eq!(bodies[0]["turn_index"], 0);
+        assert_eq!(items(&bodies[0]), expected);
+        assert_eq!(bodies[1]["turn_index"], 1);
+        assert_eq!(
+            items(&bodies[1]),
+            vec![
+                tc("1:r100", "read_file", "OK100"),
+                tr("1:r100", false, ""),
+                tc("2:cf", "finish", ""),
+                tr("2:cf", false, ""),
+            ]
+        );
+    }
+
+    // AC15 (f)
+    #[tokio::test]
+    async fn a_digest_closes_at_the_byte_budget() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let reasoning = "r".repeat(2000);
+        let mut turns: Vec<AssistantTurn> = (1..=40)
+            .map(|i| {
+                turn_of(vec![
+                    ContentBlock::Reasoning {
+                        text: reasoning.clone(),
+                        opaque: None,
+                    },
+                    tool(&format!("c{i}"), "read_file", json!({"path": "OK"})),
+                ])
+            })
+            .collect();
+        turns.push(finish_turn());
+        run_digests(memory, MemoryMode::Annotate, turns, 50).await;
+        let requests = turn_requests(&server).await;
+        assert!(requests.len() >= 2, "{}", requests.len());
+        let mut all = Vec::new();
+        for r in &requests {
+            assert!(r.body.len() <= MAX_TURN_BODY_BYTES, "{}", r.body.len());
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            assert_eq!(body["truncated"], false);
+            let its = items(&body);
+            assert!(its.len() <= MAX_TURN_ITEMS);
+            all.extend(its);
+        }
+        let mut expected = Vec::new();
+        for i in 1..=40 {
+            let id = format!("{i}:c{i}");
+            expected.push(json!({"kind": "reasoning", "text": reasoning, "truncated": false}));
+            expected.push(tc(&id, "read_file", "OK"));
+            expected.push(tr(&id, false, ""));
+        }
+        expected.push(tc("41:cf", "finish", ""));
+        expected.push(tr("41:cf", false, ""));
+        assert_eq!(expected.len(), 122);
+        assert_eq!(all, expected);
+    }
+
+    // AC15 (g)
+    #[tokio::test]
+    async fn fields_are_truncated_to_the_contract() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let task = "p".repeat(5000);
+        memory.observe(&Observation::RunStart { task: &task });
+        let (x, y) = ("x".repeat(2500), "y".repeat(2500));
+        memory.observe(&Observation::Turn {
+            iteration: 1,
+            reasoning: &x,
+            text: &y,
+        });
+        let args = json!({"command": "z".repeat(800)});
+        let error = "e".repeat(3000);
+        memory.after_tool(
+            &view("bash", &args),
+            &ToolResultView {
+                call_id: "c1",
+                iteration: 1,
+                is_error: true,
+                content: &error,
+                duration_ms: None,
+            },
+        );
+        let detail = "d".repeat(2000);
+        memory.observe(&Observation::Correction {
+            trigger: CorrectionTrigger::GateRed,
+            iteration: 1,
+            detail: &detail,
+        });
+        let blocked = crate::run_record::Disposition::Blocked {
+            decision_needed: "q".repeat(5000),
+        };
+        let finish_args = json!({});
+        memory.observe(&Observation::Finish {
+            call_id: "cf",
+            iteration: 2,
+            args: &finish_args,
+            is_error: false,
+            content: "",
+            accepted: Some(&blocked),
+        });
+        let flushed = memory.flush().await;
+        assert_eq!(flushed.digests_sent, 1);
+        let bodies = digests(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let b = &bodies[0];
+        assert_eq!(b["user_prompt"], "p".repeat(4000));
+        assert_eq!(b["final_message"], "q".repeat(4000));
+        assert_eq!(
+            items(b),
+            vec![
+                json!({"kind": "reasoning", "text": "x".repeat(2000), "truncated": true}),
+                json!({"kind": "assistant_text", "text": "y".repeat(2000)}),
+                tc("1:c1", "bash", &"z".repeat(500)),
+                tr("1:c1", true, &"e".repeat(1500)),
+                tc("2:cf", "finish", ""),
+                tr("2:cf", false, ""),
+                corr("gate_red", &"d".repeat(1500), &[], false),
+            ]
+        );
+    }
+
+    // AC15 (h)
+    #[tokio::test]
+    async fn same_call_id_in_two_iterations_gets_distinct_tool_use_ids() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let turns = vec![
+            call_turn("ollama-call-0", "read_file", json!({"path": "OK"})),
+            call_turn("ollama-call-0", "read_file", json!({"path": "OK"})),
+            finish_turn(),
+        ];
+        run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        let bodies = digests(&server).await;
+        let ids: Vec<String> = items(&bodies[0])
+            .iter()
+            .filter(|i| i["kind"] == "tool_call" && i["tool"] == "read_file")
+            .map(|i| i["tool_use_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["1:ollama-call-0", "2:ollama-call-0"]);
+    }
+
+    // AC15 (i)
+    #[tokio::test]
+    async fn only_tool_map_names_are_posted() {
+        let mut prevention = contract_example("talos_gate_armed");
+        prevention["tool_map"] = json!({"bash": "Bash"});
+        let server = turn_kb(prevention, recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let turns = vec![
+            call_turn("b1", "bash", json!({"command": "echo OK"})),
+            call_turn("r1", "read_file", json!({"path": "OK"})),
+            finish_turn(),
+        ];
+        run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+        let bodies = digests(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            items(&bodies[0]),
+            vec![tc("1:b1", "bash", "echo OK"), tr("1:b1", false, "")]
+        );
+    }
+
+    // AC15 (j)
+    #[tokio::test]
+    async fn a_blank_or_invalid_engine_sends_no_engine_header() {
+        for engine in ["  ", "bad\nengine"] {
+            let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+            let memory = digest_memory(&server, engine).await;
+            let turns = vec![
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ];
+            run_digests(memory, MemoryMode::Annotate, turns, 10).await;
+            let events = event_requests(&server).await;
+            let turns = turn_requests(&server).await;
+            assert_eq!((events.len(), turns.len()), (1, 1));
+            for r in events.iter().chain(&turns) {
+                assert!(!r.headers.contains_key("x-kb-engine"), "{engine:?}");
+            }
+        }
+    }
+
+    fn outcome_shape(result: &crate::engine::RunResult) -> String {
+        format!("{:?}", result.outcome)
+    }
+
+    // AC16 (a)
+    #[tokio::test]
+    async fn a_500_turn_counts_as_failed_and_changes_nothing() {
+        let script = || {
+            vec![
+                call_turn("rc1", "run_checks", json!({})),
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ]
+        };
+        let ok_server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let (ok_backend, ok) = run_digests(
+            digest_memory(&ok_server, "m").await,
+            MemoryMode::Annotate,
+            script(),
+            10,
+        )
+        .await;
+        let bad_server = turn_kb(
+            contract_example("talos_gate_armed"),
+            ResponseTemplate::new(500),
+        )
+        .await;
+        let (bad_backend, bad) = run_digests(
+            digest_memory(&bad_server, "m").await,
+            MemoryMode::Annotate,
+            script(),
+            10,
+        )
+        .await;
+        assert_eq!(outcome_shape(&ok), outcome_shape(&bad));
+        assert_eq!(ok.stats.iterations, bad.stats.iterations);
+        assert_eq!(ok_backend.messages_seen(), bad_backend.messages_seen());
+        assert_eq!(
+            (ok.stats.memory_digests_sent, ok.stats.memory_digests_failed),
+            (1, 0)
+        );
+        assert_eq!(
+            (
+                bad.stats.memory_digests_sent,
+                bad.stats.memory_digests_failed
+            ),
+            (0, 1)
+        );
+    }
+
+    // AC16 (b)
+    #[tokio::test]
+    async fn a_slow_turn_endpoint_does_not_hold_the_run() {
+        let server = turn_kb(
+            contract_example("talos_gate_armed"),
+            recorded().set_delay(Duration::from_secs(10)),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let (_, result) = run_digests(
+            digest_memory(&server, "m").await,
+            MemoryMode::Annotate,
+            vec![finish_turn()],
+            10,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_blocked(&result);
+        assert_eq!(result.stats.memory_digests_sent, 0);
+        // The per-POST TURN_TIMEOUT (2 s) fires inside the engine's 3 s
+        // flush bound, so the slow digest settles as failed, not aborted;
+        // the abort-at-the-bound path is pinned by the next test.
+        assert_eq!(result.stats.memory_digests_failed, 1);
+    }
+
+    // AC16 (c)
+    #[tokio::test]
+    async fn a_cut_off_flush_aborts_its_pending_digests() {
+        let server = turn_kb(
+            contract_example("talos_gate_armed"),
+            recorded().set_delay(Duration::from_secs(10)),
+        )
+        .await;
+        let memory = digest_memory(&server, "m").await;
+        memory.observe(&Observation::RunStart { task: "t" });
+        let cut = tokio::time::timeout(Duration::from_millis(200), memory.flush()).await;
+        assert!(cut.is_err(), "flush must still be pending");
+        assert_eq!(memory.flush().await, MemoryFlush::default());
+    }
+
+    // AC16 (d)
+    #[tokio::test]
+    async fn no_tool_map_posts_no_digest() {
+        let mut prevention = contract_example("talos_gate_armed");
+        prevention.as_object_mut().unwrap().remove("tool_map");
+        let server = turn_kb(prevention, recorded()).await;
+        let (_, result) = run_digests(
+            digest_memory(&server, "m").await,
+            MemoryMode::Annotate,
+            vec![call_turn("rc1", "run_checks", json!({})), finish_turn()],
+            10,
+        )
+        .await;
+        assert!(turn_requests(&server).await.is_empty());
+        assert_eq!(result.stats.memory_digests_sent, 0);
+        assert_eq!(result.stats.memory_digests_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn degraded_memory_posts_no_digest_even_when_called_directly() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        // A project-less connect degrades without a request.
+        let memory = connect_to(&server.uri(), None).await;
+        let args = json!({});
+        let blocked = crate::run_record::Disposition::Blocked {
+            decision_needed: "q".into(),
+        };
+        for observation in [
+            Observation::RunStart { task: "t" },
+            Observation::Turn {
+                iteration: 1,
+                reasoning: "r",
+                text: "t",
+            },
+            Observation::Finish {
+                call_id: "cf",
+                iteration: 1,
+                args: &args,
+                is_error: false,
+                content: "",
+                accepted: Some(&blocked),
+            },
+            Observation::Correction {
+                trigger: CorrectionTrigger::Nudge,
+                iteration: 1,
+                detail: "n",
+            },
+        ] {
+            memory.observe(&observation);
+        }
+        assert_eq!(memory.flush().await, MemoryFlush::default());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // AC17 (a)
+    #[tokio::test]
+    async fn memory_off_posts_no_digest() {
+        let server = turn_kb(contract_example("talos_gate_armed"), recorded()).await;
+        let memory = digest_memory(&server, "m").await;
+        let after_connect = server.received_requests().await.unwrap().len();
+        let (_, result) = run_digests(
+            memory,
+            MemoryMode::Off,
+            vec![
+                call_turn("c1", "bash", json!({"command": "false"})),
+                finish_turn(),
+            ],
+            10,
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), after_connect);
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.url.path() != TURN_PATH && r.url.path() != EVENT_PATH)
+        );
+        assert_eq!(result.stats.memory_digests_sent, 0);
+        assert_eq!(result.stats.memory_digests_failed, 0);
     }
 }

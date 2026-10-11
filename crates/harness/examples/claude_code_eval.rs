@@ -546,6 +546,8 @@ async fn main() {
                 memory_events_sent: 0,
                 memory_events_failed: 0,
                 memory_events_capped: 0,
+                memory_digests_sent: 0,
+                memory_digests_failed: 0,
             };
 
             let trial = TrialResult {

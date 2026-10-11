@@ -389,7 +389,8 @@
 //!   `memory_denies`, `memory_kb_tool_calls`, `memory_deny_overrides`,
 //!   `memory_degraded` (a string or `null`), `mcp_tool_calls`,
 //!   `mcp_tool_call_errors`, `memory_events_sent`, `memory_events_failed`,
-//!   `memory_events_capped` — matching
+//!   `memory_events_capped`, `memory_digests_sent`,
+//!   `memory_digests_failed` — matching
 //!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
@@ -426,7 +427,8 @@
 //!             "memory_deny_overrides":0,"memory_degraded":null,
 //!             "mcp_tool_calls":0,"mcp_tool_call_errors":0,
 //!             "memory_events_sent":0,"memory_events_failed":0,
-//!             "memory_events_capped":0}}
+//!             "memory_events_capped":0,"memory_digests_sent":0,
+//!             "memory_digests_failed":0}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -586,7 +588,8 @@ use serde_json::{Map, Value};
 /// events (and the additive `mcp_tool_calls` / `mcp_tool_call_errors` keys on
 /// `run_end.stats`). The `memory_events_sent` / `memory_events_failed` /
 /// `memory_events_capped` keys on `run_end.stats` are additive too, so they
-/// did not bump it.
+/// did not bump it, and so are the `memory_digests_sent` /
+/// `memory_digests_failed` keys (turn digests): the version stays 5.
 pub const TRANSCRIPT_VERSION: u32 = 5;
 
 /// The complete, closed set of `"event"` tag values a transcript line can

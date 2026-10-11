@@ -2939,6 +2939,8 @@ async fn no_mcp_flag_writes_no_mcp_lines_or_warnings() {
         "memory_events_sent",
         "memory_events_failed",
         "memory_events_capped",
+        "memory_digests_sent",
+        "memory_digests_failed",
     ] {
         assert_eq!(stats[key], 0, "{key}");
     }
@@ -3242,6 +3244,8 @@ fn memory_off_makes_no_kb_connection() {
         "memory_events_sent",
         "memory_events_failed",
         "memory_events_capped",
+        "memory_digests_sent",
+        "memory_digests_failed",
     ] {
         assert_eq!(run_end["stats"][key], 0, "{key}");
     }
@@ -3349,6 +3353,141 @@ fn memory_deny_once_fake_kb_appends_slice() {
             .iter()
             .any(|l| l["event"] == "mcp_connect_failed" && l["name"] == "kb")
     );
+    // The one-connection fake is gone by flush time, so the final turn
+    // digest is refused and counted as failed.
+    let stats = &run.lines.last().expect("lines")["stats"];
+    assert_eq!(stats["memory_digests_failed"], 1, "{stats}");
+    assert_eq!(stats["memory_digests_sent"], 0, "{stats}");
+}
+
+/// A multi-connection fake KB: accepts up to `max_conns` connections in
+/// turn, reads each request head (up to CRLFCRLF) and then exactly
+/// `Content-Length` body bytes, and answers `GET /api/kb/prevention` with
+/// `prevention_body`, `POST /api/kb/turn` with a `recorded` response, and
+/// anything else 404 — always `Connection: close`. Every `(head, body)` is
+/// sent over the channel.
+fn fake_kb_multi(
+    prevention_body: &str,
+    max_conns: usize,
+) -> (u16, std::sync::mpsc::Receiver<(String, String)>) {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake kb");
+    let port = listener.local_addr().expect("addr").port();
+    let prevention_body = prevention_body.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..max_conns {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            let _ = stream.read_exact(&mut body);
+            let first = head.lines().next().unwrap_or("");
+            let (status, reply) = if first.starts_with("GET /api/kb/prevention") {
+                ("200 OK", prevention_body.clone())
+            } else if first.starts_with("POST /api/kb/turn ") {
+                (
+                    "200 OK",
+                    r#"{"recorded":true,"reason":"recorded","redactions":[]}"#.to_string(),
+                )
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = tx.send((head, String::from_utf8_lossy(&body).into_owned()));
+        }
+    });
+    (port, rx)
+}
+
+#[test]
+fn memory_annotate_posts_a_final_turn_digest() {
+    let (port, rx) = fake_kb_multi(KB_FIXTURE, 8);
+    let run = memory_run(
+        &["--memory", "annotate"],
+        &format!("http://127.0.0.1:{port}"),
+        Some("fake-project\n"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut received = Vec::new();
+    while !received
+        .iter()
+        .any(|(h, _): &(String, String)| h.starts_with("POST /api/kb/turn "))
+    {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        received.push(
+            rx.recv_timeout(left)
+                .expect("talos made no /api/kb/turn POST"),
+        );
+    }
+    while let Ok(more) = rx.try_recv() {
+        received.push(more);
+    }
+    let turns: Vec<&(String, String)> = received
+        .iter()
+        .filter(|(h, _)| h.starts_with("POST /api/kb/turn "))
+        .collect();
+    assert_eq!(turns.len(), 1, "{received:?}");
+    let (head, body) = turns[0];
+    let lower = head.to_ascii_lowercase();
+    for needle in [
+        "authorization: bearer local-no-auth",
+        "x-kb-harness: talos",
+        "x-kb-mode: headless",
+        "x-kb-engine: x",
+    ] {
+        assert!(lower.contains(needle), "{needle}: {head}");
+    }
+    let body: serde_json::Value = serde_json::from_str(body).expect("JSON digest");
+    let session = body["session_id"].as_str().expect("session_id");
+    assert!(session.starts_with("talos:cli-test-memory:1:"), "{body}");
+    assert_eq!(body["event_id"], format!("{session}:0"));
+    assert_eq!(body["turn_index"], 0);
+    assert_eq!(body["harness"], "talos");
+    assert_eq!(body["mode"], "headless");
+    assert_eq!(body["items"], serde_json::json!([]));
+    assert_eq!(body["final_message"], serde_json::Value::Null);
+    assert_eq!(body["truncated"], false);
+    assert!(
+        body["user_prompt"]
+            .as_str()
+            .expect("user_prompt")
+            .contains("Integration test task"),
+        "{body}"
+    );
+    let slice = run
+        .lines
+        .iter()
+        .find(|l| l["event"] == "memory_slice")
+        .expect("memory_slice");
+    assert_eq!(slice["kb_session_id"], session);
+    let stats = &run.lines.last().expect("lines")["stats"];
+    assert_eq!(stats["memory_digests_sent"], 1, "{stats}");
+    assert_eq!(stats["memory_digests_failed"], 0, "{stats}");
 }
 
 #[test]

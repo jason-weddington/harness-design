@@ -1949,13 +1949,15 @@ fn kb_session_id(run_id: &str, unix_ms: u128, pid: u32) -> String {
 /// non-blank), else the `.kb_project` walk-up from `workspace_root`; then one
 /// `/prevention` fetch and, unless that degraded, the KB MCP connect; the
 /// adapter also gets the event context (workspace root, talos version) for
-/// failed-tool events. Never fails: every failure is a degraded memory or a
-/// failed report.
+/// failed-tool events and turn digests, and `engine` — the provider-verbatim
+/// model id — sent as the `X-KB-Engine` header on every event and digest
+/// post. Never fails: every failure is a degraded memory or a failed report.
 async fn build_memory(
     mode: MemoryMode,
     kb_project: Option<&str>,
     workspace_root: &Path,
     session_id: &str,
+    engine: &str,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Option<MemoryWiring> {
     if mode == MemoryMode::Off {
@@ -1974,8 +1976,9 @@ async fn build_memory(
     )
     .await
     // Failed-tool events carry the workspace root (canonical, so absolute)
-    // as `cwd` and the talos version as `hook_version`.
-    .with_event_context(workspace_root, env!("TALOS_VERSION"));
+    // as `cwd`; events and digests carry the talos version as
+    // `hook_version` and the model id as `X-KB-Engine`.
+    .with_event_context(workspace_root, env!("TALOS_VERSION"), engine);
     let (memory, kb_mcp_report) = memory.attach_kb_tools(KB_MCP_CONNECT_TIMEOUT).await;
     Some(MemoryWiring {
         memory: Arc::new(memory),
@@ -2253,6 +2256,7 @@ async fn run_cmd(args: RunArgs) {
         args.kb_project.as_deref(),
         &workspace_root,
         &kb_session,
+        &settings.model,
         &env_accessor,
     )
     .await;
@@ -3376,6 +3380,7 @@ mod tests {
             kb_project,
             dir.path(),
             "t:1",
+            "m",
             &env_with(&vars),
         )
         .await
@@ -3395,6 +3400,7 @@ mod tests {
             Some("p"),
             Path::new("/nonexistent"),
             "t:1",
+            "m",
             &env,
         )
         .await;

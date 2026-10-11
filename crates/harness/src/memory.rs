@@ -15,7 +15,12 @@
 //! - register extra **tools** (typically read-only KB tools) for the run;
 //! - **observe** each invoked tool call's result via [`Memory::after_tool`]
 //!   and settle any reports it started in [`Memory::flush`] — observation
-//!   only: nothing it does can change the run.
+//!   only: nothing it does can change the run;
+//! - **observe** what the engine already knows about the run via
+//!   [`Memory::observe`] — the task, each model turn's reasoning and text,
+//!   each handled `finish` call, and every harness correction
+//!   ([`CorrectionTrigger`]) — so an adapter can report turn digests; again
+//!   observation only.
 //!
 //! Memory is OFF by default ([`MemoryMode::Off`] with [`NoMemory`]), and an
 //! Off run is byte-identical to a run on an engine without this seam.
@@ -59,13 +64,19 @@ pub const MEMORY_DENY_RETRY_SUFFIX: &str =
 /// send from [`Memory::after_tool`] is spawned, never awaited in place.
 ///
 /// **Call order.** When memory is on, the engine calls `degraded()` →
-/// `label()` → `tools()` → `session_slice()`, each at most once per loop
-/// invocation and all before the first model request; then `before_tool()`
-/// once per dispatched non-finish tool call, and `after_tool()` once per such
-/// call that was invoked (not denied); finally `flush()` once before
+/// `label()` → `tools()` → `session_slice()` → `observe(RunStart)`, each at
+/// most once per loop invocation and all before the first model request;
+/// then, per successful model turn, `observe(Turn)` before any of that
+/// turn's calls is dispatched; `before_tool()` once per dispatched
+/// non-finish tool call, and `after_tool()` once per such call that was
+/// invoked (not denied); `observe(Correction{GateRed})` right after the
+/// `after_tool()` of a red `run_checks`; `observe(Finish)` then (when
+/// applicable) `observe(Correction)` per handled `finish` call;
+/// `observe(Correction{Nudge})` per nudge; finally `flush()` once before
 /// `run_end`. A `Some` from `degraded()` forces Off behaviour for the
-/// invocation: `tools()`, `session_slice()`, `before_tool()` and
-/// `after_tool()` are then never called, and the engine prints one warning.
+/// invocation: `tools()`, `session_slice()`, `before_tool()`,
+/// `after_tool()` and `observe()` are then never called, and the engine
+/// prints one warning. Off or degraded never calls `observe()`.
 ///
 /// **Decision precedence.** Each [`Advice`] is resolved against the run's
 /// [`MemoryMode`] (first match wins): Off → nothing; `Advice::None` →
@@ -126,6 +137,13 @@ pub trait Memory: Send + Sync {
     /// [`Memory::flush`]. Default: no-op.
     fn after_tool(&self, _call: &ToolCallView, _result: &ToolResultView) {}
 
+    /// Observe one thing the engine already knows about the run (see
+    /// [`Observation`]). Called only when memory is on and not degraded,
+    /// synchronously inside the loop. Must not block, await or do I/O: an
+    /// implementation that reports to a store spawns the request and settles
+    /// it in [`Memory::flush`]. Default: no-op.
+    fn observe(&self, _observation: &Observation<'_>) {}
+
     /// Settle whatever [`Memory::after_tool`] started. The engine awaits it
     /// exactly once per loop invocation, just before `run_end`, under a
     /// bound of a few seconds; a flush still pending at the bound is
@@ -153,7 +171,8 @@ pub struct ToolResultView<'a> {
 }
 
 /// What [`Memory::flush`] settled: reports delivered, reports that failed,
-/// and reports not sent because a per-run cap was reached.
+/// reports not sent because a per-run cap was reached, and turn digests
+/// delivered or failed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryFlush {
     /// Reports the store acknowledged.
@@ -162,6 +181,82 @@ pub struct MemoryFlush {
     pub failed: u32,
     /// Reports skipped because the per-run cap was reached.
     pub capped: u32,
+    /// Turn digests the store acknowledged with a 2xx.
+    pub digests_sent: u32,
+    /// Turn digests that failed: transport error, timeout, non-2xx, or a
+    /// digest that could not be fitted to the store's budget at all.
+    pub digests_failed: u32,
+}
+
+/// Which harness rejection a [`Observation::Correction`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionTrigger {
+    /// A `run_checks` call came back red.
+    GateRed,
+    /// A `done` / `already_satisfied` claim was rejected by red checks.
+    ClaimRejected,
+    /// A `done` claim was rejected because the working tree was unchanged.
+    NoChange,
+    /// The engine injected a finish-recovery nudge.
+    Nudge,
+}
+
+impl CorrectionTrigger {
+    /// The wire spelling: `gate_red`, `claim_rejected`, `no_change` or
+    /// `nudge`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GateRed => "gate_red",
+            Self::ClaimRejected => "claim_rejected",
+            Self::NoChange => "no_change",
+            Self::Nudge => "nudge",
+        }
+    }
+}
+
+/// One thing the engine reports to [`Memory::observe`]. Every variant is
+/// something the loop already knows; nothing is computed for memory alone.
+#[derive(Debug, Clone, Copy)]
+pub enum Observation<'a> {
+    /// The run is starting on `task` (the rendered task prompt).
+    RunStart {
+        /// The task prompt.
+        task: &'a str,
+    },
+    /// One successful model turn, before any of its calls is dispatched.
+    Turn {
+        /// The engine iteration.
+        iteration: u32,
+        /// Every reasoning block's text, in order, joined with a blank line.
+        reasoning: &'a str,
+        /// The turn's assistant text.
+        text: &'a str,
+    },
+    /// One handled `finish` call and what the engine fed back.
+    Finish {
+        /// The model-assigned call id.
+        call_id: &'a str,
+        /// The engine iteration.
+        iteration: u32,
+        /// The call's JSON arguments.
+        args: &'a Value,
+        /// Whether the fed-back result is an error (a rejected claim).
+        is_error: bool,
+        /// The fed-back content.
+        content: &'a str,
+        /// The accepted disposition, when the claim terminated the run.
+        accepted: Option<&'a crate::run_record::Disposition>,
+    },
+    /// The harness corrected the agent.
+    Correction {
+        /// What kind of correction.
+        trigger: CorrectionTrigger,
+        /// The engine iteration.
+        iteration: u32,
+        /// What the agent was shown (the gate output, rejection or nudge).
+        detail: &'a str,
+    },
 }
 
 impl fmt::Debug for dyn Memory {
@@ -503,6 +598,46 @@ mod tests {
                 duration_ms: Some(3),
             },
         );
+        let disposition = crate::run_record::Disposition::Blocked {
+            decision_needed: "q".into(),
+        };
+        for observation in [
+            Observation::RunStart { task: "t" },
+            Observation::Turn {
+                iteration: 1,
+                reasoning: "r",
+                text: "t",
+            },
+            Observation::Finish {
+                call_id: "cf",
+                iteration: 1,
+                args: &args,
+                is_error: false,
+                content: "ok",
+                accepted: Some(&disposition),
+            },
+            Observation::Correction {
+                trigger: CorrectionTrigger::Nudge,
+                iteration: 1,
+                detail: "d",
+            },
+        ] {
+            m.observe(&observation);
+        }
+        assert_eq!(m.session_slice(), None);
+        assert_eq!(m.before_tool(&view), Advice::None);
+    }
+
+    #[test]
+    fn correction_trigger_as_str() {
+        for (trigger, expected) in [
+            (CorrectionTrigger::GateRed, "gate_red"),
+            (CorrectionTrigger::ClaimRejected, "claim_rejected"),
+            (CorrectionTrigger::NoChange, "no_change"),
+            (CorrectionTrigger::Nudge, "nudge"),
+        ] {
+            assert_eq!(trigger.as_str(), expected);
+        }
     }
 
     #[tokio::test]
@@ -513,7 +648,9 @@ mod tests {
             MemoryFlush {
                 sent: 0,
                 failed: 0,
-                capped: 0
+                capped: 0,
+                digests_sent: 0,
+                digests_failed: 0,
             }
         );
     }
