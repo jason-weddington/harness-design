@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::{
     MAX_RESOLVED_BY, MAX_TURN_BODY_BYTES, MAX_TURN_EXCERPT_CHARS, MAX_TURN_ITEMS,
     MAX_TURN_PROMPT_CHARS, MAX_TURN_TARGET_CHARS, MAX_TURN_TEXT_CHARS, native_target,
-    truncate_chars,
+    scrub_offload_paths, truncate_chars,
 };
 use crate::memory::{CorrectionTrigger, Observation, ToolCallView, ToolResultView};
 use crate::run_record::Disposition;
@@ -313,7 +313,7 @@ impl DigestBuffer {
                 "tool_use_id": id,
                 "is_error": is_error,
                 "excerpt": if is_error {
-                    truncate_chars(content, MAX_TURN_EXCERPT_CHARS)
+                    truncate_chars(&scrub_offload_paths(content), MAX_TURN_EXCERPT_CHARS)
                 } else {
                     String::new()
                 },
@@ -444,7 +444,10 @@ impl DigestBuffer {
                 if !self.corrections.iter().any(|c| c.trigger == trigger) {
                     self.corrections.push(OpenCorrection {
                         trigger,
-                        detail: truncate_chars(detail, MAX_TURN_EXCERPT_CHARS),
+                        detail: truncate_chars(
+                            &scrub_offload_paths(detail),
+                            MAX_TURN_EXCERPT_CHARS,
+                        ),
                         pending: Vec::new(),
                     });
                 }
@@ -638,7 +641,7 @@ mod tests {
             &Observation::Correction {
                 trigger: CorrectionTrigger::Nudge,
                 iteration: 1,
-                detail: "n",
+                detail: "n [full check output: /some/path]",
             },
             Instant::now(),
         );
@@ -648,7 +651,7 @@ mod tests {
         assert_eq!(closed[0]["final_message"], Value::Null);
         assert_eq!(
             closed[1]["items"],
-            json!([{"kind": "harness_correction", "trigger": "nudge", "detail": "n", "resolved_by": [], "resolved": false}])
+            json!([{"kind": "harness_correction", "trigger": "nudge", "detail": "n [full check output offloaded]", "resolved_by": [], "resolved": false}])
         );
     }
 

@@ -616,6 +616,32 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// `s` with talos's local offload pointers replaced by fixed markers: the
+/// `[full check output: <path>]` and `; full output at <path>]` tails name
+/// a file on this host, which is noise off-host. An unclosed pointer is left
+/// as is.
+fn scrub_offload_paths(s: &str) -> String {
+    let s = scrub_between(s, "[full check output: ", "[full check output offloaded]");
+    scrub_between(&s, "; full output at ", "; full output offloaded]")
+}
+
+/// Replace each `start`..next `]` span in `s` with `replacement`.
+fn scrub_between(s: &str, start: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(start) {
+        let after = i + start.len();
+        let Some(close) = rest[after..].find(']') else {
+            break;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str(replacement);
+        rest = &rest[after + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The `tool_input` of an event: only the call's target argument, never
 /// edit contents. `None` for a tool that is not posted.
 fn event_tool_input(call: &ToolCallView) -> Option<Value> {
@@ -871,7 +897,7 @@ impl PersonalKbMemory {
             "tool_name": call.name,
             "tool_input": tool_input,
             "tool_use_id": result.call_id,
-            "error": truncate_chars(result.content, MAX_EVENT_FIELD_CHARS),
+            "error": truncate_chars(&scrub_offload_paths(result.content), MAX_EVENT_FIELD_CHARS),
             "is_error": true,
             "is_interrupt": false,
             "duration_ms": result.duration_ms,
@@ -1069,7 +1095,8 @@ mod tests {
         DIGEST_PERIOD, EVENT_PATH, EVENT_TIMEOUT, HOSTNAME_PATH, KB_ENGINE_HEADER,
         MAX_EVENT_FIELD_CHARS, MAX_EVENTS_PER_RUN, MAX_RESOLVED_BY, MAX_TURN_BODY_BYTES,
         MAX_TURN_EXCERPT_CHARS, MAX_TURN_ITEMS, MAX_TURN_PROMPT_CHARS, MAX_TURN_TARGET_CHARS,
-        MAX_TURN_TEXT_CHARS, TURN_PATH, TURN_TIMEOUT, event_tool_input, read_host, truncate_chars,
+        MAX_TURN_TEXT_CHARS, TURN_PATH, TURN_TIMEOUT, event_tool_input, read_host,
+        scrub_offload_paths, truncate_chars,
     };
     use super::{
         KB_HARNESS_HEADERS, KB_MCP_CONNECT_TIMEOUT, KB_PROJECT_FILENAME, KbEndpoint,
@@ -2411,7 +2438,10 @@ mod tests {
             if input.to_string().contains("OK") {
                 ToolResult::ok("fine")
             } else {
-                ToolResult::error(format!("{} failed", self.0))
+                ToolResult::error(format!(
+                    "{} failed\n[full check output: /some/path]",
+                    self.0
+                ))
             }
         }
     }
@@ -2540,6 +2570,33 @@ mod tests {
     }
 
     #[test]
+    fn scrub_offload_paths_replaces_pointers() {
+        assert_eq!(
+            scrub_offload_paths(
+                "checks FAILED: exit 1 (0.00s)\n\n\n[full check output: /home/u/.local/state/talos/x/offload/offload-0000.txt]"
+            ),
+            "checks FAILED: exit 1 (0.00s)\n\n\n[full check output offloaded]"
+        );
+        assert_eq!(
+            scrub_offload_paths(
+                "abc\n…[truncated at 4000 chars; full output at /tmp/o/offload-0001.txt]"
+            ),
+            "abc\n…[truncated at 4000 chars; full output offloaded]"
+        );
+        assert_eq!(
+            scrub_offload_paths(
+                "a [full check output: /p] b …; full output at /q] c [full check output: /r]"
+            ),
+            "a [full check output offloaded] b …; full output offloaded] c [full check output offloaded]"
+        );
+        assert_eq!(scrub_offload_paths("no markers here"), "no markers here");
+        assert_eq!(
+            scrub_offload_paths("[full check output: /no/close"),
+            "[full check output: /no/close"
+        );
+    }
+
+    #[test]
     fn event_helpers() {
         assert_eq!(truncate_chars("héllo", 2), "hé");
         assert_eq!(truncate_chars("hé", 5), "hé");
@@ -2654,6 +2711,8 @@ mod tests {
         assert!(body["ts"].as_str().unwrap().ends_with('Z'), "{body}");
         let error = body["error"].as_str().unwrap();
         assert!(error.starts_with("bash failed"), "{error}");
+        assert!(error.contains("[full check output offloaded]"), "{error}");
+        assert!(!error.contains("/some/path"), "{error}");
         assert_eq!(result.stats.memory_events_sent, 1);
         assert_eq!(result.stats.memory_events_failed, 0);
         assert_eq!(result.stats.memory_events_capped, 0);
@@ -3141,7 +3200,7 @@ mod tests {
                 json!({"kind": "reasoning", "text": "weighing the remote", "truncated": false}),
                 json!({"kind": "assistant_text", "text": "Pushing now."}),
                 tc("1:c1", "bash", "git push mirror feat/x"),
-                tr("1:c1", true, "bash failed"),
+                tr("1:c1", true, "bash failed\n[full check output offloaded]"),
                 tc("2:e1", "edit_file", "src/a.py"),
                 tr("2:e1", false, ""),
                 tc("3:cf", "finish", ""),
@@ -3179,7 +3238,11 @@ mod tests {
             items(&bodies[0]),
             vec![
                 tc("1:rc1", "run_checks", ""),
-                tr("1:rc1", true, "run_checks failed")
+                tr(
+                    "1:rc1",
+                    true,
+                    "run_checks failed\n[full check output offloaded]"
+                )
             ]
         );
         assert_eq!(
@@ -3191,7 +3254,12 @@ mod tests {
             vec![
                 tc("3:rc2", "run_checks", ""),
                 tr("3:rc2", false, ""),
-                corr("gate_red", "run_checks failed", &["2:e1"], true),
+                corr(
+                    "gate_red",
+                    "run_checks failed\n[full check output offloaded]",
+                    &["2:e1"],
+                    true
+                ),
             ]
         );
         assert_eq!(
@@ -3220,7 +3288,12 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert_eq!(
             items(&bodies[0]).last().unwrap(),
-            &corr("gate_red", "run_checks failed", &[], false)
+            &corr(
+                "gate_red",
+                "run_checks failed\n[full check output offloaded]",
+                &[],
+                false
+            )
         );
     }
 
@@ -3259,7 +3332,7 @@ mod tests {
             corrections,
             [&corr(
                 "gate_red",
-                "run_checks failed",
+                "run_checks failed\n[full check output offloaded]",
                 &["2:rc2", "3:b1"],
                 true
             )]
