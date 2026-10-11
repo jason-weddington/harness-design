@@ -50,6 +50,8 @@ Each request example carries its `stored` computed fields under the top-level `s
 
 A mapped harness (today talos) sends its native `tool_name` and native `tool_input` argument names (`edit_file` with `path`, for instance), and the KB normalizes both to the canonical Claude Code names before computing the cue, so the stored `tool` is `Edit` and `target` is the path.
 
+Mapped harnesses send their native error text (talos opens with `exit 1 (0.01s)` and `--- stdout ---` / `--- stderr ---` markers, Claude Code with `Exit code 1`) and the KB normalizes it, so the same failure gets the same `cue_key` from either.
+
 `event_id` must be unique per session; a repeated `event_id` is answered `duplicate` and not stored again.
 
 ## Seeing drift in production

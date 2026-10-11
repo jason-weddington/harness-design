@@ -1,2 +1,2 @@
-Vendored from personal_kb contracts/ at 57faa12 (main after v1.8.0; adds event.json for POST /api/kb/event). prevention.json and turn.json are byte-identical to tag v1.8.0 (8e7a358). Regenerate there, then re-copy; never edit by hand.
-matcher_vectors.json: produced by running personal-kb-hook cues_lite.target_class, cues_lite.bash_args_after_class and prevention._find_match at v1.8.0, unchanged at 57faa12 (scripts/gen-kb-matcher-vectors.py; Bash rows are dropped from target_class because the Bash path goes through bash_segments).
+Vendored from personal_kb tag v1.9.0 (649f452), contracts/ unchanged. Regenerate there, then re-copy; never edit by hand.
+matcher_vectors.json: produced by running personal-kb-hook cues_lite.target_class, cues_lite.bash_args_after_class and prevention._find_match at v1.8.0; both are unchanged at v1.9.0 (scripts/gen-kb-matcher-vectors.py; Bash rows are dropped from target_class because the Bash path goes through bash_segments).

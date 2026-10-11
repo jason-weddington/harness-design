@@ -266,7 +266,7 @@
             "command": "git push mirror feat/x"
           },
           "tool_use_id": "toolu_contract_t1",
-          "error": "Exit code 1\nremote: Permission to mirror denied",
+          "error": "exit 1 (0.01s)\n--- stdout ---\n\n--- stderr ---\nremote: Permission to mirror denied\n",
           "is_error": true,
           "is_interrupt": false,
           "duration_ms": 95
@@ -301,8 +301,8 @@
   },
   "stored": {
     "claude_code_bash_failure": {
-      "cue_key": "93ccc92c974a2310",
-      "normalizer_version": 1,
+      "cue_key": "aa55d24cbfcccf89",
+      "normalizer_version": 2,
       "host_class": "linux",
       "project_source": "kb_project",
       "tool": "Bash",
@@ -314,8 +314,8 @@
       "raw_error_excerpt": "Exit code 1\nremote: Permission to mirror denied"
     },
     "talos_bash_failure": {
-      "cue_key": "93ccc92c974a2310",
-      "normalizer_version": 1,
+      "cue_key": "aa55d24cbfcccf89",
+      "normalizer_version": 2,
       "host_class": "linux",
       "project_source": "kb_project",
       "tool": "Bash",
@@ -324,11 +324,11 @@
       "normalized_error": "exit 1 | remote: permission to mirror denied",
       "error_rule": "keyword",
       "anomaly": null,
-      "raw_error_excerpt": "Exit code 1\nremote: Permission to mirror denied"
+      "raw_error_excerpt": "exit 1 (0.01s)\n--- stdout ---\n\n--- stderr ---\nremote: Permission to mirror denied\n"
     },
     "talos_edit_file_failure": {
-      "cue_key": "49be3684f0e9ad3e",
-      "normalizer_version": 1,
+      "cue_key": "32dff6743756c312",
+      "normalizer_version": 2,
       "host_class": "linux",
       "project_source": "kb_project",
       "tool": "Edit",
@@ -397,8 +397,8 @@
         "name": "claude_code_bash_failure",
         "body": {
           "recorded": true,
-          "cue_key": "93ccc92c974a2310",
-          "normalizer_version": 1,
+          "cue_key": "aa55d24cbfcccf89",
+          "normalizer_version": 2,
           "reason": "recorded"
         }
       },
@@ -406,8 +406,8 @@
         "name": "talos_bash_failure",
         "body": {
           "recorded": true,
-          "cue_key": "93ccc92c974a2310",
-          "normalizer_version": 1,
+          "cue_key": "aa55d24cbfcccf89",
+          "normalizer_version": 2,
           "reason": "recorded"
         }
       },
@@ -415,8 +415,8 @@
         "name": "talos_edit_file_failure",
         "body": {
           "recorded": true,
-          "cue_key": "49be3684f0e9ad3e",
-          "normalizer_version": 1,
+          "cue_key": "32dff6743756c312",
+          "normalizer_version": 2,
           "reason": "recorded"
         }
       },
