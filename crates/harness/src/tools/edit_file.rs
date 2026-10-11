@@ -240,6 +240,27 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
             return Err(err);
         }
     }
+    // The rename below replaces the target's inode, which would drop its
+    // permission bits (a 100755 script would come back as 100644). When the
+    // target already exists, copy its mode onto the temp file before the
+    // rename. CREATE mode has no existing mode to preserve, so it is
+    // untouched: the fresh file keeps the default creation mode. Never rename
+    // a temp whose mode could not be set.
+    if target.exists() {
+        match std::fs::metadata(target) {
+            Ok(meta) => match std::fs::set_permissions(&temp, meta.permissions()) {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(err);
+                }
+            },
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(err);
+            }
+        }
+    }
     match std::fs::rename(&temp, target) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -753,5 +774,106 @@ mod tests {
             out.summary,
         );
         assert!(out.summary.contains("adir"));
+    }
+
+    /// REPLACE mode must copy the target's existing permissions onto the temp
+    /// file before the rename — otherwise the rename replaces the target's
+    /// inode and a 100755 script silently becomes 100644.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_preserves_executable_mode_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().expect("tempdir");
+        let ctx = ctx_for(&root);
+        let path = root.path().join("serve.sh");
+        std::fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = EditFileTool
+            .run(
+                json!({
+                    "path": "serve.sh",
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!out.is_error, "replace should succeed: {}", out.summary);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "executable bit lost on edit: got {mode:o}"
+        );
+    }
+
+    /// Same as above but with a non-executable starting mode: proves the mode
+    /// is *copied from the target*, not hard-coded to 0o755.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_preserves_restricted_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().expect("tempdir");
+        let ctx = ctx_for(&root);
+        let path = root.path().join("secret.sh");
+        std::fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let out = EditFileTool
+            .run(
+                json!({
+                    "path": "secret.sh",
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!out.is_error, "replace should succeed: {}", out.summary);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "mode must be copied from the target, not hard-coded: got {mode:o}"
+        );
+    }
+
+    /// CREATE mode has no existing mode to preserve: the new file keeps the
+    /// default (non-executable) creation mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_produces_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().expect("tempdir");
+        let ctx = ctx_for(&root);
+
+        let out = EditFileTool
+            .run(
+                json!({
+                    "path": "fresh.sh",
+                    "old_string": "",
+                    "new_string": "#!/bin/sh\necho hi\n",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!out.is_error, "create should succeed: {}", out.summary);
+        let mode = std::fs::metadata(root.path().join("fresh.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "CREATE mode must not produce an executable file: got {mode:o}"
+        );
     }
 }
