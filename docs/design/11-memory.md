@@ -1,6 +1,6 @@
 # 11 — Memory as a harness feature
 
-Status: decided 2026-10-10 (Jason, with the personal-kb lead session). Phase 1 is built; phase 3 native capture (failure events and turn digests) is built, default-off behind `--memory`; phase 2 waits on its kb-bench eval.
+Status: decided 2026-10-10 (Jason, with the personal-kb lead session). Phases 1 and 3 shipped in v0.15.0, default-off in the binary; the dispatch fleet runs `--memory annotate` since 2026-10-11, with the pre-registered kb-bench test (H-013) running alongside and deciding between annotate, deny-once and off. Phase 2 waits on its kb-bench eval.
 
 ## Decision
 

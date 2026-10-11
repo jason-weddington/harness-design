@@ -10,13 +10,15 @@ Living document: updated at session boundaries. The per-session narrative lives 
 [`session-summaries.md`](./session-summaries.md); decisions of record live in the
 KB (`project_ref: harness-design`).
 
-## Where we are — v0.14.0 (2026-10-07), plus memory and Harbor unreleased on main
+## Where we are — v0.15.0 (2026-10-11): memory on the fleet, tier-2 on Harbor
+
+**v0.15.0 makes memory a harness feature, and the fleet now runs it in annotate mode.** Talos consumes the personal KB natively behind `--memory off|annotate|deny-once` ([`design/11`](./design/11-memory.md)): the session slice and per-call advice from `/prevention` (translated through the KB's `tool_map`, lexical matcher), the KB's agent tools over MCP-over-HTTP, failure events to `/api/kb/event`, and periodic turn digests to `/api/kb/turn` carrying reasoning and the four harness corrections. Every KB contract is vendored and tested against (`crates/harness/testdata/personal_kb_contracts`, personal_kb v1.9.0). The binary default stays `off`; the dispatch fleet passes `--memory annotate` through agent-gtd-dispatch's `TALOS_MEMORY` switch (2.5.0), flipped on 2026-10-11 on the strength of an exploratory kb-bench run (annotate rescued 10 of 15 paired trials and broke none) and a clean tier-1 perfect-spec guard (30/30 against 30/30 off; the fixed cost is context, roughly double the uncached input per run; `kb-03848`). The same release moves tier-2 to Harbor (`scripts/tier2-harbor.sh`, runbook [`design/10`](./design/10-tier2-on-harbor.md); calibration MATCH in [`design/09`](./design/09-harbor-calibration.md)) and builds fleet binaries against a glibc 2.39 floor.
+
+**What decides the next step.** The pre-registered kb-bench test (H-013, on new gated scenarios) runs alongside the fleet flip rather than gating it: a null or negative result reverts the fleet to `off`, a positive one decides whether deny-once replaces annotate. Deny-once is untested on perfect-spec work, because the tier-1 index held no matching cue. The KB session is watching whether four hosts running the same workflow promote autonomous lessons on recurrence too fast. Phase 2 (Clef-driven annotate for lessons with no command cue) stays conditional on its own kb-bench arm.
+
+## Previously — v0.14.0 (2026-10-07)
 
 **v0.14.0 released `somnus`**, the personal KB's nightly map-maintenance loop and the harness's first external consumer (the v0.13.0 section below tells how it got there), together with the wall-clock default of `0` and the metered-backend token budget.
-
-**Unreleased on main, and on the fleet as `0.14.0-32-g3df06eb`: tier-2 on Harbor, and memory as a harness feature.** Tier-2 runs through the Harbor `TalosAgent` adapter (`scripts/tier2-harbor.sh`, runbook [`design/10`](./design/10-tier2-on-harbor.md)); the calibration against the in-process runner returned MATCH ([`design/09`](./design/09-harbor-calibration.md)) and that runner is gone. Fleet binaries build with cargo-zigbuild against a glibc 2.39 floor. Talos consumes the personal KB natively behind `--memory annotate|deny-once`, **default off** ([`design/11`](./design/11-memory.md)): the session slice and per-call advice from `/prevention` (translated through the KB's `tool_map`, lexical matcher, annotate or deny-once), the KB's agent tools over MCP-over-HTTP, failure events to `/api/kb/event`, and periodic turn digests to `/api/kb/turn` carrying reasoning and the four harness corrections. Every KB contract is vendored and tested against (`crates/harness/testdata/personal_kb_contracts`, personal_kb v1.9.0).
-
-**What decides the next step.** An exploratory kb-bench run on qwen had annotate rescue 10 of 15 paired trials and break none; the personal-kb session is pre-registering it as H-013. Flipping `--memory` on for the fleet needs that result, a clean tier-1 perfect-spec guard, and the dispatch-side switch (agent_gtd `2835cabd`). Phase 2 (Clef-driven annotate for lessons with no command cue) stays conditional on its own kb-bench arm. A release cut is due: main is 32 commits past 0.14.0.
 
 ## Previously — v0.13.0 (2026-09-20), plus an unreleased sibling crate
 
