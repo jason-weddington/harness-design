@@ -2,6 +2,50 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.15.0 - 2026-10-11
+#### Features
+- (**0f6638bb**) harbor: talos_harbor.TalosAgent — a Harbor BaseInstalledAgent that runs talos in a trial container - (5a77cea) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**3cf20522**) talos posts turn digests with harness corrections and reasoning to the KB - (c5cfa68) - Jason Weddington, *Claude Opus 5.5*
+- (**3d81a2cc**) talos personal-kb memory adapter — /prevention slice + cached cue index + lexical matcher, KB MCP tools, --memory flag - (dc8e970) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**4e728e2b**) personal-kb adapter consumes the KB's tool_map and drops the gate-switch cue filter - (483037b) - Jason Weddington, *Claude Opus 5.5*
+- (**6d50f073**) Memory seam in the engine loop — session slice, before_tool advice (annotate | deny-once), memory telemetry - (a663ac3) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**863042fc**) port the tier-2 mined-task scorer to a self-contained Python verifier script - (47d421e) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**a9e0aa0e**) talos posts failed tool calls to the KB as failure_events - (bf8f13c) - Jason Weddington, *Claude Opus 5.5*
+- (**adf97c83**) harness: generic MCP client (streamable HTTP) — discover a server's tools at run start and register them as talos tools - (75ae49a) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**c58e8a7b**) talos: run --instruction-file renders a free-text instruction verbatim, with an optional --gate-command - (b0967ed) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**d1cda4b8**) feat(harbor): TalosAgent memory kwarg passes --memory through to talos - (8f6b1e4) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**evals**) mined_to_harbor emitter — convert talos-evals mined tasks into Harbor task dirs - (bdb44b9) - Jason Weddington, *Claude Opus 5.5*
+- (**harbor**) calibration report comparing a Harbor job against a mined_eval run, plus a shared GPU lock wrapper - (e13131d) - Jason Weddington, *Claude Opus 5.5*
+- (**scripts**) gpu-eval.sh records opt-in GPU telemetry for a run - (ddd6d36) - Jason Weddington, *Claude Opus 5.5*
+- (**somnus**) a map-op 409 pointer_superseded is a per-op skip, not a cap admission or a fault - (98e3a27) - Jason Weddington, *Claude Opus 5.5*
+#### Bug Fixes
+- (**2b7384e5**) strip talos offload paths from text the personal-kb adapter sends to the KB - (3df06eb) - Jason Weddington, *Claude Opus 5.5*
+- (**e56d1c3d**) unique per-invocation KB session id - (d317a23) - Jason Weddington, *Claude Opus 5.5*
+- (**evals**) mined_to_harbor vendors ssh-sourced uv git dependencies so task images build without credentials - (ff48d4c) - Jason Weddington, *Claude Opus 5.5*
+- (**harbor**) TalosAgent forwards only the selected backend's credentials into the trial container - (55af920) - Jason Weddington, *Claude Opus 5.5*
+- (**publish**) preflight cargo-zigbuild via its own binary — `cargo zigbuild --version` is not a valid invocation - (625f71f) - Jason Weddington, *Claude Opus 5.5*
+- (**scripts**) publish preflight names whichever of cargo-zigbuild or zig is missing - (9c54d9c) - Jason Weddington, *Claude Opus 5.5*
+#### Documentation
+- (**design**) 11 — correct the talos tool map (no write_file; list_files→LS) and record the tool_map / gate-decoupling contract - (c2d2990) - Jason Weddington, *Claude Opus 5.5*
+- (**design**) 11 — talos consumes KB tools over MCP-over-HTTP; one server-side write policy for every surface - (e9b5012) - Jason Weddington, *Claude Opus 5.5*
+- (**design**) 11 — record the clef-vs-lexical result: deny stays lexical, clef annotate is conditional - (caa9b15) - Jason Weddington, *Claude Opus 5.5*
+- (**design**) 11 — memory as a harness feature (decision of record, phases, KB contracts) - (00f012b) - Jason Weddington, *Claude Opus 5.5*
+- (**harbor**) record the 2026-10-10 calibration result (MATCH, 37/40 vs 36/40) - (31774d3) - Jason Weddington, *Claude Opus 5.5*
+- (**harbor**) calibration runbook — serial trials on a single local GPU, and pin num_ctx/think on both sides - (9811f04) - Jason Weddington, *Claude Opus 5.5*
+- session 21 summary and roadmap 'Where we are' (Harbor tier-2, memory phases 1 and 3) - (680b84e) - Jason Weddington, *Claude Opus 5.5*
+#### Tests
+- (**6cf7527b**) scrub inherited git-hook env from every test git subprocess - (6b01bf7) - Jason Weddington, *Claude Opus 5.5*
+#### Build system
+- (**publish**) build fleet binaries with cargo-zigbuild against a pinned glibc 2.39 floor - (4a46c51) - Jason Weddington, *Claude Opus 5.5*
+#### Refactoring
+- (**evals**) retire the in-process tier-2 runner — Harbor is the tier-2 instrument - (45097b1) - Jason Weddington, *Claude Opus 5.5*
+#### Miscellaneous Chores
+- (**harness**) re-vendor personal_kb contracts at v1.9.0 - (b9135ab) - Jason Weddington, *Claude Opus 5.5*
+- (**harness**) vendor personal_kb event.json contract (POST /api/kb/event) at 57faa12 - (b30bdcd) - Jason Weddington, *Claude Opus 5.5*
+- (**harness**) vendor personal_kb v1.8.0 contracts and the matcher vectors for the talos tool_map work - (967df93) - Jason Weddington, *Claude Opus 5.5*
+
+- - -
+
 ## 0.14.0 - 2026-10-07
 #### Features
 - (**engine**) arm the cumulative token budget for metered backends - (5b06daf) - Jason Weddington, *Claude Opus 5*
