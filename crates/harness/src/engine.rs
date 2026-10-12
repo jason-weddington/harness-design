@@ -1631,6 +1631,27 @@ fn wrong_mode_rejection_content(claim: &str) -> String {
     )
 }
 
+/// The `is_error=true` fed-back content for a missing, non-string, or
+/// unrecognized disposition ([`FinishClaim::Invalid`]). Names the dispositions
+/// that ARE valid in the run's mode: in build mode (`answer_mode == false`)
+/// the wording is byte-identical to the pre-existing rejection; in answer mode
+/// it names `answer`, `blocked`, `failed` and steers the model to call finish
+/// again with `answer` and a schema-matching `result`.
+fn invalid_disposition_rejection_content(raw: &str, answer_mode: bool) -> String {
+    if answer_mode {
+        format!(
+            "finish rejected: this run is in answer mode — disposition must be one of: \
+             answer, blocked, failed; got {raw}. Call finish again with disposition \
+             `answer` and a `result` matching the schema in the task."
+        )
+    } else {
+        format!(
+            "finish rejected: disposition must be one of: done, blocked, failed, \
+             already_satisfied; got {raw}. Call finish again with one of those values."
+        )
+    }
+}
+
 /// Character cap on the rendered schema-error block fed back to the model.
 /// Mirrors `exec::CHECK_EXCERPT_CAP` (also `4_000`), the precedent for
 /// model-facing bounded text: a pathological schema can produce megabytes of
@@ -2335,10 +2356,7 @@ async fn handle_finish_call(
         ),
         FinishClaim::Invalid { raw } => FinishOutcome::rejected(
             call_id,
-            format!(
-                "finish rejected: disposition must be one of: done, blocked, failed, \
-                 already_satisfied; got {raw}. Call finish again with one of those values."
-            ),
+            invalid_disposition_rejection_content(&raw, answer_schema.is_some()),
             Some(raw),
             None,
         ),
@@ -5963,10 +5981,11 @@ mod tests {
         ResumeError, ResumeMode, RunConfig, RunResult, RunStats, answer_schema_rejection_content,
         answer_schema_streak_resets, bound_raw_answer_payload, budget_consumed_now,
         coerce_stringified_result, compact_history, emit_run_end, inert_precondition_warning,
-        missing_reason_rejection_content, missing_result_rejection_content,
-        modified_workspace_rejection_content, next_answer_schema_streak,
-        no_change_rejection_content, rejection_content, render_tool_result, resume, retry_delay,
-        run, run_id, run_persisted, should_compact, token_budget_breached,
+        invalid_disposition_rejection_content, missing_reason_rejection_content,
+        missing_result_rejection_content, modified_workspace_rejection_content,
+        next_answer_schema_streak, no_change_rejection_content, rejection_content,
+        render_tool_result, resume, retry_delay, run, run_id, run_persisted, should_compact,
+        token_budget_breached,
     };
     use super::{finish_correction, handle_finish_call};
     use crate::exec::{
@@ -15675,6 +15694,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_disposition_rejection_content_names_the_mode_dispositions() {
+        assert_eq!(
+            invalid_disposition_rejection_content("<missing>", false),
+            "finish rejected: disposition must be one of: done, blocked, failed, \
+             already_satisfied; got <missing>. Call finish again with one of those values."
+        );
+        assert_eq!(
+            invalid_disposition_rejection_content("<missing>", true),
+            "finish rejected: this run is in answer mode — disposition must be one of: \
+             answer, blocked, failed; got <missing>. Call finish again with disposition \
+             `answer` and a `result` matching the schema in the task."
+        );
+    }
+
     /// Build mode is byte-identical: the `answer` disposition is not
     /// advertised, so a `finish(answer)` is rejected by the pre-existing
     /// invalid-disposition path with the pre-existing wording and counters.
@@ -15761,6 +15795,49 @@ mod tests {
                     b,
                     UserBlock::ToolResult { content, is_error, .. }
                         if *is_error && *content == missing_result_rejection_content()
+                ))
+        )));
+    }
+
+    #[tokio::test]
+    async fn answer_mode_missing_disposition_names_the_answer_dispositions() {
+        let root = TempDir::new().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let ctx = git_ctx(&root_path);
+        let tools = registry_with_finish_and_edit();
+
+        let backend = MockBackend::from_turns(vec![
+            finish_call(
+                "c-bad",
+                serde_json::json!({ "answer": "{\"verdict\": \"ok\"}" }),
+            ),
+            finish_call(
+                "c-ok",
+                serde_json::json!({ "disposition": "answer", "result": { "verdict": "ok" } }),
+            ),
+        ]);
+        let config = RunConfig::new("answer me", 3).with_answer_schema(verdict_schema());
+        let RunResult { outcome, stats } = run(&backend, &tools, &ctx, &config).await;
+
+        match outcome {
+            LoopOutcome::Finished(Disposition::Answer { result, .. }) => {
+                assert_eq!(result, serde_json::json!({ "verdict": "ok" }));
+            }
+            other => panic!("expected Finished(Answer), got {other:?}"),
+        }
+        assert_eq!(stats.invalid_finish_calls, 1);
+        assert_eq!(stats.first_invalid_finish_raw.as_deref(), Some("<missing>"));
+
+        let fed_back = backend.last_messages();
+        assert!(fed_back.iter().any(|m| matches!(
+            m,
+            Message::User { content }
+                if content.iter().any(|b| matches!(
+                    b,
+                    UserBlock::ToolResult { call_id, content, is_error }
+                        if *call_id == "c-bad"
+                            && *is_error
+                            && *content == invalid_disposition_rejection_content("<missing>", true)
                 ))
         )));
     }
