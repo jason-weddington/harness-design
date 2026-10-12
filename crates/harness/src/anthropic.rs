@@ -46,8 +46,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{
-    AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason, TerminalKind,
-    ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
+    self, AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason,
+    TerminalKind, ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
 };
 
 /// Anthropic's public API origin — the default backend target.
@@ -79,9 +79,17 @@ pub struct AnthropicBackend {
 impl AnthropicBackend {
     /// Build a backend pinned to `model`, authenticated with `api_key`, and
     /// pointed at the default Anthropic origin.
+    ///
+    /// # Panics
+    ///
+    /// Only on an impossible client-builder failure: the builder is fully
+    /// configured with fixed settings (`read_timeout`), so it cannot fail.
     pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .read_timeout(model::CHAT_READ_TIMEOUT)
+                .build()
+                .expect("client builder with fixed settings cannot fail"),
             model: model.into(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -95,6 +103,19 @@ impl AnthropicBackend {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Test-only seam: rebuild the HTTP client with a short inactivity
+    /// timeout so in-file tests can force the hung-connection guard without
+    /// waiting for `model::CHAT_READ_TIMEOUT`. Not part of the public API;
+    /// no production call site uses it.
+    #[cfg(test)]
+    fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("client builder with fixed settings cannot fail");
         self
     }
 }
@@ -524,7 +545,11 @@ struct ErrorInner {
 /// Reqwest's pre-response errors (connect refused, DNS, timeout, …) → the
 /// transient bucket the loop knows how to retry.
 fn map_reqwest_error(e: &reqwest::Error) -> BackendError {
-    let kind = if e.is_timeout() {
+    classify_transport_error(e.is_timeout())
+}
+
+fn classify_transport_error(is_timeout: bool) -> BackendError {
+    let kind = if is_timeout {
         TransientKind::Timeout
     } else {
         // is_connect / is_request / is_body / is_decode all collapse to a
@@ -634,8 +659,8 @@ fn parse_retry_after(header: Option<&reqwest::header::HeaderValue>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::{
-        AnthropicBackend, build_request_body, classify_bad_request, map_stop_reason,
-        output_cap_for_model, parse_retry_after,
+        AnthropicBackend, build_request_body, classify_bad_request, classify_transport_error,
+        map_stop_reason, output_cap_for_model, parse_retry_after,
     };
     use crate::model::{
         BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
@@ -714,6 +739,74 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(server)
             .await;
+    }
+
+    #[test]
+    fn transport_error_classification_covers_timeout_and_network() {
+        assert!(matches!(
+            classify_transport_error(true),
+            BackendError::Transient {
+                kind: TransientKind::Timeout,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_transport_error(false),
+            BackendError::Transient {
+                kind: TransientKind::Network,
+                ..
+            }
+        ));
+    }
+
+    /// The hung-connection guard, forced explicitly: a loopback listener that
+    /// accepts ONE connection and then holds it forever — no byte sent, no
+    /// close. With a 1 s read timeout injected, the call must fail with a
+    /// retryable `Transient { Timeout }` instead of hanging until an
+    /// unattended loop is killed externally.
+    #[tokio::test]
+    async fn read_timeout_maps_to_transient_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            // Park on a never-completing future: if this task's body ever
+            // RETURNED, the local `stream` would drop and the connection
+            // would close — holding it is the whole point.
+            let _held_forever = stream; // never read, never written, never closed
+            std::future::pending::<()>().await;
+        });
+        let backend = AnthropicBackend::new("claude-haiku-4-5", "test-key")
+            .with_base_url(format!("http://{addr}"))
+            .with_read_timeout(std::time::Duration::from_secs(1));
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), backend.turn(&req))
+            .await
+            .expect("the read timeout must fire before the 5 s outer bound")
+            .expect_err("a held-forever connection must not produce a turn");
+        assert!(err.is_retryable());
+        assert!(matches!(
+            err,
+            BackendError::Transient {
+                kind: TransientKind::Timeout,
+                retry_after: None
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the guard must fail fast, not sit on the socket"
+        );
     }
 
     // ---- (a) happy path: text + tool_use ----------------------------------

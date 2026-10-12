@@ -464,6 +464,54 @@ impl BackendError {
     }
 }
 
+/// Inactivity (per-read) timeout shared by every production chat backend —
+/// the liveness guard for a model call that never returns.
+///
+/// **Why 900 s.** A legitimate single turn measured 409 s: glm-5.3-flash:cloud,
+/// `num_predict: 60000`, 50,205 eval tokens at ~123 tok/s, measured 2026-09-19
+/// and recorded verbatim in `docs/design/07-num-ctx.md`. (The 986,188 figure
+/// elsewhere in this crate is NOT a turn measurement — it is the derived
+/// `max_tokens` output-headroom constant; do not cite it in this role.) 900 s
+/// is 2.2× that worst legitimate turn and 3.1× the 289 s fleet maximum across
+/// 7,441 retained talos model turns. A guess erring LOW destroyed a dispatch
+/// run on 2026-09-20; erring high only costs the detection time for a hang.
+///
+/// **Why an inactivity timeout, never a total-response ceiling.** The constant
+/// is set on the per-read APIs — `Client::builder().read_timeout(...)` for
+/// reqwest (fires when no bytes arrive, resetting after each successful read)
+/// and `TimeoutConfig::builder().read_timeout(...)` for the AWS SDK (a
+/// time-to-first-byte limit on the connector) — and NEVER on a
+/// total-response API (`Client::timeout(...)` / `operation_timeout(...)`).
+/// Any total-response ceiling generous enough not to kill a 409 s turn is too
+/// generous to catch a hang in useful time; inactivity distinguishes
+/// slow-from-dead, which is the actual distinction. The two APIs converge on
+/// true slow-vs-dead inactivity semantics the moment a streaming chat
+/// response path lands (reqwest resets per read across the stream; smithy's
+/// first-byte limit is where the divergence lives today).
+///
+/// **Streaming status — load-bearing.** All three chat calls are
+/// NON-streaming today: Ollama forces `"stream": false` on every
+/// `/api/chat` request, Anthropic awaits the full body via
+/// `response.text()`, and Bedrock uses non-streaming `converse()` (no
+/// `converse_stream` anywhere). Consequence: on the current wire this
+/// constant is numerically a time-to-first-response-byte ceiling, and it
+/// MUST exceed the measured 409 s worst legitimate turn — the
+/// `chat_read_timeout_is_pinned` test enforces exactly that.
+///
+/// **How a fired guard is observable post-hoc.** Each fired turn surfaces as
+/// a `backend_error` transcript event whose `error` field contains
+/// `"transient backend failure (Timeout;"` (the `BackendError` Display
+/// rendering) and whose `latency_ms` is ≈ 900,000; it is retryable and
+/// rides the engine's normal retry schedule. The armed value also rides on
+/// `run_start.config.chat_read_timeout_secs`, distinguishing an
+/// armed-and-untriggered binary from a pre-change one.
+///
+/// Pinned to `from_secs(900)` rather than `from_mins(15)` so the
+/// measured-turn derivation — 900 s vs the 409 s worst legitimate turn —
+/// stays visible in the source next to its doc comment.
+#[allow(clippy::duration_suboptimal_units)]
+pub const CHAT_READ_TIMEOUT: Duration = Duration::from_secs(900);
+
 // ===== Output cap =====================================================
 
 /// The per-turn output cap used when NOTHING better is known — the
@@ -625,6 +673,18 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip should be lossless");
+    }
+
+    // ---- chat read timeout: the shared hung-call guard ---------------------
+
+    #[allow(clippy::duration_suboptimal_units)]
+    #[test]
+    fn chat_read_timeout_is_pinned() {
+        assert_eq!(super::CHAT_READ_TIMEOUT, Duration::from_secs(900));
+        assert!(
+            super::CHAT_READ_TIMEOUT > Duration::from_secs(409),
+            "chat read timeout must exceed the measured 409 s worst legitimate turn (docs/design/07-num-ctx.md)"
+        );
     }
 
     // --- the billed-token core (one definition for the whole workspace) ---

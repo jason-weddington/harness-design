@@ -89,8 +89,8 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::model::{
-    AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason, TerminalKind,
-    ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
+    self, AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason,
+    TerminalKind, ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
 };
 
 // ============================================================================
@@ -185,9 +185,17 @@ impl OllamaBackend {
     /// makes explicitly (`http://localhost:11434` or `https://ollama.com`). A
     /// trailing slash on `base_url` is tolerated — it is stripped at request
     /// time so `{base}/api/chat` is always a single-slash URL.
+    ///
+    /// # Panics
+    ///
+    /// Only on an impossible client-builder failure: the builder is fully
+    /// configured with fixed settings (`read_timeout`), so it cannot fail.
     pub fn new(model: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .read_timeout(model::CHAT_READ_TIMEOUT)
+                .build()
+                .expect("client builder with fixed settings cannot fail"),
             model: model.into(),
             base_url: base_url.into(),
             api_key: None,
@@ -201,6 +209,19 @@ impl OllamaBackend {
     #[must_use]
     pub fn with_api_key(mut self, api_key: String) -> Self {
         self.api_key = Some(api_key);
+        self
+    }
+
+    /// Test-only seam: rebuild the HTTP client with a short inactivity
+    /// timeout so in-file tests can force the hung-connection guard without
+    /// waiting for `crate::model::CHAT_READ_TIMEOUT`. Not part of the public
+    /// API; no production call site uses it.
+    #[cfg(test)]
+    fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("client builder with fixed settings cannot fail");
         self
     }
 
@@ -356,8 +377,11 @@ impl ModelBackend for OllamaBackend {
 /// Timeout for the `POST /api/show` probe.
 ///
 /// A hung daemon must not wedge eval startup; `reqwest` 0.12 has NO default
-/// request timeout. `OllamaBackend::new` uses a bare `Client::new()` — that is
-/// deliberately not copied here.
+/// request timeout. The chat client in [`OllamaBackend::new`] sits at
+/// `crate::model::CHAT_READ_TIMEOUT` (900 s) — the shared hung-call guard
+/// for the chat turn — and this 10-second probe timeout is deliberately NOT
+/// reused there: `/api/show` runs at eval startup, where a fast failure is
+/// what matters, while a chat turn is allowed to be arbitrarily slow.
 const SHOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The result of a successful [`resolve_context_length`] call.
@@ -1414,6 +1438,50 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(server)
             .await;
+    }
+
+    /// The hung-connection guard, forced explicitly: a loopback listener that
+    /// accepts ONE connection and then holds it forever — no byte sent, no
+    /// close. With a 1 s read timeout injected, the call must fail with a
+    /// retryable `Transient { Timeout }` instead of hanging until an
+    /// unattended loop is killed externally.
+    #[tokio::test]
+    async fn read_timeout_maps_to_transient_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            // Park on a never-completing future: if this task's body ever
+            // RETURNED, the local `stream` would drop and the connection
+            // would close — holding it is the whole point.
+            let _held_forever = stream; // never read, never written, never closed
+            std::future::pending::<()>().await;
+        });
+        let backend = OllamaBackend::new("qwen3.8:27b", format!("http://{addr}"))
+            .with_read_timeout(std::time::Duration::from_secs(1));
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = simple_req(&messages, &tools, &p);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), backend.turn(&req))
+            .await
+            .expect("the read timeout must fire before the 5 s outer bound")
+            .expect_err("a held-forever connection must not produce a turn");
+        assert!(err.is_retryable());
+        assert!(matches!(
+            err,
+            BackendError::Transient {
+                kind: TransientKind::Timeout,
+                retry_after: None
+            }
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the guard must fail fast, not sit on the socket"
+        );
     }
 
     fn simple_req<'a>(

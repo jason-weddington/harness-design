@@ -299,12 +299,10 @@ pub struct RunConfig {
     ///
     /// Granularity is TURN-level: a turn already in flight when the budget
     /// expires runs to completion, so the worst-case overshoot is one full
-    /// turn. No production chat client sets a request timeout —
-    /// `OllamaBackend::new` uses a bare `reqwest::Client::new()` (the
-    /// 10-second `SHOW_TIMEOUT` covers only `POST /api/show`),
-    /// `AnthropicBackend::new` is a bare `Client::new()`, and the production
-    /// `BedrockBackend::new` sets no `TimeoutConfig` — so a hung model call
-    /// is bounded only by the caller's outer timeout, not by this check.
+    /// turn. Every production chat client sits behind one shared chat read
+    /// timeout — `model::CHAT_READ_TIMEOUT` (900 s) — so a hung model call
+    /// dies with a retryable `Transient { Timeout }` after at most 900 s
+    /// instead of hanging forever.
     pub wall_clock_secs: u64,
     /// Cumulative token budget for the WHOLE run, in billed tokens. `0`
     /// means UNBOUNDED — the default (OFF by default, the deliberate
@@ -550,10 +548,11 @@ impl RunConfig {
     /// loop iteration (before each `backend.turn`) plus one post-loop
     /// evaluation, and self-terminates with [`LoopOutcome::BudgetExhausted`]
     /// when `elapsed >= wall_clock_secs`. The bound is turn-granularity: a
-    /// turn already in flight when the budget expires runs to completion (no
-    /// production chat client sets a request timeout — Ollama, Anthropic, and
-    /// Bedrock backends are all bare clients), so worst-case overshoot is one
-    /// full turn.
+    /// turn already in flight when the budget expires runs to completion, so
+    /// worst-case overshoot is one full turn — bounded by the shared chat
+    /// read timeout, `model::CHAT_READ_TIMEOUT` (900 s): a hung model call
+    /// dies with a retryable `Transient { Timeout }` after at most 900 s
+    /// instead of hanging forever.
     #[must_use]
     pub fn with_wall_clock_secs(mut self, secs: u64) -> Self {
         self.wall_clock_secs = secs;
@@ -4165,6 +4164,13 @@ async fn run_loop_body(
                     "static_tree_k": config.static_tree_k,
                     "max_nudges": config.max_nudges,
                     "max_retries": config.max_retries,
+                    // The armed hung-call guard in THIS binary (a fired turn
+                    // shows up as a `backend_error` with
+                    // "transient backend failure (Timeout;" and
+                    // `latency_ms` ≈ this value × 1000) — telemetry, not a
+                    // knob: distinguishing an armed-and-untriggered binary
+                    // from a pre-change one, next to `compact_threshold_pct`.
+                    "chat_read_timeout_secs": model::CHAT_READ_TIMEOUT.as_secs(),
                     // The RESOLVED compaction threshold in force for the run
                     // (0 = disabled) — what an A/B experiment reads to prove
                     // the two arms really differ.
@@ -14599,6 +14605,93 @@ mod tests {
         let run_end = lines.last().unwrap();
         assert_eq!(run_end["event"], "run_end");
         assert_eq!(run_end["outcome"], "BackendError");
+    }
+
+    /// The fired guard must be NAME-distinguishable in the transcript: a
+    /// read-timeout turn and a connection-refused turn land in the same
+    /// `Transient` bucket (both retryable, same accounting) but their
+    /// `error` Display string carries the kind — `Timeout;` vs `Network;` —
+    /// so a hung model call is separable from a dead endpoint after the
+    /// fact. Also pins the armed value in `run_start.config`.
+    #[tokio::test]
+    async fn timeout_and_network_backend_errors_are_distinguishable_in_transcript() {
+        async fn drive_and_assert(kind: TransientKind, expected_display: &str) {
+            let expected_display = expected_display.to_string();
+            let max_retries = super::DEFAULT_MAX_RETRIES;
+            let script: Vec<Result<AssistantTurn, BackendError>> = (0..=max_retries)
+                .map(|_| {
+                    Err(BackendError::Transient {
+                        kind,
+                        retry_after: None,
+                    })
+                })
+                .collect();
+            let backend = MockBackend::new(script);
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().join("t.jsonl");
+            let config = RunConfig::new("task", 5)
+                .with_retry_backoff_base(Duration::ZERO)
+                .with_transcript(path.clone(), "t");
+            let tools = registry_with_finish_and_echo();
+            let ctx = ToolCtx::stub();
+
+            let RunResult { outcome, .. } = run(&backend, &tools, &ctx, &config).await;
+            assert!(
+                matches!(outcome, LoopOutcome::BackendError(_)),
+                "{kind:?} run"
+            );
+            assert_eq!(backend.calls(), max_retries + 1);
+
+            let lines = read_transcript_lines(&path);
+            let run_start = lines
+                .iter()
+                .find(|l| l["event"] == "run_start")
+                .expect("run_start line");
+            assert_eq!(
+                run_start["config"]["chat_read_timeout_secs"], 900,
+                "the armed guard must ride on the run_start config"
+            );
+            let backend_errors: Vec<&serde_json::Value> = lines
+                .iter()
+                .filter(|l| l["event"] == "backend_error")
+                .collect();
+            assert_eq!(backend_errors.len(), (max_retries + 1) as usize);
+            for (i, ev) in backend_errors.iter().enumerate() {
+                let attempt = u32::try_from(i).unwrap();
+                assert_eq!(ev["attempt"], attempt);
+                assert_eq!(ev["retryable"], true);
+                let is_last = attempt == max_retries;
+                assert_eq!(ev["will_retry"], !is_last);
+                if is_last {
+                    assert!(ev["retry_delay_ms"].is_null());
+                } else {
+                    assert!(ev["retry_delay_ms"].is_number());
+                }
+                assert!(
+                    ev["error"].as_str().unwrap().contains(&expected_display),
+                    "each backend_error must name the {kind:?} kind: {}",
+                    ev["error"]
+                );
+                assert!(
+                    ev["latency_ms"].is_number(),
+                    "each backend_error must carry a numeric latency_ms"
+                );
+            }
+            let run_end = lines.last().unwrap();
+            assert_eq!(run_end["event"], "run_end");
+            assert_eq!(run_end["outcome"], "BackendError");
+        }
+
+        drive_and_assert(
+            TransientKind::Timeout,
+            "transient backend failure (Timeout;",
+        )
+        .await;
+        drive_and_assert(
+            TransientKind::Network,
+            "transient backend failure (Network;",
+        )
+        .await;
     }
 
     #[tokio::test]

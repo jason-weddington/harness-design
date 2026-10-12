@@ -148,6 +148,50 @@ impl BedrockBackend {
             client: cell,
         }
     }
+
+    /// Test-only mirror of [`Self::with_test_endpoint`] that swaps the
+    /// `operation_timeout` for a connector-level `read_timeout`.
+    ///
+    /// The gating divergence is DELIBERATE: `with_test_endpoint` ships
+    /// un-gated (it already carries the same dummy credentials) and is
+    /// reachable from integration callers, while this one exists ONLY so the
+    /// in-file tests can assert the read-timeout path in isolation — its
+    /// `TimeoutConfig` sets ONLY `read_timeout`, never `operation_timeout`,
+    /// so an assertion cannot be satisfied by the 1 s operation timeout
+    /// standing in for the connector read timeout. No production code uses
+    /// it.
+    #[cfg(test)]
+    #[must_use]
+    fn with_test_endpoint_read_timeout(
+        self,
+        endpoint_url: &str,
+        region: &str,
+        read_timeout: std::time::Duration,
+    ) -> Self {
+        let conf = Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url(endpoint_url)
+            .region(Region::new(region.to_string()))
+            .credentials_provider(Credentials::new(
+                "AKIATEST",
+                "secrettest",
+                None,
+                None,
+                "bedrock-test",
+            ))
+            .http_client(ring_http_client())
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .timeout_config(TimeoutConfig::builder().read_timeout(read_timeout).build())
+            .build();
+        let client = Client::from_conf(conf);
+        let cell = OnceCell::new();
+        let _ = cell.set(client);
+        Self {
+            model_id: self.model_id,
+            canonical: self.canonical,
+            client: cell,
+        }
+    }
 }
 
 /// Bedrock's per-model output cap — same shape as
@@ -200,6 +244,7 @@ impl ModelBackend for BedrockBackend {
             .get_or_try_init(|| async {
                 let sdk = aws_config::defaults(BehaviorVersion::latest())
                     .http_client(ring_http_client())
+                    .timeout_config(production_timeout_config())
                     .load()
                     .await;
                 Ok::<_, BackendError>(Client::new(&sdk))
@@ -263,6 +308,20 @@ fn ring_http_client() -> impl aws_sdk_bedrockruntime::config::HttpClient {
     HttpClientBuilder::new()
         .tls_provider(Provider::Rustls(CryptoMode::Ring))
         .build_https()
+}
+
+/// The frozen production [`TimeoutConfig`] for the lazy AWS client init in
+/// [`BedrockBackend::turn`]: the shared chat inactivity (read) timeout, and
+/// nothing else — no `operation_timeout`, so a slow-but-alive generation is
+/// never killed by a total-response ceiling. Pure, so the production value
+/// is unit-pinnable even though the lazy-init chain itself is
+/// integration-unreachable from unit tests (see
+/// `production_timeout_config_pins_the_read_timeout`).
+#[must_use]
+fn production_timeout_config() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .read_timeout(crate::model::CHAT_READ_TIMEOUT)
+        .build()
 }
 
 /// Map the conversation [`Message`]s into Bedrock `Message`s. Assistant
@@ -634,7 +693,8 @@ fn document_to_value(doc: &Document) -> Value {
 mod tests {
     use super::{
         BedrockBackend, classify_validation, document_to_value, map_converse_error, map_model_id,
-        map_stop_reason, map_usage, output_cap_for_model, value_to_document,
+        map_stop_reason, map_usage, output_cap_for_model, production_timeout_config,
+        value_to_document,
     };
     use crate::model::{
         BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
@@ -767,6 +827,76 @@ mod tests {
         BedrockBackend::new("claude-haiku-4-5")
             .expect("haiku maps")
             .with_test_endpoint(endpoint, "us-east-1")
+    }
+
+    /// The production lazy-init chain is integration-unreachable from unit
+    /// tests (the AWS default credential chain would do async I/O), so the
+    /// frozen value it installs is pinned HERE instead: a later refactor
+    /// that drops the `.timeout_config(...)` line or retunes the constant
+    /// fails this test even though the chain itself is not unit-reachable.
+    #[allow(clippy::duration_suboptimal_units)]
+    #[test]
+    fn production_timeout_config_pins_the_read_timeout() {
+        assert_eq!(
+            production_timeout_config().read_timeout(),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// The authoritative in-repo verification of the AWS read-timeout
+    /// plumbing: a loopback endpoint that accepts ONE connection and holds
+    /// it forever (no byte sent, no close). Under a 1 s connector read
+    /// timeout — with NO `operation_timeout` in the mix — the call must
+    /// surface as a retryable `Transient { Timeout }` via
+    /// [`map_converse_error`] (`SdkError::TimeoutError` /
+    /// `DispatchFailure(is_timeout)`), never hang to the outer bound.
+    #[tokio::test]
+    async fn read_timeout_maps_to_transient_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            // Park on a never-completing future: if this task's body ever
+            // RETURNED, the local `stream` would drop and the connection
+            // would close — holding it is the whole point.
+            let _held_forever = stream; // never read, never written, never closed
+            std::future::pending::<()>().await;
+        });
+        let backend = BedrockBackend::new("claude-haiku-4-5")
+            .expect("haiku maps")
+            .with_test_endpoint_read_timeout(
+                &format!("http://{addr}"),
+                "us-east-1",
+                Duration::from_secs(1),
+            );
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), backend.turn(&req))
+            .await
+            .expect("the read timeout must fire before the 5 s outer bound")
+            .expect_err("a held-forever connection must not produce a turn");
+        assert!(err.is_retryable());
+        assert!(matches!(
+            err,
+            BackendError::Transient {
+                kind: TransientKind::Timeout,
+                retry_after: None
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the guard must fail fast, not sit on the socket"
+        );
     }
 
     // ---- model-id map ------------------------------------------------------
