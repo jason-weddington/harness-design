@@ -15,7 +15,7 @@ use crate::tool::ToolRegistry;
 use crate::tools::bash::BashTool;
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::list_files::ListFilesTool;
-use crate::tools::read_file::{READ_FILE_TOOL_NAME, ReadFileTool};
+use crate::tools::read_file::{NumberedReadFileTool, READ_FILE_TOOL_NAME, ReadFileTool};
 use crate::tools::run_checks::RunChecksTool;
 
 pub mod bash;
@@ -65,13 +65,21 @@ pub fn answer_registry(checks: Option<ChecksRunner>) -> ToolRegistry {
 
 /// The shared builder behind [`standard_registry`] and [`answer_registry`].
 ///
-/// `answer_mode` does exactly two things: it drops `edit_file`, and it flips
-/// [`FinishTool::answer_mode`]. With `answer_mode == false` the output is
-/// byte-identical to what `standard_registry` has always produced —
-/// [`FinishTool::default()`] IS `FinishTool { answer_mode: false }`.
+/// `answer_mode` does exactly three things: it drops `edit_file`, it flips
+/// [`FinishTool::answer_mode`], and it registers the line-numbered
+/// [`NumberedReadFileTool`] under the same `read_file` name — safe there
+/// precisely because answer mode has no `edit_file` to poison. With
+/// `answer_mode == false` the output is byte-identical to what
+/// `standard_registry` has always produced — [`FinishTool::default()`] IS
+/// `FinishTool { answer_mode: false }` and [`ReadFileTool`] is the raw
+/// variant.
 fn build_registry(checks: Option<ChecksRunner>, answer_mode: bool) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(READ_FILE_TOOL_NAME, Arc::new(ReadFileTool));
+    if answer_mode {
+        registry.register(READ_FILE_TOOL_NAME, Arc::new(NumberedReadFileTool));
+    } else {
+        registry.register(READ_FILE_TOOL_NAME, Arc::new(ReadFileTool));
+    }
     registry.register("list_files", Arc::new(ListFilesTool));
     if !answer_mode {
         registry.register("edit_file", Arc::new(EditFileTool));
@@ -89,6 +97,8 @@ mod tests {
     use super::{answer_registry, standard_registry};
     use crate::engine::FINISH_TOOL_NAME;
     use crate::exec::{CheckCommand, ChecksRunner};
+    use crate::tool::Tool;
+    use crate::tools::read_file::{NumberedReadFileTool, ReadFileTool};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -239,6 +249,55 @@ mod tests {
             finish.schema()["input_schema"]["properties"]["disposition"]["enum"],
             serde_json::json!(["done", "blocked", "failed", "already_satisfied"]),
             "standard_registry's finish schema is unchanged — no `answer`"
+        );
+    }
+
+    /// Tripwire with zero derivation: the build-mode registry must advertise
+    /// a `read_file` schema byte-identical to [`ReadFileTool`]'s own — a
+    /// construction that accidentally registers the numbered variant here is
+    /// a regression.
+    #[test]
+    fn standard_registry_read_file_schema_is_unchanged() {
+        let registered = standard_registry(None)
+            .get("read_file")
+            .expect("read_file registered");
+        assert_eq!(
+            serde_json::to_string(&registered.schema()).expect("serialize registered"),
+            serde_json::to_string(&ReadFileTool.schema()).expect("serialize variant"),
+            "standard_registry's read_file schema is byte-identical to ReadFileTool's"
+        );
+    }
+
+    /// The two registries register `read_file` under the SAME name with the
+    /// SAME `input_schema`; only the description differs, and it is
+    /// [`NumberedReadFileTool`]'s verbatim.
+    #[test]
+    fn answer_registry_read_file_schema_differs_only_in_description() {
+        let answer = answer_registry(None)
+            .get("read_file")
+            .expect("read_file registered")
+            .schema();
+        let build = ReadFileTool.schema();
+
+        assert_eq!(
+            answer["name"], build["name"],
+            "same tool name in both registries"
+        );
+        assert_eq!(
+            serde_json::to_string(&answer["input_schema"]).expect("serialize answer schema"),
+            serde_json::to_string(&build["input_schema"]).expect("serialize build schema"),
+            "input_schema byte-identical"
+        );
+
+        let answer_desc = answer["description"].as_str().expect("answer description");
+        let build_desc = build["description"].as_str().expect("build description");
+        assert_ne!(answer_desc, build_desc, "descriptions must differ");
+        assert_eq!(
+            answer_desc,
+            NumberedReadFileTool.schema()["description"]
+                .as_str()
+                .expect("numbered description"),
+            "answer registry carries NumberedReadFileTool's description verbatim"
         );
     }
 }
