@@ -4,9 +4,10 @@
 //! Rung 2 of `reference/somnus-functional-spec.md`: the model emits ops from
 //! a **closed vocabulary** and nothing else. The four externally-callable ops
 //! are registered as tools whose schemas pin exactly that vocabulary;
-//! `no_change` exists ONLY as a variant of [`Op`] — the model declines a
-//! cluster by not acting, and code can represent the decline without giving
-//! the model a tool for it.
+//! `no_change` is the fifth, PARSE-ONLY name the model may emit: `no_change`
+//! is parseable by `op_from_call` but is NOT a registered tool and has no
+//! execution leg — code represents the decline without giving the model a
+//! tool for it.
 //!
 //! Op execution stays behind a [`MapOpSink`] seam. The op tools are
 //! SCHEMA-ONLY in the somnus run path: rung-2 tool calls are parsed via
@@ -31,9 +32,11 @@ use harness::tool::{Tool, ToolCtx, ToolResult};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-/// The closed vocabulary of rung-2 ops (plus the decline variant). Field
-/// names are IDENTICAL to the pinned tool schemas in
-/// [`crate::gate::build_registry`], so the tool→Op mapping is mechanical.
+/// The closed vocabulary of rung-2 ops (plus the decline variant). The four
+/// registered ops' field names are IDENTICAL to the pinned tool schemas in
+/// [`crate::gate::build_registry`], so the tool→Op mapping is mechanical;
+/// `no_change` is the fifth PARSE-ONLY name — parseable by [`op_from_call`],
+/// never registered as a tool.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -119,8 +122,10 @@ pub enum Op {
         /// Why it needs an upstream authoring run.
         reason: String,
     },
-    /// The model declines a cluster without an external action. NEVER a
-    /// registered tool (see [`crate::gate::build_registry`]'s registry test).
+    /// The model declines a cluster without an external action. The model
+    /// DOES emit it as an unregistered tool call that `op_from_call` parses;
+    /// it is never registered as a tool and has no execution leg (see
+    /// [`crate::gate::build_registry`]'s registry test).
     NoChange {
         /// The declined cluster.
         cluster_id: String,
@@ -339,16 +344,22 @@ fn req_gaps(input: &Value) -> Result<Vec<String>, String> {
 }
 
 /// Parse a rung-2 tool call (`name`, `input`) into an [`Op`], routing the
-/// NAME first: any string outside the four op names is a named `Err` before
-/// any field is read and before any [`OpTool`] is constructed — `finish`,
-/// `run_checks`, `no_change`, and anything else the model might reach for
-/// are parse errors, never panics, never silently applied.
+/// NAME first: the four registered ops route through `parse_op_fields`;
+/// `no_change` returns early. Any string outside the five parse names is a
+/// named `Err` before any field is read and before any [`OpTool`] is
+/// constructed — `finish`, `run_checks`, and anything else the model might
+/// reach for are parse errors, never panics, never silently applied.
 ///
 /// # Errors
 /// `Err` naming the unknown tool, or naming the missing/ill-typed field.
 pub fn op_from_call(name: &str, input: &Value) -> Result<Op, String> {
+    if name == "no_change" {
+        return Ok(Op::NoChange {
+            cluster_id: req_str(input, "cluster_id")?,
+        });
+    }
     let kind = OpKind::from_name(name).ok_or_else(|| {
-        format!("unknown tool `{name}`: the rung-2 closed vocabulary is add_pointer, create_map, strike_gap, propose_gap")
+        format!("unknown tool `{name}`: the rung-2 closed vocabulary is add_pointer, create_map, strike_gap, propose_gap, no_change")
     })?;
     parse_op_fields(kind, input)
 }
@@ -1034,17 +1045,69 @@ mod tests {
 
     #[test]
     fn op_from_call_refuses_every_name_outside_the_closed_vocabulary() {
-        // `finish`, `run_checks`, `no_change`, and anything else the model
-        // might reach for: a named Err, never a panic, never an op.
-        for name in ["finish", "run_checks", "no_change", "bogus"] {
+        // `finish`, `run_checks`, and anything else the model might reach
+        // for: a named Err, never a panic, never an op.
+        for name in ["finish", "run_checks", "bogus"] {
             let error = op_from_call(name, &serde_json::json!({}))
                 .expect_err("every non-op tool name must be refused");
-            assert!(
-                error.contains("unknown tool"),
-                "{name} must be named as an unknown tool, got {error}"
+            assert_eq!(
+                error,
+                format!(
+                    "unknown tool `{name}`: the rung-2 closed vocabulary is add_pointer, create_map, strike_gap, propose_gap, no_change"
+                )
             );
-            assert!(error.contains(name), "the error must name {name}: {error}");
         }
+    }
+
+    // --- op_from_call: the parse-only `no_change` name -------------------
+
+    #[test]
+    fn op_from_call_parses_no_change_with_a_cluster_id() {
+        let op = op_from_call("no_change", &serde_json::json!({"cluster_id": "c3"}))
+            .expect("no_change is a parseable rung-2 name");
+        assert_eq!(
+            op,
+            Op::NoChange {
+                cluster_id: "c3".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn op_from_call_refuses_no_change_without_a_cluster_id() {
+        // Same wording `req_str` produces for every other op's missing
+        // field: a named field error, not a name error.
+        let error = op_from_call("no_change", &serde_json::json!({}))
+            .expect_err("an absent cluster_id is a named error");
+        assert_eq!(error, "missing required string field `cluster_id`");
+    }
+
+    #[test]
+    fn a_no_change_with_a_foreign_cluster_id_parses_verbatim() {
+        // The parsed `cluster_id` is carried verbatim, exactly as
+        // `propose_gap`'s is: the pipeline cross-checks no parsed op's
+        // cluster id against the pinned `c{index}` id, so a mismatch is not
+        // a parse error.
+        let op = op_from_call("no_change", &serde_json::json!({"cluster_id": "c9"}))
+            .expect("the cluster id is never cross-checked at the parse seam");
+        assert_eq!(
+            op,
+            Op::NoChange {
+                cluster_id: "c9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "OpTool constructed with a name outside the closed vocabulary: no_change"
+    )]
+    fn op_tool_new_still_refuses_no_change() {
+        // `no_change` routes only through `op_from_call`, never through
+        // `OpKind::from_name`, so constructing a tool for it is still a
+        // programmer error that panics — the parse-only name stays out of
+        // the registered vocabulary by construction.
+        let _tool = OpTool::new("no_change", Arc::new(SchemaOnlySink));
     }
 
     // --- op_tool_schemas: the rung-2 tool union ---------------------------

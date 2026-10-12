@@ -352,6 +352,19 @@ pub struct UnitReport {
     /// counted once. That misreading cost a diagnosis on 2026-09-21, and the
     /// field exists so it cannot recur.
     pub clusters_emitted: usize,
+    /// Parsed rung-2 records whose op set contains at least one
+    /// `no_change`, the model's own decline counted where it happens — a
+    /// lone `no_change` and a prompt-violating mixed set both count; the
+    /// lone-vs-mixed distinction stays readable per cluster.
+    pub no_change_clusters: usize,
+    /// Parsed rung-2 records whose op set is EMPTY (a zero-tool-call
+    /// turn): a silent no-op, distinct from a decline the model spelled
+    /// out.
+    pub zero_op_clusters: usize,
+    /// Records whose rung-2 turn failed to parse into ops, the parse
+    /// failures counted where they happen so a nightly's rate is readable
+    /// without re-scanning `clusters` by hand.
+    pub parse_error_clusters: usize,
     /// Rung-1 cost telemetry.
     pub usage_rung1: UsageTotals,
     /// Rung-2 cost telemetry.
@@ -397,6 +410,9 @@ impl UnitReport {
             somnus_version: crate::SOMNUS_VERSION.to_string(),
             backend_calls: 0,
             clusters_emitted: 0,
+            no_change_clusters: 0,
+            zero_op_clusters: 0,
+            parse_error_clusters: 0,
             usage_rung1: UsageTotals::default(),
             usage_rung2: UsageTotals::default(),
             wall_rung1_ms: 0,
@@ -1628,6 +1644,27 @@ async fn observe_and_finalize(
 ) -> UnitReport {
     let current = observer.observe(Path::new(".")).await;
     report.change = classify_change(baseline, &current);
+    report.no_change_clusters = report
+        .clusters
+        .iter()
+        .filter(|record| {
+            matches!(record.rung2, Rung2Outcome::Parsed)
+                && record
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, Op::NoChange { .. }))
+        })
+        .count();
+    report.zero_op_clusters = report
+        .clusters
+        .iter()
+        .filter(|record| matches!(record.rung2, Rung2Outcome::Parsed) && record.ops.is_empty())
+        .count();
+    report.parse_error_clusters = report
+        .clusters
+        .iter()
+        .filter(|record| matches!(record.rung2, Rung2Outcome::ParseError { .. }))
+        .count();
     report.call_count_audit =
         render_call_count_audit_line(report.backend_calls, report.clusters.len());
     finalize(report)
@@ -2375,6 +2412,10 @@ mod tests {
             "apply_audit",
             "change",
             "backend_calls",
+            "clusters_emitted",
+            "no_change_clusters",
+            "zero_op_clusters",
+            "parse_error_clusters",
             "usage_rung1",
             "usage_rung2",
             "wall_rung1_ms",
@@ -3918,6 +3959,190 @@ mod tests {
         // The declined nothing: clusters a and b never parsed ops, and c
         // acted.
         assert!(report.declines_recorded.is_empty());
+        // The aggregate counts: two clusters failed to parse (the backend
+        // error and the unknown `finish` call), and no cluster parsed a
+        // `no_change` or an empty op set.
+        assert_eq!(report.no_change_clusters, 0);
+        assert_eq!(report.zero_op_clusters, 0);
+        assert_eq!(report.parse_error_clusters, 2);
+    }
+
+    #[tokio::test]
+    async fn a_no_change_op_set_parses_and_is_a_silent_no_op_in_the_pipeline() {
+        // The exact shape of the 2026-10-07 catch-up's 69 parse-failed
+        // clusters: the prompt told the model to emit no_change, and the
+        // model obeyed. It must now parse into Op::NoChange and stay a
+        // silent no-op — no body, no decline, no POST, no raw offload.
+        let clusters_json = json!([{"label": "a", "member_entry_ids": ["kb-10001", "kb-10002"], "owning_map_id": null}])
+            .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters_json, usage(1, 1, None, None)),
+            calls_turn(
+                &[("no_change", json!({"cluster_id": "c0"}))],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let report = run_with(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+        )
+        .await;
+        assert_eq!(backend.calls(), 2);
+        assert_eq!(report.backend_calls, 2);
+        assert_eq!(report.clusters_emitted, 1);
+        assert_eq!(report.clusters.len(), 1);
+        assert_eq!(report.clusters[0].rung2, Rung2Outcome::Parsed);
+        assert_eq!(
+            report.clusters[0].ops,
+            vec![Op::NoChange {
+                cluster_id: "c0".to_string(),
+            }]
+        );
+        assert!(report.clusters[0].raw_path.is_none());
+        assert!(report.composed_bodies.is_empty());
+        assert!(report.declines_recorded.is_empty());
+        assert!(report.applied.is_empty());
+        assert!(report.skipped.is_empty());
+        assert!(report.cap_admissions.is_empty());
+        assert!(report.authorship_refusals.is_empty());
+        assert!(report.compose_refusals.is_empty());
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(report.no_change_clusters, 1);
+        assert_eq!(report.zero_op_clusters, 0);
+        assert_eq!(report.parse_error_clusters, 0);
+        assert_eq!(
+            serde_json::to_value(&report).expect("serializes")["no_change_clusters"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rung2_turn_with_zero_tool_calls_is_a_silent_no_op_with_parsed_outcome() {
+        // A rung-2 turn carrying no ToolCall blocks parses as an empty op
+        // set with the Parsed outcome: not a parse error, not a decline —
+        // a silent no-op, counted as such in the aggregate.
+        let clusters_json = json!([{"label": "a", "member_entry_ids": ["kb-10001", "kb-10002"], "owning_map_id": null}])
+            .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters_json, usage(1, 1, None, None)),
+            calls_turn(&[], usage(1, 1, None, None)),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let report = run_with(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+        )
+        .await;
+        assert_eq!(report.backend_calls, 2);
+        assert_eq!(report.clusters_emitted, 1);
+        assert_eq!(report.clusters.len(), 1);
+        assert_eq!(report.clusters[0].rung2, Rung2Outcome::Parsed);
+        assert!(report.clusters[0].ops.is_empty());
+        assert!(report.clusters[0].raw_path.is_none());
+        assert!(report.composed_bodies.is_empty());
+        assert!(report.declines_recorded.is_empty());
+        assert!(report.applied.is_empty());
+        assert_eq!(report.outcome, UnitOutcome::Ready);
+        assert_eq!(report.no_change_clusters, 0);
+        assert_eq!(report.zero_op_clusters, 1);
+        assert_eq!(report.parse_error_clusters, 0);
+        assert_eq!(
+            serde_json::to_value(&report).expect("serializes")["zero_op_clusters"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_change_alongside_add_pointer_still_counts_in_no_change_clusters() {
+        // A prompt-violating MIXED set (the `and nothing else` the
+        // unowned-cluster prompt spells out): the add_pointer composes and
+        // applies normally, the no_change rides along verbatim, and BOTH
+        // records are visible in the no-change aggregate rather than
+        // silently absorbed.
+        let clusters_json = json!([
+            {"label": "a", "member_entry_ids": ["kb-10001", "kb-10002"], "owning_map_id": null},
+            {"label": "b", "member_entry_ids": ["kb-10006"], "owning_map_id": null}
+        ])
+        .to_string();
+        let backend = MockBackend::from_turns(vec![
+            text_turn(&clusters_json, usage(1, 1, None, None)),
+            calls_turn(
+                &[("no_change", json!({"cluster_id": "c0"}))],
+                usage(1, 1, None, None),
+            ),
+            calls_turn(
+                &[
+                    (
+                        "add_pointer",
+                        json!({"map_id": "kb-20001", "entry_id": "kb-10005", "gloss": "GLOSS-5"}),
+                    ),
+                    ("no_change", json!({"cluster_id": "c1"})),
+                ],
+                usage(1, 1, None, None),
+            ),
+        ]);
+        let source = std::sync::Arc::new(ScriptedSource::new(vec![FetchOutcome::Ready(fixture())]));
+        let ledger = InMemoryLedger::new();
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let report = run_with(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+        )
+        .await;
+        assert_eq!(backend.calls(), 3);
+        assert_eq!(report.clusters.len(), 2);
+        assert_eq!(report.clusters[0].rung2, Rung2Outcome::Parsed);
+        assert_eq!(report.clusters[1].rung2, Rung2Outcome::Parsed);
+        assert_eq!(
+            report.clusters[0].ops,
+            vec![Op::NoChange {
+                cluster_id: "c0".to_string(),
+            }]
+        );
+        assert_eq!(
+            report.clusters[1].ops,
+            vec![
+                Op::AddPointer {
+                    map_id: "kb-20001".to_string(),
+                    entry_id: "kb-10005".to_string(),
+                    gloss: "GLOSS-5".to_string(),
+                },
+                Op::NoChange {
+                    cluster_id: "c1".to_string(),
+                },
+            ]
+        );
+        assert_eq!(report.no_change_clusters, 2);
+        assert_eq!(report.zero_op_clusters, 0);
+        assert_eq!(report.parse_error_clusters, 0);
+        assert!(
+            report.declines_recorded.is_empty(),
+            "cluster 1's set is not all-propose_gap, so no decline is written"
+        );
+        assert_eq!(report.composed_bodies.len(), 1);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].op_kind, "add_pointer");
+        assert_eq!(report.outcome, UnitOutcome::Ready);
     }
 
     #[tokio::test]
