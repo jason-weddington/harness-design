@@ -1248,6 +1248,29 @@ pub struct RunStats {
     /// unfittable). Zero whenever memory is off and when the flush hit its
     /// bound.
     pub memory_digests_failed: u32,
+    /// Count of turns whose cache-diagnostics `type` was `model_changed`.
+    /// The four token-carrying kinds are the ONLY ones counted here:
+    /// `PreviousMessageNotFound` and `Unavailable` mean no comparison was
+    /// produced and are **not cost evidence** — the per-turn
+    /// `model_response.cache_miss_reason` value is the per-turn evidence.
+    /// `None` (no diagnostics) counts nowhere too.
+    pub cache_miss_model_changed: u32,
+    /// Count of turns whose cache-diagnostics `type` was `system_changed`.
+    /// Not-cost-evidence note: see [`Self::cache_miss_model_changed`].
+    pub cache_miss_system_changed: u32,
+    /// Count of turns whose cache-diagnostics `type` was `tools_changed`.
+    /// Not-cost-evidence note: see [`Self::cache_miss_model_changed`].
+    pub cache_miss_tools_changed: u32,
+    /// Count of turns whose cache-diagnostics `type` was `messages_changed`.
+    /// Not-cost-evidence note: see [`Self::cache_miss_model_changed`].
+    pub cache_miss_messages_changed: u32,
+    /// Count of turns whose cache-diagnostics `type` was unrecognized —
+    /// carried fail-open as [`model::CacheMissReason::Other`]. Unlike the
+    /// non-comparison kinds it IS counted (it is a real, attributed miss).
+    pub cache_miss_other: u32,
+    /// Sum of `cache_missed_input_tokens` across the four token-carrying
+    /// kinds — a magnitude estimate, NOT a billing number.
+    pub cache_missed_input_tokens: u64,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2509,6 +2532,12 @@ pub async fn run(
         memory_events_capped: 0,
         memory_digests_sent: 0,
         memory_digests_failed: 0,
+        cache_miss_model_changed: 0,
+        cache_miss_system_changed: 0,
+        cache_miss_tools_changed: 0,
+        cache_miss_messages_changed: 0,
+        cache_miss_other: 0,
+        cache_missed_input_tokens: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2608,6 +2637,12 @@ pub async fn run_persisted(
         memory_events_capped: 0,
         memory_digests_sent: 0,
         memory_digests_failed: 0,
+        cache_miss_model_changed: 0,
+        cache_miss_system_changed: 0,
+        cache_miss_tools_changed: 0,
+        cache_miss_messages_changed: 0,
+        cache_miss_other: 0,
+        cache_missed_input_tokens: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2936,9 +2971,16 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
         "memory_events_capped": stats.memory_events_capped,
     });
     // Added outside the `json!` literal: one more key there exceeds the
-    // macro's recursion limit.
+    // macro's recursion limit. The six cache-miss keys follow the same
+    // precedent and appear in this order.
     rendered["memory_digests_sent"] = json!(stats.memory_digests_sent);
     rendered["memory_digests_failed"] = json!(stats.memory_digests_failed);
+    rendered["cache_miss_model_changed"] = json!(stats.cache_miss_model_changed);
+    rendered["cache_miss_system_changed"] = json!(stats.cache_miss_system_changed);
+    rendered["cache_miss_tools_changed"] = json!(stats.cache_miss_tools_changed);
+    rendered["cache_miss_messages_changed"] = json!(stats.cache_miss_messages_changed);
+    rendered["cache_miss_other"] = json!(stats.cache_miss_other);
+    rendered["cache_missed_input_tokens"] = json!(stats.cache_missed_input_tokens);
     rendered
 }
 
@@ -4615,6 +4657,48 @@ async fn run_loop_body(
         stats.cache_read_tokens += per_turn_cache_read;
         stats.cache_write_tokens += per_turn_cache_write;
 
+        // Cache-miss diagnostics: per-kind counters. The four token-carrying
+        // kinds each bump their own counter AND add their (clamped u32)
+        // `cache_missed_input_tokens` to the shared magnitude total. `Other`
+        // bumps `cache_miss_other` only. `PreviousMessageNotFound`,
+        // `Unavailable` and `None` are NOT cost evidence and count NOWHERE —
+        // the per-turn `model_response.cache_miss_reason` value is the
+        // per-turn evidence. By reference (`match &…`): clone-free, same
+        // read-style as `turn.stop_reason == …` just below.
+        match &turn.cache_miss_reason {
+            Some(crate::model::CacheMissReason::ModelChanged {
+                cache_missed_input_tokens,
+            }) => {
+                stats.cache_miss_model_changed += 1;
+                stats.cache_missed_input_tokens += u64::from(*cache_missed_input_tokens);
+            }
+            Some(crate::model::CacheMissReason::SystemChanged {
+                cache_missed_input_tokens,
+            }) => {
+                stats.cache_miss_system_changed += 1;
+                stats.cache_missed_input_tokens += u64::from(*cache_missed_input_tokens);
+            }
+            Some(crate::model::CacheMissReason::ToolsChanged {
+                cache_missed_input_tokens,
+            }) => {
+                stats.cache_miss_tools_changed += 1;
+                stats.cache_missed_input_tokens += u64::from(*cache_missed_input_tokens);
+            }
+            Some(crate::model::CacheMissReason::MessagesChanged {
+                cache_missed_input_tokens,
+            }) => {
+                stats.cache_miss_messages_changed += 1;
+                stats.cache_missed_input_tokens += u64::from(*cache_missed_input_tokens);
+            }
+            Some(crate::model::CacheMissReason::Other(_)) => stats.cache_miss_other += 1,
+            // Not cost evidence — not counted.
+            Some(
+                crate::model::CacheMissReason::PreviousMessageNotFound
+                | crate::model::CacheMissReason::Unavailable,
+            )
+            | None => {}
+        }
+
         // Snapshot the calls before moving the turn into history (the `From`
         // impl consumes `turn.content`).
         let calls: Vec<_> = turn.tool_calls().into_iter().cloned().collect();
@@ -4650,6 +4734,15 @@ async fn run_loop_body(
                     "stop_reason": serde_json::to_value(&turn.stop_reason).unwrap_or(Value::Null),
                     "usage": serde_json::to_value(turn.usage).unwrap_or(Value::Null),
                     "content": serde_json::to_value(&turn.content).unwrap_or(Value::Null),
+                    // By REFERENCE — `Option<CacheMissReason>` is not Copy
+                    // (its `Other` arm carries a `String`), so moving it here
+                    // would partially move `turn` and E0382 at the
+                    // `Message::from(turn)` push below. The block's own
+                    // convention is by-ref (`to_value(&turn.stop_reason)`).
+                    // `null` when `None`, otherwise the externally tagged
+                    // object (e.g. {"MessagesChanged":{"cache_missed_input_tokens":1234}}).
+                    "cache_miss_reason": serde_json::to_value(&turn.cache_miss_reason).unwrap_or(Value::Null),
+                    "cache_diagnostics": serde_json::to_value(&turn.cache_diagnostics).unwrap_or(Value::Null),
                 }),
             );
         }
@@ -5870,6 +5963,12 @@ pub async fn resume(
         memory_events_capped: 0,
         memory_digests_sent: 0,
         memory_digests_failed: 0,
+        cache_miss_model_changed: 0,
+        cache_miss_system_changed: 0,
+        cache_miss_tools_changed: 0,
+        cache_miss_messages_changed: 0,
+        cache_miss_other: 0,
+        cache_missed_input_tokens: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -6228,6 +6327,8 @@ mod tests {
             content,
             stop_reason,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -6242,6 +6343,8 @@ mod tests {
             content,
             stop_reason,
             usage,
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -7610,6 +7713,12 @@ mod tests {
             memory_events_capped: 0,
             memory_digests_sent: 0,
             memory_digests_failed: 0,
+            cache_miss_model_changed: 0,
+            cache_miss_system_changed: 0,
+            cache_miss_tools_changed: 0,
+            cache_miss_messages_changed: 0,
+            cache_miss_other: 0,
+            cache_missed_input_tokens: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -14862,6 +14971,12 @@ mod tests {
             memory_events_capped: 0,
             memory_digests_sent: 0,
             memory_digests_failed: 0,
+            cache_miss_model_changed: 0,
+            cache_miss_system_changed: 0,
+            cache_miss_tools_changed: 0,
+            cache_miss_messages_changed: 0,
+            cache_miss_other: 0,
+            cache_missed_input_tokens: 0,
         }
     }
 
@@ -18535,6 +18650,8 @@ mod tests {
             content: vec![tool_call(id, name, input)],
             stop_reason: StopReason::ToolUse,
             usage,
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -19063,6 +19180,8 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: hot_usage(95_000, 1, 0),
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             });
         }
         // Post-compaction turns: 500 then 700 reasoning chars. Their
@@ -19075,6 +19194,8 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: hot_usage(1, 1, 0),
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             });
         }
         script.push(finish_call(
@@ -21372,5 +21493,133 @@ mod tests {
             assert_eq!(lines[1]["unregistered"], json!(["ghost", "echo"]));
             assert!(lines[1]["server_name"].is_null());
         }
+    }
+
+    // ---- cache diagnostics: per-turn emit + run_end stats ----------------
+
+    /// AC12: a scripted turn's `cache_miss_reason` and raw diagnostics ride on
+    /// the `model_response` event, next to the existing usage keys.
+    #[tokio::test]
+    async fn model_response_emits_cache_miss_reason_from_scripted_turn() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("diag.jsonl");
+        let mut turn = turn_with(
+            vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+            StopReason::ToolUse,
+        );
+        turn.cache_miss_reason = Some(crate::model::CacheMissReason::MessagesChanged {
+            cache_missed_input_tokens: 1234,
+        });
+        turn.cache_diagnostics = Some(serde_json::json!({
+            "cache_miss_reason": {
+                "type": "messages_changed",
+                "cache_missed_input_tokens": 1234
+            }
+        }));
+        let backend = MockBackend::from_turns(vec![
+            turn,
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_transcript(path.clone(), "t");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&path);
+        let model_response = lines
+            .iter()
+            .find(|l| l["event"] == "model_response")
+            .expect("a model_response event");
+        assert_eq!(
+            model_response["cache_miss_reason"],
+            serde_json::json!({"MessagesChanged": {"cache_missed_input_tokens": 1234}})
+        );
+        assert_eq!(
+            model_response["cache_diagnostics"],
+            serde_json::json!({"cache_miss_reason": {"type": "messages_changed", "cache_missed_input_tokens": 1234}})
+        );
+    }
+
+    /// AC12 (null arm): a scripted turn carrying no diagnostics serializes
+    /// BOTH keys as `null` (present, not absent).
+    #[tokio::test]
+    async fn model_response_cache_miss_reason_and_diagnostics_are_null_when_absent() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("absent.jsonl");
+        let backend = MockBackend::from_turns(vec![
+            turn_with(
+                vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+                StopReason::ToolUse,
+            ),
+            finish_call(
+                "c2",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 5).with_transcript(path.clone(), "t");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&path);
+        let model_response = lines
+            .iter()
+            .find(|l| l["event"] == "model_response")
+            .expect("a model_response event");
+        assert!(
+            model_response.get("cache_miss_reason").is_some(),
+            "the key must be present"
+        );
+        assert_eq!(model_response["cache_miss_reason"], serde_json::Value::Null);
+        assert!(
+            model_response.get("cache_diagnostics").is_some(),
+            "the key must be present"
+        );
+        assert_eq!(model_response["cache_diagnostics"], serde_json::Value::Null);
+    }
+
+    /// AC14: `run_end.stats` carries per-reason cache-miss counters and the
+    /// summed `cache_missed_input_tokens` magnitude.
+    #[tokio::test]
+    async fn run_end_stats_count_cache_misses_by_reason() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("stats.jsonl");
+        let mut t1 = turn_with(
+            vec![tool_call("c1", "echo", serde_json::json!({"i": 1}))],
+            StopReason::ToolUse,
+        );
+        t1.cache_miss_reason = Some(crate::model::CacheMissReason::ToolsChanged {
+            cache_missed_input_tokens: 777,
+        });
+        let mut t2 = turn_with(
+            vec![tool_call("c2", "echo", serde_json::json!({"i": 2}))],
+            StopReason::ToolUse,
+        );
+        t2.cache_miss_reason = Some(crate::model::CacheMissReason::Other("x".to_string()));
+        let backend = MockBackend::from_turns(vec![
+            t1,
+            t2,
+            finish_call(
+                "cf",
+                serde_json::json!({"disposition": "done", "summary": "ok"}),
+            ),
+        ]);
+        let tools = registry_with_finish_and_echo();
+        let ctx = ToolCtx::stub();
+        let config = RunConfig::new("do the task", 10).with_transcript(path.clone(), "t");
+        let _ = run(&backend, &tools, &ctx, &config).await;
+        let lines = read_transcript_lines(&path);
+        let end = lines
+            .iter()
+            .find(|l| l["event"] == "run_end")
+            .expect("run_end");
+        let stats = &end["stats"];
+        assert_eq!(stats["cache_miss_tools_changed"], 1);
+        assert_eq!(stats["cache_miss_other"], 1);
+        assert_eq!(stats["cache_missed_input_tokens"], 777);
+        assert_eq!(stats["cache_miss_model_changed"], 0);
+        assert_eq!(stats["cache_miss_system_changed"], 0);
+        assert_eq!(stats["cache_miss_messages_changed"], 0);
     }
 }

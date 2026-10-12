@@ -457,6 +457,9 @@ fn parse_converse_output(
         content,
         stop_reason: map_stop_reason(out.stop_reason()),
         usage: map_usage(out.usage(), Some(format!("{out:?}")))?,
+        // Bedrock has no diagnostics wire shape — locked: never parsed here.
+        cache_miss_reason: None,
+        cache_diagnostics: None,
     })
 }
 

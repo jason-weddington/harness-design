@@ -1066,6 +1066,8 @@ mod tests {
             content,
             stop_reason,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 

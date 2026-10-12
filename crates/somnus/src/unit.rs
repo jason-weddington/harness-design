@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness::exec::{ChangeEvidence, ChangeObserver, ChecksRunner, classify_change};
-use harness::model::ModelBackend;
+use harness::model::{CacheMissReason, ModelBackend};
 use harness::tool::ToolCtx;
 use serde::Serialize;
 
@@ -231,6 +231,11 @@ pub struct ClusterRecord {
     /// member set changes substantially, and one run retired nine legitimate
     /// subject areas that way before anyone saw a map.
     pub admission_refusal: Option<String>,
+    /// Why this cluster's rung-2 call's prompt-cache read missed (Anthropic
+    /// cache diagnostics, GA, Anthropic-API-only), `None` when the provider
+    /// sent none or the comparison was still pending. Captured on the
+    /// Ok path only — a rung-2 backend error pushes the record with `None`.
+    pub cache_miss_reason: Option<CacheMissReason>,
 }
 
 impl ClusterRecord {
@@ -380,6 +385,11 @@ pub struct UnitReport {
     pub rung1_raw_path: Option<PathBuf>,
     /// Where this report was written.
     pub report_path: PathBuf,
+    /// Why the rung-1 call's prompt-cache read missed (Anthropic cache
+    /// diagnostics, GA, Anthropic-API-only), `None` when the provider sent
+    /// none or the comparison was still pending. The raw `diagnostics`
+    /// value is deliberately NOT recorded here (per-turn evidence only).
+    pub cache_miss_rung1: Option<CacheMissReason>,
 }
 
 impl UnitReport {
@@ -420,6 +430,7 @@ impl UnitReport {
             call_count_audit: None,
             rung1_raw_path: None,
             report_path,
+            cache_miss_rung1: None,
         }
     }
 }
@@ -840,6 +851,7 @@ async fn run_unit_inner(
     report.wall_rung1_ms = u64::try_from(rung1_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     report.backend_calls += 1;
     report.usage_rung1.add(&turn.usage);
+    report.cache_miss_rung1 = turn.cache_miss_reason.clone();
 
     // A failed rung-1 parse aborts the unit (single-shot: no retry), with
     // the raw model text offloaded for a human to read.
@@ -895,6 +907,9 @@ async fn run_unit_inner(
             raw_path: None,
             merit_reason: cluster.merit_reason.clone(),
             admission_refusal: None,
+            // Built BEFORE the rung-2 turn is awaited, so a rung-2 backend
+            // error pushes the record with this still `None` by construction.
+            cache_miss_reason: None,
         };
         let rung2_started = std::time::Instant::now();
         let turn = match rung2_turn(deps.backend, project_ref, &filtered, cluster, index).await {
@@ -911,6 +926,7 @@ async fn run_unit_inner(
             u64::try_from(rung2_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         report.backend_calls += 1;
         report.usage_rung2.add(&turn.usage);
+        record.cache_miss_reason.clone_from(&turn.cache_miss_reason);
 
         let mut ops = Vec::new();
         let mut parse_error = None;
@@ -1970,6 +1986,8 @@ mod tests {
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: StopReason::EndTurn,
             usage,
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -1987,6 +2005,8 @@ mod tests {
                 .collect(),
             stop_reason: StopReason::ToolUse,
             usage,
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -2104,6 +2124,99 @@ mod tests {
     // ======================================================================
     // the e2e night: wiremock + MockBackend + InMemoryLedger + tempdir
     // ======================================================================
+
+    /// AC17: a rung-1 and a rung-2 turn carrying a cache-miss reason serialize
+    /// that reason into the on-disk report; a rung-2 turn that carried none
+    /// serializes `null` for that cluster.
+    #[tokio::test]
+    async fn unit_report_serializes_cache_miss_reasons() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/kb/map-loop-input"))
+            .respond_with(SequencedBodies {
+                bodies: std::sync::Mutex::new(vec![
+                    FIXTURE.to_string(),
+                    FIXTURE.to_string(),
+                    bumped_fixture_json(),
+                ]),
+            })
+            .mount(&server)
+            .await;
+        let source = std::sync::Arc::new(crate::loop_input::HttpLoopInputSource::new(
+            server.uri(),
+            "kb-token".to_string(),
+        ));
+        drop(server);
+
+        let ledger = InMemoryLedger::new();
+
+        // rung-1 carries the reason + the raw diagnostics.
+        let mut rung1 = text_turn(
+            &format!("```json\n{}\n```", e2e_clusters_json()),
+            usage(1000, 50, Some(200), None),
+        );
+        rung1.cache_miss_reason = Some(CacheMissReason::SystemChanged {
+            cache_missed_input_tokens: 900,
+        });
+        rung1.cache_diagnostics = Some(json!({
+            "cache_miss_reason": {"type": "system_changed", "cache_missed_input_tokens": 900}
+        }));
+        // cluster 0's rung-2 turn carries the same reason.
+        let mut rung2_cluster0 = calls_turn(
+            &[(
+                "create_map",
+                json!({"title": "Wireguard and DNS", "orientation_prose": "ORIENTATION-PROSE", "gaps": [], "pointers": [{"entry_id": "kb-10001", "gloss": "GLOSS-1"}, {"entry_id": "kb-10002", "gloss": "GLOSS-2"}]}),
+            )],
+            usage(900, 30, Some(100), Some(10)),
+        );
+        rung2_cluster0.cache_miss_reason = Some(CacheMissReason::SystemChanged {
+            cache_missed_input_tokens: 900,
+        });
+        // cluster 1's rung-2 turn carries NONE (control).
+        let rung2_cluster1 = calls_turn(
+            &[(
+                "propose_gap",
+                json!({"cluster_id": "c2", "reason": "needs an upstream authoring run"}),
+            )],
+            usage(900, 30, Some(100), Some(10)),
+        );
+
+        let backend = MockBackend::from_turns(vec![rung1, rung2_cluster0, rung2_cluster1]);
+        let body_root = tempfile::tempdir().expect("tempdir");
+        let gate = gate_for_script("exit 0");
+        let map_ops: std::sync::Arc<RecordingMapOps> = std::sync::Arc::default();
+        let _report = run_with_map_ops(
+            &backend,
+            source,
+            &ledger,
+            &gate,
+            body_root.path(),
+            "demo-project",
+            map_ops.clone(),
+        )
+        .await;
+
+        let on_disk: Value = {
+            let path = crate::materialize::run_report_path(body_root.path(), "demo-project");
+            let text = std::fs::read_to_string(&path).expect("the report is on disk");
+            serde_json::from_str(&text).expect("the report parses as JSON")
+        };
+        // rung-1 reason + the raw diagnostics are NOT recorded (per-turn only).
+        assert_eq!(
+            on_disk["cache_miss_rung1"],
+            json!({"SystemChanged": {"cache_missed_input_tokens": 900}})
+        );
+        assert!(
+            on_disk.get("cache_diagnostics").is_none(),
+            "the raw diagnostics value is deliberately not on the report"
+        );
+        // cluster 0's rung-2 reason is recorded; cluster 1's is the null control.
+        assert_eq!(
+            on_disk["clusters"][0]["cache_miss_reason"],
+            json!({"SystemChanged": {"cache_missed_input_tokens": 900}})
+        );
+        assert_eq!(on_disk["clusters"][1]["cache_miss_reason"], Value::Null);
+    }
 
     #[allow(clippy::too_many_lines)] // the e2e asserts every report field in one place
     #[tokio::test]
@@ -2434,6 +2547,11 @@ mod tests {
         assert_eq!(on_disk["change"], "TreeChanged");
         assert_eq!(on_disk["usage_rung1"]["cache_read"], 200);
         assert_eq!(on_disk["usage_rung2"]["cache_write"], 20);
+        // Cache-miss diagnostics: the helpers are untouched, so every
+        // cache-miss field serializes `null` (the control case).
+        assert_eq!(on_disk["cache_miss_rung1"], Value::Null);
+        assert_eq!(on_disk["clusters"][0]["cache_miss_reason"], Value::Null);
+        assert_eq!(on_disk["clusters"][1]["cache_miss_reason"], Value::Null);
         assert_eq!(on_disk["clusters"].as_array().map(Vec::len), Some(2));
         assert_eq!(on_disk["composed_bodies"].as_array().map(Vec::len), Some(2));
         assert_eq!(on_disk["gate_reports"].as_array().map(Vec::len), Some(2));

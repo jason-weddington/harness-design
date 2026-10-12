@@ -249,14 +249,21 @@
 //!   `latency_ms` (the successful call only), `stop_reason`
 //!   ([`crate::model::StopReason`], externally tagged), `usage`
 //!   ([`crate::model::Usage`]), `content` (the full
-//!   `Vec<`[`crate::model::ContentBlock`]`>`, tool-call inputs verbatim).
+//!   `Vec<`[`crate::model::ContentBlock`]`>`, tool-call inputs verbatim),
+//!   `cache_miss_reason` (an externally tagged
+//!   [`crate::model::CacheMissReason`], `null` when the provider sent no
+//!   diagnostics or the comparison was still pending), and `cache_diagnostics`
+//!   (the raw response `diagnostics` value verbatim, `null` when the provider
+//!   sent none — the raw evidence behind `cache_miss_reason`).
 //!
 //!   ```json
 //!   {"event":"model_response","ts":"2026-09-15T02:00:02Z","elapsed_ms":2003,
 //!    "iteration":1,"attempts":1,"latency_ms":998,"stop_reason":"ToolUse",
 //!    "usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":null,
 //!             "cache_write_tokens":null,"reasoning_tokens":null},
-//!    "content":[{"ToolCall":{"id":"c1","name":"echo","input":{"i":1}}}]}
+//!    "content":[{"ToolCall":{"id":"c1","name":"echo","input":{"i":1}}}],
+//!    "cache_miss_reason":null,
+//!    "cache_diagnostics":null}
 //!   ```
 //!
 //! - **`tool_result`** — emitted once per executed call, in call order, after
@@ -390,7 +397,10 @@
 //!   `memory_degraded` (a string or `null`), `mcp_tool_calls`,
 //!   `mcp_tool_call_errors`, `memory_events_sent`, `memory_events_failed`,
 //!   `memory_events_capped`, `memory_digests_sent`,
-//!   `memory_digests_failed` — matching
+//!   `memory_digests_failed`, `cache_miss_model_changed`,
+//!   `cache_miss_system_changed`, `cache_miss_tools_changed`,
+//!   `cache_miss_messages_changed`, `cache_miss_other`,
+//!   `cache_missed_input_tokens` — matching
 //!   `render_run_end_stats` byte-for-byte in key set).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
@@ -428,7 +438,10 @@
 //!             "mcp_tool_calls":0,"mcp_tool_call_errors":0,
 //!             "memory_events_sent":0,"memory_events_failed":0,
 //!             "memory_events_capped":0,"memory_digests_sent":0,
-//!             "memory_digests_failed":0}}
+//!             "memory_digests_failed":0,
+//!             "cache_miss_model_changed":0,"cache_miss_system_changed":0,
+//!             "cache_miss_tools_changed":0,"cache_miss_messages_changed":0,
+//!             "cache_miss_other":0,"cache_missed_input_tokens":0}}
 //!   ```
 //!
 //! - **`contract_violation`** — emitted from the same choke point as
@@ -589,7 +602,14 @@ use serde_json::{Map, Value};
 /// `run_end.stats`). The `memory_events_sent` / `memory_events_failed` /
 /// `memory_events_capped` keys on `run_end.stats` are additive too, so they
 /// did not bump it, and so are the `memory_digests_sent` /
-/// `memory_digests_failed` keys (turn digests): the version stays 5.
+/// `memory_digests_failed` keys (turn digests): the version stays 5. So too
+/// are the cache-diagnostics keys added with the Anthropic cache-diagnostics
+/// work — the six `cache_miss_model_changed` / `cache_miss_system_changed` /
+/// `cache_miss_tools_changed` / `cache_miss_messages_changed` /
+/// `cache_miss_other` / `cache_missed_input_tokens` counters on
+/// `run_end.stats`, and the `cache_miss_reason` / `cache_diagnostics` keys on
+/// `model_response`: new keys only, no existing key's shape changed, so the
+/// version stays 5.
 pub const TRANSCRIPT_VERSION: u32 = 5;
 
 /// The complete, closed set of `"event"` tag values a transcript line can

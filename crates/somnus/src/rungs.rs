@@ -485,6 +485,8 @@ mod tests {
             content: vec![ContentBlock::Text(text.to_string())],
             stop_reason: StopReason::EndTurn,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -502,6 +504,8 @@ mod tests {
                 .collect(),
             stop_reason: StopReason::ToolUse,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 

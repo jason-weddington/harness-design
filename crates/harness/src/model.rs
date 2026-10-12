@@ -140,6 +140,36 @@ pub enum StopReason {
     Other(String),
 }
 
+/// Why a prompt-cache read MISSED on this turn, per Anthropic's cache
+/// diagnostics (GA, Anthropic-API-only, Claude API only — not Bedrock).
+///
+/// Carried as turn metadata by [`AssistantTurn::cache_miss_reason`].
+/// The four token-carrying variants (`model_changed` … `messages_changed`)
+/// carry `cache_missed_input_tokens`, a magnitude estimate — NOT a billing
+/// number. `previous_message_not_found` and `unavailable` mean NO
+/// comparison was produced and are therefore not evidence of anything.
+/// Serde uses the default (externally tagged) representation, so this
+/// serializes e.g. `{"SystemChanged":{"cache_missed_input_tokens":900}}` —
+/// the same shape as [`StopReason`], which carries no serde attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheMissReason {
+    /// The model id changed between the previous call and this one.
+    ModelChanged { cache_missed_input_tokens: u32 },
+    /// The system prompt changed between the previous call and this one.
+    SystemChanged { cache_missed_input_tokens: u32 },
+    /// The tool set changed between the previous call and this one.
+    ToolsChanged { cache_missed_input_tokens: u32 },
+    /// The message history changed between the previous call and this one.
+    MessagesChanged { cache_missed_input_tokens: u32 },
+    /// The previous response id was not found — no comparison was produced.
+    PreviousMessageNotFound,
+    /// Diagnostics are unavailable — no comparison was produced.
+    Unavailable,
+    /// A `type` the backend doesn't recognize yet — fail-open, carried
+    /// verbatim as the raw string.
+    Other(String),
+}
+
 /// Token accounting for a single turn.
 ///
 /// `input_tokens` / `output_tokens` are required (every provider returns
@@ -309,6 +339,19 @@ pub struct AssistantTurn {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// Why this call's prompt-cache read missed (Anthropic cache
+    /// diagnostics, GA, Anthropic-API-only) — `None` when the provider sent
+    /// no diagnostics or the comparison was still pending/inconclusive.
+    /// Declared LAST with `#[serde(default)]` so transcripts/state JSON
+    /// predating the field still deserialize.
+    #[serde(default)]
+    pub cache_miss_reason: Option<CacheMissReason>,
+    /// The RAW `diagnostics` value the provider sent, verbatim (the raw
+    /// evidence behind [`Self::cache_miss_reason`] — a schema drift is
+    /// immediately visible in the transcript). `None` when the provider
+    /// sent none.
+    #[serde(default)]
+    pub cache_diagnostics: Option<Value>,
 }
 
 impl AssistantTurn {
@@ -752,6 +795,8 @@ mod tests {
             ],
             stop_reason: StopReason::ToolUse,
             usage: sample_usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -903,6 +948,8 @@ mod tests {
             ],
             stop_reason: StopReason::ToolUse,
             usage: sample_usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         };
         assert_eq!(turn.text(), "");
     }
@@ -931,6 +978,8 @@ mod tests {
             ],
             stop_reason: StopReason::ToolUse,
             usage: sample_usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         };
         let calls = turn.tool_calls();
         assert_eq!(calls.len(), 2);
@@ -944,6 +993,8 @@ mod tests {
             content: vec![ContentBlock::Text("just words".to_string())],
             stop_reason: StopReason::EndTurn,
             usage: sample_usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         };
         assert!(turn.tool_calls().is_empty());
     }
@@ -1098,6 +1149,8 @@ mod tests {
                     cache_write_tokens: None,
                     reasoning_tokens: None,
                 },
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             })
         }
     }
@@ -1153,6 +1206,8 @@ mod tests {
                     cache_write_tokens: None,
                     reasoning_tokens: None,
                 },
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             })
         }
     }

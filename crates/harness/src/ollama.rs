@@ -1175,6 +1175,10 @@ fn map_response(body: ResponseBody) -> AssistantTurn {
         content: blocks,
         stop_reason: map_stop_reason(has_tool_calls, body.done_reason.as_deref()),
         usage,
+        // Ollama prefix caching carries no diagnostics wire shape — locked:
+        // never parsed here.
+        cache_miss_reason: None,
+        cache_diagnostics: None,
     }
 }
 

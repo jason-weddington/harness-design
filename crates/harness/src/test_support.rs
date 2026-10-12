@@ -367,6 +367,8 @@ mod tests {
                 cache_write_tokens: None,
                 reasoning_tokens: None,
             },
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         };
         let backend = MockBackend::from_turns(vec![turn]);
         let messages = [Message::User {

@@ -914,6 +914,8 @@ mod tests {
             })],
             stop_reason: StopReason::ToolUse,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -936,6 +938,8 @@ mod tests {
             })],
             stop_reason: StopReason::ToolUse,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -950,6 +954,8 @@ mod tests {
             })],
             stop_reason: StopReason::ToolUse,
             usage: usage(),
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -1293,6 +1299,8 @@ mod tests {
                 cache_write_tokens: cache_write,
                 reasoning_tokens: None,
             },
+            cache_miss_reason: None,
+            cache_diagnostics: None,
         }
     }
 
@@ -1338,6 +1346,8 @@ mod tests {
                     cache_write_tokens: Some(3),
                     reasoning_tokens: None,
                 },
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             },
             AssistantTurn {
                 content: vec![ContentBlock::ToolCall(ToolCallRequest {
@@ -1353,6 +1363,8 @@ mod tests {
                     cache_write_tokens: Some(4),
                     reasoning_tokens: None,
                 },
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             },
             finish_done_turn_with_usage(30, 3, Some(10), Some(5)),
             // trial 1
@@ -1370,6 +1382,8 @@ mod tests {
                     cache_write_tokens: Some(6),
                     reasoning_tokens: None,
                 },
+                cache_miss_reason: None,
+                cache_diagnostics: None,
             },
             finish_done_turn_with_usage(50, 5, Some(12), Some(9)),
             // trial 2 — uncached (cache fields None, like an Ollama turn on a daemon < 0.33.3).
@@ -1548,6 +1562,12 @@ mod tests {
                 memory_events_capped: 0,
                 memory_digests_sent: 0,
                 memory_digests_failed: 0,
+                cache_miss_model_changed: 0,
+                cache_miss_system_changed: 0,
+                cache_miss_tools_changed: 0,
+                cache_miss_messages_changed: 0,
+                cache_miss_other: 0,
+                cache_missed_input_tokens: 0,
             },
             transcript_path: None,
         };
@@ -2066,6 +2086,12 @@ mod tests {
                 memory_events_capped: 0,
                 memory_digests_sent: 0,
                 memory_digests_failed: 0,
+                cache_miss_model_changed: 0,
+                cache_miss_system_changed: 0,
+                cache_miss_tools_changed: 0,
+                cache_miss_messages_changed: 0,
+                cache_miss_other: 0,
+                cache_missed_input_tokens: 0,
             },
             transcript_path: None,
         };

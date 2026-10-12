@@ -548,6 +548,12 @@ async fn main() {
                 memory_events_capped: 0,
                 memory_digests_sent: 0,
                 memory_digests_failed: 0,
+                cache_miss_model_changed: 0,
+                cache_miss_system_changed: 0,
+                cache_miss_tools_changed: 0,
+                cache_miss_messages_changed: 0,
+                cache_miss_other: 0,
+                cache_missed_input_tokens: 0,
             };
 
             let trial = TrialResult {

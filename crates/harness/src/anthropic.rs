@@ -46,8 +46,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{
-    self, AssistantTurn, BackendError, ContentBlock, Message, ModelBackend, StopReason,
-    TerminalKind, ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
+    self, AssistantTurn, BackendError, CacheMissReason, ContentBlock, Message, ModelBackend,
+    StopReason, TerminalKind, ToolCallRequest, TransientKind, TurnRequest, Usage, UserBlock,
 };
 
 /// Anthropic's public API origin — the default backend target.
@@ -74,6 +74,14 @@ pub struct AnthropicBackend {
     model: String,
     api_key: String,
     base_url: String,
+    /// The last successful response's `id`, sent as `previous_message_id`
+    /// on the next call (the cache-diagnostics opt-in). `None` before the
+    /// first success; overwritten ONLY by a 2xx body that carried a non-null
+    /// `id` — every error path and an id-less 200 leave it untouched.
+    /// A `Mutex` (not an `Arc<Atomic…>`): the stored value is a `String`,
+    /// and the trait's `Send + Sync` only needs the guard's clone-then-drop
+    /// discipline, never a lock held across an await.
+    previous_message_id: std::sync::Mutex<Option<String>>,
 }
 
 impl AnthropicBackend {
@@ -93,6 +101,7 @@ impl AnthropicBackend {
             model: model.into(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            previous_message_id: std::sync::Mutex::new(None),
         }
     }
 
@@ -165,7 +174,17 @@ impl ModelBackend for AnthropicBackend {
     }
 
     async fn turn(&self, req: &TurnRequest<'_>) -> Result<AssistantTurn, BackendError> {
-        let body = build_request_body(&self.model, req);
+        // Read the previous response id under the lock and DROP it before
+        // the (awaitable) HTTP call — the lock is never held across an
+        // await, preserving `trait ModelBackend: Send + Sync`. `None` on
+        // the first call; a failed call never reaches the write below, so
+        // the stored id survives errors and id-less 200s.
+        let previous_message_id = self
+            .previous_message_id
+            .lock()
+            .expect("previous-message-id lock poisoned")
+            .clone();
+        let body = build_request_body(&self.model, req, previous_message_id.as_deref());
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
         let response = self
@@ -193,7 +212,16 @@ impl ModelBackend for AnthropicBackend {
                 raw: Some(body_text.clone()),
             })?;
 
-        Ok(map_response(parsed))
+        let (turn, response_id) = map_response(parsed);
+        // A 2xx body that parsed AND carried a non-null id advances the
+        // chain; an id-less 200 leaves the stored id untouched.
+        if let Some(id) = response_id {
+            *self
+                .previous_message_id
+                .lock()
+                .expect("previous-message-id lock poisoned") = Some(id);
+        }
+        Ok(turn)
     }
 }
 
@@ -207,6 +235,11 @@ impl ModelBackend for AnthropicBackend {
 /// order, and the prompt cache hashes the serialized bytes — reordering any
 /// of these is a silent cache miss. The order encoded here matches the order
 /// in the spec.
+///
+/// `diagnostics` (the cache-diagnostics opt-in, GA, Anthropic-API-only
+/// contract) is documented to be EXCLUDED from the prompt-cache fingerprint,
+/// and it sits after all breakpoint-carrying content — after `messages` —
+/// so it precedes no hashed prefix.
 #[derive(Serialize)]
 struct RequestBody<'a> {
     model: &'a str,
@@ -220,6 +253,15 @@ struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     messages: Vec<WireMessage<'a>>,
+    diagnostics: RequestDiagnostics<'a>,
+}
+
+/// The outgoing `diagnostics` object — the cache-diagnostics opt-in.
+/// `None` serializes as `null` (the first call, before any response id is
+/// known); thereafter it carries the previous response's `id`.
+#[derive(Serialize)]
+struct RequestDiagnostics<'a> {
+    previous_message_id: Option<&'a str>,
 }
 
 /// Anthropic prompt-cache breakpoint marker. Serializes to exactly
@@ -309,7 +351,11 @@ impl WireContentBlock<'_> {
     }
 }
 
-fn build_request_body<'a>(model: &'a str, req: &'a TurnRequest<'a>) -> RequestBody<'a> {
+fn build_request_body<'a>(
+    model: &'a str,
+    req: &'a TurnRequest<'a>,
+    previous_message_id: Option<&'a str>,
+) -> RequestBody<'a> {
     // STATIC breakpoint: a single system text block carrying cache_control.
     // Anthropic's canonical cache order is tools -> system -> messages, so a
     // breakpoint on the system block also covers the tools that precede it —
@@ -377,6 +423,9 @@ fn build_request_body<'a>(model: &'a str, req: &'a TurnRequest<'a>) -> RequestBo
             Some(req.tools)
         },
         messages,
+        diagnostics: RequestDiagnostics {
+            previous_message_id,
+        },
     }
 }
 
@@ -444,9 +493,16 @@ fn map_message(m: &Message) -> WireMessage<'_> {
 
 #[derive(Deserialize)]
 struct ResponseBody {
+    /// The response's own id. Deserialized (a missing key → `None`) so the
+    /// backend can chain it as `previous_message_id` on the next call.
+    id: Option<String>,
     content: Vec<ResponseBlock>,
     stop_reason: Option<String>,
     usage: ResponseUsage,
+    /// The raw `diagnostics` value, kept verbatim for the transcript.
+    /// `#[serde(default)]` so a body without the key deserializes to `None`.
+    #[serde(default)]
+    diagnostics: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -480,8 +536,68 @@ struct ResponseUsage {
     cache_creation_input_tokens: Option<u32>,
 }
 
-fn map_response(body: ResponseBody) -> AssistantTurn {
-    AssistantTurn {
+/// Parse the raw `diagnostics` value into a [`CacheMissReason`], fail-open.
+///
+/// A malformed or absent value NEVER turns a good response into an error —
+/// every unrecognized shape maps to `None`, and every arm that returns `Some`
+/// carries either a documented `type` or the fail-open [`CacheMissReason::Other`].
+/// This borrows its input (no clone of the raw value).
+fn parse_diagnostics(value: Option<&Value>) -> Option<CacheMissReason> {
+    let Value::Object(diagnostics) = value? else {
+        // `None`, `null`, or a non-object (e.g. a JSON string) → nothing to
+        // map. The good response is returned untouched.
+        return None;
+    };
+
+    // `cache_miss_reason` absent OR null is the documented "comparison still
+    // pending" shape → inconclusive → `None`.
+    let Value::Object(cache_miss_reason) = diagnostics.get("cache_miss_reason")? else {
+        // Present but neither null (handled above) nor an object →
+        // unrecognized → `None`.
+        return None;
+    };
+
+    // `type` missing or not a string → `None`.
+    let type_str = cache_miss_reason.get("type")?.as_str()?;
+
+    // Read `cache_missed_input_tokens` as u64 and clamp to u32::MAX. The
+    // field absent OR not a JSON number → treated as absent → 0.
+    let tokens = cache_miss_reason
+        .get("cache_missed_input_tokens")
+        .and_then(Value::as_u64)
+        .map_or(0, |t| u32::try_from(t).unwrap_or(u32::MAX));
+
+    Some(match type_str {
+        "model_changed" => CacheMissReason::ModelChanged {
+            cache_missed_input_tokens: tokens,
+        },
+        "system_changed" => CacheMissReason::SystemChanged {
+            cache_missed_input_tokens: tokens,
+        },
+        "tools_changed" => CacheMissReason::ToolsChanged {
+            cache_missed_input_tokens: tokens,
+        },
+        "messages_changed" => CacheMissReason::MessagesChanged {
+            cache_missed_input_tokens: tokens,
+        },
+        "previous_message_not_found" => CacheMissReason::PreviousMessageNotFound,
+        "unavailable" => CacheMissReason::Unavailable,
+        // ANY other type string (e.g. "invented_kind") → fail-open, carried
+        // verbatim as `Other`.
+        other => CacheMissReason::Other(other.to_string()),
+    })
+}
+
+/// Map a parsed [`ResponseBody`] into an [`AssistantTurn`], and return the
+/// response's own `id` so the caller can chain it as `previous_message_id`.
+///
+/// The two new turn fields are populated from the raw `diagnostics` value:
+/// `cache_miss_reason` is the fail-open parse (see [`parse_diagnostics`])
+/// and `cache_diagnostics` is the raw value verbatim (the only site permitted
+/// to set `Some`).
+fn map_response(body: ResponseBody) -> (AssistantTurn, Option<String>) {
+    let cache_miss_reason = parse_diagnostics(body.diagnostics.as_ref());
+    let turn = AssistantTurn {
         content: body
             .content
             .into_iter()
@@ -509,7 +625,10 @@ fn map_response(body: ResponseBody) -> AssistantTurn {
             // separately in `usage` — leave it `None` (absent ≠ zero).
             reasoning_tokens: None,
         },
-    }
+        cache_miss_reason,
+        cache_diagnostics: body.diagnostics,
+    };
+    (turn, body.id)
 }
 
 fn map_stop_reason(s: Option<&str>) -> StopReason {
@@ -1119,12 +1238,18 @@ mod tests {
         let system_idx = body_text.find("\"system\"").expect("system present");
         let tools_idx = body_text.find("\"tools\"").expect("tools present");
         let messages_idx = body_text.find("\"messages\"").expect("messages present");
+        // diagnostics is declared LAST — after all breakpoint-carrying
+        // content — so it precedes no hashed prefix.
+        let diagnostics_idx = body_text
+            .find("\"diagnostics\"")
+            .expect("diagnostics present");
         assert!(model_idx < max_tokens_idx);
         assert!(max_tokens_idx < temperature_idx);
         assert!(temperature_idx < stop_seqs_idx);
         assert!(stop_seqs_idx < system_idx);
         assert!(system_idx < tools_idx);
         assert!(tools_idx < messages_idx);
+        assert!(diagnostics_idx > messages_idx);
 
         // Parsed-value spot checks.
         let parsed: Value = serde_json::from_str(body_text).expect("json");
@@ -1228,7 +1353,7 @@ mod tests {
             tools: &tools,
             params: &params,
         };
-        let body = serde_json::to_value(build_request_body("claude-sonnet-5", &request))
+        let body = serde_json::to_value(build_request_body("claude-sonnet-5", &request, None))
             .expect("the body serializes");
         let msgs = body["messages"].as_array().expect("messages");
 
@@ -1884,5 +2009,346 @@ mod tests {
         assert_eq!(parse_retry_after(Some(&h_bad)), None);
 
         assert_eq!(parse_retry_after(None), None);
+    }
+
+    // ---- cache diagnostics: previous_message_id chaining -------------------
+
+    async fn captured_body(server: &MockServer) -> Value {
+        let received = server.received_requests().await.expect("requests captured");
+        let body = &received[received.len() - 1].body;
+        serde_json::from_slice(body).expect("request body is json")
+    }
+
+    #[tokio::test]
+    async fn first_call_sends_null_previous_message_id_and_second_call_sends_previous_response_id()
+    {
+        let server = MockServer::start().await;
+        mount_success(
+            &server,
+            &json!({
+                "id": "msg_01ABC",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+
+        // TWO sequential calls on ONE instance: the second must chain the
+        // first response's id.
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+        backend.turn(&req).await.expect("the first turn succeeds");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            Value::Null,
+            "the first call has no previous response to chain"
+        );
+        backend.turn(&req).await.expect("the second turn succeeds");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            "msg_01ABC",
+            "the second call chains the previous response id"
+        );
+
+        // INSTANCE SCOPING: a second backend instance starts its chain at
+        // null — the id lives on the backend, not on the server.
+        let other = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+        other
+            .turn(&req)
+            .await
+            .expect("the instance's first call succeeds");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            Value::Null,
+            "chaining is per-instance: a fresh instance sends null"
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_message_id_survives_errors_and_idless_responses() {
+        let server = MockServer::start().await;
+        // Phase 1: a 500 — the error path must not store anything.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"boom"}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+
+        // Turn 1: error propagation is unchanged (500 → Transient, retryable).
+        let err = backend
+            .turn(&req)
+            .await
+            .expect_err("the 500 must still surface");
+        assert!(err.is_retryable(), "a 500 is retryable: {err:?}");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            Value::Null,
+            "nothing has ever been stored before the first call"
+        );
+
+        // Phase 2: a 200 carrying an id — the id is stored for the NEXT call.
+        server.reset().await;
+        mount_success(
+            &server,
+            &json!({
+                "id": "msg_01ABC",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+        backend
+            .turn(&req)
+            .await
+            .expect("the id-carrying 200 succeeds");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            Value::Null,
+            "the failed turn 1 stored nothing, so this call still sends null"
+        );
+
+        // Phase 3: a 200 WITHOUT an id — an id-less 200 must not clear it.
+        server.reset().await;
+        mount_success(
+            &server,
+            &json!({
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })
+            .to_string(),
+        )
+        .await;
+        backend
+            .turn(&req)
+            .await
+            .expect("the id-less 200 still succeeds");
+        assert_eq!(
+            captured_body(&server).await["diagnostics"]["previous_message_id"],
+            "msg_01ABC",
+            "an id-less 200 does not clear the stored id"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_miss_reason_maps_the_six_documented_types_and_the_clamp() {
+        let server = MockServer::start().await;
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+
+        let cases: &[(&str, crate::model::CacheMissReason)] = &[
+            (
+                r#"{"cache_miss_reason":{"type":"model_changed","cache_missed_input_tokens":1}}"#,
+                crate::model::CacheMissReason::ModelChanged {
+                    cache_missed_input_tokens: 1,
+                },
+            ),
+            // Field ABSENT on the wire → parsed as 0 (the absent → 0 arm).
+            (
+                r#"{"cache_miss_reason":{"type":"system_changed"}}"#,
+                crate::model::CacheMissReason::SystemChanged {
+                    cache_missed_input_tokens: 0,
+                },
+            ),
+            (
+                r#"{"cache_miss_reason":{"type":"tools_changed","cache_missed_input_tokens":777}}"#,
+                crate::model::CacheMissReason::ToolsChanged {
+                    cache_missed_input_tokens: 777,
+                },
+            ),
+            (
+                r#"{"cache_miss_reason":{"type":"messages_changed","cache_missed_input_tokens":1234}}"#,
+                crate::model::CacheMissReason::MessagesChanged {
+                    cache_missed_input_tokens: 1234,
+                },
+            ),
+            // CLAMP: 2^32 overflows u32 and clamps to u32::MAX.
+            (
+                r#"{"cache_miss_reason":{"type":"model_changed","cache_missed_input_tokens":4294967296}}"#,
+                crate::model::CacheMissReason::ModelChanged {
+                    cache_missed_input_tokens: 4_294_967_295,
+                },
+            ),
+            (
+                r#"{"cache_miss_reason":{"type":"previous_message_not_found"}}"#,
+                crate::model::CacheMissReason::PreviousMessageNotFound,
+            ),
+            (
+                r#"{"cache_miss_reason":{"type":"unavailable"}}"#,
+                crate::model::CacheMissReason::Unavailable,
+            ),
+        ];
+
+        for (diagnostics_fragment, expected) in cases {
+            let body = serde_json::to_string(&json!({
+                "id": "msg_01ABC",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "diagnostics": serde_json::from_str::<serde_json::Value>(diagnostics_fragment).expect("case body")
+            }))
+            .expect("body serializes");
+            server.reset().await;
+            mount_success(&server, &body).await;
+            let turn = backend.turn(&req).await.expect("the turn succeeds");
+            assert_eq!(
+                turn.cache_miss_reason,
+                Some(expected.clone()),
+                "case: {diagnostics_fragment}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_fail_open() {
+        async fn call(
+            server: &MockServer,
+            req: &TurnRequest<'_>,
+            backend: &AnthropicBackend,
+            body: serde_json::Value,
+        ) -> crate::model::AssistantTurn {
+            server.reset().await;
+            mount_success(server, &body.to_string()).await;
+            backend
+                .turn(req)
+                .await
+                .expect("fail-open: never a BackendError")
+        }
+
+        fn base_body() -> Value {
+            json!({
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 7, "output_tokens": 3}
+            })
+        }
+
+        let server = MockServer::start().await;
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let p = params();
+        let req = TurnRequest {
+            system: None,
+            messages: &messages,
+            tools: &tools,
+            params: &p,
+        };
+        let backend = AnthropicBackend::new("m", "k").with_base_url(server.uri());
+
+        // (a) NO diagnostics key at all.
+        let turn = call(&server, &req, &backend, base_body()).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(turn.cache_diagnostics, None);
+        assert_eq!(turn.usage.output_tokens, 3, "usage untouched");
+
+        // (b) diagnostics: null.
+        let mut body = base_body();
+        body["diagnostics"] = Value::Null;
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(turn.cache_diagnostics, None);
+
+        // (c) comparison still pending — raw value passes through.
+        let body = json!({"cache_miss_reason": null});
+        let mut body2 = base_body();
+        body2["diagnostics"] = body;
+        let turn = call(&server, &req, &backend, body2).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(
+            turn.cache_diagnostics,
+            Some(json!({"cache_miss_reason": null}))
+        );
+
+        // (d) a non-object diagnostics value.
+        let mut body = base_body();
+        body["diagnostics"] = Value::String("junk".to_string());
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(
+            turn.cache_diagnostics,
+            Some(Value::String("junk".to_string()))
+        );
+
+        // (e) an empty object.
+        let mut body = base_body();
+        body["diagnostics"] = json!({});
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(turn.cache_diagnostics, Some(json!({})));
+
+        // (f) cache_miss_reason present but not an object (not null, not an
+        // object) — the pending check does not swallow it; still fail-open.
+        let mut body = base_body();
+        body["diagnostics"] = json!({"cache_miss_reason": 5});
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(turn.cache_miss_reason, None);
+        assert_eq!(
+            turn.cache_diagnostics,
+            Some(json!({"cache_miss_reason": 5}))
+        );
+
+        // (g) tokens field present but a JSON STRING → treated as absent → 0.
+        let mut body = base_body();
+        body["diagnostics"] =
+            json!({"cache_miss_reason":{"type":"tools_changed","cache_missed_input_tokens":"777"}});
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(
+            turn.cache_miss_reason,
+            Some(crate::model::CacheMissReason::ToolsChanged {
+                cache_missed_input_tokens: 0
+            })
+        );
+
+        // (h) an unknown type string → Other, raw value preserved verbatim.
+        let mut body = base_body();
+        body["diagnostics"] =
+            json!({"cache_miss_reason":{"type":"invented_kind","cache_missed_input_tokens":5}});
+        let turn = call(&server, &req, &backend, body).await;
+        assert_eq!(
+            turn.cache_miss_reason,
+            Some(crate::model::CacheMissReason::Other(
+                "invented_kind".to_string()
+            ))
+        );
+        assert_eq!(
+            turn.cache_diagnostics,
+            Some(
+                json!({"cache_miss_reason":{"type":"invented_kind","cache_missed_input_tokens":5}})
+            )
+        );
     }
 }
