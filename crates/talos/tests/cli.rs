@@ -1204,7 +1204,7 @@ fn help_flag_exits_0_with_plain_help() {
 /// `scripts/publish-talos.sh`): the output is `talos <TOKEN>` where `<TOKEN>` is
 /// `<semver>-g<short-sha>`, a single URL/path-safe string. `talos-update.sh`
 /// extracts it via `talos --version | awk '{print $2}'` and uses it verbatim as
-/// a pi-04 path component, so a token free of spaces, slashes, and plus-signs is
+/// an artifact-host path component, so a token free of spaces, slashes, and plus-signs is
 /// load-bearing, not cosmetic.
 #[test]
 fn version_flag_exits_0_with_fleet_token() {
@@ -1239,7 +1239,7 @@ fn version_flag_exits_0_with_fleet_token() {
     // changes every release. Path-safety is asserted below.
     assert!(!token.is_empty(), "token must be non-empty; got: {token:?}");
     // URL/path-safe: no `+`, no `/`, no whitespace (split_whitespace already
-    // guarantees the last), so it drops into a pi-04 path unescaped.
+    // guarantees the last), so it drops into an artifact-host path unescaped.
     assert!(
         token
             .chars()

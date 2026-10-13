@@ -41,29 +41,29 @@ Traceback (most recent call last):
   File "/tmp/harness-mined-mined-agent-gtd-dispatch-attribution-3050470-0/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 66, in _connection_worker_thread
     future.get_loop().call_soon_threadsafe(set_result, future, result)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
     self._check_closed()
     ~~~~~~~~~~~~~~~~~~^^
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
     raise RuntimeError('Event loop is closed')
 RuntimeError: Event loop is closed
 
 During handling of the above exception, another exception occurred:
 
 Traceback (most recent call last):
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/threading.py", line 1044, in _bootstrap_inner
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/threading.py", line 1044, in _bootstrap_inner
     self.run()
     ~~~~~~~~^^
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/threading.py", line 995, in run
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/threading.py", line 995, in run
     self._target(*self._args, **self._kwargs)
     ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/tmp/harness-mined-mined-agent-gtd-dispatch-attribution-3050470-0/agent_gtd/.venv/lib/python3.13/site-packages/aiosqlite/core.py", line 75, in _connection_worker_thread
     future.get_loop().call_soon_threadsafe(set_exception, future, e)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
     self._check_closed()
     ~~~~~~~~~~~~~~~~~~^^
-  File "/home/jason/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
+  File "/home/user/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
     raise RuntimeError('Event loop is closed')
 RuntimeError: Event loop is closed
 

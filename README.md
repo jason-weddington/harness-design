@@ -174,24 +174,24 @@ Decoupled from deploy (matches the Python projects). At a meaningful boundary:
 talos is self-hosting — we dispatch talos features to talos — so the binary
 changes every wave. Rather than each dispatch host compiling it (slow, especially
 the aarch64 Pi), the fast x86_64 dev box builds **both** arches and publishes them
-to the homelab artifact host (`pi-04`); the fleet's `talos-update.sh`
+to an artifact host over ssh; the fleet's `talos-update.sh`
 (in `agent-gtd-dispatch`) then just pulls the binary.
 
 ```bash
-./scripts/publish-talos.sh    # gate -> build x86_64 + aarch64 -> scp to pi-04 -> advance 'latest'
+./scripts/publish-talos.sh    # gate -> build x86_64 + aarch64 -> scp to the artifact host -> advance 'latest'
 ```
 
 - **Version token.** `talos --version` prints `talos <semver>-g<short-sha>`
   (stamped by `crates/talos/build.rs`). It is a single URL/path-safe string; the
   consumer reads it via `talos --version | awk '{print $2}'`.
-- **pi-04 layout.** `pi-04:/srv/talos/<TOKEN>/<arch>/talos` where `<arch>` ∈
-  `{x86_64, aarch64}` (matching `uname -m`), plus `pi-04:/srv/talos/latest`
+- **Artifact layout.** `<host>:/srv/talos/<TOKEN>/<arch>/talos` where `<arch>` ∈
+  `{x86_64, aarch64}` (matching `uname -m`), plus `<host>:/srv/talos/latest`
   holding the current `<TOKEN>` on one line — advanced only after both arches
   upload. Artifacts are immutable per-`<TOKEN>` (a gate-failing or dirty-tree
   build never ships; an existing `<TOKEN>` dir is never overwritten).
 - **One-time toolchain setup** (on the x86_64 publisher): `cargo binstall cargo-zigbuild` plus zig (`uv tool install ziglang` or a zig on `PATH`); `rust-toolchain.toml` installs both std targets. Binaries are built against the pinned `GLIBC_FLOOR` (2.39, Ubuntu 24.04) regardless of the host's glibc, and `scripts/check-glibc-floor.sh` refuses to publish a binary requiring a newer one. The macOS artifact is unaffected.
-- **Target override.** `TALOS_PUBLISH_HOST` (default `jason@pi-04`) and
-  `TALOS_PUBLISH_DIR` (default `/srv/talos`).
+- **Target.** `TALOS_PUBLISH_HOST` (the artifact host's ssh target, required; there is no default host) and
+  `TALOS_PUBLISH_DIR` (default `/srv/talos`). Both scripts first source a gitignored `publish.local.env` at the repo root when it exists, so a maintainer can link that to their own config instead of exporting the variables.
 
 ### macOS binary
 
@@ -200,7 +200,7 @@ plus a C cross toolchain, and `ring` adds one), so the Mac builds its own. Run
 this ON THE MAC after a Linux publish:
 
 ```bash
-./scripts/publish-talos-mac.sh    # build the commit `latest` names -> pi-04:/srv/talos/<TOKEN>/aarch64-apple-darwin/talos
+./scripts/publish-talos-mac.sh    # build the commit `latest` names -> <host>:/srv/talos/<TOKEN>/aarch64-apple-darwin/talos
 ```
 
 It is a **follower**: it reads `latest`, builds exactly that commit in a
@@ -208,6 +208,6 @@ detached worktree (persistent target dir, so rebuilds are incremental), asserts
 `talos --version` equals the token, and uploads without overwriting. It never
 touches `latest`, and the `latest` invariant stays "both Linux arches present",
 so a Mac that lags never blocks the fleet. `talos-update.sh` ignores the extra
-directory. Interactive machines (the Mac, jason-desktop) install with
+directory. Interactive machines (the Mac, the Linux dev box) install with
 `~/scripts/pull_talos.sh`, which reads the same artifact tree and places the
 binary at `~/.local/bin/talos`.

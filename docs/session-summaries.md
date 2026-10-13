@@ -238,7 +238,7 @@ while passing every MockBackend test. Three items landed ready (finish-recovery 
 retry-backoff → wall-clock, serialized on `engine.rs`).
 
 Then dispatch taught the real lesson. Rollouts can't pin a host (FR filed), so we went
-direct on **talos-glm / r7-research** — and finish-recovery **failed twice**: first
+direct on **talos-glm** on a dispatch host — and finish-recovery **failed twice**: first
 `MaxIterations@24` (talos's default cap, calibrated for small dogfood items, was far
 too low for a 5-file change — bumped 24→500, commit d59b1d9), then
 **`StoppedWithoutFinish@56` with no WIP preserved**. That second failure *is* a live
@@ -260,7 +260,7 @@ empirically. Ollama credits then ran out, so the last two items ran on claude-co
 that re-grounded correctly onto an `engine.rs` grown ~950 lines by the prior merges
 (symbol-anchored dispatch notes, no re-groom). A side-quest shipped the **talos fleet-
 publish** capability (`2d48267`, GTD 953fd927): version-stamped `talos --version` +
-`scripts/publish-talos.sh` that builds both arches on the i9 and publishes to pi-04 —
+`scripts/publish-talos.sh` that builds both arches on the i9 and publishes to the artifact host —
 build-once-and-pull, retiring the compile-on-every-host tax. `review-against-intent`
 gated the release at **meets-with-gaps**: every load-bearing seam verified correct in
 code (both recovery terminals build `RecoveryFacts` identically; three `RunConfig`

@@ -19,7 +19,7 @@
 //! and a local model's window is set from the model's own advertised
 //! `{arch}.context_length` rather than a hardcoded fallback.
 //!
-//! Note: a non-localhost, non-cloud Ollama daemon (e.g. `http://jason-desktop:11434`,
+//! Note: a non-localhost, non-cloud Ollama daemon (e.g. `http://gpu-host:11434`,
 //! a LAN address) is not matched by [`is_local_ollama_url`] and is therefore
 //! never probed — it receives no `num_ctx` and inherits Ollama's own low
 //! default (documented as 2048 with silent oldest-message dropping). Setting
@@ -2973,7 +2973,7 @@ mod tests {
         assert!(is_local_ollama_url("http://localhost:11434"));
         assert!(is_local_ollama_url("http://127.0.0.1:11434"));
         assert!(!is_local_ollama_url("https://ollama.com"));
-        assert!(!is_local_ollama_url("http://jason-desktop:11434"));
+        assert!(!is_local_ollama_url("http://gpu-host:11434"));
     }
 
     // NumCtxSource::as_str: the stable string mapping.

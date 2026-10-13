@@ -7,6 +7,9 @@
 # Local release leak scan (the maintainer links it to their scanner).
 /release.guard.local.sh
 
+# Local publish config: sets TALOS_PUBLISH_HOST for scripts/publish-talos*.sh.
+/publish.local.env
+
 # Local Claude Code session state.
 /.claude/
 

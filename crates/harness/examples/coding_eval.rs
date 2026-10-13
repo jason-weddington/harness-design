@@ -45,7 +45,7 @@
 //!   unparsable value panics naming `OLLAMA_NUM_CTX` and the raw string.
 //!   Use this as an escape hatch in BOTH directions: to pin a smaller window
 //!   when the advertised value exceeds available VRAM, or to set a window for
-//!   non-localhost daemons (e.g. `http://jason-desktop:11434`, a LAN address)
+//!   non-localhost daemons (e.g. `http://gpu-host:11434`, a LAN address)
 //!   that are neither matched by `is_local_ollama_url` nor probed — they
 //!   inherit Ollama's own low default (~2048, with silent oldest-message
 //!   dropping). An empty value (`OLLAMA_NUM_CTX= cmd`) is treated as unset.

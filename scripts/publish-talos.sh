@@ -5,7 +5,7 @@
 # Every session binary in this workspace is self-hosting (we dispatch features to
 # the fleet), so the binaries change every wave. Rather than each dispatch host
 # compiling them itself (slow, esp. the aarch64 Pi), the fast i9 builds BOTH
-# arches of EVERY binary here and publishes them to pi-04 in ONE invocation;
+# arches of EVERY binary here and publishes them to the artifact host in ONE invocation;
 # each consumer's own update script then pulls the binary it cares about.
 #
 # Fleet contract (consumers depend on these verbatim): ONE invocation publishes
@@ -17,9 +17,9 @@
 # what `crates/talos/build.rs` stamps into `talos --version` on the clean tree
 # the gate enforces (build.rs adds only `--dirty`, which a clean tree never
 # yields), so a consumer's `| awk '{print $2}'` still matches the published
-# token. Layout: pi-04:$DIR/<TOKEN>/<arch>/<bin>  where <arch> ∈ {x86_64,
+# token. Layout: <host>:$DIR/<TOKEN>/<arch>/<bin>  where <arch> ∈ {x86_64,
 # aarch64} (matching `uname -m` on the hosts) and <bin> is the crate directory
-# basename. Latest pointer: pi-04:$DIR/latest holds the current <TOKEN> (one
+# basename. Latest pointer: <host>:$DIR/latest holds the current <TOKEN> (one
 # line), advanced ONLY after every binary of every arch is verified present —
 # the per-file check runs even on the already-published skip path.
 #
@@ -45,21 +45,31 @@
 # runs); `rm "$tmp/$TOKEN/x86_64/<bin>"` then re-running exercises the
 # missing-artifact refusal (exit 1, `latest` untouched).
 #
-# Config (env, defaults target the homelab):
-#   TALOS_PUBLISH_HOST        ssh target        (default: jason@pi-04)
+# Config (env; a public checkout names no host, so there is no default host):
+#   TALOS_PUBLISH_HOST        ssh target of the artifact host (required unless
+#                             dry-running)
 #   TALOS_PUBLISH_DIR         remote base dir   (default: /srv/talos)
 #   TALOS_PUBLISH_DRY_RUN     exactly `1` activates a local staging dry run
 #   TALOS_PUBLISH_DRY_RUN_DIR staging root for the dry run (default: mktemp -d)
+# A gitignored ./publish.local.env at the repo root is sourced first when it
+# exists; the maintainer links it to their own config, which should only fill
+# unset values (`: "${TALOS_PUBLISH_HOST:=...}"`) so the environment still wins.
 #
 # Delivery is per-session (this script owns PUBLISH only): talos-update.sh
 # (agent-gtd-dispatch) pulls talos onto the dispatch hosts; the KB session
-# writes its own pull step reading the same `latest` over pi-04's Caddy.
+# writes its own pull step reading the same `latest` over the artifact host's HTTP server.
 set -euo pipefail
 
 DRY_RUN=0; [ "${TALOS_PUBLISH_DRY_RUN:-}" = "1" ] && DRY_RUN=1
 
-PUBLISH_HOST="jason@pi-04"
-[ -n "${TALOS_PUBLISH_HOST-}" ] && PUBLISH_HOST="$TALOS_PUBLISH_HOST"
+LOCAL_ENV="$(dirname "$0")/../publish.local.env"
+# shellcheck source=/dev/null
+[ -f "$LOCAL_ENV" ] && . "$LOCAL_ENV"
+PUBLISH_HOST="${TALOS_PUBLISH_HOST-}"
+if [ "$DRY_RUN" = 0 ] && [ -z "$PUBLISH_HOST" ]; then
+  echo "ERROR: TALOS_PUBLISH_HOST is unset. Set it to the artifact host's ssh target, or link publish.local.env to a file that sets it." >&2
+  exit 1
+fi
 PUBLISH_DIR="${TALOS_PUBLISH_DIR:-/srv/talos}"
 ARM_TARGET="aarch64-unknown-linux-gnu"
 X86_TARGET="x86_64-unknown-linux-gnu"
@@ -164,7 +174,7 @@ if [ "$DRY_RUN" = 0 ]; then
   done
 
   # --- Refuse to publish anything needing a newer glibc than the floor. Runs
-  # before any remote_run/remote_put, so a failure never reaches pi-04.
+  # before any remote_run/remote_put, so a failure never reaches the artifact host.
   echo "==> Checking glibc floor $GLIBC_FLOOR…"
   built=()
   for bin in "${BINS[@]}"; do

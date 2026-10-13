@@ -2,7 +2,7 @@
 
 GTD item `050252ba` asked what actually happened in two talos dispatch failures whose control-plane error strings were undiagnosable. Both transcripts were read in full. **Neither failure is the thing its error string said it was**, and the two failures are unrelated to each other: one is an output-token cutoff, the other is a dispatch-worker bug that destroyed a complete, verified, gate-green unit of work.
 
-Sources: `r7-research:/home/dispatch/.local/state/talos/<item-id>/transcript.jsonl`, the GTD `claude_runs` records, and the current `crates/harness` / `agent-gtd-dispatch` code.
+Sources: `<dispatch-host>:/home/dispatch/.local/state/talos/<item-id>/transcript.jsonl`, the GTD `claude_runs` records, and the current `crates/harness` / `agent-gtd-dispatch` code.
 
 ## Failure 1 — PhotoQueue stats sweep: a `max_tokens` cutoff, not a stall
 

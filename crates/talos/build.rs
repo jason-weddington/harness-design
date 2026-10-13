@@ -1,7 +1,7 @@
 //! Build script: stamp the git version (nearest tag + distance + sha) into
 //! `talos --version`.
 //!
-//! The dispatch fleet publishes talos binaries to `pi-04:/srv/talos/<TOKEN>/…`
+//! The dispatch fleet publishes talos binaries to the artifact host at `<publish dir>/<TOKEN>/…`
 //! and reads the target back via `talos --version | awk '{print $2}'`. That
 //! `<TOKEN>` must be a single URL/path-safe string. `git describe --tags` yields
 //! exactly that: the release tag on a tagged commit (e.g. `0.5.0`), or

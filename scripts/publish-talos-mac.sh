@@ -3,7 +3,7 @@
 # Build + publish the macOS (Apple Silicon) talos binary next to the Linux ones.
 #
 # Run this ON THE MAC. It is a FOLLOWER of `publish-talos.sh`, never a leader:
-# it builds exactly the commit that `pi-04:/srv/talos/latest` names, so the Mac
+# it builds exactly the commit that the artifact host's `latest` names, so the Mac
 # binary always matches what the fleet runs, then uploads it into that same
 # token directory as a sibling of the Linux arches. It never touches `latest`.
 #
@@ -12,7 +12,7 @@
 # toolchain (talos pulls in `ring` via rustls). The Mac already has Rust.
 #
 # Contract additions (the fleet contract in publish-talos.sh is unchanged):
-#   - Layout: pi-04:$DIR/<TOKEN>/aarch64-apple-darwin/<bin>, one file per
+#   - Layout: <host>:$DIR/<TOKEN>/aarch64-apple-darwin/<bin>, one file per
 #     workspace binary (the same discovery rule as publish-talos.sh: every
 #     crates/<name> shipping src/main.rs, published as <name>). The directory
 #     name is the Rust target triple, so it cannot collide with a `uname -m`
@@ -27,14 +27,20 @@
 #   scripts/publish-talos-mac.sh --token <TOKEN>  # build + publish a specific token
 #   scripts/publish-talos-mac.sh --no-upload      # build + verify only
 #
-# Config (env, defaults target the homelab):
-#   TALOS_PUBLISH_HOST     ssh target        (default: jason@pi-04)
+# Config (env; a public checkout names no host, so there is no default host):
+#   TALOS_PUBLISH_HOST     ssh target of the artifact host (required unless
+#                          --no-upload with --token, which never contacts it)
 #   TALOS_PUBLISH_DIR      remote base dir   (default: /srv/talos)
 #   TALOS_MAC_TARGET_DIR   cargo target dir  (default: ~/.cache/talos-mac-target;
 #                                             persistent, so rebuilds are incremental)
+# A gitignored ./publish.local.env at the repo root is sourced first when it
+# exists, exactly as publish-talos.sh does.
 set -euo pipefail
 
-PUBLISH_HOST="${TALOS_PUBLISH_HOST:-jason@pi-04}"
+LOCAL_ENV="$(dirname "$0")/../publish.local.env"
+# shellcheck source=/dev/null
+[ -f "$LOCAL_ENV" ] && . "$LOCAL_ENV"
+PUBLISH_HOST="${TALOS_PUBLISH_HOST-}"
 PUBLISH_DIR="${TALOS_PUBLISH_DIR:-/srv/talos}"
 TARGET_DIR_NAME="aarch64-apple-darwin"
 CARGO_TARGET="${TALOS_MAC_TARGET_DIR:-$HOME/.cache/talos-mac-target}"
@@ -58,6 +64,11 @@ if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
 fi
 
 cd "$(dirname "$0")/.."
+
+if [ -z "$PUBLISH_HOST" ] && { [ "$UPLOAD" = 1 ] || [ -z "$TOKEN" ]; }; then
+  echo "ERROR: TALOS_PUBLISH_HOST is unset. Set it to the artifact host's ssh target, or link publish.local.env to a file that sets it." >&2
+  exit 1
+fi
 
 # --- Resolve the token: `latest` unless pinned. This is the mutable pointer the
 # fleet consumes, so it is read fresh here rather than remembered.

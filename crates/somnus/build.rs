@@ -1,7 +1,7 @@
 //! Build script: stamp the git version (nearest tag + distance + sha) into
 //! `somnus --version`.
 //!
-//! The dispatch fleet publishes somnus binaries to `pi-04:/srv/talos/<TOKEN>/…`
+//! The dispatch fleet publishes somnus binaries to the artifact host at `<publish dir>/<TOKEN>/…`
 //! (the shared artifact host — `scripts/publish-talos.sh` publishes EVERY
 //! workspace binary at ONE token) and reads the target back via
 //! `somnus --version | awk '{print $2}'`. That
