@@ -82,12 +82,15 @@ How to run it (from a **detached worktree** of this repo, never the checkout you
 
 ```bash
 git worktree add --detach /tmp/hd-groom main
-cd ~/git/talos_flow && TALOS_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_THINK=high \
+set -a && . ~/.config/talos-flow/ollama.env && set +a && cd ~/git/talos_flow && \
+  TALOS_BACKEND=ollama OLLAMA_BASE_URL=https://ollama.com OLLAMA_THINK=high \
   uv run --frozen python -m talos_flow.workflows.groom_to_ready \
   --args args.json --workspace /tmp/hd-groom --out finals.json \
   --draft-env OLLAMA_MODEL=glm-5.3-flash:cloud --critic-env OLLAMA_MODEL=glm-5.3:cloud --synth-env OLLAMA_MODEL=glm-5.3-flash:cloud \
   --rate-in 0.15 --rate-cached 0.03 --rate-out 0.50   # flash rates; recost the critic stage at 1.40/0.26/4.40 if you want exact dollars
 ```
+
+The Ollama key comes from `~/.config/talos-flow/ollama.env` (mode 600, a single `OLLAMA_API_KEY=` line), which the command sources itself. Never rely on the key being in the interactive shell: a non-interactive Bash tool call does not have it, and the groom should run the same on any host that has the file. Never print the key.
 
 Host it in `Monitor` (the eight stdout progress lines are the events), review `finals.json` as the checkpoint, then `agent-gtd update-item <id> --from-json <spec>.json --status ready`. `args.json` is `{context, items:[{id, slug, title, seed, criticalConstraint}]}` — the same shape the JS took. Cite only paths inside this repo in `context` and seeds; the answer agents can read nothing else. Each item's final also lands in `finals.partial.jsonl` (beside `--out`) the moment its synth finishes, so a ready spec can go to GTD before the slowest item is done. A `synth <slug> substance-rejected` line means the synth returned a placeholder spec (title not the item's, or a criterion under 40 characters); the item comes back `blocked-on-prereq`, the run exits 3, and the real spec can usually be recovered from that agent's first `finish` call (kb-03926).
 
