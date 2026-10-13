@@ -13,6 +13,9 @@
 # Local Claude Code session state.
 /.claude/
 
+# Maintainer-local steering (lab hosts and paths), linked in by the maintainer.
+/CLAUDE.local.md
+
 # Local direnv env (holds secrets like OLLAMA_API_KEY) — never commit.
 /.envrc
 /.envrc.secrets

@@ -223,27 +223,34 @@ never regress it. Licenses are restricted to
 
 ## Release
 
-Decoupled from deploy (matches the Python projects). At a meaningful boundary run `./release.sh`: it cuts the version (`cog bump --auto` — trust it; type commits honestly, `fix:` vs `feat:`, and don't hand-pin the version), tags, **publishes a fresh talos fleet binary** (`scripts/publish-talos.sh`, run between the bump and the push, so a release ships an artifact by definition), then pushes main + tags to **both** `origin` and `github`. No crates.io publish.
+Decoupled from deploy (matches the Python projects). At a meaningful boundary run `./release.sh`: it cuts the version (`cog bump --auto` — trust it; type commits honestly, `fix:` vs `feat:`, and don't hand-pin the version), tags, **publishes a fresh talos fleet binary** (`scripts/publish-talos.sh`, run between the bump and the push, so a release ships an artifact by definition), then pushes main + tags to **both** `origin` and `github`. No crates.io publish. When a `github` remote exists, it first runs the gitignored leak scan `release.guard.local.sh`, before the bump, and refuses to release if the scan finds anything, cannot run, or is missing (unless `--no-guard` is passed).
+
+**Maintainer-local steering.** Anything that names a lab host, domain or private path lives in the gitignored `CLAUDE.local.md`, which the maintainer links into the checkout and Claude Code loads alongside this file: which machine releases and publishes, the artifact host, the fleet pull command and the current host list. When it is absent, this file is the whole story.
 
 ## Talos fleet binary (build + push without a release)
 
 Talos is self-hosting — the binary changes every wave — so the dispatch hosts run a *published* binary rather than compiling it themselves. A release republishes it automatically (above). To push a fresh binary **mid-work, without cutting a release** — e.g. you just merged a talos-affecting change and want the fleet on it before the next dispatch — run the two-step flow by hand:
 
 ```bash
-# 1. Build both arches on this box (the publish host needs `cargo-zigbuild` + zig; binaries are built against the pinned `GLIBC_FLOOR` of 2.39 in `publish-talos.sh`, so they start on the Ubuntu 24.04 hosts whatever the build host's glibc, and `scripts/check-glibc-floor.sh` refuses to upload anything newer) and
-#    publish to the pi-04 artifact host. Requires a CLEAN tree — the version token
-#    embeds HEAD's short SHA, so commit first. Runs the gate before it ships.
+# 1. Build both arches on this box and publish them to the artifact host named by
+#    TALOS_PUBLISH_HOST (from the environment, or the gitignored publish.local.env
+#    the script sources; there is no default host). The publish host needs
+#    `cargo-zigbuild` + zig; binaries are built against the pinned `GLIBC_FLOOR` of
+#    2.39 in `publish-talos.sh`, so they start on the Ubuntu 24.04 hosts whatever the
+#    build host's glibc, and `scripts/check-glibc-floor.sh` refuses to upload anything
+#    newer. Requires a CLEAN tree — the version token embeds HEAD's short SHA, so
+#    commit first. Runs the gate before it ships.
 ./scripts/publish-talos.sh
 
-# 2. Pull the just-published binary onto both dispatch hosts. No service restart
-#    (talos is a fresh subprocess per dispatch run — the next run picks it up).
-cd ~/git/agent-gtd-dispatch && ./talos-update.sh
+# 2. Pull the just-published binary onto the dispatch fleet with the fleet's own
+#    update step (CLAUDE.local.md has the command). No service restart: talos is a
+#    fresh subprocess per dispatch run, so the next run picks it up.
 ```
 
-`publish-talos.sh` advances `pi-04:/srv/talos/latest` to the new token only after every binary uploads for both arches (artifacts are immutable per token, and the per-file check refuses to advance `latest` on a miss); `talos-update.sh` reads that `latest` via pi-04's Caddy and installs on each host in `DISPATCH_HOSTS`, skipping any host already current. The version token is `<semver>-g<short-sha>` (from `git describe --tags`, stamped by `crates/talos/build.rs`); to verify, **each dispatch host's** installed token should carry the same `<short-sha>` as `git rev-parse --short HEAD`, and the binary to check is the **`dispatch` user's** (`sudo -n -u dispatch talos --version`) — talos is not on root's or your own `PATH` on every host.
+`publish-talos.sh` advances the artifact host's `latest` to the new token only after every binary uploads for both arches (artifacts are immutable per token, and the per-file check refuses to advance `latest` on a miss); the fleet's update step reads that `latest` and installs on each host, skipping any host already current. The version token is `<semver>-g<short-sha>` (from `git describe --tags`, stamped by `crates/talos/build.rs`); to verify, **each dispatch host's** installed token should carry the same `<short-sha>` as `git rev-parse --short HEAD`, and the binary to check is the **`dispatch` user's** (`sudo -n -u dispatch talos --version`) — talos is not on root's or your own `PATH` on every host.
 
-**`DISPATCH_HOSTS` is a hardcoded default, so a host that joins the fleet is silently outside it until someone edits the script.** That fails in the quiet direction: a delivery pass covering three of four hosts prints exactly what a complete one prints, and the missed host then runs a stale binary indefinitely. `jason-precision` joined on 2026-09-20 and this repo's own notes described the default as two hosts long after it was four. **Do not trust a remembered host list — read the current default out of `talos-update.sh`, and after any publish verify the token on each host you believe is in the fleet.** The same shape bit the unpushed-work sweep on the same day for the same reason.
+**Do not trust a remembered host list.** A delivery pass that misses a host prints exactly what a complete one prints, and the missed host then runs a stale binary indefinitely; this repo's own notes once described the fleet as two hosts long after it was four. After any publish, verify the token on every host in the fleet's *current* list, fetched at that moment rather than recalled. The same shape bit the unpushed-work sweep on the same day for the same reason.
 
-**Do not read that check as fleet-wide.** `latest` is a published pointer with **independent consumers on independent schedules** — `talos-update.sh` pulls it onto `DISPATCH_HOSTS`, and other consumers (the KB hosts, once `somnus` exists) pull the same pointer from their own deploy paths with no coordination. That is deliberate: per Jason, every session owns its own release tooling, because the session with the context to know when delivery is safe is the one that should trigger it. The consequence is that a token can be live on the dispatch fleet and not yet elsewhere for an arbitrary interval, so **nothing may assume version uniformity across all consumers** — only within a consumer's own host set.
+**Do not read that check as fleet-wide.** `latest` is a published pointer with **independent consumers on independent schedules** — the fleet's update step pulls it onto the dispatch hosts, and other consumers (the KB hosts running `somnus`) pull the same pointer from their own deploy paths with no coordination. That is deliberate: per Jason, every session owns its own release tooling, because the session with the context to know when delivery is safe is the one that should trigger it. The consequence is that a token can be live on the dispatch fleet and not yet elsewhere for an arbitrary interval, so **nothing may assume version uniformity across all consumers** — only within a consumer's own host set.
 
-**macOS artifact.** The glibc floor does not apply to it. `publish-talos.sh` ships only the two Linux arches. The Mac binary is published separately by `scripts/publish-talos-mac.sh`, run on the Mac after a Linux publish: it follows `latest` (builds that exact commit, asserts the version equals the token, uploads to `<TOKEN>/aarch64-apple-darwin/talos`, never overwrites, never touches `latest`). Interactive machines install with `~/scripts/pull_talos.sh` (installs to `~/.local/bin/talos`); the dispatch fleet still uses `talos-update.sh`. Design and rationale: `~/git/bulk-reader/docs/design.md`, "Binary distribution".
+**macOS artifact.** The glibc floor does not apply to it. `publish-talos.sh` ships only the two Linux arches. The Mac binary is published separately by `scripts/publish-talos-mac.sh`, run on the Mac after a Linux publish: it follows `latest` (builds that exact commit, asserts the version equals the token, uploads to `<TOKEN>/aarch64-apple-darwin/talos`, never overwrites, never touches `latest`). Interactive machines install from the same artifact tree with their own pull script; the dispatch fleet uses its update step.
