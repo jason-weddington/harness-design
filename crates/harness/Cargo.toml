@@ -24,6 +24,7 @@ aws-smithy-types.workspace = true
 jsonschema.workspace = true
 reqwest = { workspace = true }
 rusqlite.workspace = true
+rustix.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tempfile.workspace = true

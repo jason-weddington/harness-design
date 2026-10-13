@@ -54,6 +54,12 @@ jsonschema = { version = "0.56", default-features = false }
 # serialization, `rustls-tls` for the rustls + webpki-roots HTTPS stack).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# rustix: the safe syscall facade (no libc, no unsafe) used by exec.rs for
+# process-group signalling on exec timeout. License: Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT — an OR expression whose Apache-2.0 and
+# MIT branches are already on the deny allow list. rustix is already in the
+# lock graph via tempfile, so the rustls-ring posture is untouched.
+rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

@@ -123,6 +123,10 @@ async fn drain<R: AsyncRead + Unpin>(pipe: Option<R>) -> String {
 ///
 /// On timeout the child is killed (`start_kill` + `wait` to reap the zombie),
 /// `timed_out` is set, and captured output is dropped (the run is abandoned).
+/// The child is spawned as the leader of its own process group, so a timeout
+/// (and a dropped [`run`] future mid-wait) SIGKILLs the whole group — `sh`
+/// plus every grandchild — via the [`ProcessGroupGuard`]; on normal
+/// completion nothing is signalled.
 pub async fn run(spec: &ExecSpec) -> ExecOutcome {
     let start = Instant::now();
 
@@ -136,6 +140,11 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // New process group: the child leads its own group (pgid == its pid), so a
+    // timeout or an abandoned wait can SIGKILL the whole tree — `sh` plus every
+    // grandchild (cargo, grep, a hung test binary) — instead of orphaning them.
+    #[cfg(unix)]
+    command.process_group(0);
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
@@ -158,6 +167,14 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
             };
         }
     };
+    // The child is now the leader of its own process group whose pgid is its
+    // pid, so the guard's pgid is exactly that id. Declared AFTER `child` so
+    // local-variable reverse drop order fires the group kill BEFORE the
+    // `Child`'s own `kill_on_drop`.
+    let mut guard = ProcessGroupGuard {
+        pgid: child.id(),
+        program: spec.program.clone(),
+    };
 
     // Take the pipe handles so we can drain them concurrently with the wait —
     // draining after the wait risks deadlock when the child fills a pipe buffer
@@ -172,6 +189,7 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
 
     match collected {
         Ok((status, stdout, stderr)) => {
+            guard.disarm();
             let exit_code = status.ok().and_then(|status| status.code());
             ExecOutcome {
                 exit_code,
@@ -182,6 +200,16 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
             }
         }
         Err(_elapsed) => {
+            let pid = child.id();
+            // Kill the whole group BEFORE reaping sh: while sh is unreaped its
+            // pid cannot be reused, so the group id cannot name an unrelated
+            // group. Disarm immediately after so a drop of this future during
+            // the await below cannot signal the group a second time.
+            #[cfg(unix)]
+            terminate_group(pid, &spec.program);
+            #[cfg(not(unix))]
+            drop((pid, &spec.program));
+            guard.disarm();
             // Timed out: kill the child and reap it so we leave no zombie.
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -194,6 +222,99 @@ pub async fn run(spec: &ExecSpec) -> ExecOutcome {
             }
         }
     }
+}
+
+/// Guard that SIGKILLs the child's process group if it is dropped while the
+/// child is still unreaped — i.e. when the [`run`] future is dropped mid-wait
+/// by outer cancellation or a wall-clock timeout, before either match arm in
+/// [`run`] can run.
+///
+/// **Guarantee boundary.** This kills the group `sh` leads. A command's
+/// children that call `setsid`/`setpgid` join their OWN group and escape the
+/// group kill — for those, host-account confinement (the `env_clear` +
+/// unprivileged-host posture documented at
+/// `crates/harness/src/tools/bash.rs`) is the boundary, not this guard. On the
+/// normal-completion path nothing is signalled: a grandchild the command
+/// deliberately detached (`cmd &`) keeps running exactly as before.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct ProcessGroupGuard {
+    /// The child's pid, which is the pgid of the group it leads; `None` once
+    /// disarmed (normal completion, or the timeout arm already killed the
+    /// group).
+    pgid: Option<u32>,
+    /// The child's program, named in the drop-guard log line.
+    program: String,
+}
+
+impl ProcessGroupGuard {
+    /// Neutralize the guard: a later drop signals nothing. Called on the
+    /// normal-completion path and right after the timeout arm's own
+    /// group kill, preventing a double kill.
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            kill_group_logged(pgid, &self.program, "drop-guard");
+        }
+    }
+}
+
+/// Kill the child's process group on the timeout path, or emit a skip notice
+/// when the child had no pid (the caller still falls back to the child-only
+/// `start_kill`).
+#[cfg(unix)]
+fn terminate_group(child_pid: Option<u32>, program: &str) {
+    let Some(pid) = child_pid else {
+        eprintln!("{}", group_kill_skipped_notice(program));
+        return;
+    };
+    kill_group_logged(pid, program, "timeout");
+}
+
+/// SIGKILL the process group `pgid`, logging exactly one stderr line either
+/// way so a surviving grandchild (EPERM/ESRCH...) is observable in the logs.
+/// The `rustix::process` surface is a safe facade — no `libc`, no `unsafe`.
+#[cfg(unix)]
+fn kill_group_logged(pgid: u32, program: &str, tag: &str) {
+    if let Some(pid) = i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+            Ok(()) => eprintln!("{}", group_killed_notice(pgid, tag)),
+            Err(err) => eprintln!(
+                "{}",
+                group_kill_failed_warning(program, pgid, &std::io::Error::from(err))
+            ),
+        }
+    }
+}
+
+/// The one-line notice that a process group was killed with SIGKILL, tagged by which
+/// kill path fired (`timeout` or `drop-guard`).
+fn group_killed_notice(pgid: u32, tag: &str) -> String {
+    format!("exec: killed process group pgid {pgid} ({tag})")
+}
+
+/// The one-line warning that a process-group kill FAILED — the exact leak
+/// class the group kill exists to prevent, kept observable.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn group_kill_failed_warning(program: &str, pgid: u32, err: &std::io::Error) -> String {
+    format!("exec: process-group kill of pgid {pgid} (`{program}`) failed: {err}")
+}
+
+/// The one-line notice that the group kill was SKIPPED because the child had
+/// no pid; the fallback to a child-only kill still runs.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn group_kill_skipped_notice(program: &str) -> String {
+    format!(
+        "exec: timeout kill of group skipped: `{program}` child had no pid; fell back to child-only kill"
+    )
 }
 
 /// The last `cap` characters of `text` (the whole thing if it is shorter),
@@ -800,8 +921,11 @@ mod tests {
     use super::{
         ChangeEvidence, ChangeObserver, CheckCommand, CheckReport, ChecksRunner, ExecOutcome,
         ExecSpec, GitTreeObserver, TREE_OBSERVE_TIMEOUT, TreeObservation, classify_change,
-        format_duration, observe_tree, run, shell_checks_runner, tail,
+        format_duration, group_kill_failed_warning, group_kill_skipped_notice, group_killed_notice,
+        observe_tree, run, shell_checks_runner, tail,
     };
+    #[cfg(unix)]
+    use super::{kill_group_logged, terminate_group};
     use crate::tool::ToolCtx;
     use crate::workspace::{DiskOffloadSink, Workspace};
     use std::path::{Path, PathBuf};
@@ -1892,5 +2016,253 @@ mod tests {
             "warning: root git status failed (git status --porcelain exited Some(128): \
              fatal: not a git repository); observing 2 child repos: a, b"
         );
+    }
+
+    // ---- process-group kill on timeout / abandoned wait --------------------
+
+    /// Reads `bg.pid` once — the pid of the background `sleep` a test script
+    /// detached — for the process-group tests below.
+    #[cfg(target_os = "linux")]
+    fn poll_bg_pid(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// True iff `pid` is gone or a zombie: reads `/proc/<pid>/stat` and
+    /// checks the state field — the whitespace-delimited token immediately
+    /// after the closing paren of `comm` (which itself may contain spaces).
+    #[cfg(target_os = "linux")]
+    fn poll_pid_dead(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            return true;
+        };
+        after_comm.split_whitespace().next() == Some("Z")
+    }
+
+    /// Cleans up a leaked background process so a RED test leaves nothing
+    /// behind — group kill first (post-fix, `sh` is its own group leader),
+    /// then a direct kill that also cleans the process if the group kill
+    /// returned ESRCH (pre-fix, the process shares the test runner's group).
+    #[cfg(target_os = "linux")]
+    fn best_effort_kill(pid: u32) {
+        if let Some(pid) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_kills_process_group_grandchildren() {
+        let tempdir = tempdir().expect("tempdir");
+        let bg = tempdir.path().join("bg.pid");
+        let script = format!(
+            "sleep 300 >/dev/null 2>&1 & echo $! > {}; wait",
+            bg.display()
+        );
+        let spec = ExecSpec::new(
+            "/bin/sh",
+            vec!["-c".to_string(), script],
+            tempdir.path().to_path_buf(),
+            Duration::from_secs(1),
+        );
+        let outcome = run(&spec).await;
+        assert!(outcome.timed_out, "should have timed out");
+        assert_eq!(outcome.exit_code, None);
+
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Some(found) = poll_bg_pid(&bg) {
+                pid = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("bg.pid to appear within 5 s");
+        for _ in 0..100 {
+            if poll_pid_dead(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        best_effort_kill(pid);
+        panic!("grandchild {pid} survived the timeout process-group kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_run_kills_process_group_grandchildren() {
+        let tempdir = tempdir().expect("tempdir");
+        let bg = tempdir.path().join("bg.pid");
+        let script = format!(
+            "sleep 300 >/dev/null 2>&1 & echo $! > {}; wait",
+            bg.display()
+        );
+        let spec = ExecSpec::new(
+            "/bin/sh",
+            vec!["-c".to_string(), script],
+            tempdir.path().to_path_buf(),
+            Duration::from_mins(1),
+        );
+        let dropped = tokio::time::timeout(Duration::from_secs(1), run(&spec)).await;
+        assert!(dropped.is_err(), "outer timeout should drop the run future");
+
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Some(found) = poll_bg_pid(&bg) {
+                pid = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("bg.pid to appear within 5 s");
+        for _ in 0..100 {
+            if poll_pid_dead(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        best_effort_kill(pid);
+        panic!("grandchild {pid} survived the dropped-run process-group kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn normal_completion_leaves_background_job_running() {
+        let tempdir = tempdir().expect("tempdir");
+        let bg = tempdir.path().join("bg.pid");
+        // Redirect the detached sleep's stdout AND stderr to /dev/null: `run`
+        // returns only once all pipe write-ends are closed, so an unredirected
+        // background job would hold the pipes open until the sleep exits.
+        let script = format!(
+            "sleep 2 >/dev/null 2>&1 & echo $! > {}; exit 0",
+            bg.display()
+        );
+        let spec = ExecSpec::new(
+            "/bin/sh",
+            vec!["-c".to_string(), script],
+            tempdir.path().to_path_buf(),
+            Duration::from_secs(10),
+        );
+        let outcome = run(&spec).await;
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+
+        let mut pid = None;
+        for _ in 0..20 {
+            if let Some(found) = poll_bg_pid(&bg) {
+                pid = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("bg.pid to appear within 1 s");
+        // The detached sleep runs 2 s, so a 1 s alive-window tolerates CI
+        // load; the sleep self-exits, so cleanup is unnecessary.
+        for _ in 0..2 {
+            assert!(
+                !poll_pid_dead(pid),
+                "detached grandchild {pid} was killed on the normal-completion path"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn checks_runner_timeout_kills_process_group_grandchildren() {
+        let tempdir = tempdir().expect("tempdir");
+        let bg = tempdir.path().join("bg.pid");
+        let script = format!(
+            "sleep 300 >/dev/null 2>&1 & echo $! > {}; wait",
+            bg.display()
+        );
+        let runner = ChecksRunner::new(
+            CheckCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), script],
+            },
+            tempdir.path().to_path_buf(),
+            Duration::from_secs(1),
+        );
+        let report = runner.run(&checks_ctx()).await;
+        assert!(report.timed_out, "should have timed out");
+        assert_eq!(report.exit_code, None);
+
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Some(found) = poll_bg_pid(&bg) {
+                pid = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("bg.pid to appear within 5 s");
+        for _ in 0..100 {
+            if poll_pid_dead(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        best_effort_kill(pid);
+        panic!("grandchild {pid} survived the checks-timeout process-group kill");
+    }
+
+    #[test]
+    fn group_killed_notice_pins_wording() {
+        assert_eq!(
+            group_killed_notice(4242, "timeout"),
+            "exec: killed process group pgid 4242 (timeout)"
+        );
+        assert_eq!(
+            group_killed_notice(4242, "drop-guard"),
+            "exec: killed process group pgid 4242 (drop-guard)"
+        );
+    }
+
+    #[test]
+    fn group_kill_failed_warning_pins_wording() {
+        assert_eq!(
+            group_kill_failed_warning("sh", 4242, &std::io::Error::from_raw_os_error(13)),
+            "exec: process-group kill of pgid 4242 (`sh`) failed: Permission denied (os error 13)"
+        );
+    }
+
+    #[test]
+    fn group_kill_skipped_notice_pins_wording() {
+        assert_eq!(
+            group_kill_skipped_notice("sh"),
+            "exec: timeout kill of group skipped: `sh` child had no pid; fell back to \
+             child-only kill"
+        );
+    }
+
+    /// Executes the skip-notice branch of `terminate_group` (it only prints —
+    /// the caller's child-only fallback is unaffected), keeping the line
+    /// covered for the line-coverage gate.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_none_pid_emits_skipped_notice() {
+        terminate_group(None, "sh");
+    }
+
+    /// A pgid of 2,000,000,000 cannot exist (Linux `pid_max` caps far below it),
+    /// so `kill_process_group` deterministically returns ESRCH and the failure
+    /// branch's warning line executes — without touching any real process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_group_logged_esrch_emits_failure_warning() {
+        kill_group_logged(2_000_000_000, "sh", "timeout");
     }
 }
