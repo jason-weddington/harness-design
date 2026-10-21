@@ -2,6 +2,33 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.16.0 - 2026-10-21
+#### Features
+- (**07db96a9**) Anthropic backend sends cache diagnostics and records the cache-miss reason - (1c8d2bd) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**ed125de8**) Answer mode: read_file returns line-numbered output (build mode unchanged) - (cf64d65) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**memory**) talos --memory belief-check corrects a stated wrong belief before the turn's tool calls run (H-040) - (d5ac4f6) - Jason Weddington, *Claude Opus 5.5*
+#### Bug Fixes
+- (**01d5c7e5**) A turn that never returns is unbounded, and no budget can fire during it — two guards, one currently missing - (1ecab23) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**250c46b8**) Answer mode: a finish call with a missing or unknown disposition is told the build-mode dispositions, which steers the model away from `answer` - (62d6349) - claude-code-sonnet, *Claude Sonnet 5.5*
+- (**3538b633**) edit_file keeps the file's mode when it rewrites an existing file - (270c953) - Jason Weddington, *Claude Opus 5.5*
+- (**60221345**) a timed-out bash command or gate kills the whole process group, not just sh - (2e87d5a) - Jason Weddington, *Claude Opus 5.5*
+- (**e2a307d7**) somnus: rung-2 rejects `no_change` as an unknown tool — 69 of 263 clusters parse-failed in the 2026-10-07 catch-up - (cfe1739) - claude-code-sonnet, *Claude Sonnet 5.5*
+- bump rustls, rustls-webpki and webpki-roots past new RUSTSEC advisories - (a2566ac) - Jason Weddington, *Claude Opus 5.5*
+#### Documentation
+- the talos-flow groom sources the Ollama key from its env file - (070c89b) - Jason Weddington, *Claude Opus 5.5*
+- lab-specific steering moves to a gitignored CLAUDE.local.md - (240d07a) - Jason Weddington, *Claude Opus 5.5*
+- groom runs write a partial JSONL sidecar and reject placeholder specs - (52f5c2a) - Jason Weddington, *Claude Opus 5.5*
+- session 23 summary, roadmap notes the five unreleased items on the fleet - (0c738fb) - Jason Weddington, *Claude Opus 5.5*
+- tier-2 runbook thermal thresholds follow the 5090 fan retune - (62bd243) - Jason Weddington, *Claude Opus 5.5*
+- session 22 summary, roadmap at v0.15.0 with memory on the fleet - (dfc8814) - Jason Weddington, *Claude Opus 5.5*
+#### Tests
+- vendor personal_kb belief_check contract v1 (85ee47c) - (d215712) - Jason Weddington, *Claude Opus 5.5*
+#### Miscellaneous Chores
+- scrub lab host names from the public tree; publish host comes from env - (0ea12e2) - Jason Weddington, *Claude Opus 5.5*
+- release.sh runs the local leak guard before a GitHub release - (89ce193) - Jason Weddington, *Claude Opus 5.5*
+
+- - -
+
 ## 0.15.0 - 2026-10-11
 #### Features
 - (**0f6638bb**) harbor: talos_harbor.TalosAgent — a Harbor BaseInstalledAgent that runs talos in a trial container - (5a77cea) - claude-code-sonnet, *Claude Sonnet 5.5*
