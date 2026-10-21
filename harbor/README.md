@@ -29,7 +29,7 @@ uv run harbor run -p <task-or-dataset> --agent-import-path talos_harbor.agent:Ta
 | `max_iterations` | unset | Passed as `talos run --max-iterations`. |
 | `wall_clock_secs` | unset | Passed as `talos run --wall-clock-secs`. |
 | `gate_timeout_secs` | unset | Passed as `talos run --gate-timeout-secs`. |
-| `memory` | `"off"` | `off`, `annotate` or `deny-once`; anything else (another casing, `deny_once`, `null`, a bool or a number) raises `ValueError` when the agent is constructed, before any container exec. `off` passes no flag; `annotate` and `deny-once` pass `talos run --memory <mode>`. In a Harbor YAML job config the value must be quoted (`memory: "off"`), because YAML 1.1 reads a bare `off` as false, which is rejected. |
+| `memory` | `"off"` | `off`, `annotate`, `deny-once` or `belief-check`; anything else (another casing, `deny_once`, `null`, a bool or a number) raises `ValueError` when the agent is constructed, before any container exec. `off` passes no flag; `annotate`, `deny-once` and `belief-check` pass `talos run --memory <mode>`. In a Harbor YAML job config the value must be quoted (`memory: "off"`), because YAML 1.1 reads a bare `off` as false, which is rejected. |
 | `kb_project` | `None` | A KB project ref passed as `talos run --kb-project`, and only with memory on: with `memory=off` it raises `ValueError`. It must match `[A-Za-z0-9][A-Za-z0-9._-]*`. When it is unset, talos resolves the project by walking up from the workspace to `.kb_project`. |
 
 One of `talos_path` or `artifact_base`/`TALOS_ARTIFACT_BASE` is required; the constructor raises `ValueError` otherwise. The binary is downloaded on the host (consumer images often have neither curl nor wget), into a host temp dir rather than the logs dir, and then uploaded into the container. Unset `max_iterations`/`wall_clock_secs`/`gate_timeout_secs` emit no flag, so talos's own defaults apply.
@@ -60,7 +60,7 @@ A task with its own `docker-compose.yaml` does not get `[environment] env` on it
 
 Memory is off by default and `off` emits no flag, so any talos binary works and tier-2 runs are unchanged.
 
-`annotate` and `deny-once` need a talos binary whose `talos run` has `--memory`. An older binary exits with a CLI usage error, which raises `NonZeroAgentExitCodeError` (an Invalid trial).
+`annotate` and `deny-once` need a talos binary whose `talos run` has `--memory`; `belief-check` needs a talos binary whose `--memory` accepts `belief-check`. An older binary exits with a CLI usage error, which raises `NonZeroAgentExitCodeError` (an Invalid trial).
 
 TalosAgent never forwards `PERSONAL_KB_URL` or `PERSONAL_KB_API_KEY` from the host; set them with `--ae`. A trial image's own `ENV` also reaches talos, because the exec inherits it, and `metadata.talos.forwarded_env_keys` cannot show that.
 

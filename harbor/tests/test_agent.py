@@ -830,6 +830,7 @@ def test_memory_defaults_off(tmp_path: Path) -> None:
         ({"memory": "off"}, ""),
         ({"memory": "annotate"}, "--memory annotate"),
         ({"memory": "deny-once"}, "--memory deny-once"),
+        ({"memory": "belief-check"}, "--memory belief-check"),
         (
             {"memory": "annotate", "kb_project": "harness-design"},
             "--memory annotate --kb-project harness-design",
@@ -846,13 +847,27 @@ def test_memory_cli_flags(tmp_path: Path, kwargs: dict[str, Any], expected: str)
 
 @pytest.mark.parametrize(
     "value",
-    ["ON", "Annotate", "deny_once", "", " annotate", "annotate\n", "none", None, True, False, 1],
+    [
+        "ON",
+        "Annotate",
+        "deny_once",
+        "belief_check",
+        "",
+        " annotate",
+        "annotate\n",
+        "none",
+        None,
+        True,
+        False,
+        1,
+    ],
 )
 def test_memory_invalid_raises_at_construction(tmp_path: Path, value: Any) -> None:
     with pytest.raises(ValueError) as exc:
         make(tmp_path, memory=value)
     assert "invalid memory" in str(exc.value)
     assert "'deny-once'" in str(exc.value)
+    assert "'belief-check'" in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -869,6 +884,7 @@ def test_kb_project_without_memory_raises(tmp_path: Path) -> None:
         with pytest.raises(ValueError) as exc:
             make(tmp_path, kb_project="harness-design", **kwargs)
         assert "needs memory" in str(exc.value)
+        assert "'belief-check'" in str(exc.value)
 
 
 def test_memory_validation_precedes_binary_source_check(tmp_path: Path) -> None:
@@ -1135,6 +1151,11 @@ def test_populate_memory_off_activity(
             "annotate",
             {"memory_denies": 1},
             "memory invariant violated: memory_denies=1 under annotate",
+        ),
+        (
+            "belief-check",
+            {"memory_denies": 1},
+            "memory invariant violated: memory_denies=1 under belief-check",
         ),
         (
             "annotate",

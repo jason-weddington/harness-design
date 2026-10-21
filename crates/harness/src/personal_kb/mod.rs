@@ -6,7 +6,10 @@
 //! per run, before the run starts, and keeps the result: the KB's rendered
 //! session slice (`slice_text`) and its Bash cue index. Every [`Memory`]
 //! method then answers from that stored state — none does I/O, blocks or
-//! mutates. [`Memory::before_tool`] runs the hook's lexical matcher
+//! mutates, except [`Memory::belief_check`], which under `--memory
+//! belief-check` awaits one bounded `POST` ([`BELIEF_CHECK_PATH`]) per
+//! eligible turn in place (the seam's one documented exception).
+//! [`Memory::before_tool`] runs the hook's lexical matcher
 //! ([`cues`]) over talos `bash` commands and advises `DenyOnce` on a match;
 //! the engine owns the mode ceiling, the per-entry deny state and the deny
 //! cap ([`crate::memory::MAX_MEMORY_DENIES`]).
@@ -146,7 +149,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::mcp::{McpConnectReport, McpServerConfig};
-use crate::memory::{Advice, Memory, MemoryFlush, Observation, ToolCallView, ToolResultView};
+use crate::memory::{
+    self, Advice, BeliefCheckMatch, BeliefCheckOutcome, BeliefCheckRequest, BeliefCheckResponse,
+    Memory, MemoryFlush, Observation, ToolCallView, ToolResultView,
+};
 use crate::tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
 use cues::{IndexCue, find_match};
 use digest::{Closed, DigestBuffer, Envelope};
@@ -230,6 +236,24 @@ pub const MAX_TURN_PROMPT_CHARS: usize = 4000;
 
 /// The most ids one correction's `resolved_by` names (the last ones kept).
 pub const MAX_RESOLVED_BY: usize = 200;
+
+/// The KB's pre-dispatch belief-check route (`--memory belief-check`).
+pub const BELIEF_CHECK_PATH: &str = "/api/kb/belief-check";
+
+/// Every `reason` a belief-check response may carry; anything else makes
+/// the body malformed.
+const BELIEF_CHECK_REASONS: [&str; 10] = [
+    "checked",
+    "no-project",
+    "project-disabled",
+    "no-embedder",
+    "no-chunks",
+    "no-candidates",
+    "timeout",
+    "warming",
+    "embed-failed",
+    "error",
+];
 
 /// The header carrying the model id on every event and digest post.
 pub const KB_ENGINE_HEADER: &str = "X-KB-Engine";
@@ -444,6 +468,133 @@ pub(crate) fn parse_prevention(body: &[u8]) -> Result<Prevention, String> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
     })
+}
+
+/// `fact` trimmed and capped at [`MAX_FACT_CHARS`] chars, a cut fact ending
+/// in `…` (the cap rule [`cue_fact`] uses).
+fn cap_fact(fact: &str) -> String {
+    let fact = fact.trim();
+    if fact.chars().count() > MAX_FACT_CHARS {
+        let mut cut: String = fact.chars().take(MAX_FACT_CHARS - 1).collect();
+        cut.push('…');
+        return cut;
+    }
+    fact.to_string()
+}
+
+/// The last `max` chars of `s` (on a char boundary).
+fn tail_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    s.chars().skip(count - max).collect()
+}
+
+/// The `/api/kb/belief-check` body: exactly the contract's six request
+/// keys. `input_summary` is the call's native target only — never its
+/// arguments, so edit contents are never sent.
+fn belief_check_body(request: &BeliefCheckRequest, project: &str, session_id: &str) -> Value {
+    let reasoning = (!request.reasoning.trim().is_empty())
+        .then(|| tail_chars(&request.reasoning, memory::BELIEF_CHECK_TEXT_TAIL_CHARS));
+    let pending_calls: Vec<Value> = request
+        .pending_calls
+        .iter()
+        .map(|(name, args)| {
+            let summary = truncate_chars(
+                &native_target(&ToolCallView { name, args }),
+                memory::BELIEF_CHECK_INPUT_SUMMARY_CHARS,
+            );
+            serde_json::json!({ "tool": name, "input_summary": summary })
+        })
+        .collect();
+    serde_json::json!({
+        "text": tail_chars(&request.text, memory::BELIEF_CHECK_TEXT_TAIL_CHARS),
+        "reasoning": reasoning,
+        "project": project,
+        "pending_calls": pending_calls,
+        "session_id": session_id,
+        "turn_index": request.iteration,
+    })
+}
+
+/// Parse a belief-check response body; `None` when malformed (see the
+/// rules on [`Memory::belief_check`] for [`PersonalKbMemory`]).
+fn parse_belief_check(body: &[u8]) -> Option<BeliefCheckResponse> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let count = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let threshold = v.get("threshold")?.as_f64()?;
+    let matcher_version = v.get("matcher_version")?.as_i64()?.to_string();
+    let reason = v.get("reason")?.as_str()?;
+    if !BELIEF_CHECK_REASONS.contains(&reason) {
+        return None;
+    }
+    let candidates = count("candidates")?;
+    let scored = count("scored")?;
+    let mut matches = Vec::new();
+    for m in v.get("matches")?.as_array()? {
+        matches.push(BeliefCheckMatch {
+            entry_id: m.get("entry_id")?.as_str()?.to_string(),
+            score: m.get("score")?.as_f64()?,
+            corrected_fact: cap_fact(m.get("corrected_fact")?.as_str()?),
+        });
+    }
+    if let Some(top) = matches.first()
+        && (top.entry_id.trim().is_empty() || top.corrected_fact.is_empty())
+    {
+        return None;
+    }
+    Some(BeliefCheckResponse {
+        matches,
+        threshold,
+        matcher_version,
+        reason: reason.to_string(),
+        candidates,
+        scored,
+    })
+}
+
+/// A transport failure as a [`BeliefCheckOutcome`]: a timeout is
+/// [`BeliefCheckOutcome::Timeout`], anything else an error. Never carries
+/// the key (it travels in a header, never in the URL or a cause).
+fn belief_transport_outcome(err: &reqwest::Error) -> BeliefCheckOutcome {
+    if err.is_timeout() {
+        BeliefCheckOutcome::Timeout
+    } else {
+        BeliefCheckOutcome::Error(format!("transport: {}", transport_failure(err)))
+    }
+}
+
+/// POST one belief check and classify the answer.
+async fn post_belief_check(
+    url: String,
+    api_key: &str,
+    engine: Option<&str>,
+    body: Value,
+) -> BeliefCheckOutcome {
+    let request = kb_post(url, api_key, engine)
+        .timeout(memory::BELIEF_CHECK_TIMEOUT)
+        .json(&body);
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return belief_transport_outcome(&e),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return BeliefCheckOutcome::Error(format!("http {}", status.as_u16()));
+    }
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => return belief_transport_outcome(&e),
+    };
+    match parse_belief_check(&bytes) {
+        Some(r) => BeliefCheckOutcome::Response(r),
+        None => BeliefCheckOutcome::Error("malformed response".to_string()),
+    }
 }
 
 /// The fact shown for a matched cue: corrected fact, then the earlier wrong
@@ -1085,6 +1236,44 @@ impl Memory for PersonalKbMemory {
                 digests.0.pop();
             }
             flushed
+        })
+    }
+
+    /// POST the turn to [`BELIEF_CHECK_PATH`] and await the answer in place
+    /// — the seam's one documented exception to "no I/O in the loop",
+    /// bounded by [`memory::BELIEF_CHECK_TIMEOUT`]. Not spawned and not
+    /// counted against [`MAX_EVENTS_PER_RUN`]. Degraded, or with no
+    /// endpoint or project: `Error("memory degraded")` without I/O.
+    ///
+    /// A transport timeout is `Timeout`; another transport failure is
+    /// `Error("transport: …")`; a non-2xx is `Error("http <code>")`; a body
+    /// that fails parsing is `Error("malformed response")`. Parsing requires
+    /// `matches` (array of `{entry_id: string, score: number,
+    /// corrected_fact: string}`), a numeric `threshold`, an integer
+    /// `matcher_version`, a known `reason`, `u32` `candidates` and `scored`,
+    /// and a non-blank top `entry_id` and `corrected_fact`. Each
+    /// `corrected_fact` is trimmed and capped at [`MAX_FACT_CHARS`].
+    fn belief_check(
+        &self,
+        request: BeliefCheckRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<BeliefCheckOutcome>> + Send + '_>> {
+        let target = self
+            .endpoint
+            .as_ref()
+            .zip(self.project.as_deref())
+            .filter(|_| self.degraded.is_none());
+        let Some((endpoint, project)) = target else {
+            return Box::pin(std::future::ready(Some(BeliefCheckOutcome::Error(
+                "memory degraded".to_string(),
+            ))));
+        };
+        let url = format!("{}{BELIEF_CHECK_PATH}", endpoint.base_url);
+        let body = belief_check_body(&request, project, &self.session_id);
+        Box::pin(async move {
+            Some(
+                post_belief_check(url, &endpoint.api_key, self.events.engine.as_deref(), body)
+                    .await,
+            )
         })
     }
 }
@@ -3735,5 +3924,368 @@ mod tests {
         );
         assert_eq!(result.stats.memory_digests_sent, 0);
         assert_eq!(result.stats.memory_digests_failed, 0);
+    }
+}
+
+#[cfg(test)]
+mod belief_check_tests {
+    use super::{
+        BELIEF_CHECK_PATH, KbEndpoint, MAX_FACT_CHARS, PREVENTION_PATH, PREVENTION_TIMEOUT,
+        PersonalKbMemory, belief_check_body, parse_belief_check, tail_chars,
+    };
+    use crate::engine::belief_decision;
+    use crate::memory::{BeliefCheckOutcome, BeliefCheckRequest, Memory};
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CONTRACT: &str = include_str!("../../testdata/personal_kb_contracts/belief_check.json");
+    const PREVENTION: &str = include_str!("../../testdata/personal_kb/prevention_response.json");
+    const SECRET_KEY: &str = "sk-belief-check-secret-0123";
+
+    fn contract() -> Value {
+        serde_json::from_str(CONTRACT).expect("contract parses")
+    }
+
+    fn example(section: &str, name: &str) -> Value {
+        contract()[section]["examples"]
+            .as_array()
+            .expect("examples")
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("no {section} example {name}"))["body"]
+            .clone()
+    }
+
+    fn talos_turn_request() -> BeliefCheckRequest {
+        let body = example("request", "talos_turn");
+        BeliefCheckRequest {
+            iteration: 4,
+            text: body["text"].as_str().unwrap().to_string(),
+            reasoning: body["reasoning"].as_str().unwrap().to_string(),
+            pending_calls: vec![("bash".into(), json!({"command": "git push mirror feat/x"}))],
+        }
+    }
+
+    /// A memory connected to `server` (which must serve `/prevention`) with
+    /// a non-loopback-style explicit key.
+    async fn memory_on(server: &MockServer, session: &str) -> PersonalKbMemory {
+        Mock::given(method("GET"))
+            .and(path(PREVENTION_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(PREVENTION))
+            .mount(server)
+            .await;
+        let uri = server.uri();
+        let env = move |key: &str| match key {
+            "PERSONAL_KB_URL" => Some(uri.clone()),
+            "PERSONAL_KB_API_KEY" => Some(SECRET_KEY.to_string()),
+            _ => None,
+        };
+        let memory = PersonalKbMemory::connect(
+            KbEndpoint::from_env(&env),
+            Some("personal-kb".to_string()),
+            session,
+            PREVENTION_TIMEOUT,
+        )
+        .await;
+        assert_eq!(memory.degraded(), None);
+        memory
+    }
+
+    async fn serve_check(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path(BELIEF_CHECK_PATH))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    async fn check_with(response: ResponseTemplate) -> BeliefCheckOutcome {
+        let server = MockServer::start().await;
+        serve_check(&server, response).await;
+        let memory = memory_on(&server, "s-1").await;
+        memory
+            .belief_check(talos_turn_request())
+            .await
+            .expect("supported")
+    }
+
+    #[test]
+    fn contract_header_matches() {
+        let c = contract();
+        assert_eq!(c["contract_version"], 1);
+        assert_eq!(c["method"], "POST");
+        assert_eq!(c["path"], BELIEF_CHECK_PATH);
+        assert_eq!(BELIEF_CHECK_PATH, "/api/kb/belief-check");
+    }
+
+    #[tokio::test]
+    async fn captured_body_matches_the_contract_example() {
+        let server = MockServer::start().await;
+        serve_check(
+            &server,
+            ResponseTemplate::new(200).set_body_json(example("response", "match")),
+        )
+        .await;
+        let memory = memory_on(&server, "contract-session-2").await;
+        let outcome = memory.belief_check(talos_turn_request()).await;
+        assert!(matches!(outcome, Some(BeliefCheckOutcome::Response(_))));
+        let requests = server.received_requests().await.unwrap();
+        let posted: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == BELIEF_CHECK_PATH)
+            .collect();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(
+            posted[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {SECRET_KEY}").as_str())
+        );
+        let body: Value = serde_json::from_slice(&posted[0].body).unwrap();
+        let keys: BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let schema_keys: BTreeSet<String> = contract()["request"]["schema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            schema_keys
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        );
+        let expected = example("request", "talos_turn");
+        for key in ["text", "reasoning", "project", "session_id", "turn_index"] {
+            assert_eq!(body[key], expected[key], "{key}");
+        }
+        assert_eq!(
+            body["pending_calls"],
+            json!([{"tool": "bash", "input_summary": "git push mirror feat/x"}])
+        );
+        assert_eq!(body["pending_calls"], expected["pending_calls"]);
+    }
+
+    #[test]
+    fn body_never_carries_edit_contents_and_tails_text() {
+        let request = BeliefCheckRequest {
+            iteration: 2,
+            text: format!("{}é", "a".repeat(5000)),
+            reasoning: "   \n".into(),
+            pending_calls: vec![
+                (
+                    "edit_file".into(),
+                    json!({"path": "src/lib.rs", "old_string": "x", "new_string": "SECRET-CONTENT"}),
+                ),
+                ("kb_search".into(), json!({"query": "q"})),
+                ("bash".into(), json!({"command": "y".repeat(500)})),
+            ],
+        };
+        let body = belief_check_body(&request, "p", "s");
+        assert!(!body.to_string().contains("SECRET-CONTENT"));
+        assert_eq!(body["pending_calls"][0]["input_summary"], "src/lib.rs");
+        assert_eq!(body["pending_calls"][1]["input_summary"], "");
+        assert_eq!(
+            body["pending_calls"][2]["input_summary"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            200
+        );
+        assert_eq!(body["reasoning"], Value::Null);
+        let text = body["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 4096);
+        assert!(text.ends_with('é'));
+        assert_eq!(tail_chars("", 4), "");
+        assert_eq!(tail_chars("abc", 4), "abc");
+        assert_eq!(tail_chars("abcdé", 2), "dé");
+    }
+
+    #[test]
+    fn every_response_example_parses_and_maps() {
+        let c = contract();
+        let examples = c["response"]["examples"].as_array().unwrap();
+        assert_eq!(examples.len(), 12);
+        for e in examples {
+            let name = e["name"].as_str().unwrap();
+            let parsed = parse_belief_check(e["body"].to_string().as_bytes())
+                .unwrap_or_else(|| panic!("{name} parses"));
+            let d = belief_decision(BeliefCheckOutcome::Response(parsed.clone()), |_| false);
+            let top = parsed.matches.first();
+            match name {
+                "match" => {
+                    assert!(d.injected);
+                    assert_eq!(d.suppressed_reason, None);
+                    assert_eq!(top.unwrap().entry_id, "kb-00101");
+                    assert!((top.unwrap().score - 0.9132).abs() < f64::EPSILON);
+                    assert_eq!(parsed.matcher_version, "1");
+                }
+                "near_miss" => {
+                    assert_eq!(d.suppressed_reason, Some("below_threshold"));
+                    assert_eq!(top.unwrap().entry_id, "kb-00101");
+                    assert!((top.unwrap().score - 0.8013).abs() < f64::EPSILON);
+                }
+                "partial" => {
+                    assert_eq!(d.suppressed_reason, Some("below_threshold"));
+                    assert_eq!(parsed.candidates, 3);
+                    assert_eq!(parsed.scored, 2);
+                    assert_eq!(top.unwrap().entry_id, "kb-00102");
+                }
+                reason => {
+                    assert!(!d.injected);
+                    assert_eq!(d.suppressed_reason, Some("kb_reason"), "{reason}");
+                    assert_eq!(d.kb_reason.as_deref(), Some(reason));
+                    assert!(top.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bodies_are_rejected() {
+        let good = example("response", "match");
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v = good.clone();
+            f(&mut v);
+            parse_belief_check(v.to_string().as_bytes())
+        };
+        assert!(with(&|_| {}).is_some());
+        assert!(parse_belief_check(b"not json").is_none());
+        assert!(with(&|v| v["matcher_version"] = json!(1.0)).is_none());
+        assert!(with(&|v| v["matcher_version"] = json!("1")).is_none());
+        assert!(with(&|v| v["reason"] = json!("bogus")).is_none());
+        assert!(with(&|v| v["matches"] = json!({})).is_none());
+        assert!(with(&|v| v["threshold"] = json!("0.85")).is_none());
+        assert!(with(&|v| v["candidates"] = json!(-1)).is_none());
+        assert!(with(&|v| v["scored"] = json!(5_000_000_000_u64)).is_none());
+        assert!(with(&|v| v["matches"][1]["score"] = json!("x")).is_none());
+        assert!(with(&|v| v["matches"][0]["entry_id"] = json!("  ")).is_none());
+        assert!(with(&|v| v["matches"][0]["corrected_fact"] = json!(" ")).is_none());
+        // Never-read fields do not matter.
+        let lenient = with(&|v| {
+            v["embed_model"] = json!(7);
+            v["matches"][0]["wrong_belief"] = json!(null);
+            v["matches"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("provenance_label");
+        });
+        assert!(lenient.is_some());
+        // A blank fact on a non-top match is kept (only the top is checked).
+        assert!(with(&|v| v["matches"][2]["corrected_fact"] = json!("")).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_404_is_an_error() {
+        assert_eq!(
+            check_with(ResponseTemplate::new(404)).await,
+            BeliefCheckOutcome::Error("http 404".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_200_is_an_error() {
+        assert_eq!(
+            check_with(ResponseTemplate::new(200).set_body_string("{}")).await,
+            BeliefCheckOutcome::Error("malformed response".into())
+        );
+        let mut float_version = example("response", "match");
+        float_version["matcher_version"] = json!(1.0);
+        assert_eq!(
+            check_with(ResponseTemplate::new(200).set_body_json(float_version)).await,
+            BeliefCheckOutcome::Error("malformed response".into())
+        );
+        let mut unknown = example("response", "match");
+        unknown["reason"] = json!("sleepy");
+        assert_eq!(
+            check_with(ResponseTemplate::new(200).set_body_json(unknown)).await,
+            BeliefCheckOutcome::Error("malformed response".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_fact_is_capped() {
+        let mut body = example("response", "match");
+        body["matches"][0]["corrected_fact"] = json!("x".repeat(1500));
+        let BeliefCheckOutcome::Response(r) =
+            check_with(ResponseTemplate::new(200).set_body_json(body)).await
+        else {
+            panic!("expected a response");
+        };
+        let fact = &r.matches[0].corrected_fact;
+        assert_eq!(fact.chars().count(), MAX_FACT_CHARS);
+        assert!(fact.ends_with('…'));
+        assert!(r.matches[1].corrected_fact.chars().count() < 200);
+    }
+
+    #[tokio::test]
+    async fn a_slow_server_times_out_inside_the_bound() {
+        let started = Instant::now();
+        let outcome = check_with(
+            ResponseTemplate::new(200)
+                .set_body_json(example("response", "match"))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .await;
+        assert_eq!(outcome, BeliefCheckOutcome::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_a_transport_error_without_the_key() {
+        let server = MockServer::start().await;
+        let mut memory = memory_on(&server, "s").await;
+        // A port nothing listens on (wiremock pools and reuses servers, so
+        // dropping one does not close it).
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        memory.endpoint = Some(KbEndpoint {
+            base_url: dead_url,
+            api_key: SECRET_KEY.into(),
+            label: "dead".into(),
+        });
+        let Some(BeliefCheckOutcome::Error(detail)) =
+            memory.belief_check(talos_turn_request()).await
+        else {
+            panic!("expected an error");
+        };
+        assert!(detail.starts_with("transport: "), "{detail}");
+        assert!(!detail.contains(SECRET_KEY));
+        for status in [401, 404, 500] {
+            let BeliefCheckOutcome::Error(detail) =
+                check_with(ResponseTemplate::new(status).set_body_string(SECRET_KEY)).await
+            else {
+                panic!("expected an error");
+            };
+            assert!(!detail.contains(SECRET_KEY));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_degraded_memory_does_no_io() {
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        let env = move |key: &str| (key == "PERSONAL_KB_URL").then(|| uri.clone());
+        let memory =
+            PersonalKbMemory::connect(KbEndpoint::from_env(&env), None, "s", PREVENTION_TIMEOUT)
+                .await;
+        assert!(memory.degraded().is_some());
+        assert_eq!(
+            memory.belief_check(talos_turn_request()).await,
+            Some(BeliefCheckOutcome::Error("memory degraded".into()))
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

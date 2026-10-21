@@ -51,13 +51,18 @@
 //!
 //! ## `talos run --memory`
 //!
-//! `--memory off|annotate|deny-once` (default `off`) wires the personal-kb
+//! `--memory off|annotate|deny-once|belief-check` (default `off`) wires the personal-kb
 //! memory adapter ([`harness::personal_kb`]) into the engine's memory seam
 //! ([`harness::memory`]): the KB's session slice is appended to the system
 //! prompt, the KB's MCP tools (`<PERSONAL_KB_URL>/mcp`) are registered, and
 //! `bash`, `edit_file` and `read_file` calls matching a KB lesson are
 //! annotated (`annotate`) or refused once per entry, at most 2 per run, with
-//! an unchanged retry allowed (`deny-once`). `--kb-project <name>` names the KB project; without it the
+//! an unchanged retry allowed (`deny-once`). `belief-check` is annotate plus
+//! a pre-dispatch KB belief check: after a turn with a non-finish call, the
+//! turn's text and reasoning are `POST`ed to `/api/kb/belief-check` (2s timeout,
+//! fail open); a match at or above the server threshold suppresses every
+//! call of the turn with a [KB belief-check] tool result.
+//! `--kb-project <name>` names the KB project; without it the
 //! project is the first non-comment line of the nearest `.kb_project` file
 //! at or above `--workspace`; with neither, memory is degraded.
 //!
@@ -684,13 +689,18 @@ struct RunArgs {
     /// enables the KB's session slice, the KB's MCP tools, and appends a KB
     /// fact to each matching `bash`, `edit_file` or `read_file` result;
     /// `deny-once` additionally refuses the first matching call per KB entry,
-    /// at most 2 per run, and an unchanged retry is allowed. The `PERSONAL_KB_*` env is read only
+    /// at most 2 per run, and an unchanged retry is allowed. `belief-check` is
+    /// annotate plus a pre-dispatch KB belief check: after a turn with a
+    /// non-finish call, the turn's text and reasoning are `POST`ed to
+    /// `/api/kb/belief-check` (2s timeout, fail open); a match at or above the
+    /// server threshold suppresses every call of the turn with a [KB
+    /// belief-check] tool result. The `PERSONAL_KB_*` env is read only
     /// when the mode is not `off`. Fail-open: an unreachable KB never fails
     /// the run.
     #[arg(
         long,
         default_value = "off",
-        value_parser = clap::builder::PossibleValuesParser::new(["off", "annotate", "deny-once"])
+        value_parser = clap::builder::PossibleValuesParser::new(["off", "annotate", "deny-once", "belief-check"])
             .try_map(|s| s.parse::<MemoryMode>())
     )]
     memory: MemoryMode,
@@ -3353,6 +3363,11 @@ mod tests {
             MemoryMode::DenyOnce
         );
         assert!(with(&["--memory", "deny_once"]).is_err());
+        assert_eq!(
+            with(&["--memory", "belief-check"]).expect("parses").memory,
+            MemoryMode::BeliefCheck
+        );
+        assert!(with(&["--memory", "belief_check"]).is_err());
         assert_eq!(
             with(&["--kb-project", "p"])
                 .expect("parses")

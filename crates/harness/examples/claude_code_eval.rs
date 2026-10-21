@@ -554,6 +554,14 @@ async fn main() {
                 cache_miss_messages_changed: 0,
                 cache_miss_other: 0,
                 cache_missed_input_tokens: 0,
+                memory_belief_eligible_turns: 0,
+                memory_belief_checks: 0,
+                memory_belief_injections: 0,
+                memory_belief_suppressed_calls: 0,
+                memory_belief_timeouts: 0,
+                memory_belief_errors: 0,
+                memory_belief_actions_changed: 0,
+                memory_belief_wait_ms: 0,
             };
 
             let trial = TrialResult {

@@ -63,7 +63,7 @@ The backend is chosen with talos's own precedence (non-empty ``TALOS_BEDROCK``, 
 credentials. The bedrock set also forwards every ``AWS_*`` key; every extra_env key is
 always forwarded unchanged."""
 
-MEMORY_MODES: tuple[str, ...] = ("off", "annotate", "deny-once")
+MEMORY_MODES: tuple[str, ...] = ("off", "annotate", "deny-once", "belief-check")
 """The ``talos run --memory`` values, spelled exactly like the harness ``MemoryMode::as_str``."""
 
 KB_PROJECT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -146,7 +146,8 @@ class TalosAgent(BaseInstalledAgent):
     ) -> None:
         if not (isinstance(memory, str) and memory in MEMORY_MODES):
             raise ValueError(
-                f"invalid memory {memory!r}: expected one of 'off', 'annotate', 'deny-once'"
+                f"invalid memory {memory!r}: expected one of "
+                "'off', 'annotate', 'deny-once', 'belief-check'"
             )
         if kb_project is not None and not (
             isinstance(kb_project, str) and KB_PROJECT_PATTERN.fullmatch(kb_project)
@@ -157,8 +158,8 @@ class TalosAgent(BaseInstalledAgent):
             )
         if kb_project is not None and memory == "off":
             raise ValueError(
-                f"kb_project {kb_project!r} needs memory 'annotate' or 'deny-once', "
-                "but memory is 'off'"
+                f"kb_project {kb_project!r} needs memory 'annotate', 'deny-once' or "
+                "'belief-check', but memory is 'off'"
             )
         super().__init__(logs_dir, *args, **kwargs)
         if artifact_base is None:
@@ -552,8 +553,8 @@ class TalosAgent(BaseInstalledAgent):
             violations: list[str] = []
             if denies > MAX_MEMORY_DENIES:
                 violations.append(f"memory_denies={denies} > {MAX_MEMORY_DENIES}")
-            if self.memory == "annotate" and denies > 0:
-                violations.append(f"memory_denies={denies} under annotate")
+            if self.memory in ("annotate", "belief-check") and denies > 0:
+                violations.append(f"memory_denies={denies} under {self.memory}")
             if overrides > annotations:
                 violations.append(
                     f"memory_deny_overrides={overrides} > memory_annotations={annotations}"

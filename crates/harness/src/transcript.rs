@@ -76,12 +76,12 @@
 //!   [`crate::engine::COMPACT_THRESHOLD_PCT`]. This is how an A/B experiment
 //!   proves its two arms really differ rather than assuming it),
 //!   `memory_mode` (the run's [`crate::memory::MemoryMode::as_str`]: `"off"`,
-//!   `"annotate"` or `"deny-once"`; always present, and `"off"` never calls
+//!   `"annotate"`, `"deny-once"` or `"belief-check"`; always present, and `"off"` never calls
 //!   the memory to produce it).
 //!
 //!   ```json
 //!   {"event":"run_start","ts":"2026-09-15T02:00:00Z","elapsed_ms":0,
-//!    "transcript_version":5,"harness_version":"0.10.0","label":"claude-sonnet-5",
+//!    "transcript_version":6,"harness_version":"0.10.0","label":"claude-sonnet-5",
 //!    "run_id":"task-42:1",
 //!    "backend_settings":{"kind":"Anthropic","model":"claude-sonnet-5","think":null,"num_ctx":null,"num_ctx_source":null,"max_tokens":128000,"max_tokens_source":"table"},
 //!    "resume":false,
@@ -132,6 +132,62 @@
 //!   {"event":"memory_advice","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
 //!    "iteration":1,"call_id":"c1","tool":"bash","entry_id":"kb-1",
 //!    "advised":"deny_once","mode_applied":"deny_once","reason":"as_advised"}
+//!   ```
+//!
+//! - **`belief_check`** — `memory_mode` `"belief-check"` only: emitted once
+//!   per checked model turn (a turn with at least one non-finish call, on an
+//!   active memory that supports the check), after that turn's
+//!   `model_response` (and `belief_check_outcome`, when one is due) and
+//!   BEFORE that turn's first `memory_advice` or `tool_result`. Fields:
+//!   exactly `iteration` (u32), `entry_id` (string or `null`: the top
+//!   match's entry; `null` when there is no response or no match), `score`
+//!   (f64 or `null`, same nullability as `entry_id`), `threshold` (f64 or
+//!   `null`: the server's threshold; `null` iff there is no response),
+//!   `matcher_version` (string or `null`: the server's integer as a decimal
+//!   string such as `"1"`; `null` iff there is no response), `injected`
+//!   (bool), `suppressed_reason` (`null` iff `injected`, else one of
+//!   `"below_threshold"`, `"window"`, `"timeout"`, `"error"` or
+//!   `"kb_reason"`), `kb_reason` (string or `null`: the server's reason iff
+//!   `suppressed_reason` is `"kb_reason"`), `suppressed_calls` (u32: calls
+//!   not executed; 0 unless injected), `suppressed_call_ids` (array of
+//!   string: their ids in turn order; `[]` unless injected), `candidates`
+//!   and `scored` (u32 or `null`: copied from the response; `null` iff there
+//!   is no response; `scored < candidates` is a partial check). On a
+//!   `timeout` or `error` every response-derived field is `null`. The KB's
+//!   own timeout appears as `suppressed_reason` `"kb_reason"` with
+//!   `kb_reason` `"timeout"`, while the client-side 2s bound appears as
+//!   `suppressed_reason` `"timeout"`. On an injected turn NONE of the turn's
+//!   calls runs (a `finish` in the batch included): each gets a normal
+//!   `tool_result` with `is_error: true`, `offload_path: null`,
+//!   `duration_ms: 0` and content starting with
+//!   `"[KB belief-check] This call was not executed. "`, then the corrected
+//!   fact and ` (kb: <entry_id>)`.
+//!
+//!   ```json
+//!   {"event":"belief_check","ts":"2026-09-15T02:00:02Z","elapsed_ms":2004,
+//!    "iteration":1,"entry_id":"kb-00101","score":0.9132,"threshold":0.85,
+//!    "matcher_version":"1","injected":true,"suppressed_reason":null,
+//!    "kb_reason":null,"suppressed_calls":1,"suppressed_call_ids":["c1"],
+//!    "candidates":3,"scored":3}
+//!   ```
+//!
+//! - **`belief_check_outcome`** — exactly one per injected `belief_check`.
+//!   Emitted right after the NEXT successful model turn's `model_response`
+//!   (before that turn's own `belief_check`, `memory_advice` and
+//!   `tool_result` events), or — when the loop invocation ends before
+//!   another turn — just before `run_end`. Fields: exactly `iteration` (u32:
+//!   the injection's iteration), `entry_id` (string: the injected entry) and
+//!   `next_action_changed` (bool or `null`): `true` iff the next turn's set
+//!   of non-finish calls (name plus canonical input hash, order- and
+//!   duplicate-insensitive) differs from the suppressed set; `null` when the
+//!   run ended before another turn. `next_action_changed` is true when the
+//!   next turn's non-finish calls differ, including when it has none; it
+//!   does not establish that the correction was right.
+//!
+//!   ```json
+//!   {"event":"belief_check_outcome","ts":"2026-09-15T02:00:04Z",
+//!    "elapsed_ms":4000,"iteration":1,"entry_id":"kb-00101",
+//!    "next_action_changed":true}
 //!   ```
 //!
 //! - **`mcp_connected`** — emitted once per connected MCP server (see
@@ -401,7 +457,13 @@
 //!   `cache_miss_system_changed`, `cache_miss_tools_changed`,
 //!   `cache_miss_messages_changed`, `cache_miss_other`,
 //!   `cache_missed_input_tokens` — matching
-//!   `render_run_end_stats` byte-for-byte in key set).
+//!   `render_run_end_stats` byte-for-byte in key set; then
+//!   `memory_belief_eligible_turns`, `memory_belief_checks`,
+//!   `memory_belief_injections`, `memory_belief_suppressed_calls`,
+//!   `memory_belief_timeouts`, `memory_belief_errors`,
+//!   `memory_belief_actions_changed` and `memory_belief_wait_ms`, present
+//!   ONLY when `run_start.config.memory_mode` is `"belief-check"`; absent, not
+//!   zero, in every other mode).
 //!   `wall_clock` is intentionally omitted — the
 //!   caller (`run`/`run_persisted`/`resume`) sets `stats.wall_clock` only
 //!   AFTER `run_loop_impl` (and therefore this event) returns.
@@ -521,7 +583,8 @@
 //! The full message history is reconstructible from one run block using only
 //! `run_start.messages` + `model_response` + `tool_result` +
 //! `harness_message` + `compaction` (a reader ignores `model_request`,
-//! `backend_error`, `iteration_end`, `memory_slice` and `memory_advice`):
+//! `backend_error`, `iteration_end`, `memory_slice`, `memory_advice`,
+//! `belief_check` and `belief_check_outcome`):
 //!
 //! 1. Start from `run_start.messages`.
 //! 2. On `model_response`, push `Message::Assistant { content }`.
@@ -609,8 +672,9 @@ use serde_json::{Map, Value};
 /// `cache_miss_other` / `cache_missed_input_tokens` counters on
 /// `run_end.stats`, and the `cache_miss_reason` / `cache_diagnostics` keys on
 /// `model_response`: new keys only, no existing key's shape changed, so the
-/// version stays 5.
-pub const TRANSCRIPT_VERSION: u32 = 5;
+/// version stays 5. 6 adds the `belief_check` / `belief_check_outcome` events
+/// and the `memory_belief_*` `run_end.stats` keys (belief-check mode only).
+pub const TRANSCRIPT_VERSION: u32 = 6;
 
 /// The complete, closed set of `"event"` tag values a transcript line can
 /// carry — see the module docs for each event's fields. `contract_violation`
@@ -619,8 +683,9 @@ pub const TRANSCRIPT_VERSION: u32 = 5;
 /// `budget_breach` joins at v3, documented with its emission (no
 /// previously-emitted hole this time — the event and its array entry land
 /// together). `memory_slice` and `memory_advice` join at v4.
-/// `mcp_connected` and `mcp_connect_failed` join at v5.
-pub const EVENT_KINDS: [&str; 15] = [
+/// `mcp_connected` and `mcp_connect_failed` join at v5. `belief_check` and
+/// `belief_check_outcome` join at v6.
+pub const EVENT_KINDS: [&str; 17] = [
     "run_start",
     "compaction",
     "model_request",
@@ -636,6 +701,8 @@ pub const EVENT_KINDS: [&str; 15] = [
     "memory_advice",
     "mcp_connected",
     "mcp_connect_failed",
+    "belief_check",
+    "belief_check_outcome",
 ];
 
 /// Opt-in configuration for a run's transcript sink.

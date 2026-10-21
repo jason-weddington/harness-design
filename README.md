@@ -99,7 +99,7 @@ The transcript's `run_start.messages[0]` first Text block equals `# Task` + blan
 PERSONAL_KB_URL=http://127.0.0.1:8765 talos run --workspace /app --memory deny-once --kb-project harness-design --transcript run.jsonl < task.json
 ```
 
-The three modes: `off` (the default; byte-identical to a talos without memory), `annotate` (slice, KB tools, and a KB fact appended to each matching `bash` result), and `deny-once` (as `annotate`, but the first matching `bash` call per KB entry is refused, at most 2 per run, and an unchanged retry is allowed).
+The four modes: `off` (the default; byte-identical to a talos without memory), `annotate` (slice, KB tools, and a KB fact appended to each matching `bash` result), `deny-once` (as `annotate`, but the first matching `bash` call per KB entry is refused, at most 2 per run, and an unchanged retry is allowed), and `belief-check` (as `annotate`, plus a pre-dispatch check: after each turn with a non-finish call, the turn's text and reasoning go to the KB's `/api/kb/belief-check` under a 2 s fail-open bound, and a match at or above the server's threshold suppresses every call of that turn with a `[KB belief-check]` tool result carrying the corrected fact).
 
 The KB project is `--kb-project` when given; otherwise the first non-comment line of the nearest `.kb_project` file at or above `--workspace`; with neither, memory is degraded to off.
 

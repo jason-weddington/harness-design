@@ -30,6 +30,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -49,25 +50,59 @@ pub const MEMORY_SLICE_HEADING: &str = "# Knowledge base memory";
 pub const MEMORY_DENY_RETRY_SUFFIX: &str =
     " If you still intend this exact call, retry it unchanged and it will be allowed.";
 
+/// The bound on one awaited [`Memory::belief_check`]: a check still pending
+/// at this bound is dropped and recorded as a timeout (fail open).
+pub const BELIEF_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many iterations an injected belief-check entry stays suppressed
+/// (`window`) before it may be injected again. Any compaction re-arms it.
+pub const BELIEF_CHECK_REINJECT_WINDOW: u32 = 10;
+
+/// The tail of the turn's text and reasoning sent to the belief check, in
+/// chars.
+pub const BELIEF_CHECK_TEXT_TAIL_CHARS: usize = 4096;
+
+/// The cap on each pending call's `input_summary`, in chars.
+pub const BELIEF_CHECK_INPUT_SUMMARY_CHARS: usize = 200;
+
+/// The marker every belief-check tool result starts with.
+pub const BELIEF_CHECK_MARKER: &str = "[KB belief-check] This call was not executed. ";
+
+/// The sentence that ends every belief-check tool result. Starts with a
+/// space.
+pub const BELIEF_CHECK_REPLAN_SUFFIX: &str =
+    " None of this turn's tool calls were executed. Re-plan your next step with this fact in mind.";
+
 /// A knowledge-base memory consulted by the engine loop.
 ///
 /// **Off by default.** [`crate::engine::RunConfig::new`] installs
 /// [`NoMemory`] with [`MemoryMode::Off`], and in Off mode the engine never
 /// calls ANY method of this trait — not even [`Memory::label`].
 ///
-/// **No blocking, no I/O.** Every method except [`Memory::flush`] is called
-/// synchronously on the async executor, inside the engine loop. An
-/// implementation MUST NOT block or perform I/O there — no network, no
-/// `block_on` (a nested `block_on` inside the loop panics). An adapter does
-/// every fetch before the run, typically in its own async constructor, and
-/// reports a failed fetch through [`Memory::degraded`]; a report it wants to
-/// send from [`Memory::after_tool`] is spawned, never awaited in place.
+/// **No blocking, no I/O.** Every method except [`Memory::flush`] and
+/// [`Memory::belief_check`] is called synchronously on the async executor,
+/// inside the engine loop. An implementation MUST NOT block or perform I/O
+/// there — no network, no `block_on` (a nested `block_on` inside the loop
+/// panics). An adapter does every fetch before the run, typically in its own
+/// async constructor, and reports a failed fetch through
+/// [`Memory::degraded`]; a report it wants to send from
+/// [`Memory::after_tool`] is spawned, never awaited in place.
+///
+/// **The one bounded exception.** [`Memory::belief_check`] is the ONE method
+/// the engine awaits inside the loop, and only when the mode is
+/// [`MemoryMode::BeliefCheck`], the memory is active (not degraded), at most
+/// once per model turn, after `observe(Turn)` and before any of that turn's
+/// calls is dispatched, bounded by [`BELIEF_CHECK_TIMEOUT`]. A call still
+/// pending at the bound is dropped and recorded as a timeout (fail open).
 ///
 /// **Call order.** When memory is on, the engine calls `degraded()` →
 /// `label()` → `tools()` → `session_slice()` → `observe(RunStart)`, each at
 /// most once per loop invocation and all before the first model request;
 /// then, per successful model turn, `observe(Turn)` before any of that
-/// turn's calls is dispatched; `before_tool()` once per dispatched
+/// turn's calls is dispatched; under [`MemoryMode::BeliefCheck`], at most
+/// one awaited `belief_check()` after `observe(Turn)` and before the first
+/// of that turn's calls is dispatched (a turn whose calls it suppresses
+/// then dispatches none of them); `before_tool()` once per dispatched
 /// non-finish tool call, and `after_tool()` once per such call that was
 /// invoked (not denied); `observe(Correction{GateRed})` right after the
 /// `after_tool()` of a red `run_checks`; `observe(Finish)` then (when
@@ -87,6 +122,9 @@ pub const MEMORY_DENY_RETRY_SUFFIX: &str =
 /// already denied once, or if [`MAX_MEMORY_DENIES`] is reached; otherwise
 /// deny.
 ///
+/// The ceiling applies when the mode is [`MemoryMode::Annotate`] or
+/// [`MemoryMode::BeliefCheck`]: neither ever denies.
+///
 /// **Compaction.** Only the session slice is compaction-protected (it lives
 /// in the system prompt). Annotations live in tool results and may be elided
 /// like any other tool output.
@@ -95,7 +133,7 @@ pub const MEMORY_DENY_RETRY_SUFFIX: &str =
 /// invocation, which equals per run for `talos run`.
 ///
 /// **Spelling.** [`MemoryMode::as_str`] and its [`FromStr`] impl share the
-/// CLI spelling: `off`, `annotate`, `deny-once`.
+/// CLI spelling: `off`, `annotate`, `deny-once`, `belief-check`.
 pub trait Memory: Send + Sync {
     /// The session slice to append to the system prompt, or `None` for none.
     /// A blank slice is treated as `None`.
@@ -152,6 +190,79 @@ pub trait Memory: Send + Sync {
     fn flush(&self) -> Pin<Box<dyn Future<Output = MemoryFlush> + Send + '_>> {
         Box::pin(std::future::ready(MemoryFlush::default()))
     }
+
+    /// Check one model turn against the store's recorded wrong beliefs
+    /// before its calls are dispatched. Awaited by the engine only under
+    /// [`MemoryMode::BeliefCheck`], bounded by [`BELIEF_CHECK_TIMEOUT`] (see
+    /// the trait doc). `None` means this memory does not support
+    /// belief-check, and the turn proceeds as under `Annotate`. Default:
+    /// `None`.
+    fn belief_check(
+        &self,
+        _request: BeliefCheckRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<BeliefCheckOutcome>> + Send + '_>> {
+        Box::pin(std::future::ready(None))
+    }
+}
+
+/// One model turn handed to [`Memory::belief_check`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeliefCheckRequest {
+    /// The engine iteration (sent as `turn_index`).
+    pub iteration: u32,
+    /// The turn's assistant text.
+    pub text: String,
+    /// Every reasoning block's text, joined with a blank line.
+    pub reasoning: String,
+    /// `(tool name, args)` of each of the turn's non-finish calls, in turn
+    /// order.
+    pub pending_calls: Vec<(String, Value)>,
+}
+
+/// One recorded wrong belief the store matched against a turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeliefCheckMatch {
+    /// The KB entry id.
+    pub entry_id: String,
+    /// The store's similarity score.
+    pub score: f64,
+    /// The corrected fact, already trimmed and capped by the adapter.
+    pub corrected_fact: String,
+}
+
+/// The store's answer to a belief check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeliefCheckResponse {
+    /// Top matches by score, including below-threshold ones.
+    pub matches: Vec<BeliefCheckMatch>,
+    /// The server's injection threshold.
+    pub threshold: f64,
+    /// The server's matcher version, as a decimal string.
+    pub matcher_version: String,
+    /// The server's reason (`checked` when it scored the turn).
+    pub reason: String,
+    /// Candidate entries the server considered.
+    pub candidates: u32,
+    /// Candidate entries the server actually scored.
+    pub scored: u32,
+}
+
+/// What one belief check produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BeliefCheckOutcome {
+    /// The store answered.
+    Response(BeliefCheckResponse),
+    /// The store did not answer in time.
+    Timeout,
+    /// The check failed; the detail never carries secrets.
+    Error(String),
+}
+
+/// The error content fed back for every call a belief check suppressed.
+/// Only formats: the adapter has already trimmed and capped `fact`.
+#[must_use]
+pub fn belief_check_content(fact: &str, entry_id: &str) -> String {
+    format!("{BELIEF_CHECK_MARKER}{fact} (kb: {entry_id}){BELIEF_CHECK_REPLAN_SUFFIX}")
 }
 
 /// A read-only view of an invoked tool call's result handed to
@@ -326,7 +437,7 @@ impl Memory for NoMemory {
 }
 
 /// How much of a [`Memory`]'s advice the engine may apply. The mode is a
-/// ceiling: `Annotate` never denies.
+/// ceiling: `Annotate` and `BeliefCheck` never deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryMode {
     /// Memory is never consulted.
@@ -336,16 +447,21 @@ pub enum MemoryMode {
     Annotate,
     /// Everything, including denying a call once.
     DenyOnce,
+    /// `Annotate` plus a pre-dispatch KB belief check per eligible turn
+    /// (see [`Memory::belief_check`]).
+    BeliefCheck,
 }
 
 impl MemoryMode {
-    /// The CLI spelling: `off`, `annotate` or `deny-once` (hyphenated).
+    /// The CLI spelling: `off`, `annotate`, `deny-once` or `belief-check`
+    /// (hyphenated).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Annotate => "annotate",
             Self::DenyOnce => "deny-once",
+            Self::BeliefCheck => "belief-check",
         }
     }
 }
@@ -358,8 +474,9 @@ impl FromStr for MemoryMode {
             "off" => Ok(Self::Off),
             "annotate" => Ok(Self::Annotate),
             "deny-once" => Ok(Self::DenyOnce),
+            "belief-check" => Ok(Self::BeliefCheck),
             _ => Err(format!(
-                "unknown memory mode '{s}' (expected off, annotate or deny-once)"
+                "unknown memory mode '{s}' (expected off, annotate, deny-once or belief-check)"
             )),
         }
     }
@@ -393,7 +510,8 @@ impl AppliedMode {
 pub enum DecisionReason {
     /// Applied exactly as advised.
     AsAdvised,
-    /// A deny was downgraded because the mode is `Annotate`.
+    /// A deny was downgraded because the mode is `Annotate` or
+    /// `BeliefCheck`.
     ModeCeiling,
     /// A deny was downgraded because its entry was already denied once.
     EntryAlreadyDenied,
@@ -501,7 +619,7 @@ pub(crate) fn decide(
     if !is_deny {
         return make(AppliedMode::Annotate, DecisionReason::AsAdvised);
     }
-    if mode == MemoryMode::Annotate {
+    if matches!(mode, MemoryMode::Annotate | MemoryMode::BeliefCheck) {
         make(AppliedMode::Annotate, DecisionReason::ModeCeiling)
     } else if state.denied_entry_ids.contains(entry_id) {
         make(AppliedMode::Annotate, DecisionReason::EntryAlreadyDenied)
@@ -562,15 +680,30 @@ mod tests {
 
     #[test]
     fn memory_mode_round_trips_and_rejects_unknown() {
-        for m in [MemoryMode::Off, MemoryMode::Annotate, MemoryMode::DenyOnce] {
+        for m in [
+            MemoryMode::Off,
+            MemoryMode::Annotate,
+            MemoryMode::DenyOnce,
+            MemoryMode::BeliefCheck,
+        ] {
             assert_eq!(m.as_str().parse::<MemoryMode>(), Ok(m));
         }
+        assert_eq!(MemoryMode::BeliefCheck.as_str(), "belief-check");
         assert_eq!(
             "deny_once".parse::<MemoryMode>(),
             Err(
-                "unknown memory mode 'deny_once' (expected off, annotate or deny-once)".to_string()
+                "unknown memory mode 'deny_once' (expected off, annotate, deny-once or belief-check)"
+                    .to_string()
             )
         );
+        for bad in ["belief_check", "Belief-Check"] {
+            assert_eq!(
+                bad.parse::<MemoryMode>(),
+                Err(format!(
+                    "unknown memory mode '{bad}' (expected off, annotate, deny-once or belief-check)"
+                ))
+            );
+        }
         assert!("".parse::<MemoryMode>().is_err());
         assert_eq!(MemoryMode::default(), MemoryMode::Off);
     }
@@ -684,6 +817,42 @@ mod tests {
     }
 
     #[test]
+    fn belief_check_constants_are_pinned() {
+        assert_eq!(BELIEF_CHECK_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(BELIEF_CHECK_REINJECT_WINDOW, 10);
+        assert_eq!(BELIEF_CHECK_TEXT_TAIL_CHARS, 4096);
+        assert_eq!(BELIEF_CHECK_INPUT_SUMMARY_CHARS, 200);
+        assert_eq!(
+            BELIEF_CHECK_MARKER,
+            "[KB belief-check] This call was not executed. "
+        );
+        assert_eq!(
+            BELIEF_CHECK_REPLAN_SUFFIX,
+            " None of this turn's tool calls were executed. Re-plan your next step with this fact in mind."
+        );
+    }
+
+    #[test]
+    fn belief_check_content_is_exact() {
+        assert_eq!(
+            belief_check_content("Push feature branches to origin.", "kb-00101"),
+            "[KB belief-check] This call was not executed. Push feature branches to origin. (kb: kb-00101) None of this turn's tool calls were executed. Re-plan your next step with this fact in mind."
+        );
+    }
+
+    #[tokio::test]
+    async fn default_belief_check_is_unsupported() {
+        let request = BeliefCheckRequest {
+            iteration: 1,
+            text: "t".into(),
+            reasoning: String::new(),
+            pending_calls: vec![("bash".into(), json!({"command": "ls"}))],
+        };
+        assert_eq!(NoMemory.belief_check(request.clone()).await, None);
+        assert_eq!(Bare.belief_check(request).await, None);
+    }
+
+    #[test]
     fn dyn_memory_debug() {
         assert_eq!(format!("{:?}", &NoMemory as &dyn Memory), "dyn Memory");
     }
@@ -756,6 +925,20 @@ mod tests {
             decide(M::Annotate, &deny("f", "kb-1"), &view, &fresh),
             Some(d(A::Annotate, R::ModeCeiling))
         );
+        // R5a (belief-check is a ceiling too)
+        assert_eq!(
+            decide(M::BeliefCheck, &deny("f", "kb-1"), &view, &fresh),
+            Some(d(A::Annotate, R::ModeCeiling))
+        );
+        assert_eq!(
+            decide(M::BeliefCheck, &annotate("f", "kb-1"), &view, &fresh),
+            Some(d(A::Annotate, R::AsAdvised))
+        );
+        assert_eq!(
+            decide(M::BeliefCheck, &deny("f", "kb-2"), &view, &retried),
+            Some(d(A::Annotate, R::RetryOfDenied))
+        );
+        assert_eq!(decide(M::BeliefCheck, &Advice::None, &view, &fresh), None);
         // R5b
         let denied_entry = MemoryRunState {
             denied_entry_ids: HashSet::from(["kb-1".to_string()]),

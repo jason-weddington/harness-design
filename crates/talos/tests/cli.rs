@@ -3283,6 +3283,30 @@ fn memory_annotate_unreachable_kb_degrades_and_run_proceeds() {
 }
 
 #[test]
+fn memory_belief_check_is_recorded_and_fails_open() {
+    let run = memory_run(
+        &["--memory", "belief-check", "--kb-project", "p"],
+        "http://127.0.0.1:1",
+        None,
+    );
+    assert_eq!(run.lines[0]["config"]["memory_mode"], "belief-check");
+    assert_eq!(run.lines[1]["event"], "memory_slice", "{}", run.lines[1]);
+    assert!(
+        run.stderr.contains("warning: memory degraded to off"),
+        "{}",
+        run.stderr
+    );
+    let run_end = run.lines.last().expect("run_end");
+    assert_eq!(run_end["event"], "run_end", "{run_end}");
+    assert_eq!(run_end["stats"]["memory_belief_checks"], 0, "{run_end}");
+    assert_eq!(
+        run_end["stats"]["memory_belief_eligible_turns"], 0,
+        "{run_end}"
+    );
+    assert!(!run.lines.iter().any(|l| l["event"] == "belief_check"));
+}
+
+#[test]
 fn memory_deny_once_fake_kb_appends_slice() {
     let (port, rx) = fake_kb(KB_FIXTURE);
     let run = memory_run(
@@ -3501,7 +3525,7 @@ fn run_help_lists_memory_flags() {
     for needle in [
         "--memory",
         "--kb-project",
-        "possible values: off, annotate, deny-once",
+        "possible values: off, annotate, deny-once, belief-check",
         "possible values: build, answer",
     ] {
         assert!(stdout.contains(needle), "{needle}: {stdout}");

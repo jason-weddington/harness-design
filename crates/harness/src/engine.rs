@@ -117,7 +117,7 @@
 //! [`ChecksRunner`]: crate::exec::ChecksRunner
 //! [`TurnRequest`]: crate::model::TurnRequest
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1271,6 +1271,23 @@ pub struct RunStats {
     /// Sum of `cache_missed_input_tokens` across the four token-carrying
     /// kinds — a magnitude estimate, NOT a billing number.
     pub cache_missed_input_tokens: u64,
+    /// Turns eligible for a belief check (mode `belief-check`, memory
+    /// active, at least one non-finish call). Zero in every other mode.
+    pub memory_belief_eligible_turns: u32,
+    /// `belief_check` transcript events emitted. Zero in every other mode.
+    pub memory_belief_checks: u32,
+    /// Belief checks that injected (suppressed the turn's calls).
+    pub memory_belief_injections: u32,
+    /// Calls not executed because a belief check injected.
+    pub memory_belief_suppressed_calls: u32,
+    /// Belief checks recorded with `suppressed_reason` `timeout`.
+    pub memory_belief_timeouts: u32,
+    /// Belief checks recorded with `suppressed_reason` `error`.
+    pub memory_belief_errors: u32,
+    /// `belief_check_outcome` events with `next_action_changed` true.
+    pub memory_belief_actions_changed: u32,
+    /// Summed wall time spent awaiting belief checks, in milliseconds.
+    pub memory_belief_wait_ms: u64,
 }
 
 /// The full result of one [`run`] call: the terminal [`LoopOutcome`] plus the
@@ -2538,6 +2555,14 @@ pub async fn run(
         cache_miss_messages_changed: 0,
         cache_miss_other: 0,
         cache_missed_input_tokens: 0,
+        memory_belief_eligible_turns: 0,
+        memory_belief_checks: 0,
+        memory_belief_injections: 0,
+        memory_belief_suppressed_calls: 0,
+        memory_belief_timeouts: 0,
+        memory_belief_errors: 0,
+        memory_belief_actions_changed: 0,
+        memory_belief_wait_ms: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2643,6 +2668,14 @@ pub async fn run_persisted(
         cache_miss_messages_changed: 0,
         cache_miss_other: 0,
         cache_missed_input_tokens: 0,
+        memory_belief_eligible_turns: 0,
+        memory_belief_checks: 0,
+        memory_belief_injections: 0,
+        memory_belief_suppressed_calls: 0,
+        memory_belief_timeouts: 0,
+        memory_belief_errors: 0,
+        memory_belief_actions_changed: 0,
+        memory_belief_wait_ms: 0,
     };
     let task_message = prompt::render_task_prompt(&config.task);
     let initial_messages = vec![Message::User {
@@ -2719,6 +2752,7 @@ async fn run_loop_impl(
         .as_ref()
         .map(|p| p.rid.clone())
         .or_else(|| persistence.map(|p| run_id(&p.task_id, p.attempt_n)));
+    let mut belief = BeliefCheckState::default();
     let result = run_loop_body(
         backend,
         tools,
@@ -2731,6 +2765,7 @@ async fn run_loop_impl(
         override_persist,
         baseline_override,
         &mut writer,
+        &mut belief,
     )
     .await;
     if config.memory_mode != MemoryMode::Off {
@@ -2745,12 +2780,25 @@ async fn run_loop_impl(
             stats.memory_digests_failed += flushed.digests_failed;
         }
     }
+    // An injection whose next model turn never arrived (any exit path of
+    // the body) still gets its one `belief_check_outcome`, as `null`.
+    if let Some(pending) = belief.pending_outcome.take() {
+        writer.emit(
+            "belief_check_outcome",
+            json!({
+                "iteration": pending.iteration,
+                "entry_id": pending.entry_id,
+                "next_action_changed": Value::Null,
+            }),
+        );
+    }
     emit_run_end(
         &mut writer,
         &result,
         stats,
         run_id_hint.as_deref(),
         config.answer_schema.as_ref(),
+        config.memory_mode,
     );
     result
 }
@@ -2765,6 +2813,7 @@ fn emit_run_end(
     stats: &RunStats,
     run_id: Option<&str>,
     answer_schema: Option<&AnswerSchema>,
+    memory_mode: MemoryMode,
 ) {
     // The cheap runtime audit of the leg-3 invariant. Unlike `Verification`,
     // `Disposition::Done` is a public struct variant with a public `change`
@@ -2858,7 +2907,7 @@ fn emit_run_end(
             "outcome": outcome_str,
             "disposition": disposition,
             "detail": detail,
-            "stats": render_run_end_stats(stats),
+            "stats": render_run_end_stats(stats, memory_mode),
         }),
     );
 }
@@ -2926,7 +2975,7 @@ fn emit_mcp_report(
     }
 }
 
-fn render_run_end_stats(stats: &RunStats) -> Value {
+fn render_run_end_stats(stats: &RunStats, memory_mode: MemoryMode) -> Value {
     let mut rendered = json!({
         "iterations": stats.iterations,
         "input_tokens": stats.input_tokens,
@@ -2981,6 +3030,18 @@ fn render_run_end_stats(stats: &RunStats) -> Value {
     rendered["cache_miss_messages_changed"] = json!(stats.cache_miss_messages_changed);
     rendered["cache_miss_other"] = json!(stats.cache_miss_other);
     rendered["cache_missed_input_tokens"] = json!(stats.cache_missed_input_tokens);
+    // The belief-check counters exist ONLY in belief-check mode, so every
+    // other mode's `run_end.stats` key set is unchanged.
+    if memory_mode == MemoryMode::BeliefCheck {
+        rendered["memory_belief_eligible_turns"] = json!(stats.memory_belief_eligible_turns);
+        rendered["memory_belief_checks"] = json!(stats.memory_belief_checks);
+        rendered["memory_belief_injections"] = json!(stats.memory_belief_injections);
+        rendered["memory_belief_suppressed_calls"] = json!(stats.memory_belief_suppressed_calls);
+        rendered["memory_belief_timeouts"] = json!(stats.memory_belief_timeouts);
+        rendered["memory_belief_errors"] = json!(stats.memory_belief_errors);
+        rendered["memory_belief_actions_changed"] = json!(stats.memory_belief_actions_changed);
+        rendered["memory_belief_wait_ms"] = json!(stats.memory_belief_wait_ms);
+    }
     rendered
 }
 
@@ -3892,6 +3953,221 @@ async fn write_budget_exhausted_terminal(
     Ok(LoopOutcome::BudgetExhausted { summary })
 }
 
+/// The repeated-work hash of one tool call: the [`DefaultHasher`] hash of
+/// `(name, input.to_string())`. Shared by the disorientation telemetry and
+/// the belief-check `next_action_changed` comparison.
+fn call_hash(name: &str, input: &Value) -> u64 {
+    let mut call_hasher = DefaultHasher::new();
+    (name, input.to_string()).hash(&mut call_hasher);
+    call_hasher.finish()
+}
+
+/// The set of [`call_hash`]es of a turn's non-finish calls — order- and
+/// duplicate-insensitive by construction.
+fn non_finish_call_set(calls: &[model::ToolCallRequest]) -> BTreeSet<u64> {
+    calls
+        .iter()
+        .filter(|c| c.name != FINISH_TOOL_NAME)
+        .map(|c| call_hash(&c.name, &c.input))
+        .collect()
+}
+
+/// An injected belief check still waiting for the next model turn, so its
+/// `belief_check_outcome` can be emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingBeliefOutcome {
+    /// The injection's iteration.
+    iteration: u32,
+    /// The injected entry.
+    entry_id: String,
+    /// The suppressed turn's non-finish call set.
+    suppressed: BTreeSet<u64>,
+}
+
+/// Per-loop-invocation belief-check state (`--memory belief-check`).
+/// Created in [`run_loop_impl`] so a pending outcome left by any exit path
+/// of [`run_loop_body`] is still emitted (as `null`) before `run_end`.
+#[derive(Debug, Default)]
+struct BeliefCheckState {
+    /// `entry_id -> (injected_iteration, compactions_at_injection)`.
+    windows: HashMap<String, (u32, u32)>,
+    /// The injection awaiting its outcome event.
+    pending_outcome: Option<PendingBeliefOutcome>,
+    /// The "does not support belief-check" warning was printed.
+    warned_unsupported: bool,
+    /// Error details already warned about.
+    warned_errors: HashSet<String>,
+}
+
+impl BeliefCheckState {
+    /// Whether `entry_id` is inside its re-injection window: injected less
+    /// than [`memory::BELIEF_CHECK_REINJECT_WINDOW`] iterations ago with no
+    /// compaction since.
+    fn in_window(&self, entry_id: &str, iteration: u32, compactions: u32) -> bool {
+        self.windows.get(entry_id).is_some_and(|&(at, comp)| {
+            iteration < at.saturating_add(memory::BELIEF_CHECK_REINJECT_WINDOW)
+                && compactions == comp
+        })
+    }
+}
+
+/// How one belief check resolved (the AC-8 mapping of H-040).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BeliefDecision {
+    /// The turn's calls are suppressed and the top match injected.
+    pub(crate) injected: bool,
+    /// `None` iff injected; otherwise `below_threshold`, `window`,
+    /// `timeout`, `error` or `kb_reason`.
+    pub(crate) suppressed_reason: Option<&'static str>,
+    /// The server reason, set iff `suppressed_reason == kb_reason`.
+    pub(crate) kb_reason: Option<String>,
+    /// The store's response, when there was one.
+    pub(crate) response: Option<memory::BeliefCheckResponse>,
+}
+
+/// Map one belief check's outcome to a [`BeliefDecision`]. Only
+/// `matches[0]` is ever considered; `in_window` answers whether that entry
+/// is inside its re-injection window.
+pub(crate) fn belief_decision(
+    outcome: memory::BeliefCheckOutcome,
+    in_window: impl Fn(&str) -> bool,
+) -> BeliefDecision {
+    let suppressed = |reason: &'static str| BeliefDecision {
+        injected: false,
+        suppressed_reason: Some(reason),
+        kb_reason: None,
+        response: None,
+    };
+    let response = match outcome {
+        memory::BeliefCheckOutcome::Timeout => return suppressed("timeout"),
+        memory::BeliefCheckOutcome::Error(_) => return suppressed("error"),
+        memory::BeliefCheckOutcome::Response(r) => r,
+    };
+    let injectable = response
+        .matches
+        .first()
+        .filter(|top| top.score >= response.threshold);
+    let (injected, suppressed_reason, kb_reason) = match injectable {
+        Some(top) if in_window(&top.entry_id) => (false, Some("window"), None),
+        Some(_) => (true, None, None),
+        None if response.reason == "checked" => (false, Some("below_threshold"), None),
+        None => (false, Some("kb_reason"), Some(response.reason.clone())),
+    };
+    BeliefDecision {
+        injected,
+        suppressed_reason,
+        kb_reason,
+        response: Some(response),
+    }
+}
+
+/// The `belief_check` transcript payload: exactly the schema-of-record keys
+/// (the writer adds `event`, `ts` and `elapsed_ms`).
+fn belief_check_event(
+    iteration: u32,
+    decision: &BeliefDecision,
+    suppressed_ids: &[String],
+) -> Value {
+    let response = decision.response.as_ref();
+    let top = response.and_then(|r| r.matches.first());
+    json!({
+        "iteration": iteration,
+        "entry_id": top.map(|m| m.entry_id.clone()),
+        "score": top.map(|m| m.score),
+        "threshold": response.map(|r| r.threshold),
+        "matcher_version": response.map(|r| r.matcher_version.clone()),
+        "injected": decision.injected,
+        "suppressed_reason": decision.suppressed_reason,
+        "kb_reason": decision.kb_reason,
+        "suppressed_calls": suppressed_ids.len(),
+        "suppressed_call_ids": suppressed_ids,
+        "candidates": response.map(|r| r.candidates),
+        "scored": response.map(|r| r.scored),
+    })
+}
+
+/// Run one eligible turn's belief check: await it under
+/// [`memory::BELIEF_CHECK_TIMEOUT`], count it, update the window state and
+/// emit the `belief_check` event. Returns `Some((fact, entry_id))` when the
+/// turn's calls must all be suppressed.
+async fn run_belief_check(
+    config: &RunConfig,
+    stats: &mut RunStats,
+    writer: &mut TranscriptWriter,
+    belief: &mut BeliefCheckState,
+    calls: &[model::ToolCallRequest],
+    turn_text: &str,
+    reasoning: &str,
+) -> Option<(String, String)> {
+    stats.memory_belief_eligible_turns += 1;
+    let request = memory::BeliefCheckRequest {
+        iteration: stats.iterations,
+        text: turn_text.to_string(),
+        reasoning: reasoning.to_string(),
+        pending_calls: calls
+            .iter()
+            .filter(|c| c.name != FINISH_TOOL_NAME)
+            .map(|c| (c.name.clone(), c.input.clone()))
+            .collect(),
+    };
+    let started = Instant::now();
+    let awaited = tokio::time::timeout(
+        memory::BELIEF_CHECK_TIMEOUT,
+        config.memory.belief_check(request),
+    )
+    .await;
+    stats.memory_belief_wait_ms += u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let outcome = match awaited {
+        Ok(Some(outcome)) => outcome,
+        Err(_elapsed) => memory::BeliefCheckOutcome::Timeout,
+        Ok(None) => {
+            if !belief.warned_unsupported {
+                belief.warned_unsupported = true;
+                eprintln!("warning: memory does not support belief-check; running as annotate");
+            }
+            return None;
+        }
+    };
+    if let memory::BeliefCheckOutcome::Error(detail) = &outcome
+        && belief.warned_errors.insert(detail.clone())
+    {
+        eprintln!("warning: belief-check error ({detail})");
+    }
+    let iteration = stats.iterations;
+    let compactions = stats.compactions;
+    let decision = belief_decision(outcome, |id| belief.in_window(id, iteration, compactions));
+    stats.memory_belief_checks += 1;
+    match decision.suppressed_reason {
+        Some("timeout") => stats.memory_belief_timeouts += 1,
+        Some("error") => stats.memory_belief_errors += 1,
+        _ => {}
+    }
+    let mut injection = None;
+    let mut suppressed_ids: Vec<String> = Vec::new();
+    if decision.injected
+        && let Some(top) = decision.response.as_ref().and_then(|r| r.matches.first())
+    {
+        suppressed_ids = calls.iter().map(|c| c.id.clone()).collect();
+        stats.memory_belief_injections += 1;
+        stats.memory_belief_suppressed_calls +=
+            u32::try_from(suppressed_ids.len()).unwrap_or(u32::MAX);
+        belief
+            .windows
+            .insert(top.entry_id.clone(), (iteration, compactions));
+        belief.pending_outcome = Some(PendingBeliefOutcome {
+            iteration,
+            entry_id: top.entry_id.clone(),
+            suppressed: non_finish_call_set(calls),
+        });
+        injection = Some((top.corrected_fact.trim().to_string(), top.entry_id.clone()));
+    }
+    writer.emit(
+        "belief_check",
+        belief_check_event(iteration, &decision, &suppressed_ids),
+    );
+    injection
+}
+
 /// What the memory run-start sequence produced for one loop invocation.
 /// Only built when `config.memory_mode != Off`.
 struct MemoryRun {
@@ -4003,6 +4279,7 @@ async fn run_loop_body(
     override_persist: Option<RunPersist>,
     baseline_override: Option<TreeObservation>,
     writer: &mut TranscriptWriter,
+    belief: &mut BeliefCheckState,
 ) -> Result<LoopOutcome, StoreError> {
     // Capture the loop-start instant ONCE via the injected clock. Used both
     // for the `wall_clock_start` string on the run record and for the
@@ -4708,16 +4985,22 @@ async fn run_loop_body(
         // for nudge-status telemetry if this turn follows a nudge without
         // producing an accepted finish(done).
         let turn_text = turn.text();
-        if memory_run.as_ref().is_some_and(|m| m.active) {
-            let reasoning = turn
-                .content
+        // Joined only when memory is active; shared by `observe(Turn)` and
+        // the belief-check request.
+        let memory_active = memory_run.as_ref().is_some_and(|m| m.active);
+        let reasoning: String = if memory_active {
+            turn.content
                 .iter()
                 .filter_map(|b| match b {
                     model::ContentBlock::Reasoning { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join("\n\n");
+                .join("\n\n")
+        } else {
+            String::new()
+        };
+        if memory_active {
             config.memory.observe(&memory::Observation::Turn {
                 iteration: stats.iterations,
                 reasoning: &reasoning,
@@ -4743,6 +5026,23 @@ async fn run_loop_body(
                     // object (e.g. {"MessagesChanged":{"cache_missed_input_tokens":1234}}).
                     "cache_miss_reason": serde_json::to_value(&turn.cache_miss_reason).unwrap_or(Value::Null),
                     "cache_diagnostics": serde_json::to_value(&turn.cache_diagnostics).unwrap_or(Value::Null),
+                }),
+            );
+        }
+        // ---- belief-check outcome: the turn after an injection ----
+        // Emitted right after this turn's `model_response`, before any of
+        // its own belief_check / memory_advice / tool_result events.
+        if let Some(pending) = belief.pending_outcome.take() {
+            let changed = non_finish_call_set(&calls) != pending.suppressed;
+            if changed {
+                stats.memory_belief_actions_changed += 1;
+            }
+            writer.emit(
+                "belief_check_outcome",
+                json!({
+                    "iteration": pending.iteration,
+                    "entry_id": pending.entry_id,
+                    "next_action_changed": changed,
                 }),
             );
         }
@@ -4999,6 +5299,24 @@ async fn run_loop_body(
         // CONTINUES with the remaining calls in the same batch. An
         // unrecognized or missing disposition is likewise fed back as an
         // `is_error=true` result and the batch continues.
+        // ---- belief check (`--memory belief-check`, H-040) ----
+        // The one awaited memory call inside the loop: at most once per
+        // model turn, after `observe(Turn)` and before any call is
+        // dispatched, bounded by BELIEF_CHECK_TIMEOUT and failing open.
+        // `Some((fact, entry_id))` means the whole batch is suppressed.
+        let belief_injection = if config.memory_mode == MemoryMode::BeliefCheck
+            && memory_active
+            && calls.iter().any(|c| c.name != FINISH_TOOL_NAME)
+        {
+            run_belief_check(
+                config, stats, writer, belief, &calls, &turn_text, &reasoning,
+            )
+            .await
+        } else {
+            None
+        };
+        let belief_injected = belief_injection.is_some();
+
         let mut results = Vec::with_capacity(calls.len());
         let mut finish: Option<Disposition> = None;
         // Per-iteration mutation flag — reset before the per-call loop. A
@@ -5006,6 +5324,61 @@ async fn run_loop_body(
         // tree-counter reset) AND clears `last_gate_green`.
         let mut mutated_this_iter: bool = false;
         for call in &calls {
+            // ---- belief-check injection: no call of the turn runs ----
+            // Before everything else on the call — no hashing, no finish
+            // handling, no advice, no before_tool/after_tool — so a
+            // suppressed call is never an observation. Pairing is kept: each
+            // call still gets exactly one tool result.
+            if let Some((fact, entry_id)) = &belief_injection {
+                let content = memory::belief_check_content(fact, entry_id);
+                let result = ToolResult::error(content.clone());
+                if let (Some(ctx), Some(p)) = (persist.as_ref(), persistence) {
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::ToolCallStarted {
+                                seq: 0,
+                                name: call.name.clone(),
+                                args: call.input.clone(),
+                                call_id: call.id.clone(),
+                            },
+                        )
+                        .await?;
+                    p.store
+                        .append_event(
+                            &ctx.rid,
+                            Event::ToolCallResult {
+                                seq: 0,
+                                name: call.name.clone(),
+                                is_error: true,
+                                summary: result.summary.clone(),
+                                offload_path: None,
+                            },
+                        )
+                        .await?;
+                }
+                if writer.is_enabled() {
+                    writer.emit(
+                        "tool_result",
+                        json!({
+                            "iteration": stats.iterations,
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "is_error": true,
+                            "content": content,
+                            "offload_path": Value::Null,
+                            "duration_ms": 0,
+                        }),
+                    );
+                }
+                results.push(UserBlock::ToolResult {
+                    call_id: call.id.clone(),
+                    content,
+                    is_error: true,
+                });
+                continue;
+            }
+
             // ---- disorientation telemetry (design 08), on the CALL ----
             // Repeated-work signal: hash EVERY dispatched call
             // (`(tool_name, input.to_string())`) into the live set, and —
@@ -5015,9 +5388,7 @@ async fn run_loop_body(
             // snapshot comparison is compaction-gated, so a duplicate of a
             // call first made AFTER the compaction is ordinary duplication
             // and deliberately does not count.
-            let mut call_hasher = DefaultHasher::new();
-            (call.name.as_str(), call.input.to_string()).hash(&mut call_hasher);
-            let call_hash = call_hasher.finish();
+            let call_hash = call_hash(&call.name, &call.input);
             if let Some(snapshot) = &compaction.pre_compaction_call_snapshot
                 && snapshot.contains(&call_hash)
             {
@@ -5485,12 +5856,15 @@ async fn run_loop_body(
 
         // End-of-iteration tree-counter update — reached only when `finish`
         // was None. Reset wins over increment when a mutation and the
-        // per-iteration tick collide.
-        if mutated_this_iter {
-            iters_since_tree_change = 0;
-            stats.mutating_iters += 1;
-        } else {
-            iters_since_tree_change += 1;
+        // per-iteration tick collide. A belief-check-injected turn ran no
+        // call, so it leaves the counter exactly as it was.
+        if !belief_injected {
+            if mutated_this_iter {
+                iters_since_tree_change = 0;
+                stats.mutating_iters += 1;
+            } else {
+                iters_since_tree_change += 1;
+            }
         }
         stats.iters_since_tree_change_at_exit = iters_since_tree_change;
         // Peak update BEFORE the trip check: the green-static trip resets the
@@ -5504,7 +5878,10 @@ async fn run_loop_body(
         // update, only when finish-recovery is enabled (`max_nudges > 0`).
         // A RED gate (`last_gate_green == false`) MUST NOT trip — that case
         // falls through unchanged to the existing MaxIterations cap.
+        // A belief-check-injected turn neither nudges nor trips the
+        // FinishDiscipline terminal: the model has a correction to act on.
         if config.max_nudges > 0
+            && !belief_injected
             && last_gate_green
             && iters_since_tree_change >= config.static_tree_k
         {
@@ -5969,6 +6346,14 @@ pub async fn resume(
         cache_miss_messages_changed: 0,
         cache_miss_other: 0,
         cache_missed_input_tokens: 0,
+        memory_belief_eligible_turns: 0,
+        memory_belief_checks: 0,
+        memory_belief_injections: 0,
+        memory_belief_suppressed_calls: 0,
+        memory_belief_timeouts: 0,
+        memory_belief_errors: 0,
+        memory_belief_actions_changed: 0,
+        memory_belief_wait_ms: 0,
     };
 
     // Load the checkpoint. Return UnknownRunId immediately — no backend call —
@@ -7719,6 +8104,14 @@ mod tests {
             cache_miss_messages_changed: 0,
             cache_miss_other: 0,
             cache_missed_input_tokens: 0,
+            memory_belief_eligible_turns: 0,
+            memory_belief_checks: 0,
+            memory_belief_injections: 0,
+            memory_belief_suppressed_calls: 0,
+            memory_belief_timeouts: 0,
+            memory_belief_errors: 0,
+            memory_belief_actions_changed: 0,
+            memory_belief_wait_ms: 0,
         };
         let printed = format!("{a:?}");
         assert!(printed.contains("RunStats"));
@@ -13964,8 +14357,13 @@ mod tests {
                         other => panic!("unknown harness_message placement {other}"),
                     }
                 }
-                "iteration_end" | "backend_error" | "run_end" | "memory_slice"
-                | "memory_advice" => {}
+                "iteration_end"
+                | "backend_error"
+                | "run_end"
+                | "memory_slice"
+                | "memory_advice"
+                | "belief_check"
+                | "belief_check_outcome" => {}
                 other => panic!("unexpected event kind in reconstruction: {other}"),
             }
         }
@@ -14977,6 +15375,14 @@ mod tests {
             cache_miss_messages_changed: 0,
             cache_miss_other: 0,
             cache_missed_input_tokens: 0,
+            memory_belief_eligible_turns: 0,
+            memory_belief_checks: 0,
+            memory_belief_injections: 0,
+            memory_belief_suppressed_calls: 0,
+            memory_belief_timeouts: 0,
+            memory_belief_errors: 0,
+            memory_belief_actions_changed: 0,
+            memory_belief_wait_ms: 0,
         }
     }
 
@@ -15652,7 +16058,14 @@ mod tests {
                 verification: Verification::NoChecksConfigured,
                 change: ChangeEvidence::TreeUnchanged,
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"), None);
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            Some("task:1"),
+            None,
+            crate::memory::MemoryMode::Off,
+        );
         drop(writer);
 
         let lines = read_transcript_lines(&path);
@@ -15679,7 +16092,14 @@ mod tests {
                 verification: Verification::NoChecksConfigured,
                 change: ChangeEvidence::TreeChanged,
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), None, None);
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            None,
+            None,
+            crate::memory::MemoryMode::Off,
+        );
         drop(writer);
 
         let lines = read_transcript_lines(&path);
@@ -15705,7 +16125,14 @@ mod tests {
                           output-token cap) before any tool call; raise --max-tokens"
                     .to_string(),
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), None, None);
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            None,
+            None,
+            crate::memory::MemoryMode::Off,
+        );
         drop(writer);
 
         let lines = read_transcript_lines(&path);
@@ -16894,7 +17321,14 @@ mod tests {
                 verification: Verification::NoChecksConfigured,
                 change: ChangeEvidence::TreeUnchanged,
             }));
-        emit_run_end(&mut writer, &result, &zero_stats(), Some("task:1"), None);
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            Some("task:1"),
+            None,
+            crate::memory::MemoryMode::Off,
+        );
         drop(writer);
 
         let violation = read_transcript_lines(&path)
@@ -16926,6 +17360,7 @@ mod tests {
             &zero_stats(),
             Some("task:1"),
             Some(&schema),
+            crate::memory::MemoryMode::Off,
         );
         drop(writer);
 
@@ -16957,7 +17392,14 @@ mod tests {
                 change: ChangeEvidence::TreeUnchanged,
             }));
         let schema = verdict_schema();
-        emit_run_end(&mut writer, &result, &zero_stats(), None, Some(&schema));
+        emit_run_end(
+            &mut writer,
+            &result,
+            &zero_stats(),
+            None,
+            Some(&schema),
+            crate::memory::MemoryMode::Off,
+        );
         drop(writer);
 
         let lines = read_transcript_lines(&path);
@@ -19903,6 +20345,7 @@ mod tests {
         };
         use crate::task_spec::{FileToModify, TaskSpec};
         use serde_json::{Value, json};
+        use std::collections::VecDeque;
         use std::future::Future;
         use std::pin::Pin;
         use std::sync::Mutex;
@@ -19980,6 +20423,15 @@ mod tests {
             log: Arc<Mutex<Vec<String>>>,
             /// What `flush` returns; `None` means it never resolves.
             flush_result: Option<MemoryFlush>,
+            /// What each `belief_check` returns, front first; an empty
+            /// queue returns `None` (the trait default).
+            belief_outcomes: Mutex<VecDeque<Option<crate::memory::BeliefCheckOutcome>>>,
+            /// `belief_check` calls.
+            belief_calls: AtomicU32,
+            /// Every `belief_check` request, in order.
+            belief_requests: Mutex<Vec<crate::memory::BeliefCheckRequest>>,
+            /// `belief_check` never resolves (exercises the engine bound).
+            belief_hang: bool,
         }
 
         impl FakeMemory {
@@ -19994,7 +20446,18 @@ mod tests {
                     observed: Arc::new(Mutex::new(Vec::new())),
                     log: Arc::new(Mutex::new(Vec::new())),
                     flush_result: Some(MemoryFlush::default()),
+                    belief_outcomes: Mutex::new(VecDeque::new()),
+                    belief_calls: AtomicU32::new(0),
+                    belief_requests: Mutex::new(Vec::new()),
+                    belief_hang: false,
                 }
+            }
+            fn beliefs(
+                self,
+                outcomes: impl IntoIterator<Item = Option<crate::memory::BeliefCheckOutcome>>,
+            ) -> Self {
+                self.belief_outcomes.lock().unwrap().extend(outcomes);
+                self
             }
             fn flush_result(mut self, r: Option<MemoryFlush>) -> Self {
                 self.flush_result = r;
@@ -20116,6 +20579,19 @@ mod tests {
                     None => Box::pin(std::future::pending()),
                 }
             }
+            fn belief_check(
+                &self,
+                request: crate::memory::BeliefCheckRequest,
+            ) -> Pin<Box<dyn Future<Output = Option<crate::memory::BeliefCheckOutcome>> + Send + '_>>
+            {
+                self.belief_calls.fetch_add(1, Ordering::SeqCst);
+                self.belief_requests.lock().unwrap().push(request);
+                if self.belief_hang {
+                    return Box::pin(std::future::pending());
+                }
+                let next = self.belief_outcomes.lock().unwrap().pop_front().flatten();
+                Box::pin(std::future::ready(next))
+            }
         }
 
         fn deny(fact: &str, entry_id: &str) -> Advice {
@@ -20229,6 +20705,777 @@ mod tests {
 
         fn run_end_stats(lines: &[Value]) -> &Value {
             &lines.last().expect("lines")["stats"]
+        }
+
+        /// `--memory belief-check` (H-040): the pre-dispatch KB check.
+        mod belief_check {
+            use super::*;
+            use crate::engine::{
+                BeliefCheckState, belief_decision, call_hash, render_run_end_stats,
+            };
+            use crate::memory::{
+                BELIEF_CHECK_MARKER, BeliefCheckMatch, BeliefCheckOutcome, BeliefCheckResponse,
+                belief_check_content,
+            };
+            use std::collections::BTreeSet;
+
+            const FACT: &str = "Push feature branches to origin.";
+
+            #[allow(clippy::unnecessary_wraps)]
+            fn response(matches: Vec<(&str, f64)>, reason: &str) -> Option<BeliefCheckOutcome> {
+                Some(BeliefCheckOutcome::Response(BeliefCheckResponse {
+                    matches: matches
+                        .into_iter()
+                        .map(|(entry_id, score)| BeliefCheckMatch {
+                            entry_id: entry_id.into(),
+                            score,
+                            corrected_fact: format!("  {FACT}  "),
+                        })
+                        .collect(),
+                    threshold: 0.85,
+                    matcher_version: "1".into(),
+                    reason: reason.into(),
+                    candidates: 3,
+                    scored: 3,
+                }))
+            }
+
+            fn hit(entry_id: &str) -> Option<BeliefCheckOutcome> {
+                response(vec![(entry_id, 0.95), ("kb-77", 0.99)], "checked")
+            }
+
+            fn below() -> Option<BeliefCheckOutcome> {
+                response(vec![("kb-9", 0.5)], "checked")
+            }
+
+            fn bash(id: &str, c: &str) -> ContentBlock {
+                tool_call(id, "bash", cmd(c))
+            }
+
+            fn turn(blocks: Vec<ContentBlock>) -> AssistantTurn {
+                turn_with(blocks, StopReason::ToolUse)
+            }
+
+            fn done(id: &str) -> ContentBlock {
+                tool_call(
+                    id,
+                    FINISH_TOOL_NAME,
+                    json!({"disposition": "done", "summary": "ok"}),
+                )
+            }
+
+            fn event_keys() -> BTreeSet<String> {
+                [
+                    "event",
+                    "ts",
+                    "elapsed_ms",
+                    "iteration",
+                    "entry_id",
+                    "score",
+                    "threshold",
+                    "matcher_version",
+                    "injected",
+                    "suppressed_reason",
+                    "kb_reason",
+                    "suppressed_calls",
+                    "suppressed_call_ids",
+                    "candidates",
+                    "scored",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            }
+
+            fn keys(v: &Value) -> BTreeSet<String> {
+                v.as_object().unwrap().keys().cloned().collect()
+            }
+
+            const BELIEF_STAT_KEYS: [&str; 8] = [
+                "memory_belief_eligible_turns",
+                "memory_belief_checks",
+                "memory_belief_injections",
+                "memory_belief_suppressed_calls",
+                "memory_belief_timeouts",
+                "memory_belief_errors",
+                "memory_belief_actions_changed",
+                "memory_belief_wait_ms",
+            ];
+
+            /// Run `script` under belief-check with `fake`, a bash tool and a
+            /// transcript.
+            async fn belief_run(
+                script: Vec<AssistantTurn>,
+                fake: &Arc<FakeMemory>,
+                max_iterations: u32,
+            ) -> (RunResult, MockBackend, Vec<Value>, Arc<AtomicU32>) {
+                let dir = TempDir::new().expect("tempdir");
+                let (tools, runs) = registry_with_bash();
+                let config = RunConfig::new("do the task", max_iterations)
+                    .with_memory(Arc::clone(fake) as Arc<dyn Memory>, MemoryMode::BeliefCheck)
+                    .with_transcript(dir.path().join("t.jsonl"), "t");
+                let (res, backend, lines) = go(script, &tools, &config).await;
+                (res, backend, lines, runs)
+            }
+
+            fn tool_results_for<'a>(lines: &'a [Value], call_id: &str) -> Vec<&'a Value> {
+                lines
+                    .iter()
+                    .filter(|l| l["event"] == "tool_result" && l["call_id"] == call_id)
+                    .collect()
+            }
+
+            fn outcome_changed(lines: &[Value]) -> Value {
+                let outcomes = events_named(lines, "belief_check_outcome");
+                assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+                assert_eq!(
+                    keys(outcomes[0]),
+                    [
+                        "event",
+                        "ts",
+                        "elapsed_ms",
+                        "iteration",
+                        "entry_id",
+                        "next_action_changed"
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+                );
+                outcomes[0]["next_action_changed"].clone()
+            }
+
+            #[test]
+            fn belief_decision_table() {
+                let decide = |o: Option<BeliefCheckOutcome>, window: bool| {
+                    belief_decision(o.unwrap(), |_| window)
+                };
+                let d = decide(Some(BeliefCheckOutcome::Timeout), false);
+                assert_eq!(
+                    (d.injected, d.suppressed_reason, d.kb_reason, d.response),
+                    (false, Some("timeout"), None, None)
+                );
+                let d = decide(Some(BeliefCheckOutcome::Error("x".into())), false);
+                assert_eq!((d.injected, d.suppressed_reason), (false, Some("error")));
+                assert!(d.response.is_none());
+                let d = decide(hit("kb-1"), false);
+                assert_eq!((d.injected, d.suppressed_reason), (true, None));
+                let d = decide(hit("kb-1"), true);
+                assert_eq!((d.injected, d.suppressed_reason), (false, Some("window")));
+                // At the threshold injects; any reason with an injectable top
+                // injects.
+                let d = decide(response(vec![("kb-1", 0.85)], "warming"), false);
+                assert_eq!((d.injected, d.suppressed_reason), (true, None));
+                let d = decide(below(), false);
+                assert_eq!(d.suppressed_reason, Some("below_threshold"));
+                let d = decide(response(vec![], "checked"), false);
+                assert_eq!(d.suppressed_reason, Some("below_threshold"));
+                // matches[1..] never inject.
+                let d = decide(
+                    response(vec![("kb-1", 0.1), ("kb-2", 0.99)], "checked"),
+                    false,
+                );
+                assert_eq!(d.suppressed_reason, Some("below_threshold"));
+                let d = decide(response(vec![], "no-embedder"), false);
+                assert_eq!(
+                    (d.suppressed_reason, d.kb_reason.as_deref()),
+                    (Some("kb_reason"), Some("no-embedder"))
+                );
+                let d = decide(response(vec![("kb-1", 0.2)], "timeout"), false);
+                assert_eq!(
+                    (d.suppressed_reason, d.kb_reason.as_deref()),
+                    (Some("kb_reason"), Some("timeout"))
+                );
+            }
+
+            #[test]
+            fn window_state_and_call_hash() {
+                let mut state = BeliefCheckState::default();
+                assert!(!state.in_window("kb-1", 2, 0));
+                state.windows.insert("kb-1".into(), (1, 0));
+                assert!(state.in_window("kb-1", 2, 0));
+                assert!(state.in_window("kb-1", 10, 0));
+                assert!(!state.in_window("kb-1", 11, 0));
+                assert!(!state.in_window("kb-1", 2, 1));
+                assert!(!state.in_window("kb-2", 2, 0));
+                assert_eq!(call_hash("bash", &cmd("a")), call_hash("bash", &cmd("a")));
+                assert_ne!(call_hash("bash", &cmd("a")), call_hash("bash", &cmd("b")));
+                assert_ne!(call_hash("bash", &cmd("a")), call_hash("echo", &cmd("a")));
+            }
+
+            #[test]
+            fn run_end_stats_carry_belief_keys_only_in_belief_check_mode() {
+                let base = render_run_end_stats(&zero_stats(), MemoryMode::Off);
+                for mode in [MemoryMode::Off, MemoryMode::Annotate, MemoryMode::DenyOnce] {
+                    assert_eq!(render_run_end_stats(&zero_stats(), mode), base);
+                }
+                let mut stats = zero_stats();
+                stats.memory_belief_wait_ms = 7;
+                stats.memory_belief_checks = 2;
+                let belief = render_run_end_stats(&stats, MemoryMode::BeliefCheck);
+                let added: Vec<String> = keys(&belief).difference(&keys(&base)).cloned().collect();
+                let mut expected: Vec<String> =
+                    BELIEF_STAT_KEYS.iter().map(|k| (*k).to_string()).collect();
+                expected.sort();
+                assert_eq!(added, expected);
+                assert_eq!(belief["memory_belief_wait_ms"], 7);
+                assert_eq!(belief["memory_belief_checks"], 2);
+                let ordered: Vec<&String> = belief.as_object().unwrap().keys().collect();
+                assert_eq!(ordered.len(), keys(&base).len() + 8);
+            }
+
+            // AC-7, AC-16: the other modes never call belief_check and stay
+            // byte-identical to a run whose queue would not inject.
+            #[tokio::test]
+            async fn other_modes_never_check_and_stay_identical() {
+                let script = || {
+                    vec![
+                        turn(vec![bash("c1", "git push mirror")]),
+                        finish_blocked("cf"),
+                    ]
+                };
+                for mode in [MemoryMode::Off, MemoryMode::Annotate, MemoryMode::DenyOnce] {
+                    let dir = TempDir::new().expect("tempdir");
+                    let (tools, _) = registry_with_bash();
+                    let armed = Arc::new(FakeMemory::new().beliefs([hit("kb-1"), hit("kb-1")]));
+                    let empty = Arc::new(FakeMemory::new());
+                    let run_with = |fake: &Arc<FakeMemory>, name: &str| {
+                        RunConfig::new("do the task", 5)
+                            .with_memory(Arc::clone(fake) as Arc<dyn Memory>, mode)
+                            .with_transcript(dir.path().join(name), "t")
+                    };
+                    let (_, a, lines) = go(script(), &tools, &run_with(&armed, "a.jsonl")).await;
+                    let (_, b, _) = go(script(), &tools, &run_with(&empty, "b.jsonl")).await;
+                    assert_eq!(armed.belief_calls.load(Ordering::SeqCst), 0, "{mode:?}");
+                    assert_eq!(a.systems_seen(), b.systems_seen());
+                    assert_eq!(a.messages_seen(), b.messages_seen());
+                    assert_eq!(a.tools_seen(), b.tools_seen());
+                    assert!(events_named(&lines, "belief_check").is_empty());
+                    assert!(events_named(&lines, "belief_check_outcome").is_empty());
+                    let end = run_end_stats(&lines);
+                    assert!(
+                        keys(end).iter().all(|k| !k.starts_with("memory_belief")),
+                        "{mode:?}"
+                    );
+                    assert_eq!(lines[0]["transcript_version"], 6);
+                }
+            }
+
+            // AC-7: a degraded memory is never checked.
+            #[tokio::test]
+            async fn degraded_memory_is_never_checked() {
+                let fake = Arc::new(FakeMemory::new().degraded("down").beliefs([hit("kb-1")]));
+                let script = vec![turn(vec![bash("c1", "ls")]), finish_blocked("cf")];
+                let (res, _, lines, runs) = belief_run(script, &fake, 5).await;
+                assert_eq!(fake.belief_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(runs.load(Ordering::SeqCst), 1);
+                assert!(events_named(&lines, "belief_check").is_empty());
+                assert_eq!(res.stats.memory_belief_eligible_turns, 0);
+                assert_eq!(run_end_stats(&lines)["memory_belief_checks"], 0);
+                assert_eq!(lines[0]["config"]["memory_mode"], "belief-check");
+            }
+
+            // AC-7: only-finish and no-call turns are never eligible; the
+            // request carries the turn's text, reasoning and non-finish calls.
+            #[tokio::test]
+            async fn eligibility_and_request_shape() {
+                let fake = Arc::new(FakeMemory::new().beliefs([below(), below()]));
+                let script = vec![
+                    turn(vec![
+                        ContentBlock::Reasoning {
+                            text: "first".into(),
+                            opaque: None,
+                        },
+                        ContentBlock::Reasoning {
+                            text: "second".into(),
+                            opaque: None,
+                        },
+                        ContentBlock::Text("Listing.".into()),
+                        bash("c1", "ls"),
+                        tool_call("c2", "echo", json!({"i": 1})),
+                    ]),
+                    turn(vec![tool_call(
+                        "cf0",
+                        FINISH_TOOL_NAME,
+                        json!({"disposition": "bogus"}),
+                    )]),
+                    finish_blocked("cf"),
+                ];
+                let (res, _, lines, runs) = belief_run(script, &fake, 5).await;
+                assert!(matches!(
+                    res.outcome,
+                    LoopOutcome::Finished(Disposition::Blocked { .. })
+                ));
+                assert_eq!(runs.load(Ordering::SeqCst), 1);
+                assert_eq!(fake.belief_calls.load(Ordering::SeqCst), 1);
+                let requests = fake.belief_requests.lock().unwrap().clone();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].iteration, 1);
+                assert_eq!(requests[0].text, "Listing.");
+                assert_eq!(requests[0].reasoning, "first\n\nsecond");
+                assert_eq!(
+                    requests[0].pending_calls,
+                    vec![
+                        ("bash".to_string(), cmd("ls")),
+                        ("echo".to_string(), json!({"i": 1}))
+                    ]
+                );
+                let checks = events_named(&lines, "belief_check");
+                assert_eq!(checks.len(), 1);
+                assert_eq!(keys(checks[0]), event_keys());
+                assert_eq!(checks[0]["suppressed_reason"], "below_threshold");
+                assert_eq!(checks[0]["entry_id"], "kb-9");
+                assert_eq!(checks[0]["score"], 0.5);
+                assert_eq!(checks[0]["suppressed_calls"], 0);
+                assert_eq!(checks[0]["suppressed_call_ids"], json!([]));
+                assert!(
+                    index_of(&lines, "tool_result", "c1")
+                        > lines
+                            .iter()
+                            .position(|l| l["event"] == "belief_check")
+                            .unwrap()
+                );
+                let s = &res.stats;
+                assert_eq!(s.memory_belief_eligible_turns, 1);
+                assert_eq!(s.memory_belief_checks, s.memory_belief_eligible_turns);
+                assert!(events_named(&lines, "belief_check_outcome").is_empty());
+            }
+
+            // AC-11, AC-9 (injected), AC-14 (true with no next calls), AC-15.
+            #[tokio::test]
+            #[allow(clippy::too_many_lines)]
+            async fn an_injection_suppresses_the_whole_batch_and_keeps_pairing() {
+                let fake = Arc::new(FakeMemory::new().beliefs([hit("kb-1")]));
+                let counters = Arc::clone(&fake.counters);
+                let log = Arc::clone(&fake.log);
+                let script = vec![
+                    turn(vec![
+                        ContentBlock::Text("Pushing now.".into()),
+                        bash("c1", "git push mirror feat/x"),
+                        done("cf1"),
+                    ]),
+                    turn(vec![done("cf2")]),
+                ];
+                let (res, backend, lines, runs) = belief_run(script, &fake, 5).await;
+                assert!(
+                    matches!(res.outcome, LoopOutcome::Finished(_)),
+                    "{:?}",
+                    res.outcome
+                );
+                assert_eq!(res.stats.iterations, 2);
+                assert_eq!(runs.load(Ordering::SeqCst), 0, "bash must not run");
+                assert_eq!(counters.before.load(Ordering::SeqCst), 0);
+                assert_eq!(counters.after.load(Ordering::SeqCst), 0);
+                assert!(
+                    !log.lock()
+                        .unwrap()
+                        .iter()
+                        .any(|l| l.starts_with("finish:cf1")),
+                    "a suppressed finish is never observed"
+                );
+                let expected = belief_check_content(FACT, "kb-1");
+                for id in ["c1", "cf1"] {
+                    let (content, is_error) = fed_back(&backend, id);
+                    assert!(content.starts_with(BELIEF_CHECK_MARKER));
+                    assert_eq!(content, expected);
+                    assert!(is_error);
+                }
+                let checks = events_named(&lines, "belief_check");
+                assert_eq!(checks.len(), 1);
+                let c = checks[0];
+                assert_eq!(keys(c), event_keys());
+                assert_eq!(c["iteration"], 1);
+                assert_eq!(c["entry_id"], "kb-1");
+                assert_eq!(c["score"], 0.95);
+                assert_eq!(c["threshold"], 0.85);
+                assert_eq!(c["matcher_version"], "1");
+                assert_eq!(c["injected"], true);
+                assert!(c["suppressed_reason"].is_null());
+                assert!(c["kb_reason"].is_null());
+                assert_eq!(c["suppressed_calls"], 2);
+                assert_eq!(c["suppressed_call_ids"], json!(["c1", "cf1"]));
+                assert_eq!(c["candidates"], 3);
+                assert_eq!(c["scored"], 3);
+                let check_at = lines
+                    .iter()
+                    .position(|l| l["event"] == "belief_check")
+                    .unwrap();
+                for id in c["suppressed_call_ids"].as_array().unwrap() {
+                    let id = id.as_str().unwrap();
+                    let results = tool_results_for(&lines, id);
+                    assert_eq!(results.len(), 1, "{id}");
+                    let r = results[0];
+                    let content = r["content"].as_str().unwrap();
+                    assert!(content.starts_with("[KB belief-check] This call was not executed. "));
+                    assert!(content.contains(" (kb: kb-1)"));
+                    assert_eq!(r["is_error"], true);
+                    assert!(r["offload_path"].is_null());
+                    assert_eq!(r["duration_ms"], 0);
+                    assert!(r.get("finish_accepted").is_none());
+                    assert!(index_of(&lines, "tool_result", id) > check_at);
+                }
+                // The outcome lands right after iteration 2's model_response.
+                assert_eq!(outcome_changed(&lines), json!(true));
+                let outcome_at = lines
+                    .iter()
+                    .position(|l| l["event"] == "belief_check_outcome")
+                    .unwrap();
+                assert_eq!(lines[outcome_at - 1]["event"], "model_response");
+                assert_eq!(lines[outcome_at - 1]["iteration"], 2);
+                assert_eq!(lines[outcome_at]["iteration"], 1);
+                assert_eq!(lines[outcome_at]["entry_id"], "kb-1");
+                assert!(index_of(&lines, "tool_result", "cf2") > outcome_at);
+                let s = &res.stats;
+                assert_eq!(
+                    (
+                        s.memory_belief_eligible_turns,
+                        s.memory_belief_checks,
+                        s.memory_belief_injections,
+                        s.memory_belief_suppressed_calls,
+                        s.memory_belief_timeouts,
+                        s.memory_belief_errors,
+                        s.memory_belief_actions_changed,
+                    ),
+                    (1, 1, 1, 2, 0, 0, 1)
+                );
+                assert_eq!(s.memory_kb_tool_calls, 0);
+                let end = run_end_stats(&lines);
+                for k in BELIEF_STAT_KEYS {
+                    assert!(end.get(k).is_some(), "{k}");
+                }
+                assert_eq!(end["memory_belief_injections"], 1);
+                assert_eq!(end["memory_belief_suppressed_calls"], 2);
+                assert_eq!(
+                    end["memory_belief_checks"],
+                    end["memory_belief_eligible_turns"]
+                );
+            }
+
+            // AC-9: the exact key set for each suppression reason.
+            #[tokio::test]
+            async fn every_reason_has_the_schema_of_record_keys() {
+                let fake = Arc::new(FakeMemory::new().beliefs([
+                    hit("kb-1"),
+                    hit("kb-1"),
+                    response(vec![("kb-2", 0.80)], "checked"),
+                    Some(BeliefCheckOutcome::Timeout),
+                    Some(BeliefCheckOutcome::Error("boom".into())),
+                    response(vec![], "warming"),
+                ]));
+                let script = (1..=6)
+                    .map(|i| turn(vec![bash(&format!("c{i}"), &format!("cmd {i}"))]))
+                    .chain([finish_blocked("cf")])
+                    .collect();
+                let (res, _, lines, runs) = belief_run(script, &fake, 10).await;
+                assert_eq!(runs.load(Ordering::SeqCst), 5);
+                let checks = events_named(&lines, "belief_check");
+                assert_eq!(checks.len(), 6);
+                for c in &checks {
+                    assert_eq!(keys(c), event_keys(), "{c}");
+                }
+                let reasons: Vec<Value> = checks
+                    .iter()
+                    .map(|c| c["suppressed_reason"].clone())
+                    .collect();
+                assert_eq!(
+                    reasons,
+                    vec![
+                        Value::Null,
+                        json!("window"),
+                        json!("below_threshold"),
+                        json!("timeout"),
+                        json!("error"),
+                        json!("kb_reason"),
+                    ]
+                );
+                assert_eq!(checks[1]["entry_id"], "kb-1");
+                assert_eq!(checks[1]["injected"], false);
+                assert_eq!(checks[1]["suppressed_calls"], 0);
+                assert_eq!(checks[1]["suppressed_call_ids"], json!([]));
+                assert_eq!(checks[2]["entry_id"], "kb-2");
+                assert_eq!(checks[2]["score"], 0.8);
+                for c in [checks[3], checks[4]] {
+                    for k in [
+                        "entry_id",
+                        "score",
+                        "threshold",
+                        "matcher_version",
+                        "candidates",
+                        "scored",
+                        "kb_reason",
+                    ] {
+                        assert!(c[k].is_null(), "{k} in {c}");
+                    }
+                }
+                assert_eq!(checks[5]["kb_reason"], "warming");
+                assert!(checks[5]["entry_id"].is_null());
+                assert!(checks[5]["score"].is_null());
+                assert_eq!(checks[5]["threshold"], 0.85);
+                assert_eq!(checks[5]["candidates"], 3);
+                for (i, c) in checks.iter().enumerate() {
+                    assert_eq!(c["iteration"], i + 1);
+                    if i > 0 {
+                        assert!(c["kb_reason"].is_null() || i == 5);
+                    }
+                }
+                let s = &res.stats;
+                assert_eq!(
+                    (
+                        s.memory_belief_checks,
+                        s.memory_belief_eligible_turns,
+                        s.memory_belief_injections,
+                        s.memory_belief_timeouts,
+                        s.memory_belief_errors,
+                    ),
+                    (6, 6, 1, 1, 1)
+                );
+                // The injected c1 is followed by a different call: changed.
+                assert_eq!(outcome_changed(&lines), json!(true));
+                assert_eq!(s.memory_belief_actions_changed, 1);
+            }
+
+            // AC-8: an unsupported memory (None) emits nothing and runs as
+            // annotate.
+            #[tokio::test]
+            async fn an_unsupported_memory_runs_as_annotate() {
+                let fake = Arc::new(FakeMemory::new());
+                let script = vec![
+                    turn(vec![bash("c1", "ls")]),
+                    turn(vec![bash("c2", "ls -a")]),
+                    finish_blocked("cf"),
+                ];
+                let (res, _, lines, runs) = belief_run(script, &fake, 5).await;
+                assert_eq!(fake.belief_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(runs.load(Ordering::SeqCst), 2);
+                assert!(events_named(&lines, "belief_check").is_empty());
+                let s = &res.stats;
+                assert_eq!(s.memory_belief_eligible_turns, 2);
+                assert_eq!(s.memory_belief_checks, 0);
+                assert_eq!(s.memory_belief_timeouts, 0);
+                assert_eq!(run_end_stats(&lines)["memory_belief_checks"], 0);
+            }
+
+            // AC-8: a check still pending at BELIEF_CHECK_TIMEOUT fails open.
+            #[tokio::test]
+            async fn a_hung_check_times_out_and_fails_open() {
+                let mut fake = FakeMemory::new();
+                fake.belief_hang = true;
+                let fake = Arc::new(fake);
+                let script = vec![turn(vec![bash("c1", "ls")]), finish_blocked("cf")];
+                let (res, _, lines, runs) = belief_run(script, &fake, 5).await;
+                assert_eq!(runs.load(Ordering::SeqCst), 1);
+                let checks = events_named(&lines, "belief_check");
+                assert_eq!(checks.len(), 1);
+                assert_eq!(checks[0]["suppressed_reason"], "timeout");
+                assert!(checks[0]["threshold"].is_null());
+                assert_eq!(res.stats.memory_belief_timeouts, 1);
+                assert!(res.stats.memory_belief_wait_ms >= 2000);
+            }
+
+            // AC-10, AC-13: the window, its expiry, compaction re-arming, and
+            // pairing across a tier-2 compaction.
+            #[tokio::test]
+            async fn window_rails_and_pairing_survive_compaction() {
+                let dir = TempDir::new().expect("tempdir");
+                let path = dir.path().join("t.jsonl");
+                let mut beliefs = vec![hit("kb-1"), hit("kb-1")];
+                beliefs.extend((3..=10).map(|_| below()));
+                beliefs.extend([hit("kb-1"), hit("kb-1")]);
+                let fake = Arc::new(FakeMemory::new().beliefs(beliefs));
+                let script: Vec<AssistantTurn> = (0..12)
+                    .map(|i| {
+                        echo_turn_usage(&format!("c{i}"), json!({ "i": i }), hot_usage(1_000, 1, 0))
+                    })
+                    .chain([finish_blocked("cf")])
+                    .collect();
+                let backend = MockBackend::from_turns(script).with_context_limit_override(100_000);
+                let tools = registry_with_finish_and_echo();
+                let config = RunConfig::new("do the task", 20)
+                    .with_compact_threshold_pct(1)
+                    .with_memory(
+                        Arc::clone(&fake) as Arc<dyn Memory>,
+                        MemoryMode::BeliefCheck,
+                    )
+                    .with_transcript(path.clone(), "t");
+                let res = run(&backend, &tools, &ToolCtx::stub(), &config).await;
+                assert!(matches!(
+                    res.outcome,
+                    LoopOutcome::Finished(Disposition::Blocked { .. })
+                ));
+                let lines = read_transcript_lines(&path);
+                let checks = events_named(&lines, "belief_check");
+                assert_eq!(checks.len(), 12);
+                let at = |i: usize| {
+                    (
+                        checks[i]["injected"].clone(),
+                        checks[i]["suppressed_reason"].clone(),
+                    )
+                };
+                // Iteration 1 injects, 2 is inside the window.
+                assert_eq!(at(0), (json!(true), Value::Null));
+                assert_eq!(at(1), (json!(false), json!("window")));
+                // Iteration 11 = 1 + WINDOW: injectable again.
+                assert_eq!(at(10), (json!(true), Value::Null));
+                // Iteration 12 is inside 11's window, but a compaction ran.
+                assert!(res.stats.compactions >= 1);
+                assert_eq!(at(11), (json!(true), Value::Null));
+                let compaction_at = lines
+                    .iter()
+                    .position(|l| l["event"] == "compaction")
+                    .expect("a compaction");
+                let check_12_at = lines
+                    .iter()
+                    .position(|l| l["event"] == "belief_check" && l["iteration"] == 12)
+                    .unwrap();
+                assert!(compaction_at < check_12_at);
+                assert!(res.stats.highest_compaction_tier >= 2);
+                assert_eq!(res.stats.compaction_orphan_tool_results, 0);
+                assert_eq!(run_end_stats(&lines)["compaction_orphan_tool_results"], 0);
+                assert_eq!(res.stats.memory_belief_injections, 3);
+                for c in checks.iter().filter(|c| c["injected"] == true) {
+                    for id in c["suppressed_call_ids"].as_array().unwrap() {
+                        let results = tool_results_for(&lines, id.as_str().unwrap());
+                        assert_eq!(results.len(), 1);
+                        assert!(
+                            results[0]["content"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with(BELIEF_CHECK_MARKER)
+                        );
+                    }
+                }
+                // Every request after the compaction pairs every call id.
+                let seen = backend.messages_seen();
+                for history in &seen[11..] {
+                    let mut call_ids = Vec::new();
+                    let mut result_ids = BTreeSet::new();
+                    for m in history {
+                        match m {
+                            Message::Assistant { content } => {
+                                for b in content {
+                                    if let ContentBlock::ToolCall(c) = b {
+                                        call_ids.push(c.id.clone());
+                                    }
+                                }
+                            }
+                            Message::User { content } => {
+                                for b in content {
+                                    if let UserBlock::ToolResult { call_id, .. } = b {
+                                        result_ids.insert(call_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(call_ids.contains(&"c0".to_string()));
+                    for id in &call_ids {
+                        assert!(result_ids.contains(id), "unpaired {id}");
+                    }
+                }
+            }
+
+            // AC-12: an injected turn neither nudges nor trips FinishDiscipline.
+            #[tokio::test]
+            async fn an_injected_turn_skips_the_nudge_and_tree_counter() {
+                let dir = TempDir::new().expect("tempdir");
+                let (mut tools, bash_runs) = registry_with_bash();
+                tools.register(
+                    "run_checks",
+                    Arc::new(TestTool::new("run_checks", "run the gate", "green")),
+                );
+                let fake = Arc::new(FakeMemory::new().beliefs([below(), hit("kb-1")]));
+                let script = vec![
+                    turn(vec![
+                        bash("c1", "touch x"),
+                        tool_call("c2", "run_checks", json!({})),
+                    ]),
+                    turn(vec![tool_call("c3", "echo", json!({"i": 3})), done("cf1")]),
+                    finish_blocked("cf"),
+                ];
+                let config = RunConfig::new("do the task", 5)
+                    .with_static_tree_k(1)
+                    .with_max_nudges(1)
+                    .with_memory(
+                        Arc::clone(&fake) as Arc<dyn Memory>,
+                        MemoryMode::BeliefCheck,
+                    )
+                    .with_transcript(dir.path().join("t.jsonl"), "t");
+                let (res, _, lines) = go(script, &tools, &config).await;
+                assert_eq!(bash_runs.load(Ordering::SeqCst), 1);
+                assert!(
+                    matches!(
+                        res.outcome,
+                        LoopOutcome::Finished(Disposition::Blocked { .. })
+                    ),
+                    "{:?}",
+                    res.outcome
+                );
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l["event"] == "harness_message" && l["kind"] == "nudge")
+                );
+                assert_eq!(res.stats.nudges_fired, 0);
+                assert_eq!(res.stats.mutating_iters, 1);
+                assert!(res.stats.gates_green_at_exit);
+                assert_eq!(res.stats.memory_belief_injections, 1);
+                let end = lines
+                    .iter()
+                    .filter(|l| l["event"] == "iteration_end")
+                    .map(|l| l["iters_since_tree_change"].clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(end, vec![json!(0), json!(0)]);
+            }
+
+            // AC-14: next_action_changed true / false / false / null.
+            #[tokio::test]
+            async fn next_action_changed_cases() {
+                // true: a different call.
+                let fake = Arc::new(FakeMemory::new().beliefs([hit("kb-1")]));
+                let script = vec![
+                    turn(vec![bash("c1", "a")]),
+                    turn(vec![bash("c2", "b")]),
+                    finish_blocked("cf"),
+                ];
+                let (res, _, lines, _) = belief_run(script, &fake, 5).await;
+                assert_eq!(outcome_changed(&lines), json!(true));
+                assert_eq!(res.stats.memory_belief_actions_changed, 1);
+
+                // false: the same calls in a different order.
+                let fake = Arc::new(FakeMemory::new().beliefs([hit("kb-1"), below()]));
+                let script = vec![
+                    turn(vec![bash("c1", "a"), bash("c2", "b")]),
+                    turn(vec![bash("c3", "b"), bash("c4", "a")]),
+                    finish_blocked("cf"),
+                ];
+                let (res, _, lines, _) = belief_run(script, &fake, 5).await;
+                assert_eq!(outcome_changed(&lines), json!(false));
+                assert_eq!(res.stats.memory_belief_actions_changed, 0);
+
+                // false: a duplicate of the suppressed call.
+                let fake = Arc::new(FakeMemory::new().beliefs([hit("kb-1"), below()]));
+                let script = vec![
+                    turn(vec![bash("c1", "a")]),
+                    turn(vec![bash("c2", "a"), bash("c3", "a")]),
+                    finish_blocked("cf"),
+                ];
+                let (_, _, lines, runs) = belief_run(script, &fake, 5).await;
+                assert_eq!(outcome_changed(&lines), json!(false));
+                assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+                // null: the run ends before another turn.
+                let fake = Arc::new(FakeMemory::new().beliefs([hit("kb-1")]));
+                let script = vec![turn(vec![bash("c1", "a")]), finish_blocked("cf")];
+                let (res, _, lines, _) = belief_run(script, &fake, 1).await;
+                assert!(matches!(res.outcome, LoopOutcome::MaxIterations));
+                assert_eq!(outcome_changed(&lines), Value::Null);
+                let n = lines.len();
+                assert_eq!(lines[n - 1]["event"], "run_end");
+                assert_eq!(lines[n - 2]["event"], "belief_check_outcome");
+                assert_eq!(lines[n - 2]["iteration"], 1);
+                assert_eq!(lines[n - 2]["entry_id"], "kb-1");
+                assert_eq!(res.stats.memory_belief_actions_changed, 0);
+            }
         }
 
         fn registry_with_bash() -> (ToolRegistry, Arc<AtomicU32>) {
@@ -20958,7 +22205,7 @@ mod tests {
                 let (_, _, lines) =
                     go(echo_script(), &registry_with_finish_and_echo(), &config).await;
                 assert_eq!(lines[0]["config"]["memory_mode"], expected);
-                assert_eq!(lines[0]["transcript_version"], 5);
+                assert_eq!(lines[0]["transcript_version"], 6);
             }
         }
 
