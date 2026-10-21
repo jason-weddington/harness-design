@@ -231,11 +231,11 @@
 //!   selects the AWS Bedrock backend (Converse API) AHEAD of `TALOS_BACKEND`
 //!   / `ANTHROPIC_*` / `OLLAMA_*`; unset/empty/whitespace-only falls through.
 //!   Credentials AND region resolve via the standard AWS chain (env/profile
-//!   /SSO/IMDS — no keys in source). Only `claude-haiku-4-5` /
-//!   `claude-sonnet-5` / `claude-opus-4-8` (via `ANTHROPIC_MODEL`) are mapped.
+//!   /SSO/IMDS — no keys in source). Only `claude-haiku-5-5` /
+//!   `claude-sonnet-5-5` / `claude-opus-5-5` (via `ANTHROPIC_MODEL`) are mapped.
 //! - `TALOS_BACKEND` — `anthropic` (default when unset) | `ollama`
 //! - `ANTHROPIC_API_KEY` — required for anthropic
-//! - `ANTHROPIC_MODEL` — optional; default `claude-haiku-4-5`
+//! - `ANTHROPIC_MODEL` — optional; default `claude-haiku-4-5` (anthropic) / `claude-haiku-5-5` (bedrock)
 //! - `OLLAMA_MODEL` — required for ollama
 //! - `OLLAMA_BASE_URL` — optional; default `http://localhost:11434`
 //! - `OLLAMA_API_KEY` — optional bearer token
@@ -1459,10 +1459,10 @@ async fn build_ollama_backend(
 
 /// Build a [`BedrockBackend`] from the injected environment accessor.
 ///
-/// Reads `ANTHROPIC_MODEL` (default `claude-haiku-4-5`, mirroring
-/// [`build_anthropic_backend`]), maps it to the Bedrock inference-profile id
+/// Reads `ANTHROPIC_MODEL` (default `claude-haiku-5-5`; the anthropic backend's default differs),
+/// maps it to the Bedrock inference-profile id
 /// (returning `Err` on an unmapped model), constructs the backend, and
-/// records the CANONICAL model name (e.g. `claude-haiku-4-5` — NOT the
+/// records the CANONICAL model name (e.g. `claude-haiku-5-5` — NOT the
 /// inference-profile id) as `settings.model`; `settings.model_label()`
 /// yields the historical `bedrock:{canonical}` label. `think`/`num_ctx`/
 /// `num_ctx_source` are `None` (Bedrock has no such knobs this cut).
@@ -1472,7 +1472,7 @@ async fn build_ollama_backend(
 fn build_bedrock_backend(
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<(Backend, BackendSettings), String> {
-    let canonical = env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-haiku-4-5".to_string());
+    let canonical = env("ANTHROPIC_MODEL").unwrap_or_else(|| "claude-haiku-5-5".to_string());
     let backend = BedrockBackend::new(&canonical)?;
     Ok((
         Backend::Bedrock(backend),
@@ -1504,7 +1504,7 @@ fn build_bedrock_backend(
 /// - `TALOS_BACKEND` set to anything other than `"anthropic"` / `"ollama"`
 /// - Missing required provider vars (`ANTHROPIC_API_KEY`, `OLLAMA_MODEL`)
 /// - `ANTHROPIC_MODEL` set to a model `TALOS_BEDROCK` cannot map (only
-///   `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-4-8`)
+///   `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5`)
 /// - `OLLAMA_THINK` outside the accepted set
 /// - `OLLAMA_NUM_CTX` present (non-empty) but unparsable as `u32`
 /// - a `POST /api/show` probe failure for a local (`localhost`/`127.0.0.1`)
@@ -2709,7 +2709,7 @@ mod tests {
                 source: MaxTokensSource::Derived,
             }
         );
-        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5").expect("mapped"));
+        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5-5").expect("mapped"));
         assert_eq!(
             bedrock.output_cap(None),
             OutputCapResolution {
@@ -2772,7 +2772,7 @@ mod tests {
             Backend::Anthropic(AnthropicBackend::new("claude-haiku-4-5", "k")).context_limit(),
             None
         );
-        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5").expect("mapped"));
+        let bedrock = Backend::Bedrock(BedrockBackend::new("claude-sonnet-5-5").expect("mapped"));
         assert_eq!(bedrock.context_limit(), None);
     }
 
@@ -3212,7 +3212,7 @@ mod tests {
         let bedrock = |think: Option<&str>, num_ctx: Option<u32>, num_ctx_source: Option<&str>| {
             BackendSettings {
                 kind: BackendKind::Bedrock,
-                model: "claude-haiku-4-5".to_string(),
+                model: "claude-haiku-5-5".to_string(),
                 think: think.map(str::to_string),
                 num_ctx,
                 num_ctx_source: num_ctx_source.map(str::to_string),
@@ -3222,12 +3222,12 @@ mod tests {
         };
         assert_eq!(
             transcript_label(&bedrock(None, None, None)),
-            "bedrock:claude-haiku-4-5",
+            "bedrock:claude-haiku-5-5",
             "a non-ollama label is unchanged"
         );
         assert_eq!(
             transcript_label(&bedrock(Some("on"), Some(65536), Some("explicit"))),
-            "bedrock:claude-haiku-4-5",
+            "bedrock:claude-haiku-5-5",
             "a non-ollama label is unchanged regardless of populated ollama-ish fields"
         );
 
@@ -3608,8 +3608,8 @@ mod tests {
         // The CANONICAL model name is recorded — NOT the inference-profile
         // id the backend was actually built with.
         assert_eq!(settings.kind, BackendKind::Bedrock);
-        assert_eq!(settings.model, "claude-haiku-4-5");
-        assert_eq!(settings.model_label(), "bedrock:claude-haiku-4-5");
+        assert_eq!(settings.model, "claude-haiku-5-5");
+        assert_eq!(settings.model_label(), "bedrock:claude-haiku-5-5");
         assert_eq!(settings.think, None);
         assert_eq!(settings.num_ctx, None);
         assert_eq!(settings.num_ctx_source, None);
@@ -3624,7 +3624,7 @@ mod tests {
         ]);
         let (backend, label_settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Bedrock(_)));
-        assert_eq!(label_settings.model_label(), "bedrock:claude-haiku-4-5");
+        assert_eq!(label_settings.model_label(), "bedrock:claude-haiku-5-5");
     }
 
     #[tokio::test]
@@ -3657,12 +3657,27 @@ mod tests {
     async fn talos_bedrock_explicit_model_label() {
         let env = env_with(&[
             ("TALOS_BEDROCK", "1"),
-            ("ANTHROPIC_MODEL", "claude-sonnet-5"),
+            ("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
         ]);
         let (backend, settings) = backend_from_env(&env).await.expect("must succeed");
         assert!(matches!(backend, Backend::Bedrock(_)));
-        assert_eq!(settings.model, "claude-sonnet-5");
-        assert_eq!(settings.model_label(), "bedrock:claude-sonnet-5");
+        assert_eq!(settings.model, "claude-sonnet-5-5");
+        assert_eq!(settings.model_label(), "bedrock:claude-sonnet-5-5");
+    }
+
+    #[tokio::test]
+    async fn talos_bedrock_old_model_name_is_err() {
+        let env = env_with(&[
+            ("TALOS_BEDROCK", "1"),
+            ("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+        ]);
+        let Err(msg) = backend_from_env(&env).await else {
+            panic!("a pre-5.5 model name under TALOS_BEDROCK must be Err");
+        };
+        assert!(
+            msg.contains("unsupported bedrock model: claude-haiku-4-5"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]

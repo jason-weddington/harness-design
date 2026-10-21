@@ -26,8 +26,8 @@
 //!   `aws-lc-sys` is absent from the tree (verified via `cargo tree`) and
 //!   `cargo deny check` stays green with no OpenSSL entry.
 //! - **Model id fixed + restricted at construction.** The canonical model
-//!   name (e.g. `claude-haiku-4-5`) is mapped to a Bedrock inference-profile
-//!   id for EXACTLY three models; anything else is rejected at construction
+//!   name (e.g. `claude-haiku-5-5`) is mapped to a Bedrock cross-region
+//!   inference-profile id for EXACTLY three models; anything else is rejected at construction
 //!   with `Err` (never a panic), mirroring `build_anthropic_backend`'s
 //!   Result contract.
 //! - **No credential leakage in `Debug`.** [`BedrockBackend`] deliberately
@@ -38,13 +38,34 @@
 //!   retries or backs off (`retry_after` is `None` on every Bedrock
 //!   transient in v1 — the SDK's own retry metadata is not plumbed through).
 //!
+//! ## Reasoning round-trip
+//!
+//! Bedrock `reasoningContent` blocks are mapped, not dropped. A
+//! `reasoningText` block becomes [`ContentBlock::Reasoning`] with its
+//! `signature` in `opaque`; a `redactedContent` blob becomes a `Reasoning`
+//! with empty `text` and `opaque` = `bedrock-redacted:` + the base64 payload.
+//! On the request side a signed block is echoed back as `reasoningText`
+//! (text + signature), a `bedrock-redacted:` block is decoded back into
+//! `redactedContent`, and an unsigned block (`opaque: None`) is dropped — it
+//! cannot be echoed. Any reasoning block that cannot be mapped is dropped
+//! with a one-line stderr warning (`warning: bedrock dropped a reasoning
+//! block (...)`).
+//!
+//! **Post-hoc transcript check for the first live run.** In the run
+//! transcript, Bedrock `model_response.content` Reasoning blocks should carry
+//! a non-null `opaque`; the next iteration should have no `backend_error`
+//! whose `error_debug` mentions reasoning, thinking or signature; and a
+//! Reasoning block with `opaque: null` (never signed, or nulled by a
+//! `compaction` event) is expected to be absent from the next request.
+//!
 //! ## Testing
 //!
 //! Tests use `wiremock` against the SDK `endpoint_url` override plus dummy
 //! static credentials + an explicit region (the [`BedrockBackend::with_test_endpoint`]
 //! hook), so the full `turn()` path (request serialization + response parse +
 //! tool-use mapping + error classification) runs with NO real AWS. A
-//! `#[ignore]`-marked smoke test hits live Bedrock haiku for the lead to run
+//! `#[ignore]`-marked smoke test hits live Bedrock haiku (plus a sibling
+//! reasoning round-trip smoke) for the lead to run
 //! post-merge with `AWS_PROFILE=gritmile-bedrock-test`.
 
 use async_trait::async_trait;
@@ -53,16 +74,16 @@ use aws_sdk_bedrockruntime::error::SdkError;
 use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock as BedrockContentBlock, ConversationRole, InferenceConfiguration,
-    Message as BedrockMessage, StopReason as BedrockStopReason, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    Message as BedrockMessage, ReasoningContentBlock, ReasoningTextBlock,
+    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::{Client, Config};
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use aws_smithy_types::retry::RetryConfig;
 use aws_smithy_types::timeout::TimeoutConfig;
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number, base64};
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
@@ -88,7 +109,7 @@ use crate::model::{
 pub struct BedrockBackend {
     /// The Bedrock inference-profile id this backend invokes.
     model_id: String,
-    /// The canonical model name (`claude-haiku-4-5`, …) — kept for labels.
+    /// The canonical model name (`claude-haiku-5-5`, …) — kept for labels.
     canonical: String,
     /// Lazily-initialized SDK client. Empty after [`Self::new`] (production
     /// loads it via `aws-config` on the first `turn()`); pre-filled by
@@ -97,7 +118,7 @@ pub struct BedrockBackend {
 }
 
 impl BedrockBackend {
-    /// Construct a backend for `canonical` (e.g. `claude-haiku-4-5`), mapped
+    /// Construct a backend for `canonical` (e.g. `claude-haiku-5-5`), mapped
     /// to its Bedrock inference-profile id. Returns `Err` — never panics —
     /// for an unmapped model. No AWS I/O happens here: the SDK client is
     /// loaded lazily on the first `turn()` via the standard AWS credential
@@ -212,8 +233,7 @@ impl BedrockBackend {
 #[must_use]
 pub fn output_cap_for_model(canonical: &str) -> Option<u32> {
     match canonical {
-        "claude-haiku-4-5" => Some(64_000),
-        "claude-sonnet-5" | "claude-opus-4-8" => Some(128_000),
+        "claude-haiku-5-5" | "claude-sonnet-5-5" | "claude-opus-5-5" => Some(128_000),
         _ => None,
     }
 }
@@ -274,26 +294,27 @@ impl ModelBackend for BedrockBackend {
 // ============================================================================
 
 /// Map a canonical model name to its Bedrock inference-profile id for EXACTLY
-/// the three v1-supported models. `None` for anything else (construction
-/// rejects it with `Err`). The haiku id is the only provisioned/testable one;
-/// sonnet-5 / opus-4-8 are unverified and wired through as-given.
+/// the three supported models. `None` for anything else (construction
+/// rejects it with `Err`). All three ids are cross-region inference profiles
+/// (`us.` prefix) with no date or `-v1:0` suffix; none of them has been
+/// verified with a live call yet.
 ///
 /// # Examples
 ///
 /// ```
 /// # use harness::bedrock::map_model_id;
 /// assert_eq!(
-///     map_model_id("claude-haiku-4-5"),
-///     Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+///     map_model_id("claude-haiku-5-5"),
+///     Some("us.anthropic.claude-haiku-5-5")
 /// );
-/// assert!(map_model_id("claude-3-opus").is_none());
+/// assert!(map_model_id("claude-haiku-4-5").is_none());
 /// ```
 #[must_use]
 pub fn map_model_id(canonical: &str) -> Option<&'static str> {
     match canonical {
-        "claude-haiku-4-5" => Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        "claude-sonnet-5" => Some("us.anthropic.claude-sonnet-5"),
-        "claude-opus-4-8" => Some("us.anthropic.claude-opus-4-8"),
+        "claude-haiku-5-5" => Some("us.anthropic.claude-haiku-5-5"),
+        "claude-sonnet-5-5" => Some("us.anthropic.claude-sonnet-5-5"),
+        "claude-opus-5-5" => Some("us.anthropic.claude-opus-5-5"),
         _ => None,
     }
 }
@@ -325,9 +346,10 @@ fn production_timeout_config() -> TimeoutConfig {
 }
 
 /// Map the conversation [`Message`]s into Bedrock `Message`s. Assistant
-/// `Reasoning` blocks are DROPPED unconditionally on the request side (v1 pin
-/// — Bedrock's `reasoningContent` echo semantics differ from Anthropic's
-/// signed-thinking; deferred). All other assistant blocks map 1:1.
+/// blocks map in order via [`map_assistant_block`]: `Text` and `ToolCall`
+/// 1:1, signed or redacted `Reasoning` echoed back as `reasoningContent`,
+/// unsigned `Reasoning` dropped — every emitted block keeps its original
+/// position relative to the others.
 fn build_messages(req: &TurnRequest<'_>) -> Vec<BedrockMessage> {
     req.messages
         .iter()
@@ -372,7 +394,20 @@ fn map_user_block(b: &UserBlock) -> BedrockContentBlock {
 }
 
 /// Map an assistant-lane [`ContentBlock`] to a Bedrock `ContentBlock`.
-/// `Reasoning { .. }` is dropped unconditionally (see [`build_messages`]).
+///
+/// `Reasoning { text, opaque }` is echoed back so the model can continue its
+/// signed reasoning:
+/// - `opaque` starting with [`REDACTED_OPAQUE_PREFIX`] → the base64 remainder
+///   decoded into `redactedContent`; an undecodable payload is dropped with
+///   the [`bedrock_reasoning_drop_warning`] tripwire.
+/// - any other `opaque: Some(sig)` → `reasoningText { text, signature }`; a
+///   builder error drops the block rather than panicking.
+/// - `opaque: None` → dropped silently: an unsigned block cannot be echoed
+///   (the same rule the anthropic adapter applies), and compaction nulls
+///   `opaque` routinely, so this is not warning-worthy.
+///
+/// Never panics on a `Reasoning` input and never builds
+/// `ReasoningContentBlock::Unknown` (the SDK refuses to serialize it).
 fn map_assistant_block(b: &ContentBlock) -> Option<BedrockContentBlock> {
     match b {
         ContentBlock::Text(t) => Some(BedrockContentBlock::Text(t.clone())),
@@ -384,15 +419,58 @@ fn map_assistant_block(b: &ContentBlock) -> Option<BedrockContentBlock> {
                 .build()
                 .expect("tool use block requires tool_use_id + name"),
         )),
-        ContentBlock::Reasoning { .. } => None,
+        ContentBlock::Reasoning { text, opaque } => {
+            // Unsigned: cannot be echoed — dropped silently.
+            let sig = opaque.as_ref()?;
+            if let Some(payload) = sig.strip_prefix(REDACTED_OPAQUE_PREFIX) {
+                if let Ok(bytes) = base64::decode(payload) {
+                    Some(BedrockContentBlock::ReasoningContent(
+                        ReasoningContentBlock::RedactedContent(Blob::new(bytes)),
+                    ))
+                } else {
+                    eprintln!(
+                        "{}",
+                        bedrock_reasoning_drop_warning("redacted payload is not valid base64")
+                    );
+                    None
+                }
+            } else {
+                ReasoningTextBlock::builder()
+                    .text(text.clone())
+                    .signature(sig.clone())
+                    .build()
+                    .ok()
+                    .map(|b| {
+                        BedrockContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+                            b,
+                        ))
+                    })
+            }
+        }
     }
+}
+
+/// Prefix marking a [`ContentBlock::Reasoning`] `opaque` that carries
+/// Bedrock `redactedContent` (base64-encoded) rather than a signature.
+/// Bedrock `reasoningText` signatures are base64 strings (no `:`), so an
+/// opaque starting with this prefix is unambiguously redacted content.
+const REDACTED_OPAQUE_PREFIX: &str = "bedrock-redacted:";
+
+/// The one-line stderr tripwire for a reasoning block this backend had to
+/// drop (an undecodable redacted payload, or an unknown SDK variant). Pure so
+/// the exact text is unit-pinnable.
+fn bedrock_reasoning_drop_warning(reason: &str) -> String {
+    format!("warning: bedrock dropped a reasoning block ({reason}); it cannot be echoed")
 }
 
 /// Build the `InferenceConfiguration`: `max_tokens` from `req.params` (read
 /// exactly like the anthropic adapter — the resolved/fallback cap lives in
 /// `crate::model::DEFAULT_MAX_TOKENS` and reaches the backend pre-resolved
 /// by the engine loop, which consults [`ModelBackend::output_cap`]),
-/// temperature only when `Some`, `stopSequences` only when non-empty.
+/// temperature only when `Some`, `stopSequences` only when non-empty. The
+/// engine sends temperature `None`; adaptive-thinking models (Opus 5.5
+/// always, Sonnet/Haiku 5.5 by default) may reject a non-default
+/// temperature.
 fn build_inference_config(req: &TurnRequest<'_>) -> InferenceConfiguration {
     InferenceConfiguration::builder()
         .max_tokens(i32::try_from(req.params.max_tokens).unwrap_or(i32::MAX))
@@ -464,11 +542,36 @@ fn parse_converse_output(
 }
 
 /// Map a Bedrock response `ContentBlock` to a normalized [`ContentBlock`].
-/// `Text` and `ToolUse` map; `ReasoningContent` and any other Bedrock block
-/// (image, cachePoint, guard, citations, …) are intentionally ignored in v1
-/// — they are valid blocks we don't map, NOT an unparsable shape.
+/// `Text` and `ToolUse` map 1:1. `ReasoningContent` maps to
+/// [`ContentBlock::Reasoning`]: `reasoningText` keeps its text with the
+/// signature in `opaque`; `redactedContent` becomes empty text with `opaque`
+/// = [`REDACTED_OPAQUE_PREFIX`] + base64 payload; an unknown reasoning
+/// variant is dropped with the [`bedrock_reasoning_drop_warning`] tripwire.
+/// Any other Bedrock block (image, cachePoint, guard, citations, …) is
+/// intentionally ignored — a valid block we don't map, NOT an unparsable
+/// shape.
 fn map_response_block(block: &BedrockContentBlock) -> Option<ContentBlock> {
     match block {
+        BedrockContentBlock::ReasoningContent(rc) => match rc {
+            ReasoningContentBlock::ReasoningText(t) => Some(ContentBlock::Reasoning {
+                text: t.text().to_string(),
+                opaque: t.signature().map(str::to_string),
+            }),
+            ReasoningContentBlock::RedactedContent(blob) => Some(ContentBlock::Reasoning {
+                text: String::new(),
+                opaque: Some(format!(
+                    "{REDACTED_OPAQUE_PREFIX}{}",
+                    base64::encode(blob.as_ref())
+                )),
+            }),
+            _ => {
+                eprintln!(
+                    "{}",
+                    bedrock_reasoning_drop_warning("unknown ReasoningContentBlock variant")
+                );
+                None
+            }
+        },
         BedrockContentBlock::Text(t) => Some(ContentBlock::Text(t.clone())),
         BedrockContentBlock::ToolUse(tu) => Some(ContentBlock::ToolCall(ToolCallRequest {
             id: tu.tool_use_id().to_string(),
@@ -695,9 +798,10 @@ fn document_to_value(doc: &Document) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        BedrockBackend, classify_validation, document_to_value, map_converse_error, map_model_id,
-        map_stop_reason, map_usage, output_cap_for_model, production_timeout_config,
-        value_to_document,
+        BedrockBackend, REDACTED_OPAQUE_PREFIX, bedrock_reasoning_drop_warning,
+        classify_validation, document_to_value, map_assistant_block, map_converse_error,
+        map_model_id, map_response_block, map_stop_reason, map_usage, output_cap_for_model,
+        production_timeout_config, value_to_document,
     };
     use crate::model::{
         BackendError, ContentBlock, DEFAULT_MAX_TOKENS, MaxTokensSource, Message, ModelBackend,
@@ -707,6 +811,9 @@ mod tests {
     use aws_sdk_bedrockruntime::error::SdkError;
     use aws_sdk_bedrockruntime::operation::converse::ConverseError;
     use aws_sdk_bedrockruntime::types::TokenUsage;
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlock as BedrockContentBlock, ReasoningContentBlock, ReasoningTextBlock,
+    };
     use serde_json::{Value, json};
     use std::time::Duration;
     use wiremock::matchers::{method, path_regex};
@@ -719,10 +826,14 @@ mod tests {
     /// `BedrockBackend::new`, which rejects the unmapped names).
     #[test]
     fn output_cap_for_model_pins_every_arm() {
-        assert_eq!(output_cap_for_model("claude-haiku-4-5"), Some(64_000));
-        assert_eq!(output_cap_for_model("claude-sonnet-5"), Some(128_000));
-        assert_eq!(output_cap_for_model("claude-opus-4-8"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-haiku-5-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-sonnet-5-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-opus-5-5"), Some(128_000));
+        assert_eq!(output_cap_for_model("claude-haiku-4-5"), None);
+        assert_eq!(output_cap_for_model("claude-sonnet-5"), None);
+        assert_eq!(output_cap_for_model("claude-opus-4-8"), None);
         assert_eq!(output_cap_for_model("claude-opus-5"), None);
+        assert_eq!(output_cap_for_model("claude-3-opus"), None);
     }
 
     /// The backend resolves its canonical model's published cap with source
@@ -730,9 +841,9 @@ mod tests {
     #[test]
     fn bedrock_backend_output_cap_uses_the_table() {
         for (canonical, cap) in [
-            ("claude-haiku-4-5", 64_000),
-            ("claude-sonnet-5", 128_000),
-            ("claude-opus-4-8", 128_000),
+            ("claude-haiku-5-5", 128_000),
+            ("claude-sonnet-5-5", 128_000),
+            ("claude-opus-5-5", 128_000),
         ] {
             let backend = BedrockBackend::new(canonical).expect("mapped canonical model");
             assert_eq!(
@@ -827,7 +938,7 @@ mod tests {
     }
 
     fn backend(endpoint: &str) -> BedrockBackend {
-        BedrockBackend::new("claude-haiku-4-5")
+        BedrockBackend::new("claude-haiku-5-5")
             .expect("haiku maps")
             .with_test_endpoint(endpoint, "us-east-1")
     }
@@ -867,7 +978,7 @@ mod tests {
             let _held_forever = stream; // never read, never written, never closed
             std::future::pending::<()>().await;
         });
-        let backend = BedrockBackend::new("claude-haiku-4-5")
+        let backend = BedrockBackend::new("claude-haiku-5-5")
             .expect("haiku maps")
             .with_test_endpoint_read_timeout(
                 &format!("http://{addr}"),
@@ -907,27 +1018,49 @@ mod tests {
     #[test]
     fn map_model_id_three_known_and_rejects_unknown() {
         assert_eq!(
-            map_model_id("claude-haiku-4-5"),
-            Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+            map_model_id("claude-haiku-5-5"),
+            Some("us.anthropic.claude-haiku-5-5")
         );
         assert_eq!(
-            map_model_id("claude-sonnet-5"),
-            Some("us.anthropic.claude-sonnet-5")
+            map_model_id("claude-sonnet-5-5"),
+            Some("us.anthropic.claude-sonnet-5-5")
         );
         assert_eq!(
-            map_model_id("claude-opus-4-8"),
-            Some("us.anthropic.claude-opus-4-8")
+            map_model_id("claude-opus-5-5"),
+            Some("us.anthropic.claude-opus-5-5")
         );
-        assert!(map_model_id("claude-3-opus").is_none());
+        for old in [
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-3-opus",
+        ] {
+            assert!(map_model_id(old).is_none(), "{old} must not map");
+        }
     }
 
     #[test]
     fn new_rejects_unmapped_model() {
-        assert!(
-            BedrockBackend::new("claude-3-opus").is_err(),
-            "unmapped model must be Err at construction, never panic"
+        for x in [
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-3-opus",
+        ] {
+            assert!(
+                BedrockBackend::new(x).is_err(),
+                "unmapped model {x} must be Err at construction, never panic"
+            );
+        }
+        for y in ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"] {
+            assert!(BedrockBackend::new(y).is_ok(), "{y} must map");
+        }
+        assert_eq!(
+            BedrockBackend::new("claude-opus-4-8")
+                .err()
+                .expect("rejected"),
+            "unsupported bedrock model: claude-opus-4-8"
         );
-        assert!(BedrockBackend::new("claude-haiku-4-5").is_ok());
     }
 
     // ---- happy path: text + tool_use -------------------------------------
@@ -978,14 +1111,14 @@ mod tests {
         assert_eq!(turn.usage.reasoning_tokens, None);
     }
 
-    // ---- reasoningContent output block is safely ignored ------------------
+    // ---- reasoningContent output blocks map to Reasoning -------------------
 
     #[tokio::test]
-    async fn reasoning_content_block_is_ignored_not_errored() {
+    async fn reasoning_content_maps_to_reasoning_with_signature() {
         let server = MockServer::start().await;
         let body = converse_body(
             &json!([
-                {"reasoningContent": {"reasoningText": {"text": "let me think"}}},
+                {"reasoningContent": {"reasoningText": {"text": "let me think", "signature": "sig-xyz"}}},
                 {"text": "answer"},
                 {
                     "toolUse": {
@@ -1007,8 +1140,14 @@ mod tests {
         let req = request(&messages, &tools, None);
 
         let turn = backend.turn(&req).await.expect("turn ok");
-        // reasoningContent dropped; text + toolUse kept.
-        assert_eq!(turn.content.len(), 2);
+        assert_eq!(turn.content.len(), 3);
+        assert_eq!(
+            turn.content[0],
+            ContentBlock::Reasoning {
+                text: "let me think".into(),
+                opaque: Some("sig-xyz".into()),
+            }
+        );
         assert_eq!(turn.text(), "answer");
         let calls = turn.tool_calls();
         assert_eq!(calls.len(), 1);
@@ -1017,13 +1156,118 @@ mod tests {
         assert!(matches!(turn.stop_reason, StopReason::EndTurn));
     }
 
-    // ---- request side: reasoning blocks dropped, tool results carried ------
+    #[tokio::test]
+    async fn redacted_reasoning_maps_to_prefixed_opaque() {
+        let server = MockServer::start().await;
+        // "AQID" is the base64 of bytes [1, 2, 3].
+        let body = converse_body(
+            &json!([
+                {"reasoningContent": {"redactedContent": "AQID"}},
+                {"text": "ok"}
+            ]),
+            "end_turn",
+            &json!({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}),
+        );
+        mount_ok(&server, &body).await;
+
+        let backend = backend(&server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let req = request(&messages, &tools, None);
+
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(
+            turn.content[0],
+            ContentBlock::Reasoning {
+                text: String::new(),
+                opaque: Some("bedrock-redacted:AQID".into()),
+            }
+        );
+        assert_eq!(turn.text(), "ok");
+    }
+
+    #[test]
+    fn unsigned_reasoning_text_maps_with_none_opaque() {
+        let block = BedrockContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+            ReasoningTextBlock::builder().text("t").build().unwrap(),
+        ));
+        assert_eq!(
+            map_response_block(&block),
+            Some(ContentBlock::Reasoning {
+                text: "t".into(),
+                opaque: None,
+            })
+        );
+    }
 
     #[tokio::test]
-    async fn drops_assistant_reasoning_and_carries_tool_result_on_request() {
-        // The mock echoes back a canned turn regardless of request body; this
-        // test exercises the request-side build (assistant reasoning dropped,
-        // user tool-result mapped with is_error status) without erroring.
+    async fn unknown_reasoning_member_is_ignored_not_errored() {
+        let server = MockServer::start().await;
+        let body = converse_body(
+            &json!([
+                {"reasoningContent": {"futureMember": {}}},
+                {"text": "ok"}
+            ]),
+            "end_turn",
+            &json!({"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}),
+        );
+        mount_ok(&server, &body).await;
+
+        let backend = backend(&server.uri());
+        let messages = user_hi();
+        let tools: Vec<Value> = vec![];
+        let req = request(&messages, &tools, None);
+
+        let turn = backend.turn(&req).await.expect("turn ok");
+        assert_eq!(turn.content.len(), 1);
+        assert_eq!(turn.text(), "ok");
+    }
+
+    /// Response → normalized → request is the identity for both the signed
+    /// and the redacted shape. Compared with `PartialEq`, never `Debug` (the
+    /// SDK's `Debug` redacts reasoning content).
+    #[test]
+    fn reasoning_round_trips_response_to_request() {
+        let signed = BedrockContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+            ReasoningTextBlock::builder()
+                .text("let me think")
+                .signature("sig-xyz")
+                .build()
+                .unwrap(),
+        ));
+        let redacted = BedrockContentBlock::ReasoningContent(
+            ReasoningContentBlock::RedactedContent(aws_smithy_types::Blob::new(vec![1u8, 2, 3])),
+        );
+        for x in [signed, redacted] {
+            let normalized = map_response_block(&x).expect("reasoning maps");
+            assert!(map_assistant_block(&normalized) == Some(x));
+        }
+        assert!(!"sig-xyz".starts_with(REDACTED_OPAQUE_PREFIX));
+    }
+
+    #[test]
+    fn bad_redacted_payload_is_dropped() {
+        assert!(
+            map_assistant_block(&ContentBlock::Reasoning {
+                text: "x".into(),
+                opaque: Some("bedrock-redacted:!!!not-base64".into()),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn bedrock_reasoning_drop_warning_text() {
+        assert_eq!(
+            bedrock_reasoning_drop_warning("x"),
+            "warning: bedrock dropped a reasoning block (x); it cannot be echoed"
+        );
+    }
+
+    // ---- request side: reasoning echoed, tool results carried --------------
+
+    #[tokio::test]
+    async fn echoes_signed_reasoning_and_carries_tool_result_on_request() {
         let server = MockServer::start().await;
         mount_ok(
             &server,
@@ -1043,6 +1287,14 @@ mod tests {
                     ContentBlock::Reasoning {
                         text: "secret".to_string(),
                         opaque: Some("sig".to_string()),
+                    },
+                    ContentBlock::Reasoning {
+                        text: "unsigned".to_string(),
+                        opaque: None,
+                    },
+                    ContentBlock::Reasoning {
+                        text: String::new(),
+                        opaque: Some("bedrock-redacted:AQID".to_string()),
                     },
                     ContentBlock::ToolCall(ToolCallRequest {
                         id: "c1".to_string(),
@@ -1071,6 +1323,37 @@ mod tests {
 
         let turn = backend.turn(&req).await.expect("turn ok");
         assert_eq!(turn.text(), "ok");
+
+        let received = server.received_requests().await.expect("recording on");
+        assert_eq!(received.len(), 1);
+        let raw = std::str::from_utf8(&received[0].body).expect("utf8 body");
+        let body: Value = serde_json::from_str(raw).expect("json body");
+        let assistant = body["messages"][0]["content"]
+            .as_array()
+            .expect("assistant content array");
+        assert_eq!(assistant.len(), 4);
+        assert_eq!(assistant[0], json!({"text": "hi"}));
+        assert_eq!(
+            assistant[1],
+            json!({"reasoningContent": {"reasoningText": {"text": "secret", "signature": "sig"}}})
+        );
+        assert_eq!(
+            assistant[2],
+            json!({"reasoningContent": {"redactedContent": "AQID"}})
+        );
+        assert_eq!(
+            assistant[3],
+            json!({"toolUse": {"toolUseId": "c1", "name": "run", "input": {"a": 1}}})
+        );
+        assert!(!raw.contains("unsigned"));
+        assert_eq!(
+            body["messages"][1]["content"][0]["toolResult"],
+            json!({"toolUseId": "c1", "content": [{"text": "boom"}], "status": "error"})
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1]["toolResult"]["status"],
+            "success"
+        );
     }
 
     // ---- tools wired on the request side ----------------------------------
@@ -1623,7 +1906,7 @@ mod tests {
         // lines have executed — that is what this test pins. (It is NOT the
         // live smoke test; the gate environment has no AWS credentials, so no
         // live Bedrock call is made there.)
-        let backend = BedrockBackend::new("claude-haiku-4-5").expect("haiku maps");
+        let backend = BedrockBackend::new("claude-haiku-5-5").expect("haiku maps");
         let messages = user_hi();
         let tools: Vec<Value> = vec![];
         let req = request(&messages, &tools, None);
@@ -1644,11 +1927,68 @@ mod tests {
     #[ignore = "live AWS: run by the lead with AWS_PROFILE=gritmile-bedrock-test"]
     #[tokio::test]
     async fn live_haiku_smoke() {
-        let backend = BedrockBackend::new("claude-haiku-4-5").expect("haiku maps");
+        let backend = BedrockBackend::new("claude-haiku-5-5").expect("haiku maps");
         let messages = user_hi();
         let tools: Vec<Value> = vec![];
         let req = request(&messages, &tools, Some("Reply with the single word: pong"));
         let turn = backend.turn(&req).await.expect("live turn ok");
         assert!(!turn.text().is_empty());
+    }
+
+    /// Hits LIVE Bedrock haiku twice: turn 1 must return signed reasoning
+    /// alongside a tool call; turn 2 echoes that assistant content verbatim
+    /// (Reasoning included) plus the tool result and must be accepted.
+    ///
+    /// ```sh
+    /// AWS_PROFILE=gritmile-bedrock-test cargo nextest --run-ignored only \
+    ///   -p harness bedrock::tests::live_reasoning_round_trip_smoke
+    /// ```
+    #[ignore = "live AWS: run by the lead with AWS_PROFILE=gritmile-bedrock-test"]
+    #[tokio::test]
+    async fn live_reasoning_round_trip_smoke() {
+        let backend = BedrockBackend::new("claude-haiku-5-5").expect("haiku maps");
+        let tools: Vec<Value> = vec![json!({
+            "name": "get_time",
+            "description": "Return the current time.",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let mut messages = vec![Message::User {
+            content: vec![UserBlock::Text(
+                "Call the get_time tool, then tell me the time.".to_string(),
+            )],
+        }];
+        let turn1 = backend
+            .turn(&request(&messages, &tools, None))
+            .await
+            .expect("live turn 1 ok");
+        assert!(
+            turn1.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Reasoning {
+                    opaque: Some(_),
+                    ..
+                }
+            )),
+            "no signature from Bedrock: turn 1 carried no signed Reasoning block"
+        );
+        let call = turn1
+            .tool_calls()
+            .first()
+            .map(|c| c.id.clone())
+            .expect("turn 1 must call the tool");
+        messages.push(Message::Assistant {
+            content: turn1.content.clone(),
+        });
+        messages.push(Message::User {
+            content: vec![UserBlock::ToolResult {
+                call_id: call,
+                content: "12:00".to_string(),
+                is_error: false,
+            }],
+        });
+        backend
+            .turn(&request(&messages, &tools, None))
+            .await
+            .expect("live turn 2 (reasoning echoed) ok");
     }
 }

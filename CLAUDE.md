@@ -46,7 +46,7 @@ this, not in spite of it.
     abstracts over heterogeneous model backends.
   - **AWS Bedrock** (Converse API) — for environments where the Anthropic API isn't
     reachable (e.g. a work machine); gated by `TALOS_BEDROCK` (wins over any
-    Anthropic/Ollama env), standard AWS credential chain, haiku-4-5/sonnet-5/opus-4-8 only.
+    Anthropic/Ollama env), standard AWS credential chain, haiku-5-5/sonnet-5-5/opus-5-5 only.
 - **Be the kind of codebase autonomous agents can build safely.** Strong commit-time
   and pre-push quality gates so headless agents can "run wild" without a human
   reviewing every line. (The gate stack is in place — see Quality gates below.)

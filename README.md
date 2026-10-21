@@ -37,10 +37,10 @@ cargo test --doc --workspace       # doctests (nextest skips these)
 
 `talos run` selects a model backend from the environment (see `backend_from_env` in `crates/talos/src/main.rs`). Precedence: a `TALOS_BEDROCK` value that is non-empty after trimming selects the AWS Bedrock backend (Converse API) ahead of everything else; otherwise `TALOS_BACKEND` picks `anthropic` (default) or `ollama`.
 
-- `TALOS_BEDROCK` — set to any non-empty (after `.trim()`) value to run on AWS Bedrock (Converse API) instead of the Anthropic API or Ollama. This is for work machines that cannot call the Anthropic API directly. Credentials AND region resolve via the standard AWS chain (env/profile/SSO/IMDS — no keys in source). It wins over `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*`; an unset, empty, or whitespace-only value falls through to the `TALOS_BACKEND` match. Only `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-4-8` (via `ANTHROPIC_MODEL`) are mapped to Bedrock inference-profile ids; anything else is rejected at construction.
+- `TALOS_BEDROCK` — set to any non-empty (after `.trim()`) value to run on AWS Bedrock (Converse API) instead of the Anthropic API or Ollama. This is for work machines that cannot call the Anthropic API directly. Credentials AND region resolve via the standard AWS chain (env/profile/SSO/IMDS — no keys in source). It wins over `TALOS_BACKEND` / `ANTHROPIC_*` / `OLLAMA_*`; an unset, empty, or whitespace-only value falls through to the `TALOS_BACKEND` match. Only `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` (via `ANTHROPIC_MODEL`) are mapped to Bedrock inference-profile ids; anything else is rejected at construction.
 - `TALOS_BACKEND` — `anthropic` (default when unset) | `ollama`.
 - `ANTHROPIC_API_KEY` — required for the anthropic backend.
-- `ANTHROPIC_MODEL` — optional; default `claude-haiku-4-5`. Used by both the anthropic and bedrock backends.
+- `ANTHROPIC_MODEL` — optional. Used by both backends; default `claude-haiku-4-5` for anthropic and `claude-haiku-5-5` under `TALOS_BEDROCK`.
 - `OLLAMA_MODEL` — required for ollama.
 - `OLLAMA_BASE_URL` — optional; default `http://localhost:11434`.
 - `OLLAMA_API_KEY` — optional bearer token.
