@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## 0.17.0 - 2026-10-21
+#### Features
+- (**bedrock**) move the Bedrock backend to Claude Haiku/Sonnet/Opus 5.5 and round-trip signed reasoning - (7df4de9) - Jason Weddington, *Claude Opus 5.5*
+
+- - -
+
 ## 0.16.0 - 2026-10-21
 #### Features
 - (**07db96a9**) Anthropic backend sends cache diagnostics and records the cache-miss reason - (1c8d2bd) - claude-code-sonnet, *Claude Sonnet 5.5*
