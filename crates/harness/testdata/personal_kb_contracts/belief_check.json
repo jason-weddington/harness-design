@@ -1,0 +1,423 @@
+{
+  "contract": "belief_check",
+  "contract_version": 1,
+  "generated_by": "packages/kb-service/scripts/gen_contracts.py",
+  "method": "POST",
+  "path": "/api/kb/belief-check",
+  "request": {
+    "schema": {
+      "$defs": {
+        "BeliefCheckPendingCall": {
+          "description": "A tool call the agent is about to make: native tool name (not canonicalized) and a short input summary; not scored in matcher_version 1.",
+          "properties": {
+            "tool": {
+              "title": "Tool",
+              "type": "string"
+            },
+            "input_summary": {
+              "title": "Input Summary",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool",
+            "input_summary"
+          ],
+          "title": "BeliefCheckPendingCall",
+          "type": "object"
+        }
+      },
+      "description": "``POST /api/kb/belief-check``: the agent's latest text and reasoning, each truncated server-side to its last 4096 characters; session_id and turn_index are only logged.",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reasoning"
+        },
+        "project": {
+          "title": "Project",
+          "type": "string"
+        },
+        "pending_calls": {
+          "items": {
+            "$ref": "#/$defs/BeliefCheckPendingCall"
+          },
+          "title": "Pending Calls",
+          "type": "array"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "turn_index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Turn Index"
+        }
+      },
+      "required": [
+        "text",
+        "project"
+      ],
+      "title": "BeliefCheckRequest",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "talos_turn",
+        "body": {
+          "text": "Tests are green. Push feature branches to the mirror remote.",
+          "reasoning": "The branch is ready for review, so it should go to the shared remote now.",
+          "project": "personal-kb",
+          "pending_calls": [
+            {
+              "tool": "bash",
+              "input_summary": "git push mirror feat/x"
+            }
+          ],
+          "session_id": "contract-session-2",
+          "turn_index": 4
+        }
+      },
+      {
+        "name": "minimal",
+        "body": {
+          "text": "Push feature branches to the mirror remote.",
+          "reasoning": null,
+          "project": "personal-kb",
+          "pending_calls": [],
+          "session_id": null,
+          "turn_index": null
+        }
+      }
+    ]
+  },
+  "response": {
+    "schema": {
+      "$defs": {
+        "BeliefCheckMatch": {
+          "description": "One recorded wrong belief and its raw cosine score (max over chunks) against the request.",
+          "properties": {
+            "entry_id": {
+              "title": "Entry Id",
+              "type": "string"
+            },
+            "score": {
+              "title": "Score",
+              "type": "number"
+            },
+            "wrong_belief": {
+              "title": "Wrong Belief",
+              "type": "string"
+            },
+            "corrected_fact": {
+              "title": "Corrected Fact",
+              "type": "string"
+            },
+            "provenance_label": {
+              "title": "Provenance Label",
+              "type": "string"
+            }
+          },
+          "required": [
+            "entry_id",
+            "score",
+            "wrong_belief",
+            "corrected_fact",
+            "provenance_label"
+          ],
+          "title": "BeliefCheckMatch",
+          "type": "object"
+        }
+      },
+      "description": "``POST /api/kb/belief-check``: top matches by score including below-threshold ones; inject only when ``matches[0].score >= threshold``; ``scored < candidates`` is a partial check.",
+      "properties": {
+        "matches": {
+          "items": {
+            "$ref": "#/$defs/BeliefCheckMatch"
+          },
+          "title": "Matches",
+          "type": "array"
+        },
+        "threshold": {
+          "title": "Threshold",
+          "type": "number"
+        },
+        "matcher_version": {
+          "title": "Matcher Version",
+          "type": "integer"
+        },
+        "reason": {
+          "enum": [
+            "checked",
+            "no-project",
+            "project-disabled",
+            "no-embedder",
+            "no-chunks",
+            "no-candidates",
+            "timeout",
+            "warming",
+            "embed-failed",
+            "error"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "candidates": {
+          "title": "Candidates",
+          "type": "integer"
+        },
+        "scored": {
+          "title": "Scored",
+          "type": "integer"
+        },
+        "embed_model": {
+          "title": "Embed Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "matches",
+        "threshold",
+        "matcher_version",
+        "reason",
+        "candidates",
+        "scored",
+        "embed_model"
+      ],
+      "title": "BeliefCheckResponse",
+      "type": "object"
+    },
+    "examples": [
+      {
+        "name": "match",
+        "body": {
+          "matches": [
+            {
+              "entry_id": "kb-00101",
+              "score": 0.9132,
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "provenance_label": "deliberate/observed"
+            },
+            {
+              "entry_id": "kb-00102",
+              "score": 0.612,
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "provenance_label": "autonomous/observed"
+            },
+            {
+              "entry_id": "kb-00105",
+              "score": 0.5507,
+              "wrong_belief": "Iterate with the bare uv run pytest.",
+              "corrected_fact": "Iterate with uv run pytest -m 'not eval'; the bare command runs the live-API eval tests.",
+              "provenance_label": "deliberate/asserted"
+            }
+          ],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "checked",
+          "candidates": 3,
+          "scored": 3,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "near_miss",
+        "body": {
+          "matches": [
+            {
+              "entry_id": "kb-00101",
+              "score": 0.8013,
+              "wrong_belief": "Push feature branches to the mirror remote.",
+              "corrected_fact": "Push feature branches to origin; the mirror remote receives release pushes only.",
+              "provenance_label": "deliberate/observed"
+            },
+            {
+              "entry_id": "kb-00102",
+              "score": 0.512,
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "provenance_label": "autonomous/observed"
+            },
+            {
+              "entry_id": "kb-00105",
+              "score": 0.471,
+              "wrong_belief": "Iterate with the bare uv run pytest.",
+              "corrected_fact": "Iterate with uv run pytest -m 'not eval'; the bare command runs the live-API eval tests.",
+              "provenance_label": "deliberate/asserted"
+            }
+          ],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "checked",
+          "candidates": 3,
+          "scored": 3,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "partial",
+        "body": {
+          "matches": [
+            {
+              "entry_id": "kb-00102",
+              "score": 0.612,
+              "wrong_belief": "Add a new remote with git remote add.",
+              "corrected_fact": "Create remotes with ./scripts/add_remote.sh so the server-side repository exists first.",
+              "provenance_label": "autonomous/observed"
+            },
+            {
+              "entry_id": "kb-00105",
+              "score": 0.5507,
+              "wrong_belief": "Iterate with the bare uv run pytest.",
+              "corrected_fact": "Iterate with uv run pytest -m 'not eval'; the bare command runs the live-API eval tests.",
+              "provenance_label": "deliberate/asserted"
+            }
+          ],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "checked",
+          "candidates": 3,
+          "scored": 2,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "no-project",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "no-project",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "project-disabled",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "project-disabled",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "no-embedder",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "no-embedder",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": ""
+        }
+      },
+      {
+        "name": "no-chunks",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "no-chunks",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "no-candidates",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "no-candidates",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "timeout",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "timeout",
+          "candidates": 3,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "warming",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "warming",
+          "candidates": 3,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "embed-failed",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "embed-failed",
+          "candidates": 3,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      },
+      {
+        "name": "error",
+        "body": {
+          "matches": [],
+          "threshold": 0.85,
+          "matcher_version": 1,
+          "reason": "error",
+          "candidates": 0,
+          "scored": 0,
+          "embed_model": "qwen3-embedding:0.6b"
+        }
+      }
+    ]
+  }
+}
